@@ -88,6 +88,7 @@ their effects alongside the command.
 | `VALUE=example` | No subject; `UNDETERMINED` | Shell-state assignment |
 | `# comment` | No subject; `ALLOW` | Policy-neutral source |
 | `[[ -n word ]]` | No subject; `ALLOW` when conditionals are enabled | String truth and substitution dependencies |
+| `[[ "$mode" == "release" ]]` | No subject; `ALLOW` when conditionals are enabled | Exact comparison; unresolved values and substitutions |
 | `(( 2 + 3 ))` | No subject; `ALLOW` when arithmetic is enabled | Expression truth and status |
 | `(( 1 )) >report.txt` | No subject; `UNDETERMINED` when arithmetic is enabled | File setup; no stdout byte flow |
 | `cd /tmp` | One subject: `cd /tmp`; requires a matching rule | CWD changes and command I/O |
@@ -158,7 +159,7 @@ pre-push verification use that same reference.
 
 | Area | Current analysis support |
 |---|---|
-| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, unary string `[[ … ]]` tests |
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, unary string tests and exact comparisons with quoted right operands in `[[ … ]]` |
 | Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
 | Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
 | Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, wider `[[ … ]]` predicates, dynamic or mutating arithmetic, and the builtin forms listed in the reference |

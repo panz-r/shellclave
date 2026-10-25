@@ -345,19 +345,24 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       header->conditional_expression =
           (shell_source_span_t){(uint32_t)(base + condition.content),
                                 (uint32_t)(condition.end - condition.content)};
-      header->conditional_operand =
-          (shell_source_span_t){(uint32_t)(base + condition.operand),
-                                (uint32_t)condition.operand_length};
+      header->conditional_operand_count = condition.operand_count;
+      header->conditional_predicate = condition.predicate;
+      header->conditional_negated = condition.negated;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        header->conditional_operands[operand] = (shell_source_span_t){
+            (uint32_t)(base + condition.operands[operand]),
+            (uint32_t)condition.operand_lengths[operand]};
       if (condition.frame == SHELL_CONDITIONAL_INCOMPLETE) {
         header->complete = false;
         need(body, SHELL_SOURCE_NEEDS_CONDITIONAL, base + start);
       }
-      if (condition.operand_length &&
-          !collect_expansions(
-              collector, body, base + condition.operand,
-              condition.operand_length, depth + group_count, false,
-              condition.frame == SHELL_CONDITIONAL_INCOMPLETE, false))
-        return false;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        if (condition.operand_lengths[operand] &&
+            !collect_expansions(
+                collector, body, base + condition.operands[operand],
+                condition.operand_lengths[operand], depth + group_count, false,
+                condition.frame == SHELL_CONDITIONAL_INCOMPLETE, false))
+          return false;
       covered = condition.after;
       continue;
     }

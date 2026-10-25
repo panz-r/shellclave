@@ -4442,15 +4442,18 @@ shell_source_word_has_executable_substitution(const char *input,
          SHELL_SOURCE_SCAN_FOUND;
 }
 
-/* Recognize a compound-array opener, including a received unfinished body.
- * This shape does not establish lexical assignment eligibility: unlike
- * a[0]=word, a=(one two) cannot be an ordinary command or redirect argument. */
-static inline SHELL_NONNULL(1) bool shell_source_array_assignment_is_compound(
-    const char *input, size_t length) {
-  if (length < 3 ||
-      !(shell_ascii_alpha((unsigned char)input[0]) || input[0] == '_'))
+/* Recognize scalar or indexed assignment spelling, including += and logical
+ * continuations. This does not establish assignment eligibility or evaluate a
+ * subscript. input is an immutable readable span; equals receives the operator
+ * offset only on success. */
+static inline SHELL_NONNULL(1, 3) bool shell_source_assignment_equals(
+    const char *input, size_t length, size_t *equals) {
+  size_t position = shell_source_skip_escaped_line_endings(input, length, 0);
+  if (position == length ||
+      !(shell_ascii_alpha((unsigned char)input[position]) ||
+        input[position] == '_'))
     return false;
-  size_t position = shell_source_logical_following(input, length, 0);
+  position = shell_source_logical_following(input, length, position);
   while (position < length &&
          (shell_ascii_alnum((unsigned char)input[position]) ||
           input[position] == '_'))
@@ -4463,6 +4466,18 @@ static inline SHELL_NONNULL(1) bool shell_source_array_assignment_is_compound(
   if (position < length && input[position] == '+')
     position = shell_source_logical_following(input, length, position);
   if (position == length || input[position] != '=')
+    return false;
+  *equals = position;
+  return true;
+}
+
+/* Recognize a compound-array opener, including a received unfinished body.
+ * This shape does not establish lexical assignment eligibility: unlike
+ * a[0]=word, a=(one two) cannot be an ordinary command or redirect argument. */
+static inline SHELL_NONNULL(1) bool shell_source_array_assignment_is_compound(
+    const char *input, size_t length) {
+  size_t position;
+  if (!shell_source_assignment_equals(input, length, &position))
     return false;
   position = shell_source_logical_following(input, length, position);
   return position < length && input[position] == '(';
@@ -5435,14 +5450,16 @@ static SHELL_NONNULL(1) inline shell_source_brace_fragment_t
 }
 
 /* Whether a complete shell word needs runtime expansion before it has one
- * static byte spelling. Quoted and escaped bytes are literal; ANSI-C quotes
- * are decoded statically. This rejects parameter and command substitutions,
- * glob syntax, actual brace expansion, and unquoted tilde expansion. Semantic
- * consumers use it before quote removal so they cannot promote a
- * runtime-computed word into a builtin, descriptor name, or concrete path. */
+ * static byte spelling in the given context. Quoted and escaped bytes are
+ * literal; ANSI-C quotes are decoded statically. Active parameter, command,
+ * arithmetic and tilde expansions remain dynamic. Glob syntax and actual
+ * brace expansion also remain dynamic outside conditional operands. Semantic
+ * consumers classify before quote removal so they cannot promote a
+ * runtime-computed word into a builtin, descriptor name or concrete path. */
 typedef enum {
   SHELL_SOURCE_WORD_GENERIC,
   SHELL_SOURCE_WORD_ARGUMENT,
+  SHELL_SOURCE_WORD_CONDITIONAL,
 } shell_source_word_context_t;
 
 typedef struct {
@@ -5450,10 +5467,12 @@ typedef struct {
   bool leading_tilde; /* An unquoted, uncancelled leading tilde prefix. */
 } shell_source_word_expansion_t;
 
-/* Argument words (and FILE redirect operands) undergo Bash's assignment-shaped
- * tilde expansion. Recognize the unquoted name[+]= prefix alongside the word
- * walk, not by searching every suffix. A tilde prefix must remain unquoted
- * through its slash/assignment-colon delimiter or the end of the word.
+/* Argument words, FILE redirect operands and conditional operands undergo
+ * Bash's assignment-shaped tilde expansion. Qualify the scalar or indexed
+ * assignment spelling once, then track unquoted = and : in the word walk.
+ * Conditional operands suppress pathname and brace expansion; their other
+ * expansions use the same classification as arguments. A tilde prefix must
+ * remain unquoted through its slash/assignment-colon delimiter or word end.
  * CWD resolution models leading tilde expansion separately, but must still
  * reject any later runtime expansion. Keep scanning after its delimiter.
  * NULL or an empty span denotes an unavailable word and is dynamic; otherwise
@@ -5469,13 +5488,12 @@ shell_source_word_expansion(const char *input, size_t length,
   bool in_double_quote = false;
   bool tilde_start = true, tilde_prefix = false;
   bool leading_prefix = false;
-  enum {
-    PREFIX_NONE,
-    PREFIX_START,
-    PREFIX_NAME,
-    PREFIX_PLUS,
-    PREFIX_VALUE
-  } prefix = context == SHELL_SOURCE_WORD_ARGUMENT ? PREFIX_START : PREFIX_NONE;
+  size_t equals;
+  bool assignment = context != SHELL_SOURCE_WORD_GENERIC &&
+                    shell_source_assignment_equals(input, length, &equals);
+  bool seen_equals = false;
+  bool conditional = context == SHELL_SOURCE_WORD_CONDITIONAL;
+  size_t leading = shell_source_skip_escaped_line_endings(input, length, 0);
   shell_source_brace_scan_t braces = {0};
   shell_source_glob_scan_t glob = {0};
   for (size_t position = 0; position < length;) {
@@ -5498,8 +5516,6 @@ shell_source_word_expansion(const char *input, size_t length,
       }
       if (position + 1 >= length)
         return (shell_source_word_expansion_t){.dynamic = true};
-      if (prefix != PREFIX_VALUE)
-        prefix = PREFIX_NONE;
       tilde_prefix = false;
       shell_source_brace_scan_literal(&braces);
       shell_source_glob_scan_step(&glob, (unsigned char)input[position + 1],
@@ -5511,8 +5527,6 @@ shell_source_word_expansion(const char *input, size_t length,
     if (!in_double_quote && c == '\'') {
       shell_source_brace_scan_literal(&braces);
       in_single_quote = true;
-      if (prefix != PREFIX_VALUE)
-        prefix = PREFIX_NONE;
       tilde_start = tilde_prefix = false;
       position++;
       continue;
@@ -5520,8 +5534,6 @@ shell_source_word_expansion(const char *input, size_t length,
     if (c == '"') {
       shell_source_brace_scan_literal(&braces);
       in_double_quote = !in_double_quote;
-      if (prefix != PREFIX_VALUE)
-        prefix = PREFIX_NONE;
       tilde_start = tilde_prefix = false;
       position++;
       continue;
@@ -5534,8 +5546,6 @@ shell_source_word_expansion(const char *input, size_t length,
                                            shell_source_glob_ansi_byte, &glob))
         return (shell_source_word_expansion_t){.dynamic = true};
       position = after;
-      if (prefix != PREFIX_VALUE)
-        prefix = PREFIX_NONE;
       tilde_start = tilde_prefix = false;
       continue;
     }
@@ -5543,23 +5553,13 @@ shell_source_word_expansion(const char *input, size_t length,
         shell_source_dollar_has_dynamic_syntax(input, length, position))
       return (shell_source_word_expansion_t){.dynamic = true};
     if (!in_double_quote) {
-      bool value_start = false;
-      if (prefix == PREFIX_START)
-        prefix = shell_ascii_alpha((unsigned char)c) || c == '_' ? PREFIX_NAME
-                                                                 : PREFIX_NONE;
-      else if (prefix == PREFIX_NAME) {
-        if (c == '=') {
-          prefix = PREFIX_VALUE;
-          value_start = true;
-        } else if (c == '+')
-          prefix = PREFIX_PLUS;
-        else if (!shell_ascii_alnum((unsigned char)c) && c != '_')
-          prefix = PREFIX_NONE;
-      } else if (prefix == PREFIX_PLUS) {
-        value_start = c == '=';
-        prefix = value_start ? PREFIX_VALUE : PREFIX_NONE;
-      }
-      if (tilde_prefix && (c == '/' || (prefix == PREFIX_VALUE && c == ':'))) {
+      /* Bash marks the whole word as assignment-shaped, then recognizes the
+       * first unquoted = and every unquoted colon, including in a subscript.
+       * This is string expansion, not an assignment or arithmetic evaluation.
+       */
+      bool value_start = assignment && c == '=' && !seen_equals;
+      seen_equals |= c == '=';
+      if (tilde_prefix && (c == '/' || (assignment && c == ':'))) {
         if (!leading_prefix)
           return (shell_source_word_expansion_t){.dynamic = true};
         expansion.leading_tilde = true;
@@ -5573,24 +5573,25 @@ shell_source_word_expansion(const char *input, size_t length,
           return (shell_source_word_expansion_t){.dynamic = true};
         position = after;
         tilde_start = tilde_prefix = false;
-        if (prefix != PREFIX_VALUE)
-          prefix = PREFIX_NONE;
         continue;
       }
-      if ((c == '?' || c == '*' || c == '+' || c == '@' || c == '!') &&
-          shell_source_logical_next_is(input, length, position, '(', NULL))
-        return (shell_source_word_expansion_t){.dynamic = true};
-      if (c == '*' || c == '?')
-        return (shell_source_word_expansion_t){.dynamic = true};
-      if (shell_source_glob_scan_step(&glob, (unsigned char)c, false))
-        return (shell_source_word_expansion_t){.dynamic = true};
+      if (!conditional) {
+        if ((c == '?' || c == '*' || c == '+' || c == '@' || c == '!') &&
+            shell_source_logical_next_is(input, length, position, '(', NULL))
+          return (shell_source_word_expansion_t){.dynamic = true};
+        if (c == '*' || c == '?')
+          return (shell_source_word_expansion_t){.dynamic = true};
+        if (shell_source_glob_scan_step(&glob, (unsigned char)c, false))
+          return (shell_source_word_expansion_t){.dynamic = true};
+      }
       if (c == '~' && tilde_start) {
         tilde_prefix = true;
-        leading_prefix = prefix != PREFIX_VALUE;
+        leading_prefix = position == leading;
       }
-      if (shell_source_brace_scan_step(&braces, (unsigned char)c))
+      if (!conditional &&
+          shell_source_brace_scan_step(&braces, (unsigned char)c))
         return (shell_source_word_expansion_t){.dynamic = true};
-      tilde_start = value_start || (prefix == PREFIX_VALUE && c == ':');
+      tilde_start = value_start || (assignment && c == ':');
     } else
       shell_source_glob_scan_step(&glob, (unsigned char)c, true);
     position++;

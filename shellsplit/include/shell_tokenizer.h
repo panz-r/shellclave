@@ -52,6 +52,16 @@ typedef enum {
   SHELL_COMMAND_CONDITIONAL,
 } shell_command_kind_t;
 
+/* Normalized conditional predicate. Bare words use STRING_NONEMPTY; = and ==
+ * share STRING_EQUAL. Lexical ! parity is represented separately. */
+typedef enum {
+  SHELL_CONDITIONAL_PREDICATE_NONE = 0,
+  SHELL_CONDITIONAL_STRING_NONEMPTY,
+  SHELL_CONDITIONAL_STRING_EMPTY,
+  SHELL_CONDITIONAL_STRING_EQUAL,
+  SHELL_CONDITIONAL_STRING_NOT_EQUAL,
+} shell_conditional_predicate_t;
+
 /**
  * Subcommand type - the operator or structural marker associated with this
  * subcommand. These are a mutually exclusive token-type field; callers that

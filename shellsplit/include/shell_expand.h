@@ -23,6 +23,9 @@ extern "C" {
  * CONDITIONAL requests instead require one final NUL-free string record,
  * including 0:, for empty; suppress splitting, pathname and brace expansion.
  * Join positional expansion results according to Bash conditional semantics.
+ * Exact comparisons query each dynamic operand separately in source order;
+ * return ordinary final string bytes for both sides, without pattern escaping.
+ * Left operand synchronous effects precede the right operand query.
  *
  * For argument and pathname purposes the application performs quote-sensitive
  * composition, splitting and globbing

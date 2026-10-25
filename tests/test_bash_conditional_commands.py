@@ -1,4 +1,4 @@
-"""Qualify unary conditional grammar and truth against the pinned Bash."""
+"""Qualify string conditional grammar and truth against the pinned Bash."""
 
 import argparse
 import os
@@ -8,7 +8,8 @@ import unittest
 
 class ConditionalCommands(unittest.TestCase):
     def bash_result(self, source, syntax=False):
-        environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C")
+        environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C",
+                           HOME="/model-home")
         for name in ("BASHOPTS", "SHELLOPTS", "POSIXLY_CORRECT", "BASH_COMPAT"):
             environment.pop(name, None)
         return subprocess.run(
@@ -35,6 +36,151 @@ class ConditionalCommands(unittest.TestCase):
                         self.assertIn(truth, (1, 2))
                         self.assertEqual(self.bash_result(source).returncode,
                                          0 if truth == 2 else 1)
+
+    def test_exact_comparisons(self):
+        pairs = (("x", '"x"'), ("x", '"y"'), ("''", '""'),
+                 ("'*'", '"*"'), ("x", '"*"'),
+                 ("日本", '"日本"'), ("日本", '"日本語"'),
+                 ("'-n'", '"-n"'), ("'!'", '"!"'),
+                 ("xy", "'x'" + '"y"'),
+                 ("x", "$'x\\0tail'"), ("''", "$'\\0tail'"),
+                 ("'a b'", '"a b"'), ("'\\'", '"\\\\"'))
+        for left, right in pairs:
+            for operator in ("=", "==", "!="):
+                for negate in ("", "! ", "! ! "):
+                    source = f"[[ {negate}{left} {operator} {right} ]]"
+                    with self.subTest(source=source):
+                        self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+                        truth = self.probe_result(source)
+                        self.assertIn(truth, (1, 2))
+                        self.assertEqual(self.bash_result(source).returncode,
+                                         0 if truth == 2 else 1)
+        for source in ('[[ x == "x" # $(|)\n]]',
+                       '[[ x == "x"\n]]',
+                       '[[ x =\\\n= "x" ]]',
+                       '[[ x !\\\n= "y" ]]'):
+            with self.subTest(source=source):
+                self.assertEqual(self.bash_result(source).returncode, 0)
+                self.assertEqual(self.probe_result(source), 2)
+        for source in ('[[ x == ]]', '[[ x != ]]', '[[ x = ]]',
+                       '[[ x\n== "x" ]]', '[[ x ==\n"x" ]]',
+                       '[[ x == # note\n"x" ]]', '[[ -n == "x" ]]',
+                       '[[ x == "$(|)" ]]', '[[ $(|) == "x" ]]'):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
+                self.assertEqual(self.probe_result(source, "--status"), 2)
+        for source in ('[[ x == x ]]', '[[ x == ""x ]]',
+                       '[[ x == x"" ]]', '[[ x == $value ]]',
+                       '[[ x == "${value}"* ]]', '[[ x == \\x ]]'):
+            with self.subTest(source=source):
+                self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+                self.assertEqual(self.probe_result(source, "--status"), 4)
+        for source in ('[[ x == ', '[[ x == "', '[[ x == "$(printf x',
+                       '[[ x == "x" # $(|)'):
+            with self.subTest(source=source):
+                self.assertEqual(self.probe_result(source, "--status"), 1)
+        # The producer is asynchronous. The subprocess deadline bounds this
+        # check without imposing a scheduler-dependent deadline on its read.
+        result = self.bash_result(
+            '[[ <(printf x) == "$(read -r -u63 -n1 value || exit 1; printf "%s" "$value" >&2)" ]] 2>&1')
+        self.assertEqual(result.stdout, b"x")
+
+    def test_tilde_comparisons(self):
+        cases = (
+            ("name=~", "name=/model-home", True),
+            ("name+=~", "name+=/model-home", True),
+            ("name=prefix:~", "name=prefix:/model-home", True),
+            ("name='prefix':~", "name=prefix:/model-home", True),
+            ("arr[0]=~", "arr[0]=/model-home", True),
+            ("arr['0']+=~", "arr[0]+=/model-home", True),
+            ("a[:~/x]=~", "a[:/model-home/x]=/model-home", True),
+            ("a[=~/x]=~", "a[=/model-home/x]=~", True),
+            ("na\\\nme=\\\n~", "name=/model-home", True),
+            ("name=prefix:\\\n~", "name=prefix:/model-home", True),
+            ("name='~'", "name=~", False),
+            ('name="~"', "name=~", False),
+            ("name=\\~", "name=~", False),
+            ("name=~''", "name=~", False),
+            ('name=~""/x', "name=~/x", False),
+            ("~''", "~", False),
+            ("name\\=~", "name=~", False),
+            ("1name=~", "1name=~", False),
+            ("name:~", "name:~", False),
+            ("name=x=~", "name=x=~", False),
+            ("*", "*", False),
+            ("{a,b}", "{a,b}", False),
+            ("@(a|b)", "@(a|b)", False),
+        )
+        for word, value, dynamic in cases:
+            for operator in ("=", "==", "!="):
+                for negate in ("", "! "):
+                    source = f"[[ {negate}{word} {operator} '{value}' ]]"
+                    with self.subTest(source=source):
+                        truth = (operator != "!=") != bool(negate)
+                        self.assertEqual(self.bash_result(source).returncode,
+                                         0 if truth else 1)
+                        self.assertEqual(self.probe_result(source),
+                                         0 if dynamic else 2 if truth else 1)
+
+    def test_token_prefixes(self):
+        pairs = (
+            ('[[ x ]', ']'),
+            ('[[ x ]\\', '\n]'),
+            ('[[ x ]\\\n', ']'),
+            ('[[ x \\', '\n]]'),
+            ('[[ x ]]\\', '\n;'),
+            ('[[ -n x ]', ']'),
+            ('[[ -n x ]\\', '\n]'),
+            ('[[ -n x ]\\\n', ']'),
+            ('[[ -n x \\', '\n]]'),
+            ('[[ -n x ]]\\', '\n;'),
+            ("[[ -z '' ]", ']'),
+            ("[[ -z '' ]\\", '\n]'),
+            ("[[ -z '' ]\\\n", ']'),
+            ("[[ -z '' \\", '\n]]'),
+            ("[[ -z '' ]]\\", '\n;'),
+            ('[[ ! x ]', ']'),
+            ('[[ ! x ]\\', '\n]'),
+            ('[[ ! x ]\\\n', ']'),
+            ('[[ ! x \\', '\n]]'),
+            ('[[ ! x ]]\\', '\n;'),
+            ('[[ x == "x" ]', ']'),
+            ('[[ x == "x" ]\\', '\n]'),
+            ('[[ x == "x" ]\\\n', ']'),
+            ('[[ x == "x" \\', '\n]]'),
+            ('[[ x == "x" ]]\\', '\n;'),
+            ('[[ ! x != "y" ]', ']'),
+            ('[[ ! x != "y" ]\\', '\n]'),
+            ('[[ ! x != "y" ]\\\n', ']'),
+            ('[[ ! x != "y" \\', '\n]]'),
+            ('[[ ! x != "y" ]]\\', '\n;'),
+            ('[[ x !', '= "y" ]]'),
+            ('[[ x !\\', '\n= "y" ]]'),
+            ('[[ x =\\', '\n= "x" ]]'),
+            ('[[ x ==\\', '\n "x" ]]'),
+            ('[[ x !=\\', '\n "y" ]]'),
+            ('[[ x \\', '\n== "x" ]]'),
+        )
+        for received, completion in pairs:
+            with self.subTest(received=received):
+                self.assertEqual(self.probe_result(received, "--status"), 1)
+                complete = received + completion
+                self.assertEqual(self.bash_result(complete, syntax=True).returncode, 0)
+                self.assertEqual(self.probe_result(complete, "--status"), 0)
+                truth = self.probe_result(complete)
+                self.assertEqual(self.bash_result(complete).returncode,
+                                 0 if truth == 2 else 1)
+                if not received.endswith("\\"):
+                    for wrapper in ('printf "$(%s)"', 'cat <(%s)'):
+                        closed = wrapper % received
+                        self.assertNotEqual(self.bash_result(closed, syntax=True).returncode, 0)
+                        self.assertEqual(self.probe_result(closed, "--status"), 2)
+        for source in ('[[ x ] ]]', '[[ x == "x" ] ]]', '[[ x ]x', '[[ x \\x', '[[ x\n]', '[[ x == "x" "]"'):
+            with self.subTest(source=source):
+                self.assertEqual(self.probe_result(source, "--status"), 2)
+        for source in ('[[ x ! ', '[[ x =~', '[[ x == "x" &&'):
+            with self.subTest(source=source):
+                self.assertEqual(self.probe_result(source, "--status"), 4)
 
     def test_extglob_operands(self):
         words = ("@(left|right)", "pre@(@(if|for|case)|tail)suffix",

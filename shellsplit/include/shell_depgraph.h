@@ -325,9 +325,16 @@ typedef enum {
  */
 typedef struct {
   shell_command_kind_t kind;
-  /* Borrowed source spans for CONDITIONAL; never argv or pathname operands. */
-  const char *conditional_expression, *conditional_operand;
-  uint32_t conditional_expression_length, conditional_operand_length;
+  /* Borrowed CONDITIONAL spans in source/expansion order; never argv or
+   * pathname operands. Predicate truth includes lexical negation. EQUAL and
+   * NOT_EQUAL require a fully quoted RHS and nocasematch disabled. */
+  const char *conditional_expression;
+  uint32_t conditional_expression_length;
+  const char *conditional_operands[2];
+  uint32_t conditional_operand_lengths[2];
+  uint8_t conditional_operand_count; /* One for unary, two for comparison. */
+  shell_conditional_predicate_t conditional_predicate;
+  bool conditional_negated; /* Parity of lexical ! operators. */
   shell_conditional_truth_t conditional_truth;
   const char *arithmetic_expression; /* Borrowed content for ARITHMETIC. */
   uint32_t arithmetic_expression_length;
@@ -939,7 +946,8 @@ typedef struct {
  * supported basis: privileged mode ignores `BASH_ENV`, `BASHOPTS`, and
  * `SHELLOPTS`, and declines imported shell functions that could shadow a
  * modelled builtin such as `exec`. An equivalent launcher must establish the
- * same option and command-lookup state before source validation, including no
+ * same option and command-lookup state before source validation, including
+ * nocasematch disabled, no
  * startup aliases or traps, no disabled or shadowed modelled builtins, and a
  * frozen `POSIXLY_CORRECT`, `BASH_COMPAT`, `BASH_XTRACEFD`, and `LC_ALL`. A
  * runtime-expanded command word is

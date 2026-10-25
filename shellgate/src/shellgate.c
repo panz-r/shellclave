@@ -1476,10 +1476,13 @@ static SHELL_NONNULL(1, 2, 3) uint32_t
     if (node->type != SHELL_NODE_CMD)
       continue;
     if (node->cmd.kind == SHELL_COMMAND_CONDITIONAL) {
-      const shell_dep_word_value_t *value =
-          shell_expand_lookup(cache, node->cmd.conditional_operand);
-      if (value && value->dynamic && !value->resolved)
-        flags[ni] |= SG_EXPANSION_UNRESOLVED_CONDITION;
+      for (unsigned operand = 0; operand < node->cmd.conditional_operand_count;
+           ++operand) {
+        const shell_dep_word_value_t *value =
+            shell_expand_lookup(cache, node->cmd.conditional_operands[operand]);
+        if (value && value->dynamic && !value->resolved)
+          flags[ni] |= SG_EXPANSION_UNRESOLVED_CONDITION;
+      }
     }
     for (uint32_t token = 0; token < node->cmd.token_count; token++) {
       SG_EXPANSION_WORK();

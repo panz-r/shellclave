@@ -56,8 +56,14 @@ static void test_nodes(void) {
   CMD_FIELD(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)              \
   CMD_FIELD(conditional_expression, NULL, "x")                                 \
   CMD_FIELD(conditional_expression_length, 0, 1)                               \
-  CMD_FIELD(conditional_operand, NULL, "x")                                    \
-  CMD_FIELD(conditional_operand_length, 0, 1)                                  \
+  CMD_FIELD(conditional_operands[0], NULL, "x")                                \
+  CMD_FIELD(conditional_operand_lengths[0], 0, 1)                              \
+  CMD_FIELD(conditional_operands[1], NULL, "x")                                \
+  CMD_FIELD(conditional_operand_lengths[1], 0, 1)                              \
+  CMD_FIELD(conditional_operand_count, 0, 2)                                   \
+  CMD_FIELD(conditional_predicate, SHELL_CONDITIONAL_PREDICATE_NONE,           \
+            SHELL_CONDITIONAL_STRING_EQUAL)                                    \
+  CMD_FIELD(conditional_negated, false, true)                                  \
   CMD_FIELD(conditional_truth, 0, 1)                                           \
   CMD_FIELD(arithmetic_expression, NULL, "1")                                  \
   CMD_FIELD(arithmetic_expression_length, 0, 1)                                \

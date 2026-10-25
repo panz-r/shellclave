@@ -51,25 +51,25 @@ typedef enum {
  * A compound record spans the compound and its trailing redirects, has no
  * ordinary words, and keeps its enclosed headers separate. Arithmetic headers
  * have kind ARITHMETIC, compound true and an expression span with no argv
- * words. Unary string conditions have kind CONDITIONAL with separate
- * expression and operand spans and no argv. Supported literal arithmetic has no
- * nested headers; executable substitutions in semantically unsupported
- * arithmetic retain their lexical headers. Container headers have kind GROUP.
- * words includes assignment prefixes; assignment_count identifies that initial
- * subset. first_redirect heads an ordered linked list in result.redirects;
- * follow next for redirect_count records (UINT32_MAX ends the list).
- * Quoted/expanded words retain their exact source spelling; use Shellsplit's
- * isolated-word interfaces when a static decoded value is needed. complete
- * establishes this header's grammar only, never execution or native-write
- * eligibility. A closed nested header can be complete inside an unfinished
- * enclosing group, word, or heredoc body. An open compound spans all received
- * bytes through EOF and is incomplete; its closed children remain complete.
- * COMPLETE source has complete headers. A comment ends at its raw LF even
- * when its final byte is a backslash; that LF separates headers normally.
- * Completed substitutions retain their headers, redirects and heredocs even
- * when a following word fragment is unfinished. Malformed closed children
- * invalidate the draft; appending cannot repair their enclosed grammar.
- * Closed children using Bash's implicit heredoc termination at EOF are
+ * words. String conditions have kind CONDITIONAL with an expression span,
+ * ordered operands, normalized predicate and lexical negation, and no argv.
+ * Supported literal arithmetic has no nested headers; executable substitutions
+ * in semantically unsupported arithmetic retain their lexical headers.
+ * Container headers have kind GROUP. words includes assignment prefixes;
+ * assignment_count identifies that initial subset. first_redirect heads an
+ * ordered linked list in result.redirects; follow next for redirect_count
+ * records (UINT32_MAX ends the list). Quoted/expanded words retain their exact
+ * source spelling; use Shellsplit's isolated-word interfaces when a static
+ * decoded value is needed. complete establishes this header's grammar only,
+ * never execution or native-write eligibility. A closed nested header can be
+ * complete inside an unfinished enclosing group, word, or heredoc body. An open
+ * compound spans all received bytes through EOF and is incomplete; its closed
+ * children remain complete. COMPLETE source has complete headers. A comment
+ * ends at its raw LF even when its final byte is a backslash; that LF separates
+ * headers normally. Completed substitutions retain their headers, redirects and
+ * heredocs even when a following word fragment is unfinished. Malformed closed
+ * children invalidate the draft; appending cannot repair their enclosed
+ * grammar. Closed children using Bash's implicit heredoc termination at EOF are
  * UNSUPPORTED: complete delimiter words exist, but exact termination framing
  * is not modeled. Missing delimiter words remain grammar errors.
  * Supported unfinished $(), process substitutions and backticks retain their
@@ -87,9 +87,14 @@ typedef enum {
 typedef struct {
   shell_source_span_t source;
   shell_command_kind_t kind;
-  shell_source_span_t conditional_expression; /* Content without [[ and ]]. */
-  shell_source_span_t conditional_operand;    /* The sole string operand. */
-  shell_source_span_t arithmetic_expression;  /* Content without delimiters. */
+  shell_source_span_t conditional_expression;  /* Content without [[ and ]]. */
+  shell_source_span_t conditional_operands[2]; /* In source/expansion order. */
+  /* Complete: one operand for unary, two for comparison. Incomplete headers
+   * retain received operands, including an unfinished final word. */
+  uint8_t conditional_operand_count;
+  shell_conditional_predicate_t conditional_predicate;
+  bool conditional_negated; /* Parity of lexical ! operators. */
+  shell_source_span_t arithmetic_expression; /* Content without delimiters. */
   shell_source_span_t words[SHELL_DEP_MAX_TOKENS];
   uint32_t word_count, assignment_count;
   uint32_t first_redirect, redirect_count;

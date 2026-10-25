@@ -161,10 +161,27 @@ static void register_temp_file(const char *path) {
   temp_file_count++;
 }
 
+/* path has capacity writable bytes; stem is a trusted fixture basename.
+ * This filesystem boundary checks environment-derived path length and creates
+ * the unique file. Callers own the returned descriptor and generated path. */
+static SHELL_NONNULL(1, 3) int temp_fixture_file(char *path, size_t capacity,
+                                                 const char *stem) {
+  const char *directory = getenv("TMPDIR");
+  if (!directory || !directory[0])
+    directory = "/tmp";
+  int length = snprintf(path, capacity, "%s/%s-XXXXXX", directory, stem);
+  if (length < 0)
+    return -1;
+  if ((size_t)length >= capacity) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return mkstemp(path);
+}
+
 static const char *temp_policy_file(void) {
   static char path[256];
-  snprintf(path, sizeof(path), "/tmp/shellgate-test-XXXXXX");
-  int fd = mkstemp(path);
+  int fd = temp_fixture_file(path, sizeof(path), "shellgate-test");
   if (fd < 0)
     return NULL;
   if (close(fd) != 0) {
@@ -3734,14 +3751,63 @@ TEST(conditional_string_contract) {
   ASSERT(result.verdict == SG_VERDICT_REJECT);
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
   static const char *const invalid_boundaries[] = {
-      "[[ x\n]]",    "[[ ! x\n]]",      "[[ ! ! x\n]]",
-      "[[ '-n'\n]]", "[[ x # note\n]]", "[[ x\n",
+      "[[ x == \"x\" ]", "[[ -n x ]",  "[[ x !",       "[[ x =\\",
+      "[[ x\n]]",        "[[ ! x\n]]", "[[ ! ! x\n]]", "[[ '-n'\n]]",
+      "[[ x # note\n]]", "[[ x\n",
   };
   for (size_t i = 0;
        i < sizeof(invalid_boundaries) / sizeof(invalid_boundaries[0]); ++i)
     ASSERT(eval_cmd(gate, invalid_boundaries[i], &result) == SG_ERR_PARSE);
   ASSERT_SG_OK(eval_cmd(gate, "[[ -z '' ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"x\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count);
+  static const char *const comparisons[] = {
+      "[[ $left == \"x\" ]]",
+      "[[ x == \"$right\" ]]",
+      "[[ $left != \"$right\" ]]",
+      "[[ name=~ == 'name=~' ]]",
+      "[[ name=prefix:~ == 'name=prefix:~' ]]",
+      "[[ arr[0]=~ == 'arr[0]=~' ]]",
+      "[[ arr['0']+=~ == 'arr[0]+=~' ]]",
+  };
+  for (unsigned i = 0; i < sizeof(comparisons) / sizeof(comparisons[0]); ++i) {
+    ASSERT_SG_OK(eval_cmd(gate, comparisons[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count);
+    ASSERT(result.unresolved_expansion_flags ==
+           SG_EXPANSION_UNRESOLVED_CONDITION);
+  }
+  static const char *const literal_tildes[] = {
+      "[[ name='~' == 'name=~' ]]",
+      "[[ name=~'' == 'name=~' ]]",
+      "[[ name\\=~ == 'name=~' ]]",
+      "[[ ~'' == '~' ]]",
+  };
+  for (size_t i = 0; i < sizeof(literal_tildes) / sizeof(literal_tildes[0]);
+       ++i) {
+    ASSERT_SG_OK(eval_cmd(gate, literal_tildes[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
+           !result.unresolved_expansion_flags);
+  }
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(printf value)\" ]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+      result.subcommand_count == 1 && result.requires_substitution_evaluation &&
+      result.has_dynamic_substitution_io &&
+      result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(cat)\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"x\" ]] >report", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.subcommand_count);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, SHELL_FEAT_SUBSHELL));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(printf x)\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, SHELL_FEAT_ARITH));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$((1))\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n x # note\n]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
   static const char *const commented[] = {
@@ -3792,6 +3858,20 @@ TEST(conditional_string_contract) {
   ASSERT(result.subcommand_count == 0);
   ASSERT_SG_OK(
       sg_gate_set_expand_word_netargv(gate, conditional_value, "1:x,"));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ $left == \"$right\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  for (size_t i = 0; i < sizeof(comparisons) / sizeof(comparisons[0]); ++i) {
+    ASSERT_SG_OK(eval_cmd(gate, comparisons[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+           !result.unresolved_expansion_flags);
+  }
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(printf x)\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+         result.requires_substitution_evaluation &&
+         result.has_dynamic_substitution_io &&
+         !result.unresolved_expansion_flags);
+
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n $value ]] && cat", &result));
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
          result.subcommand_count == 1);
@@ -6584,8 +6664,8 @@ TEST(policy_replacement_failure_atomicity) {
   ASSERT_SG_OK(eval_cmd(gate, "cat /etc/hosts", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
 
-  char missing[] = "/tmp/shellgate-missing-XXXXXX";
-  int fd = mkstemp(missing);
+  char missing[256];
+  int fd = temp_fixture_file(missing, sizeof(missing), "shellgate-missing");
   ASSERT(fd >= 0);
   ASSERT(close(fd) == 0);
   ASSERT(unlink(missing) == 0);
@@ -14674,7 +14754,7 @@ static SHELL_NONNULL(1, 2, 3) bool calibration_score(
 
 typedef struct {
   sg_gate_t *source;
-  char path[64];
+  char path[256];
   size_t size;
   size_t raw_size;
   long raw_alpha_offset;
@@ -14686,9 +14766,8 @@ typedef struct {
  * on success or failure and unlinks a nonempty path; fixture starts zeroed. */
 static SHELL_NONNULL(1) bool test_bundle_fixture_create(
     test_bundle_fixture_t *fixture) {
-  snprintf(fixture->path, sizeof(fixture->path),
-           "/tmp/shellgate-bundle-snapshot-XXXXXX");
-  int fd = mkstemp(fixture->path);
+  int fd = temp_fixture_file(fixture->path, sizeof(fixture->path),
+                             "shellgate-bundle-snapshot");
   if (fd < 0) {
     fixture->path[0] = '\0';
     return false;

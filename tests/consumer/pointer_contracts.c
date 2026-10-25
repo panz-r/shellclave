@@ -595,6 +595,26 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_conditional_static_empty("x", 1, NULL);
 #elif TEST_BAD == 211
   (void)shell_conditional_word_dynamic(NULL, 0);
+#elif TEST_BAD == 212
+  shell_conditional_t condition = {0};
+  shell_conditional_value_t values[2] = {0};
+  bool truth;
+  (void)shell_conditional_evaluate(NULL, &condition, values, &truth);
+#elif TEST_BAD == 213
+  shell_conditional_t condition = {0};
+  shell_conditional_value_t values[2] = {0};
+  bool truth;
+  (void)shell_conditional_evaluate("x", NULL, values, &truth);
+#elif TEST_BAD == 214
+  shell_conditional_t condition = {0};
+  shell_conditional_value_t values[2] = {0};
+  bool truth;
+  (void)shell_conditional_evaluate("x", &condition, NULL, &truth);
+#elif TEST_BAD == 215
+  shell_conditional_t condition = {0};
+  shell_conditional_value_t values[2] = {0};
+  bool truth;
+  (void)shell_conditional_evaluate("x", &condition, values, NULL);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);

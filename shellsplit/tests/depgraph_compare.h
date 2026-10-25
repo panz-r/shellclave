@@ -68,8 +68,13 @@ static inline SHELL_NONNULL(1, 2) const
     SHELLSPLIT_COMPARE_FIELD(cmd.kind);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_expression);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_expression_length);
-    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operand);
-    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operand_length);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operands[0]);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operand_lengths[0]);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operands[1]);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operand_lengths[1]);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_operand_count);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_predicate);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_negated);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_truth);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression_length);

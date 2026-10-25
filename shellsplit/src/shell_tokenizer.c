@@ -529,10 +529,11 @@ static SHELL_NONNULL(1,
         array_context.token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       *features |= SHELL_FEAT_CONDITIONALS;
       shell_conditional_t condition = shell_conditional_parse(p, len, i);
-      if (condition.operand_length)
-        detect_features(p, (uint32_t)condition.operand,
-                        (uint32_t)condition.operand_length, features, true,
-                        FAST_FEATURE_CONDITIONAL_WORD);
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        if (condition.operand_lengths[operand])
+          detect_features(p, (uint32_t)condition.operands[operand],
+                          (uint32_t)condition.operand_lengths[operand],
+                          features, true, FAST_FEATURE_CONDITIONAL_WORD);
       i = (uint32_t)condition.after;
       continue;
     }

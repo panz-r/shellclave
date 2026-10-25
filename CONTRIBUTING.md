@@ -49,6 +49,9 @@ outside the bounded smoke seeds. Allocate large retained graph results on the
 heap in fixed sweeps; sanitizer instrumentation can reserve separate stack
 slots for sequential fixture scopes.
 
+Set `TMPDIR` to a writable directory with enough space and inodes for test
+fixtures and compiler artifacts. Shellgate policy fixtures honor this setting.
+
 Host-locale regressions require `localedef` and the `en_US` and `ISO-8859-1`
 locale sources (`locales` on Debian/Ubuntu). Tests generate private locale data
 in the build directory and remove it afterward; they do not change system
@@ -99,8 +102,8 @@ whole-source byte check and scoped admission of words, comments, substitutions,
 and heredocs. Retained draft collection remains in `shell_source.c`; lexical
 iteration and list grammar retain their own responsibilities.
 
-`shell_conditional.c` owns unary string-condition framing, primary grammar,
-operand spans and static emptiness facts. Consumers reuse those facts and the
+`shell_conditional.c` owns string-condition framing, unary/comparison grammar,
+ordered operand spans, quote restrictions and static predicate evaluation. Consumers reuse those facts and the
 shared word-expansion primitives. Descriptor snapshots distinguish body-word
 expansion after compound setup from simple-command argv expansion before setup.
 

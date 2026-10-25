@@ -3,6 +3,49 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
+## Unreleased: exact conditional string comparisons
+
+Conditional commands now support `=`, `==` and `!=` with a right operand made
+entirely from single-, double- or ANSI-C-quoted fragments. Concatenation and
+escaped line continuations between fragments are supported. Unquoted and
+partially quoted right operands remain unsupported, even without wildcard
+characters. Keep the executor's default `nocasematch` setting disabled.
+
+Replace singular `conditional_operand` and `conditional_operand_length` fields
+with `conditional_operands[2]`, `conditional_operand_lengths[2]` and
+`conditional_operand_count` in graph and owned processor results. Retained
+headers use `conditional_operands[2]` source spans and the same count. Complete
+unary predicates have one operand; comparisons have two. Incomplete headers
+retain received operands. Nonconditional entries leave these fields zero.
+
+The shared `shell_conditional_predicate_t` describes normalized STRING_NONEMPTY,
+STRING_EMPTY, STRING_EQUAL and STRING_NOT_EQUAL predicates; `conditional_negated`
+records lexical `!` parity. Bare words normalize to STRING_NONEMPTY, and `=`/`==`
+to STRING_EQUAL. Rebuild consumers for changed public layouts. Existing CT
+anomaly records, callback purposes and feature masks are unchanged.
+
+Each operand uses the existing CONDITIONAL callback purpose, requiring one
+NUL-free string record without pattern escaping. Left operand expansions finish
+before right operand value requests and descriptor imports. Unresolved values
+on either side set the existing unresolved-condition flag; substitution
+inspection remains independent of resolution.
+
+Assignment-shaped conditional operands now use the shared tilde-expansion
+classification, including scalar, append and indexed spellings. For example,
+`[[ name=~ == 'name=~' ]]` retains UNKNOWN truth until its left operand is
+resolved; it no longer compares the unexpanded spelling as a static value.
+Quoted or escaped tilde prefixes remain literal. Callback eligibility and the
+unresolved-condition flag follow the same classification.
+
+Draft framing now preserves partial conditional closers and comparison operators
+at received EOF, including pending backslash-LF continuations. For example,
+`printf before; [[ x == "x" ]` is INCOMPLETE with NEEDS_CONDITIONAL and retains
+its earlier qualified prefix. Operand metadata excludes partial grammar tokens.
+Whitespace or other bytes committing an invalid token prevent this recovery.
+Open substitutions retain their outer diagnostic; already-closed children with
+unfinished conditional tokens remain INVALID. No additional API fields are
+needed, and strict analysis still rejects incomplete source.
+
 ## Unreleased: unary conditional commands
 
 `[[ word ]]`, `[[ -n word ]]` and `[[ -z word ]]` now have an explicit

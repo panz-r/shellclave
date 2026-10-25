@@ -868,10 +868,11 @@ static SHELL_NONNULL(1, 3, 4) bool anomaly_collect_command_substitutions(
     if (token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       shell_conditional_t condition =
           shell_conditional_parse(token->start, token->length, 0);
-      if (!anomaly_collect_substitutions(token->start + condition.operand,
-                                         condition.operand_length, false,
-                                         collect))
-        return false;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        if (!anomaly_collect_substitutions(
+                token->start + condition.operands[operand],
+                condition.operand_lengths[operand], false, collect))
+          return false;
       continue;
     }
     if (token->type == SHELL_TOKEN_ARITHMETIC ||
@@ -1625,8 +1626,15 @@ static SHELL_NONNULL(1, 2) void own_token_text(const shell_command_t *basic_cmd,
           shell_conditional_parse(token->start, token->length, 0);
       info->conditional_expression = token->start + condition.content;
       info->conditional_expression_length = condition.end - condition.content;
-      info->conditional_operand = token->start + condition.operand;
-      info->conditional_operand_length = condition.operand_length;
+      info->conditional_operand_count = condition.operand_count;
+      info->conditional_predicate = condition.predicate;
+      info->conditional_negated = condition.negated;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
+        info->conditional_operands[operand] =
+            token->start + condition.operands[operand];
+        info->conditional_operand_lengths[operand] =
+            condition.operand_lengths[operand];
+      }
     }
   }
   if (info->kind == SHELL_COMMAND_ARITHMETIC) {

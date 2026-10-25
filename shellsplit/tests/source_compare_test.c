@@ -116,8 +116,14 @@ static void headers(void) {
   F(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)                      \
   F(conditional_expression.start, 0, 1)                                        \
   F(conditional_expression.length, 0, 1)                                       \
-  F(conditional_operand.start, 0, 1)                                           \
-  F(conditional_operand.length, 0, 1)                                          \
+  F(conditional_operands[0].start, 0, 1)                                       \
+  F(conditional_operands[0].length, 0, 1)                                      \
+  F(conditional_operands[1].start, 0, 1)                                       \
+  F(conditional_operands[1].length, 0, 1)                                      \
+  F(conditional_operand_count, 0, 2)                                           \
+  F(conditional_predicate, SHELL_CONDITIONAL_PREDICATE_NONE,                   \
+    SHELL_CONDITIONAL_STRING_EQUAL)                                            \
+  F(conditional_negated, false, true)                                          \
   F(arithmetic_expression.start, 0, 2)                                         \
   F(arithmetic_expression.length, 0, 1)                                        \
   F(source.length, 50, 51)                                                     \

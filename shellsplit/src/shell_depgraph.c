@@ -25460,15 +25460,27 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
           classify_redirect(&tokens.tokens[t]) != DEP_REDIRECT_NONE;
     node->cmd.conditional_expression = NULL;
     node->cmd.conditional_expression_length = 0;
-    node->cmd.conditional_operand = NULL;
-    node->cmd.conditional_operand_length = 0;
+    node->cmd.conditional_operand_count = 0;
+    node->cmd.conditional_predicate = SHELL_CONDITIONAL_PREDICATE_NONE;
+    node->cmd.conditional_negated = false;
+    for (unsigned operand = 0; operand < 2; ++operand) {
+      node->cmd.conditional_operands[operand] = NULL;
+      node->cmd.conditional_operand_lengths[operand] = 0;
+    }
     node->cmd.conditional_truth = SHELL_CONDITIONAL_UNKNOWN;
     if (conditional_command) {
       node->cmd.conditional_expression = cmd + condition.content;
       node->cmd.conditional_expression_length =
           (uint32_t)(condition.end - condition.content);
-      node->cmd.conditional_operand = cmd + condition.operand;
-      node->cmd.conditional_operand_length = (uint32_t)condition.operand_length;
+      node->cmd.conditional_operand_count = condition.operand_count;
+      node->cmd.conditional_predicate = condition.predicate;
+      node->cmd.conditional_negated = condition.negated;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
+        node->cmd.conditional_operands[operand] =
+            cmd + condition.operands[operand];
+        node->cmd.conditional_operand_lengths[operand] =
+            (uint32_t)condition.operand_lengths[operand];
+      }
     }
     if (arithmetic_command) {
       node->cmd.arithmetic_expression = cmd + arithmetic_content;
@@ -25945,35 +25957,42 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
           DEP_SNAPSHOT_BODY_WORD, &body_table);
       if (body_error != SHELL_DEP_OK)
         return dep_stop_graph_construction(out, body_error);
-      bool body_active = dep_owner_phase_active(
-          &parse_context, cmd_node_idx, DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
-      dep_token_t operand = {cmd + condition.operand,
-                             (uint32_t)condition.operand_length};
-      const shell_dep_word_value_t *value = NULL;
-      body_error = dep_resolve_word(out, &parse_context, &operand,
-                                    out->cwd_buf.data + *range_cwd_offset,
-                                    cmd_node_idx, SHELL_EXPAND_WORD_CONDITIONAL,
-                                    body_active, UINT32_MAX, &value);
-      if (body_error != SHELL_DEP_OK)
-        return dep_stop_graph_construction(out, body_error);
-      body_error = dep_connect_word_substitutions(
-          out, max_nodes, max_edges, effective_cwd_buf_size, streams, &operand,
-          out->cwd_buf.data + *range_cwd_offset, limits, depth, &parse_context,
-          cmd_node_idx, UINT32_MAX, DEP_SNAPSHOT_BODY_WORD, cmd_node_idx);
-      if (body_error != SHELL_DEP_OK)
-        return dep_stop_graph_construction(out, body_error);
-      bool empty;
-      bool known = value && value->resolved;
-      if (known)
-        empty = value->first_length == 0;
-      else
-        known =
-            shell_conditional_static_empty(operand.start, operand.len, &empty);
-      if (known) {
-        bool truth = (empty == condition.empty) != condition.negated;
+      shell_conditional_value_t values[2] = {0};
+      for (unsigned operand_index = 0; operand_index < condition.operand_count;
+           ++operand_index) {
+        /* Finish each operand's synchronous expansions before the next value
+         * query or descriptor import. Recheck phase reachability while
+         * retaining lexical children independently of their execution effects.
+         */
+        bool body_active = dep_owner_phase_active(
+            &parse_context, cmd_node_idx, DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
+        dep_token_t operand = {
+            cmd + condition.operands[operand_index],
+            (uint32_t)condition.operand_lengths[operand_index]};
+        const shell_dep_word_value_t *value = NULL;
+        body_error = dep_resolve_word(
+            out, &parse_context, &operand,
+            out->cwd_buf.data + *range_cwd_offset, cmd_node_idx,
+            SHELL_EXPAND_WORD_CONDITIONAL, body_active, UINT32_MAX, &value);
+        if (body_error != SHELL_DEP_OK)
+          return dep_stop_graph_construction(out, body_error);
+        if (value && value->resolved)
+          values[operand_index] = (shell_conditional_value_t){
+              value->first, value->first_length, true};
+        body_error = dep_connect_word_substitutions(
+            out, max_nodes, max_edges, effective_cwd_buf_size, streams,
+            &operand, out->cwd_buf.data + *range_cwd_offset, limits, depth,
+            &parse_context, cmd_node_idx, UINT32_MAX, DEP_SNAPSHOT_BODY_WORD,
+            cmd_node_idx);
+        if (body_error != SHELL_DEP_OK)
+          return dep_stop_graph_construction(out, body_error);
+      }
+      bool truth;
+      if (shell_conditional_evaluate(cmd, &condition, values, &truth))
         node->cmd.conditional_truth =
             truth ? SHELL_CONDITIONAL_TRUE : SHELL_CONDITIONAL_FALSE;
-      }
+      if (shell_source_scratch_exhausted())
+        return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
     }
 
     const dep_token_t *execution_target = effective_builtin;
@@ -27189,7 +27208,18 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       }
       if (n->cmd.kind == SHELL_COMMAND_CONDITIONAL &&
           (n->cmd.token_count || n->cmd.effective_command_known ||
-           !n->cmd.conditional_expression || !n->cmd.conditional_operand ||
+           !n->cmd.conditional_expression ||
+           n->cmd.conditional_operand_count < 1 ||
+           n->cmd.conditional_operand_count > 2 ||
+           !n->cmd.conditional_operands[0] ||
+           (n->cmd.conditional_operand_count == 2 &&
+            !n->cmd.conditional_operands[1]) ||
+           n->cmd.conditional_predicate < SHELL_CONDITIONAL_STRING_NONEMPTY ||
+           n->cmd.conditional_predicate > SHELL_CONDITIONAL_STRING_NOT_EQUAL ||
+           n->cmd.conditional_operand_count !=
+               (n->cmd.conditional_predicate >= SHELL_CONDITIONAL_STRING_EQUAL
+                    ? 2
+                    : 1) ||
            n->cmd.conditional_truth > SHELL_CONDITIONAL_TRUE)) {
         r.valid = false;
         snprintf(r.errors[r.error_count++].msg, 96,

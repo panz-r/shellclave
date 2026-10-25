@@ -64,8 +64,13 @@ static inline SHELL_NONNULL(1, 2) const
   SHELLSPLIT_SOURCE_FIELD(kind);
   SHELLSPLIT_SOURCE_FIELD(conditional_expression.start);
   SHELLSPLIT_SOURCE_FIELD(conditional_expression.length);
-  SHELLSPLIT_SOURCE_FIELD(conditional_operand.start);
-  SHELLSPLIT_SOURCE_FIELD(conditional_operand.length);
+  SHELLSPLIT_SOURCE_FIELD(conditional_operands[0].start);
+  SHELLSPLIT_SOURCE_FIELD(conditional_operands[0].length);
+  SHELLSPLIT_SOURCE_FIELD(conditional_operands[1].start);
+  SHELLSPLIT_SOURCE_FIELD(conditional_operands[1].length);
+  SHELLSPLIT_SOURCE_FIELD(conditional_operand_count);
+  SHELLSPLIT_SOURCE_FIELD(conditional_predicate);
+  SHELLSPLIT_SOURCE_FIELD(conditional_negated);
   SHELLSPLIT_SOURCE_FIELD(arithmetic_expression.start);
   SHELLSPLIT_SOURCE_FIELD(arithmetic_expression.length);
   SHELLSPLIT_SOURCE_FIELD(word_count);

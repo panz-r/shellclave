@@ -8190,6 +8190,39 @@ static void run_fixed_oracles() {
       abort();
     }
   }
+  for (const auto &fixture : conditional_prefix_cases) {
+    std::string received = std::string("printf before; ") + fixture.source;
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    std::unique_ptr<shell_source_result_t> draft(new shell_source_result_t{});
+    if (test_tokenizer_state(received.data(), received.size())) {
+      fprintf(stderr, "conditional prefix tokenizer oracle failed: %s\n",
+              fixture.source);
+      abort();
+    }
+    if (!fuzz_source_limits(received.size(), &limits) ||
+        shell_parse_draft(received.data(), received.size(), &limits,
+                          draft.get()) != SHELL_SOURCE_INCOMPLETE ||
+        draft->need != SHELL_SOURCE_NEEDS_CONDITIONAL ||
+        draft->prefix_length != strlen("printf before;") ||
+        draft->prefix.count != 1 || draft->headers[1].complete ||
+        draft->headers[1].conditional_operand_count != fixture.operands ||
+        fuzz_dep_graph_parse(received.data(), received.size(), ".", nullptr,
+                             &graph) != SHELL_DEP_EPARSE ||
+        graph.node_count || graph.edge_count) {
+      fprintf(stderr, "conditional prefix oracle failed: %s\n", fixture.source);
+      abort();
+    }
+    std::string complete = std::string(fixture.source) + fixture.completion;
+    if (fuzz_dep_graph_parse(complete.data(), complete.size(), ".", nullptr,
+                             &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid ||
+        graph.nodes[0].cmd.conditional_truth !=
+            static_cast<shell_conditional_truth_t>(fixture.truth)) {
+      fprintf(stderr, "conditional completion oracle failed: %s\n",
+              complete.c_str());
+      abort();
+    }
+  }
   for (const auto &fixture : conditional_cases) {
     size_t length = strlen(fixture.source);
     if (test_tokenizer_state(fixture.source, length) ||

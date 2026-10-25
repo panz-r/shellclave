@@ -132,10 +132,12 @@ static SHELL_NONNULL(1) shell_source_status_t
     } else if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       shell_conditional_t condition =
           shell_conditional_parse(source, length, token.position);
-      if (condition.operand_length) {
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
+        if (!condition.operand_lengths[operand])
+          continue;
         shell_source_status_t status = word_byte_islands(
-            source + condition.operand, condition.operand_length, depth, false,
-            true, false);
+            source + condition.operands[operand],
+            condition.operand_lengths[operand], depth, false, true, false);
         if (status != SHELL_SOURCE_COMPLETE)
           return status;
       }

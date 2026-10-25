@@ -28,8 +28,13 @@ typedef struct {
   shell_command_kind_t kind;
   /* Conditional spans borrow original_command, with its owned lifetime.
    * Other command kinds leave these fields zero. */
-  const char *conditional_expression, *conditional_operand;
-  size_t conditional_expression_length, conditional_operand_length;
+  const char *conditional_expression;
+  size_t conditional_expression_length;
+  const char *conditional_operands[2];
+  size_t conditional_operand_lengths[2];
+  uint8_t conditional_operand_count; /* One for unary, two for comparison. */
+  shell_conditional_predicate_t conditional_predicate;
+  bool conditional_negated; /* Parity of lexical ! operators. */
   /* Arithmetic content borrows original_command, excluding its delimiters.
    * Other command kinds leave these fields zero. Empty expressions are valid.
    */

@@ -1,1 +1,2 @@
 [[ -n "$(printf value)" ]] 2>report && printf ok
+[[ "$(printf value)" == "value" ]] && printf ok

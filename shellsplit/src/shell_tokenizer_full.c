@@ -2595,10 +2595,12 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       shell_conditional_t condition =
           shell_conditional_parse(input, input_length, token.position);
-      if (condition.frame != SHELL_CONDITIONAL_COMPLETE ||
-          word_has_unsupported_semantics(input + condition.operand,
-                                         condition.operand_length))
+      if (condition.frame != SHELL_CONDITIONAL_COMPLETE)
         return true;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        if (word_has_unsupported_semantics(input + condition.operands[operand],
+                                           condition.operand_lengths[operand]))
+          return true;
       command_start = false;
       pipeline_prefix.scanned = pipeline_prefix.has_stage = true;
       continue;
@@ -3655,15 +3657,17 @@ static bool shell_list_validate_substitutions(const char *input,
         token.length > input_length - token.position)
       return false;
     if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
-      /* The compound token includes grammar and comments. Only its operand
-       * is a word-expansion span; conditional parsing owns the trivia. */
+      /* The compound token includes grammar and comments. Only its operands
+       * are word-expansion spans; conditional parsing owns the trivia. */
       shell_conditional_t condition =
           shell_conditional_parse(input, input_length, token.position);
-      if (condition.operand_length &&
-          !shell_list_validate_substitution_span(
-              input + condition.operand, condition.operand_length,
-              recursion_depth, require_complete))
-        return false;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        if (condition.operand_lengths[operand] &&
+            !shell_list_validate_substitution_span(
+                input + condition.operands[operand],
+                condition.operand_lengths[operand], recursion_depth,
+                require_complete))
+          return false;
       continue;
     }
     if (token.type != SHELL_TOKEN_HEREDOC) {
@@ -3973,10 +3977,12 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
         draft->incomplete_at = (uint32_t)token.position;
         break;
       }
-      if (!shell_list_validate_expansion_span(
-              input + condition.operand, condition.operand_length,
-              recursion_depth, require_complete, false, false))
-        return false;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
+        if (!shell_list_validate_expansion_span(
+                input + condition.operands[operand],
+                condition.operand_lengths[operand], recursion_depth,
+                require_complete, false, false))
+          return false;
       state.needs_stage = false;
       state.pipeline_start = false;
       state.assignment_prefix_open = false;
@@ -4958,17 +4964,20 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
       current_cmd->ends_group = true;
       shell_conditional_t condition =
           shell_conditional_parse(token.start, token.length, 0);
-      shell_source_substitution_scan_t scan = {0};
-      size_t start, after;
-      shell_source_substitution_kind_t kind;
-      while (shell_source_next_executable_substitution(
-                 token.start + condition.operand, condition.operand_length,
-                 &scan, &start, &after, &kind) == SHELL_SOURCE_SCAN_FOUND)
-        current_cmd->has_subshells |= kind == SHELL_SOURCE_SUBST_COMMAND ||
-                                      kind == SHELL_SOURCE_SUBST_BACKTICK;
-      current_cmd->has_variables |=
-          scan.has_variables || scan.has_arithmetic_variables;
-      current_cmd->has_arithmetic |= scan.has_arithmetic;
+      for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
+        shell_source_substitution_scan_t scan = {0};
+        size_t start, after;
+        shell_source_substitution_kind_t kind;
+        while (shell_source_next_executable_substitution(
+                   token.start + condition.operands[operand],
+                   condition.operand_lengths[operand], &scan, &start, &after,
+                   &kind) == SHELL_SOURCE_SCAN_FOUND)
+          current_cmd->has_subshells |= kind == SHELL_SOURCE_SUBST_COMMAND ||
+                                        kind == SHELL_SOURCE_SUBST_BACKTICK;
+        current_cmd->has_variables |=
+            scan.has_variables || scan.has_arithmetic_variables;
+        current_cmd->has_arithmetic |= scan.has_arithmetic;
+      }
       break;
     }
     case SHELL_TOKEN_ARITHMETIC_COMMAND:
