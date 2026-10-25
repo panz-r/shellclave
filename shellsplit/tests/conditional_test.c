@@ -161,6 +161,7 @@ static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
 
 typedef struct {
   const char *values[2];
+  const char *words[2];
   bool unresolved[2];
   unsigned calls;
   size_t offsets[2];
@@ -170,10 +171,17 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
     resolve_comparison(const shell_expand_word_request_t *request,
                        const char **value, size_t *length, void *context) {
   comparison_resolver_t *resolver = context;
-  CHECK(request->purpose == SHELL_EXPAND_WORD_CONDITIONAL);
+  /* Nested executable children can query their own argv independently. */
+  if (request->purpose != SHELL_EXPAND_WORD_CONDITIONAL)
+    return SHELL_EXPAND_UNRESOLVED;
   CHECK(resolver->calls < 2);
   unsigned index = resolver->calls++;
   resolver->offsets[index] = request->word_offset;
+  if (resolver->words[index]) {
+    CHECK(request->word_length == strlen(resolver->words[index]));
+    CHECK(!memcmp(request->source + request->word_offset,
+                  resolver->words[index], request->word_length));
+  }
   if (index)
     CHECK(resolver->offsets[0] < resolver->offsets[1]);
   if (resolver->unresolved[index])
@@ -318,6 +326,99 @@ static const shell_source_header_t *retained_condition(void) {
       return &draft->headers[h];
   CHECK(false);
   return NULL;
+}
+
+static void check_mixed_literal_comparisons(void) {
+  static const struct {
+    const char *word, *value;
+  } cases[] = {
+      {"\"$right\".txt", "a*?[()].txt"},
+      {"release-\"$right\"", "release-"},
+      {"pre\"$right\"post", "prea bpost"},
+      {"\"$right\"\"${other:-fallback}\".txt", "afallback.txt"},
+      {"\"$(printf '%s' \"$right\")\".txt", "value.txt"},
+      {"\"${right#x*}\".txt", "value.txt"},
+      {"\"$right\"\\*.txt", "value*.txt"},
+      {"\"$right\"'?[()]'", "value?[()]"},
+      {"~\"$right\"", "~value"},
+      {"name=~\"$right\"", "name=~value"},
+      {"name=prefix:~\"$right\"", "name=prefix:~value"},
+      {"$'\\0discard'\"$right\".txt", "value.txt"},
+      {"pre\\\n\"$right\".txt", "prevalue.txt"},
+      {"日本\"$right\".txt", "日本語.txt"},
+      {"\"$right\"$'\\xff'", "value\xff"},
+      {"\"$@\".txt", "one two.txt"},
+  };
+  static const char *const operators[] = {"=", "==", "!="};
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    for (unsigned op = 0; op < 3; ++op)
+      for (unsigned negate = 0; negate < 2; ++negate)
+        for (unsigned unequal = 0; unequal < 2; ++unequal)
+          for (unsigned unresolved = 0; unresolved < 4; ++unresolved) {
+            char source[256], left[128], right[128];
+            snprintf(source, sizeof(source), "[[ %s\"$left\" %s %s ]]",
+                     negate ? "! " : "", operators[op], cases[i].word);
+            snprintf(left, sizeof(left), "%zu:%s%s,",
+                     strlen(cases[i].value) + unequal, cases[i].value,
+                     unequal ? "!" : "");
+            snprintf(right, sizeof(right), "%zu:%s,", strlen(cases[i].value),
+                     cases[i].value);
+            current = source;
+            comparison_resolver_t resolver = {
+                .values = {left, right},
+                .words = {"\"$left\"", cases[i].word},
+                .unresolved = {unresolved & 1, unresolved & 2}};
+            CHECK(shell_dep_graph_parse_resolved(
+                      source, strlen(source), "/workspace", &limits, graph,
+                      resolve_comparison, &resolver, NULL) == SHELL_DEP_OK);
+            CHECK(resolver.calls == 2);
+            const shell_dep_cmd_t *condition =
+                &graph->nodes[condition_node()].cmd;
+            CHECK(condition->conditional_predicate ==
+                  (op == 2 ? SHELL_CONDITIONAL_STRING_NOT_EQUAL
+                           : SHELL_CONDITIONAL_STRING_EQUAL));
+            bool truth = (unequal == (op == 2)) != (negate != 0);
+            CHECK(condition->conditional_truth ==
+                  (unresolved ? SHELL_CONDITIONAL_UNKNOWN
+                   : truth    ? SHELL_CONDITIONAL_TRUE
+                              : SHELL_CONDITIONAL_FALSE));
+            CHECK(shell_dep_graph_validate(graph).valid);
+          }
+
+  /* Each callback receives a complete word; both child input routes survive. */
+  current = "[[ \"$(cat <left-file)\" == pre\"$(cat <right-file)\"post ]]";
+  comparison_resolver_t resolver = {
+      .values = {"8:preapost,", "8:preapost,"},
+      .words = {"\"$(cat <left-file)\"", "pre\"$(cat <right-file)\"post"}};
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve_comparison,
+                                       &resolver, NULL) == SHELL_DEP_OK);
+  CHECK(resolver.calls == 2);
+  file_node("left-file");
+  file_node("right-file");
+
+  /* Left process allocation precedes the right operand's read from its fd. */
+  parse("[[ <(printf x) == pre\"$(read -r -u63 value)\"post ]]");
+  bool read_process = false;
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    read_process |= graph->edges[e].type == SHELL_EDGE_SUBST &&
+                    graph->edges[e].source_fd == 1 &&
+                    graph->edges[e].target_fd == 63;
+  CHECK(read_process);
+
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    current = "[[ \"$left\" == pre\"$right\".txt ]] && cat reached";
+    resolver = (comparison_resolver_t){
+        .values = {mode == 0 ? "8:prex.txt," : "5:other,", "8:prex.txt,"},
+        .unresolved = {mode == 2, false}};
+    CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                         &limits, graph, resolve_comparison,
+                                         &resolver, NULL) == SHELL_DEP_OK);
+    bool read = false;
+    for (unsigned e = 0; e < graph->edge_count; ++e)
+      read |= graph->edges[e].type == SHELL_EDGE_READ;
+    CHECK(read == (mode != 1));
+  }
 }
 
 static void check_tilde_comparisons(void) {
@@ -580,6 +681,24 @@ int main(int argc, char **argv) {
   CHECK(workspace);
   limits.workspace = workspace;
   limits.workspace_size = bytes;
+  /* Conformance probe: both operands are dynamic; arguments supply their
+   * complete final strings, not individual expansion-fragment values. */
+  if (argc == 5 && !strcmp(argv[1], "--resolved")) {
+    current = argv[2];
+    char records[2][256];
+    for (unsigned i = 0; i < 2; ++i) {
+      int used = snprintf(records[i], sizeof(records[i]), "%zu:%s,",
+                          strlen(argv[3 + i]), argv[3 + i]);
+      CHECK(used >= 0 && (size_t)used < sizeof(records[i]));
+    }
+    comparison_resolver_t resolver = {.values = {records[0], records[1]}};
+    CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                         &limits, graph, resolve_comparison,
+                                         &resolver, NULL) == SHELL_DEP_OK);
+    CHECK(resolver.calls == 2);
+    printf("%d\n", graph->nodes[condition_node()].cmd.conditional_truth);
+    goto done;
+  }
   if (argc == 3) {
     current = argv[2];
     if (!strcmp(argv[1], "--status"))
@@ -596,6 +715,7 @@ int main(int argc, char **argv) {
   check_body_setup();
   check_expansion_regions();
   check_comparisons();
+  check_mixed_literal_comparisons();
   check_tilde_comparisons();
   check_patterns();
   check_token_prefixes();
@@ -635,6 +755,8 @@ int main(int argc, char **argv) {
                                   &command_count) == SHELL_TOKENIZE_OK);
     CHECK(command_count == 1 && commands[0].has_conditionals &&
           commands[0].has_globs == pattern);
+    /* These sentinel spellings occur in the owner's own operands. Variables
+     * inside executable children are covered by the mixed-word tests above. */
     if (strstr(current, "$value"))
       CHECK(commands[0].has_variables);
     if (strstr(current, "$(printf"))
@@ -720,6 +842,8 @@ int main(int argc, char **argv) {
       "[[ x == ",
       "[[ x == \"",
       "[[ x == \"$(printf x",
+      "[[ x == pre\"$value",
+      "[[ x == pre\"$(printf x",
       "[[ x == \"x\" # $(|)",
       "[[ x ",
       "[[ ! x ",
@@ -859,6 +983,27 @@ int main(int argc, char **argv) {
     shellsplit_test_source_scan_reset();
     CHECK(shell_parse_draft(source, strlen(source), NULL, draft) ==
           SHELL_SOURCE_COMPLETE);
+    size_t work = shellsplit_test_source_scan_work();
+    CHECK(!previous_work || work <= previous_work * 3);
+    previous_work = work;
+  }
+  previous_work = 0;
+  /* Many quoted fragments must not trigger repeated prefix scans when their
+   * static neighbors make the RHS eligible for literal comparison. */
+  for (size_t terms = 16; terms <= 256; terms *= 2) {
+    char source[8192] = "[[ x == ";
+    const char fragment[] = "p\"${right:-value}\"";
+    size_t end = strlen(source);
+    for (size_t i = 0; i < terms; ++i) {
+      memcpy(source + end, fragment, sizeof(fragment) - 1);
+      end += sizeof(fragment) - 1;
+    }
+    strcpy(source + end, " ]]");
+    current = source;
+    shellsplit_test_source_scan_reset();
+    parse(source);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          SHELL_CONDITIONAL_UNKNOWN);
     size_t work = shellsplit_test_source_scan_work();
     CHECK(!previous_work || work <= previous_work * 3);
     previous_work = work;

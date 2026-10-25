@@ -172,11 +172,13 @@ String conditions (`[[ word ]]`, `[[ -n word ]]`, `[[ -z word ]]`, literal and
 static `*` comparisons with `=`/`==`/`!=`, and their negations) have kind
 `SHELL_COMMAND_CONDITIONAL`, no argv, and retained
 expression and ordered operand spans with normalized predicate metadata.
-Static RHSs preserve literal quoting and active stars; dynamic RHSs require
-full quoting. Active stars use PATTERN_MATCH/PATTERN_NOT_MATCH predicates and
-set glob feature metadata. The graph exposes TRUE/FALSE/UNKNOWN predicate truth
-and explicit redirect setup through `has_redirections`. Use the conditional
-expansion callback purpose to supply a final string value. Redirects are
+Static RHSs preserve literal quoting and active stars. Dynamic RHSs may combine
+static literal text with quoted expansions, as in `"$prefix".txt`; unquoted
+expansions and mixed dynamic patterns remain unsupported. Active stars use
+PATTERN_MATCH/PATTERN_NOT_MATCH predicates and set glob feature metadata.
+The graph exposes TRUE/FALSE/UNKNOWN predicate truth and explicit redirect
+setup through `has_redirections`. Use the conditional expansion callback
+purpose to supply a final string value. Redirects are
 installed before nested operand substitutions; the condition body has no
 stdin/stdout byte use. See [conditional semantics](../docs/shell-model.md#string-conditions).
 

@@ -100,7 +100,8 @@ The implementation owners and private interfaces are:
 | Lexical iteration, control/list/draft grammar and borrowed command construction | `shell_tokenizer_full.c`, `shell_tokenizer_full_internal.h`, `shell_source_draft_internal.h` |
 | Retained source/draft collection | `shell_source.c` |
 | Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
-| Conditional framing, predicate properties, ordered operands, pattern admission and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Whole-word expansion requests, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
 | Supported-operation inspection, builtin roles and semantic observers | `shell_semantics.c`, `shell_semantics_internal.h` |
 | Word-value operations, public decoding adapters and diagnostic word rendering | `shell_word.c`, `shell_word_internal.h` |
 | Heredoc delimiter spelling and printer storage layout | `shell_heredoc.c`, `shell_heredoc_storage_internal.h` |
@@ -141,6 +142,16 @@ shell-word projection and diagnostic rendering preserve their distinct contracts
 Public word APIs remain declared in `shell_processor.h`; their implementation is
 in the word module. Descriptor snapshots distinguish body-word expansion after
 compound setup from simple-command argv expansion before setup.
+
+Conditional RHS admission uses a source-classifier view that skips quoted
+expansions, then checks outer fragments for active pattern syntax in the
+conditional module. Value consumers retain full expansion classification:
+quoting a runtime expansion does not make its value statically known. Keep
+these two views on the same inline word walk so tilde cancellation and escape
+rules stay aligned. Complete quote framing remains with the recursive source
+scanners; conditional admission uses those boundaries to skip nested syntax.
+The expansion module requests and validates whole-word callback values, while
+the conditional evaluator consumes those values to determine predicate truth.
 
 Keep token facts, region initializers and fragment/decoder cores inline. Consume
 existing parse facts where available and retain each consumer's source traversal,

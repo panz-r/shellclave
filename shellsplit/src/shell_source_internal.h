@@ -5057,7 +5057,8 @@ typedef enum {
 } shell_source_word_context_t;
 
 typedef struct {
-  bool dynamic;       /* Runtime expansion other than a leading tilde. */
+  /* Runtime expansion in the selected quote scope, other than leading tilde. */
+  bool dynamic;
   bool leading_tilde; /* An unquoted, uncancelled leading tilde prefix. */
 } shell_source_word_expansion_t;
 
@@ -5071,10 +5072,14 @@ typedef struct {
  * reject any later runtime expansion. Keep scanning after its delimiter.
  * NULL or an empty span denotes an unavailable word and is dynamic; otherwise
  * input is an immutable readable span. leading_tilde is meaningful only when
- * dynamic is false. */
+ * dynamic is false. The private literal_quoted mode skips complete double
+ * quotes, classifying only expansions outside quotes. This mode requires
+ * CONDITIONAL context; ordinary value classification keeps all runtime
+ * expansions dynamic. Both modes share tilde cancellation rules. */
 static inline shell_source_word_expansion_t
-shell_source_word_expansion(const char *input, size_t length,
-                            shell_source_word_context_t context) {
+shell_source_word_expansion_impl(const char *input, size_t length,
+                                 shell_source_word_context_t context,
+                                 bool literal_quoted) {
   shell_source_word_expansion_t expansion = {0};
   if (!input || length == 0)
     return (shell_source_word_expansion_t){.dynamic = true};
@@ -5127,6 +5132,15 @@ shell_source_word_expansion(const char *input, size_t length,
     }
     if (c == '"') {
       shell_source_brace_scan_literal(&braces);
+      if (literal_quoted) {
+        size_t after;
+        if (!shell_source_skip_complete_quoted_text(input, length, position,
+                                                    '"', &after))
+          return (shell_source_word_expansion_t){.dynamic = true};
+        position = after;
+        tilde_start = tilde_prefix = false;
+        continue;
+      }
       in_double_quote = !in_double_quote;
       tilde_start = tilde_prefix = false;
       position++;
@@ -5194,6 +5208,25 @@ shell_source_word_expansion(const char *input, size_t length,
       in_single_quote || in_double_quote || (tilde_prefix && !leading_prefix);
   expansion.leading_tilde |= tilde_prefix && leading_prefix;
   return expansion;
+}
+
+/* Value consumers classify all runtime expansions, including quoted ones.
+ * The unquoted-only admission view below cannot establish a static value. */
+static inline shell_source_word_expansion_t
+shell_source_word_expansion(const char *input, size_t length,
+                            shell_source_word_context_t context) {
+  return shell_source_word_expansion_impl(input, length, context, false);
+}
+
+/* Report runtime expansion outside quotes in a complete nonempty conditional
+ * word, including active tilde prefixes. This is a source fact, not an RHS
+ * admission decision or a static-value proof. Quote framing uses the existing
+ * recursive scanners/index, keeping nested executable children opaque. */
+static inline SHELL_NONNULL(1) bool shell_source_conditional_unquoted_expansion(
+    const char *input, size_t length) {
+  shell_source_word_expansion_t expansion = shell_source_word_expansion_impl(
+      input, length, SHELL_SOURCE_WORD_CONDITIONAL, true);
+  return expansion.dynamic || expansion.leading_tilde;
 }
 
 static inline bool shell_source_word_has_dynamic_syntax_in_context(

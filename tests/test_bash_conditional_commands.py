@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import shlex
 import subprocess
 import unittest
 
@@ -85,6 +86,64 @@ class ConditionalCommands(unittest.TestCase):
         result = self.bash_result(
             '[[ <(printf x) == "$(read -r -u63 -n1 value || exit 1; printf "%s" "$value" >&2)" ]] 2>&1')
         self.assertEqual(result.stdout, b"x")
+
+    def test_mixed_literal_comparisons(self):
+        forms = (
+            ('"$value".txt', lambda value: value + '.txt'),
+            ('release-"$value"', lambda value: 'release-' + value),
+            ('pre"$value"post', lambda value: 'pre' + value + 'post'),
+            ('"$value""${value:-fallback}".txt',
+             lambda value: value + (value or 'fallback') + '.txt'),
+            ('"$(printf %s "$value")".txt', lambda value: value + '.txt'),
+            ('"$value"\\*.txt', lambda value: value + '*.txt'),
+            ('~"$value"', lambda value: '~' + value),
+            ('name=prefix:~"$value"', lambda value: 'name=prefix:~' + value),
+            ("$'\\0discard'\"$value\".txt", lambda value: value + '.txt'),
+        )
+        available = subprocess.run(['locale', '-a'], capture_output=True,
+                                   text=True, check=True, timeout=10).stdout.splitlines()
+        utf8 = next((name for name in available
+                     if 'utf8' in name.lower().replace('-', '')), None)
+        self.assertIsNotNone(utf8, 'install a UTF-8 locale for Bash conformance')
+        for locale in ('C', utf8):
+            for word, expanded in forms:
+                for value in ('', '日本*?[()]'):
+                    right = expanded(value)
+                    for left in (right, right + '!'):
+                        for operator in ('=', '==', '!='):
+                            for negate in ('', '! '):
+                                source = f'[[ {negate}"$left" {operator} {word} ]]'
+                                with self.subTest(source=source, value=value,
+                                                  left=left, locale=locale):
+                                    self.assertEqual(self.probe_result(source, '--status'), 0)
+                                    resolved = subprocess.run(
+                                        [self.probe, '--resolved', source, left, right],
+                                        capture_output=True, check=True, timeout=10)
+                                    truth = int(resolved.stdout)
+                                    expected = ((left == right) != (operator == '!=')) != bool(negate)
+                                    self.assertEqual(truth, 2 if expected else 1)
+                                    setup = f'left={shlex.quote(left)}; value={shlex.quote(value)}; '
+                                    self.assertEqual(self.bash_result(setup + source, locale=locale).returncode,
+                                                     0 if expected else 1)
+        for word in ('"$value"*', '"$value"?', '"$value"[ab]',
+                     '"$value"[', '"$value"@(a|b)', 'pre$value.txt',
+                     '"$value"${other}', '"$value"$(printf x)',
+                     '"$value"`printf x`', '"$value"<(printf x)',
+                     '~/"$value"', 'name=~/"$value"', 'name=~:"$value"'):
+            source = f'[[ x == {word} ]]'
+            with self.subTest(source=source):
+                self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+                self.assertEqual(self.probe_result(source, '--status'), 4)
+        for received, completion in (
+                ('[[ x == pre"$value', '".txt ]]'),
+                ('[[ x == pre"$(printf x', ')".txt ]]'),
+                ('[[ x == pre"$value".txt ]', ']')):
+            with self.subTest(received=received):
+                self.assertEqual(self.probe_result(received, '--status'), 1)
+                self.assertEqual(self.probe_result(received + completion, '--status'), 0)
+        source = '[[ x == pre"$(|)".txt ]]'
+        self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
+        self.assertEqual(self.probe_result(source, '--status'), 2)
 
     def test_star_patterns(self):
         cases = (

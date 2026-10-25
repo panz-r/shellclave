@@ -3774,6 +3774,12 @@ TEST(conditional_string_contract) {
   ASSERT_STR(result.deny_reason, "glob pattern not allowed");
   ASSERT_SG_OK(eval_cmd(gate, "[[ '*' == '*' ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$value\".txt ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         result.unresolved_expansion_flags ==
+             SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$value\"'?[()]' ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
   static const char *const comparisons[] = {
       "[[ $left == \"x\" ]]",
@@ -3784,6 +3790,8 @@ TEST(conditional_string_contract) {
       "[[ arr[0]=~ == 'arr[0]=~' ]]",
       "[[ arr['0']+=~ == 'arr[0]+=~' ]]",
       "[[ $left == *.txt ]]",
+      "[[ $left == \"$right\".txt ]]",
+      "[[ $left != release-\"$right\" ]]",
   };
   for (unsigned i = 0; i < sizeof(comparisons) / sizeof(comparisons[0]); ++i) {
     ASSERT_SG_OK(eval_cmd(gate, comparisons[i], &result));
@@ -3804,6 +3812,13 @@ TEST(conditional_string_contract) {
            !result.unresolved_expansion_flags);
   }
   ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(printf value)\" ]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+      result.subcommand_count == 1 && result.requires_substitution_evaluation &&
+      result.has_dynamic_substitution_io &&
+      result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT_SG_OK(
+      eval_cmd(gate, "[[ x == pre\"$(printf value)\"post ]]", &result));
   ASSERT(
       result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
       result.subcommand_count == 1 && result.requires_substitution_evaluation &&

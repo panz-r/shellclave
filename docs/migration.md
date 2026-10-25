@@ -3,6 +3,24 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
+## Unreleased: mixed literal conditional operands
+
+Exact comparisons with `=`, `==` and `!=` now accept literal text surrounding
+quoted expansions: `[[ "$name" == "$prefix".txt ]]` and
+`[[ "$mode" == release-"$arch" ]]`. Quoted expansion results remain literal,
+including pattern characters in their values. These operands retain
+STRING_EQUAL/STRING_NOT_EQUAL and add no glob feature metadata.
+
+The existing CONDITIONAL callback receives the entire original operand and
+returns one final composed string, including its static fragments. Requests
+remain separate for each dynamic operand and ordered from left to right;
+unresolved values retain UNKNOWN truth. Public layouts, callback formats and
+workspace requirements are unchanged.
+
+Unquoted RHS expansions, active runtime tilde prefixes and dynamic patterns
+such as `"$prefix"*` remain unsupported. Quotes that cancel tilde expansion
+remain effective, including in mixed words such as `name=~"$suffix"`.
+
 ## Unreleased: static conditional star patterns
 
 Conditional comparisons now admit static unquoted literals, mixed quoting and
@@ -17,12 +35,12 @@ and existing enum values are unchanged. Active RHS stars set the existing glob
 feature metadata and are subject to Shellgate's glob rejection mask. All these
 conditional forms retain the CT anomaly signature.
 
-Existing fully quoted dynamic RHSs still request one final conditional string.
-New mixed/unquoted RHS forms must be static: unquoted dynamic patterns, mixed
-dynamic patterns such as `"$prefix"*`, `?`, bracket expressions and extglob
-remain unsupported. A dynamic left operand uses the existing CONDITIONAL
-callback; unresolved values retain UNKNOWN truth. No pattern encoding is
-expected from callbacks, and no filesystem expansion occurs.
+Dynamic RHSs use literal composition as described above. Active star patterns
+require a static RHS: unquoted dynamic patterns, mixed dynamic patterns such
+as `"$prefix"*`, `?`, bracket expressions and extglob remain unsupported.
+A dynamic left operand uses the existing CONDITIONAL callback; unresolved
+values retain UNKNOWN truth. No pattern encoding is expected from callbacks,
+and no filesystem expansion occurs.
 
 Matching uses quote-aware literal runs and linear searches over byte strings,
 independent of the host locale. Temporary pattern, prefix-table and subject
@@ -37,8 +55,8 @@ EWORKSPACE uses the diagnostic `Dependency workspace unavailable`.
 ## Unreleased: ordered conditional comparison metadata
 
 Conditional commands support `=`, `==` and `!=` with literal or static
-star-pattern right operands as described above. Fully quoted dynamic operands
-retain literal comparison semantics. Concatenation and escaped line
+star-pattern right operands as described above. Dynamic right operands use
+the literal composition rules above. Concatenation and escaped line
 continuations are supported. Keep the executor's default `nocasematch`
 setting disabled.
 

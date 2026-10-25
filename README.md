@@ -89,6 +89,7 @@ their effects alongside the command.
 | `# comment` | No subject; `ALLOW` | Policy-neutral source |
 | `[[ -n word ]]` | No subject; `ALLOW` when conditionals are enabled | String truth and substitution dependencies |
 | `[[ "$mode" == "release" ]]` | No subject; `ALLOW` when conditionals are enabled | Exact comparison; unresolved values and substitutions |
+| `[[ "$mode" == release-"$arch" ]]` | No subject; `ALLOW` when conditionals are enabled | Literal composition; quoted expansion results remain literal |
 | `[[ "$file" == *.txt ]]` | No subject; `ALLOW` when conditionals and globs are enabled | Static star pattern; unresolved left value |
 | `(( 2 + 3 ))` | No subject; `ALLOW` when arithmetic is enabled | Expression truth and status |
 | `(( 1 )) >report.txt` | No subject; `UNDETERMINED` when arithmetic is enabled | File setup; no stdout byte flow |

@@ -66,7 +66,8 @@ shell_conditional_t shell_conditional_parse(const char *source, size_t length,
 /* Complete conditional operand, without splitting/globbing/brace expansion.
  * Static values use the shared effective fragment decoder. Dynamic values
  * include leading and assignment-shaped tilde expansion and remain unknown;
- * this operation never executes shell expansion. */
+ * quoted expansions remain dynamic. The source scanner's unquoted-only view
+ * is used solely for RHS admission. Neither operation executes expansion. */
 bool shell_conditional_static_empty(const char *word, size_t length,
                                     bool *empty) SHELL_NONNULL(1, 3);
 bool shell_conditional_word_dynamic(const char *word, size_t length)

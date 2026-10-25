@@ -68,7 +68,8 @@ static SHELL_NONNULL(1, 4, 5) conditional_token_t
   return CONDITIONAL_TOKEN_NONE;
 }
 
-/* Fully quoted dynamic RHSs retain the one-final-string callback contract. */
+/* Keep fully quoted RHSs on their existing admission path. Mixed dynamic
+ * words need the additional outer-fragment proof in literal_dynamic_rhs. */
 static SHELL_NONNULL(1) bool quoted_rhs(const char *s, size_t n, size_t p,
                                         size_t end) {
   bool quoted = false;
@@ -137,13 +138,52 @@ static SHELL_NONNULL(3) bool admit_pattern_byte(unsigned char byte, bool quoted,
   return pattern_byte(byte, quoted, context);
 }
 
+/* Admission of a preframed dynamic RHS requires quoted expansions and literal
+ * outer fragments. Source classification supplies the expansion fact; this
+ * conditional-specific walk excludes active pattern syntax. Skip complete
+ * quotes through source framing: quotes and pattern bytes inside a nested
+ * parameter/command belong to that expansion, not the outer RHS. Static
+ * patterns retain their separate quote-aware projection below. */
+static SHELL_NONNULL(1) bool literal_dynamic_rhs(const char *word,
+                                                 size_t length) {
+  if (shell_source_conditional_unquoted_expansion(word, length))
+    return false;
+  for (size_t p = 0; p < length;) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    size_t after;
+    if (word[p] == '$' &&
+        shell_source_logical_next_is(word, length, p, '\'', NULL)) {
+      if (!shell_source_skip_complete_ansi_c_quote(word, length, p, &after))
+        return false;
+      p = after;
+    } else if (word[p] == '\'' || word[p] == '"') {
+      if (!shell_source_skip_complete_quoted_text(word, length, p, word[p],
+                                                  &after))
+        return false;
+      p = after;
+    } else if ((word[p] == '<' || word[p] == '>') &&
+               shell_source_empty_process_fragment(word, length, p, &after)) {
+      p = after;
+    } else {
+      char quote = 0;
+      unsigned char byte;
+      bool protected_byte;
+      if (shell_word_literal_step(word, length, &p, &quote, &byte,
+                                  &protected_byte) &&
+          !protected_byte && strchr("*?[()", byte))
+        return false;
+    }
+  }
+  return true;
+}
+
 static SHELL_NONNULL(1, 5) bool comparison_rhs(
     const char *s, size_t n, size_t p, size_t end,
     shell_conditional_predicate_t *predicate) {
   if (quoted_rhs(s, n, p, end))
     return true;
   if (shell_conditional_word_dynamic(s + p, end - p))
-    return false;
+    return literal_dynamic_rhs(s + p, end - p);
   pattern_builder_t builder = {0};
   if (!shell_source_visit_quoted_word(s + p, end - p, admit_pattern_byte,
                                       &builder))
