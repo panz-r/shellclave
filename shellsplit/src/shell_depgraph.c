@@ -19,10 +19,12 @@
 #include "shell_pipeline_internal.h"
 #include "shell_processor.h"
 #include "shell_processor_internal.h"
+#include "shell_semantics_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
+#include "shell_word_internal.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27214,12 +27216,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            !n->cmd.conditional_operands[0] ||
            (n->cmd.conditional_operand_count == 2 &&
             !n->cmd.conditional_operands[1]) ||
-           n->cmd.conditional_predicate < SHELL_CONDITIONAL_STRING_NONEMPTY ||
-           n->cmd.conditional_predicate > SHELL_CONDITIONAL_PATTERN_NOT_MATCH ||
            n->cmd.conditional_operand_count !=
-               (n->cmd.conditional_predicate >= SHELL_CONDITIONAL_STRING_EQUAL
-                    ? 2
-                    : 1) ||
+               shell_conditional_arity(n->cmd.conditional_predicate) ||
            n->cmd.conditional_truth > SHELL_CONDITIONAL_TRUE)) {
         r.valid = false;
         snprintf(r.errors[r.error_count++].msg, 96,

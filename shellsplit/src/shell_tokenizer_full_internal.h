@@ -45,20 +45,6 @@ void shell_tokenizer_arithmetic_content(const shell_token_t *token,
                                         size_t *content_length)
     SHELL_NONNULL(1, 3, 4);
 
-static inline SHELL_NONNULL(1) bool full_token_is_redirection(
-    const shell_token_t *token) {
-  return token->type == SHELL_TOKEN_REDIRECT_IN ||
-         token->type == SHELL_TOKEN_REDIRECT_OUT ||
-         token->type == SHELL_TOKEN_REDIRECT_ERR ||
-         token->type == SHELL_TOKEN_REDIRECT_APPEND ||
-         token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
-         token->type == SHELL_TOKEN_HEREDOC ||
-         token->type == SHELL_TOKEN_HERESTRING;
-}
-
 /* Complete-word extent beginning at a parser-produced word token. An indexed
  * assignment token already owns its balanced subscript and ends at '=';
  * scan only the RHS, never reinterpret its subscript as outer word syntax.
@@ -90,59 +76,6 @@ typedef enum {
  * and returns NONE. */
 shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
                                                       size_t input_length);
-
-/* Syntax that remains lexically visible but is outside Shellclave's
- * one-command semantic model. This includes active parameter writes, prompt
- * re-evaluation, actual indirect dereferencing, test/[ variable-name
- * re-evaluation and shell-option mutations. Complete raw expansions whose
- * meaning requires decoded child source or syntax reconstructed across
- * fragments are unsupported too; malformed and incomplete framing retain
- * their separate syntax classifications. Ordinary parameter data and
- * prefix-name enumeration remain supported.
- * Source-only consumers conservatively reject read option ambiguities which
- * graph construction can resolve from captured descriptor-variable values.
- * Scratch exhaustion can also end inspection without an unsupported finding.
- * Classification callers bind sufficient source scratch and check
- * shell_source_scratch_exhausted() before ending their source operation. */
-bool shell_tokenizer_has_unsupported_semantics(const char *input,
-                                               size_t input_length);
-
-/* The same semantic boundary with token, read-FD and process observers. The
- * token observer receives each lexical token, including executable expansion
- * bodies, during the existing traversal. It must not mutate or retain
- * scanner-local storage; token source spans borrow the immutable input. No
- * additional source pass is performed. context is required caller-owned
- * observer storage. */
-typedef void (*shell_semantic_token_observer_t)(const shell_token_t *token,
-                                                void *context);
-/* The same traversal reports possible -u operands (kind 1 static, 2 dynamic;
- * 0 means none, 3 observes default stdin access), and parameter fragments
- * affecting option-operand roles.
- * parameter is an exact borrowed identifier span, or NULL with length zero
- * when no exact scalar name is present. identity distinguishes descriptor
- * identity from an empty/nonempty value observation. word points at the read
- * command (kind 3) or operand in the immutable input, allowing lifetime
- * indexing without a second source traversal. Graph inspection defers
- * narrowly marked read ambiguities to its captured-value validation boundary;
- * every other unsupported feature is still rejected here. */
-typedef void (*shell_semantic_read_fd_observer_t)(const char *word, uint32_t fd,
-                                                  unsigned kind,
-                                                  const char *parameter,
-                                                  size_t parameter_length,
-                                                  bool identity, void *context);
-/* One complete process-expansion span per occurrence, including expansions
- * hidden inside parameter words. Called before its body is inspected, during
- * the same traversal; quoting/comments and literal heredocs are respected.
- * Empty bodies are reported too, so consumers can classify them consistently.
- * word borrows the immutable source and context is caller-owned storage. */
-typedef void (*shell_semantic_process_observer_t)(const char *word,
-                                                  size_t length, void *context);
-bool shell_tokenizer_inspect_semantics(
-    const char *input, size_t input_length,
-    shell_semantic_token_observer_t observer,
-    shell_semantic_read_fd_observer_t read_fd,
-    shell_semantic_process_observer_t process, void *context)
-    SHELL_NONNULL(1, 3, 4, 5, 6);
 
 /* Whole-source validation boundary: reject embedded NUL and prohibited
  * control/DEL bytes, then qualify high bytes by their source domain. Ordinary
@@ -193,11 +126,6 @@ shell_tokenize_status_t shell_tokenize_supported_commands(
 shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     const char *input, size_t input_length, bool allow_initial_time,
     shell_command_t **commands, size_t *command_count) SHELL_NONNULL(1, 4, 5);
-
-/* Inspect the contents of one already-delimited arithmetic expansion for
- * array semantics, including nested executable substitutions. */
-bool shell_tokenizer_arithmetic_has_array_semantics(const char *input,
-                                                    size_t input_length);
 
 /* Report an unescaped parameter expansion anywhere within one lexical token.
  * This includes a variable adjacent to literal word fragments, such as

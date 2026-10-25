@@ -1,3 +1,4 @@
+#include "../src/shell_token_regions_internal.h"
 #include "conditional_cases.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
@@ -21,6 +22,51 @@ static const char *current = "setup";
 static shell_dep_graph_t *graph;
 static shell_source_result_t *draft;
 static shell_dep_limits_t limits;
+
+static void check_expansion_regions(void) {
+  static const struct {
+    const char *source;
+    unsigned count;
+    shell_token_region_context_t context;
+    const char *words[2];
+  } cases[] = {
+      {"[[ -n '$literal' # $(|)\n]]",
+       1,
+       SHELL_TOKEN_REGION_CONDITIONAL,
+       {"'$literal'"}},
+      {"[[ \"$(printf left)\" == \"pre\"* # $ignored\n]]",
+       2,
+       SHELL_TOKEN_REGION_CONDITIONAL,
+       {"\"$(printf left)\"", "\"pre\"*"}},
+      {"[[ value == \"pre",
+       2,
+       SHELL_TOKEN_REGION_CONDITIONAL,
+       {"value", "\"pre"}},
+      {"[[ -n ", 0, SHELL_TOKEN_REGION_CONDITIONAL, {NULL}},
+      {"(( 1 + (2) ))", 1, SHELL_TOKEN_REGION_ARITHMETIC, {" 1 + (2) "}},
+      {"(( 1 +", 1, SHELL_TOKEN_REGION_ARITHMETIC, {" 1 +"}},
+      {"value", 1, SHELL_TOKEN_REGION_WORD, {"value"}},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    const char *source = cases[i].source;
+    current = source;
+    shell_tokenizer_state_t state;
+    CHECK(shell_tokenizer_init(&state, source, strlen(source), NULL));
+    shell_token_t token;
+    CHECK(shell_tokenizer_next(&state, &token));
+    shell_token_regions_t regions =
+        shell_token_regions(&token, !state.in_arithmetic);
+    CHECK(regions.count == cases[i].count);
+    for (unsigned j = 0; j < regions.count; ++j) {
+      const shell_token_region_t *region = &regions.regions[j];
+      CHECK(region->context == cases[i].context);
+      CHECK(region->text >= source &&
+            region->text + region->length <= source + strlen(source));
+      CHECK(region->length == strlen(cases[i].words[j]));
+      CHECK(!memcmp(region->text, cases[i].words[j], region->length));
+    }
+  }
+}
 
 static void parse(const char *source) {
   current = source;
@@ -548,6 +594,7 @@ int main(int argc, char **argv) {
     goto done;
   }
   check_body_setup();
+  check_expansion_regions();
   check_comparisons();
   check_tilde_comparisons();
   check_patterns();

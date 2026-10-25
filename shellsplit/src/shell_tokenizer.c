@@ -3,7 +3,10 @@
 #include "shell_conditional_internal.h"
 #include "shell_keywords_internal.h"
 #include "shell_pipeline_internal.h"
+#include "shell_semantics_internal.h"
 #include "shell_source_internal.h"
+#include "shell_token_regions_internal.h"
+#include "shell_token_traits_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
 #include <string.h>
@@ -69,8 +72,8 @@ static bool group_word_ends_here(const char *cmd, uint32_t pos,
 }
 
 /* Advance across one shell word without splitting a quoted here-string
- * operand at embedded whitespace.  Full word decoding remains the processor's
- * responsibility; this only preserves the parser's source range. */
+ * operand at embedded whitespace. This preserves source ranges; shell_word.c
+ * and its private fragment/decoder headers own value decoding. */
 static uint32_t skip_shell_word(const char *cmd, uint32_t pos,
                                 uint32_t cmd_len) {
   size_t after = pos;
@@ -527,15 +530,16 @@ static SHELL_NONNULL(1,
     if (!in_single_quotes && !in_double_quotes && c == '[' &&
         have_array_context && fast_lexical_token_at(&array_context, i) &&
         array_context.token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
-      *features |= SHELL_FEAT_CONDITIONALS;
       shell_conditional_t condition = shell_conditional_parse(p, len, i);
-      if (shell_conditional_pattern(condition.predicate))
-        *features |= SHELL_FEAT_GLOBS;
-      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
-        if (condition.operand_lengths[operand])
-          detect_features(p, (uint32_t)condition.operands[operand],
-                          (uint32_t)condition.operand_lengths[operand],
-                          features, true, FAST_FEATURE_CONDITIONAL_WORD);
+      *features |= shell_conditional_features(condition.predicate);
+      shell_token_regions_t regions = shell_conditional_regions(p, &condition);
+      for (unsigned operand = 0; operand < regions.count; ++operand) {
+        const shell_token_region_t *region = &regions.regions[operand];
+        if (region->length)
+          detect_features(p, (uint32_t)(region->text - p),
+                          (uint32_t)region->length, features, true,
+                          FAST_FEATURE_CONDITIONAL_WORD);
+      }
       i = (uint32_t)condition.after;
       continue;
     }
@@ -909,7 +913,7 @@ static SHELL_NONNULL(1, 4) void detect_control_features(const char *cmd,
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
-    bool redirect = full_token_is_redirection(&token);
+    bool redirect = shell_token_type_is_redirection(token.type);
     bool boundary = redirect;
     switch (token.type) {
     case SHELL_TOKEN_PIPE:

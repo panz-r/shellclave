@@ -1,5 +1,6 @@
 #include "../src/shell_builtin_internal.h"
 #include "../src/shell_depgraph_internal.h"
+#include "../src/shell_semantics_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 #include "depgraph_compare.h"
 #include "depgraph_invariants.h"

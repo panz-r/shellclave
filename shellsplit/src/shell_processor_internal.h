@@ -3,30 +3,6 @@
 
 #include "shell_processor.h"
 
-/* Literal shell-word projection for semantic consumers: ANSI-C NUL truncates
- * only its fragment, and later fragments resume. Dynamic expansions remain
- * unevaluated, but quote and escape processing can change their spelling:
- * ${v:-$'a\0b'} projects to ${v:-a}. Exact-source consumers and expansion
- * callbacks use retained source spans; callers establish staticness separately.
- * Source is an immutable isolated word; outputs are distinct writable storage.
- * Visitor/context have the public decoded-word callback contract. A NULL
- * visitor measures. The writer checks capacity during one forward fill;
- * failures leave written zero and may modify destination bytes. Callers own
- * unpublished output storage and discard it on failure. Standalone
- * public byte decoders deliberately preserve their separate binary semantics.
- */
-shell_process_status_t shell_process_visit_word_value(
-    const char *text, size_t length, shell_decoded_word_visitor_t visitor,
-    void *context, size_t *decoded_length) SHELL_NONNULL(1, 5);
-shell_process_status_t shell_process_measure_word_value(const char *text,
-                                                        size_t length,
-                                                        size_t *decoded_length)
-    SHELL_NONNULL(1, 3);
-shell_process_status_t
-shell_process_write_word_value(const char *text, size_t length,
-                               char *destination, size_t destination_size,
-                               size_t *written) SHELL_NONNULL(1, 3, 5);
-
 /* The actual shell word excludes operator-owned punctuation (notably the &
  * in <& and >&) and inline trivia. Completeness is lexical, not a claim that
  * the operand evaluates to a valid descriptor or pathname. In lexical mode,
@@ -113,9 +89,10 @@ shell_process_status_t shell_anomaly_stages_collect_prevalidated(
  * each output; the collector has already enforced the group-I/O budget.
  * Executable-name decoding and empty-executable rejection remain renderer
  * operations. The paired form publishes both outputs atomically. For nested
- * words requiring additional delimiter scratch, keep the root source
- * operation and its borrowed arena active through collection AND rendering;
- * the public builders and gate orchestration establish this lifetime. */
+ * words requiring scratch for delimiter or subscript facts, keep the root
+ * source operation and its borrowed arena active through collection AND
+ * rendering; the public builders and gate orchestration establish this
+ * lifetime. */
 shell_process_status_t shell_build_command_netseq_from_stages(
     const shell_anomaly_stages_t *stages, const shell_process_limits_t *limits,
     shell_netstring_buffer_t *sequence, size_t *subcommand_count)

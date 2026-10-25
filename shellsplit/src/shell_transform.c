@@ -2,6 +2,7 @@
 #include "shell_transform.h"
 #include "alloc.h"
 #include "shell_source_internal.h"
+#include "shell_token_traits_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
 #include <stdint.h>
@@ -11,27 +12,6 @@
 static const char *VAR_PLACEHOLDER = "VAR_VALUE";
 static const char *GLOB_PLACEHOLDER = "FILE_PATTERN";
 static const char *SUBSHELL_PLACEHOLDER = "TEMP_FILE";
-
-static bool is_shell_syntax_token(shell_token_type_t type) {
-  return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_PIPE_BOTH ||
-         type == SHELL_TOKEN_PIPE_NEGATE || type == SHELL_TOKEN_PIPE_TIME ||
-         type == SHELL_TOKEN_PIPE_TIME_OPTION ||
-         type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
-         type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
-         type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
-         type == SHELL_TOKEN_REDIRECT_ERR ||
-         type == SHELL_TOKEN_REDIRECT_APPEND ||
-         type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         type == SHELL_TOKEN_REDIRECT_BOTH ||
-         type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
-         type == SHELL_TOKEN_SEMICOLON || type == SHELL_TOKEN_AND ||
-         type == SHELL_TOKEN_BACKGROUND || type == SHELL_TOKEN_OR ||
-         type == SHELL_TOKEN_GROUP_START || type == SHELL_TOKEN_GROUP_END ||
-         type == SHELL_TOKEN_SUBSHELL_START ||
-         type == SHELL_TOKEN_SUBSHELL_END || type == SHELL_TOKEN_HEREDOC ||
-         type == SHELL_TOKEN_HERESTRING || type == SHELL_TOKEN_PROCESS_SUB;
-}
 
 /* A variable may be adjacent to literal bytes within one shell word. Preserve
  * those bytes in the diagnostic display: `--limit=${count}` is one argv item,
@@ -182,8 +162,10 @@ static void free_transformed_tokens(shell_transformed_token_t *tokens,
 /* Adjacent tokens come from the same command's valid source spans. */
 static SHELL_NONNULL(1, 2) bool transform_tokens_share_word(
     const shell_token_t *left, const shell_token_t *right) {
-  return !is_shell_syntax_token(left->type) &&
-         !is_shell_syntax_token(right->type) &&
+  return !(shell_token_type_is_syntax(left->type) ||
+           left->type == SHELL_TOKEN_PROCESS_SUB) &&
+         !(shell_token_type_is_syntax(right->type) ||
+           right->type == SHELL_TOKEN_PROCESS_SUB) &&
          shell_tokenizer_token_continues_word(right,
                                               left->position + left->length);
 }
@@ -385,7 +367,9 @@ shell_transform_command(const shell_command_t *cmd,
       return SHELL_TRANSFORM_ENOMEM;
     }
     bool is_shell_construct =
-        replacement || is_shell_syntax_token(tok->type) ||
+        replacement ||
+        (shell_token_type_is_syntax(tok->type) ||
+         tok->type == SHELL_TOKEN_PROCESS_SUB) ||
         shell_source_word_has_executable_substitution(tok->start, tok->length);
     tokens[i] = create_transformed_token(original, transformed, type,
                                          is_shell_construct);

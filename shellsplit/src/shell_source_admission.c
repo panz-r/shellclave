@@ -1,6 +1,7 @@
 #include "shell_conditional_internal.h"
 #include "shell_source_admission_internal.h"
 #include "shell_source_internal.h"
+#include "shell_token_regions_internal.h"
 #include "shell_tokenizer_full_internal.h"
 
 static SHELL_NONNULL(1) bool ascii_span(const char *source, size_t start,
@@ -132,22 +133,23 @@ static SHELL_NONNULL(1) shell_source_status_t
     } else if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       shell_conditional_t condition =
           shell_conditional_parse(source, length, token.position);
-      for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
-        if (!condition.operand_lengths[operand])
+      shell_token_regions_t regions =
+          shell_conditional_regions(source, &condition);
+      for (unsigned operand = 0; operand < regions.count; ++operand) {
+        const shell_token_region_t *region = &regions.regions[operand];
+        if (!region->length)
           continue;
         shell_source_status_t status = word_byte_islands(
-            source + condition.operands[operand],
-            condition.operand_lengths[operand], depth, false, true, false);
+            region->text, region->length, depth, false, true, false);
         if (status != SHELL_SOURCE_COMPLETE)
           return status;
       }
     } else if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
-      const char *content;
-      size_t content_length;
-      shell_tokenizer_arithmetic_content(&token, !lexer.in_arithmetic, &content,
-                                         &content_length);
-      shell_source_status_t status =
-          word_byte_islands(content, content_length, depth, false, false, true);
+      shell_token_regions_t regions =
+          shell_token_regions(&token, !lexer.in_arithmetic);
+      const shell_token_region_t *region = &regions.regions[0];
+      shell_source_status_t status = word_byte_islands(
+          region->text, region->length, depth, false, false, true);
       if (status != SHELL_SOURCE_COMPLETE)
         return status;
     } else {

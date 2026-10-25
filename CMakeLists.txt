@@ -114,12 +114,14 @@ set(SHELLSPLIT_SOURCES
   shellsplit/src/shell_keywords.c
   shellsplit/src/shell_netstring.c
   shellsplit/src/shell_processor.c
+  shellsplit/src/shell_semantics.c
   shellsplit/src/shell_source.c
   shellsplit/src/shell_source_admission.c
   shellsplit/src/shell_source_runtime.c
   shellsplit/src/shell_tokenizer.c
   shellsplit/src/shell_tokenizer_full.c
-  shellsplit/src/shell_transform.c)
+  shellsplit/src/shell_transform.c
+  shellsplit/src/shell_word.c)
 add_library(shellsplit ${SHELLSPLIT_SOURCES})
 add_library(Shellclave::shellsplit ALIAS shellsplit)
 shellclave_project_target(shellsplit)

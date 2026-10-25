@@ -5,10 +5,14 @@
 #include "shell_netstring.h"
 #include "shell_pipeline_internal.h"
 #include "shell_processor_internal.h"
+#include "shell_semantics_internal.h"
 #include "shell_source_admission_internal.h"
 #include "shell_source_internal.h"
+#include "shell_token_regions_internal.h"
+#include "shell_token_traits_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
+#include "shell_word_decode_internal.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,47 +24,6 @@
 #else
 #define PROCESS_METADATA_WORK(kind) ((void)0)
 #endif
-
-static bool is_shell_operator_token(const shell_token_t *token) {
-  return token->type == SHELL_TOKEN_PIPE ||
-         token->type == SHELL_TOKEN_PIPE_BOTH ||
-         token->type == SHELL_TOKEN_PIPE_NEGATE ||
-         token->type == SHELL_TOKEN_PIPE_TIME ||
-         token->type == SHELL_TOKEN_PIPE_TIME_OPTION ||
-         token->type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
-         token->type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
-         token->type == SHELL_TOKEN_REDIRECT_IN ||
-         token->type == SHELL_TOKEN_REDIRECT_OUT ||
-         token->type == SHELL_TOKEN_REDIRECT_ERR ||
-         token->type == SHELL_TOKEN_REDIRECT_APPEND ||
-         token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
-         token->type == SHELL_TOKEN_SEMICOLON ||
-         token->type == SHELL_TOKEN_AND ||
-         token->type == SHELL_TOKEN_BACKGROUND ||
-         token->type == SHELL_TOKEN_OR ||
-         token->type == SHELL_TOKEN_GROUP_START ||
-         token->type == SHELL_TOKEN_GROUP_END ||
-         token->type == SHELL_TOKEN_SUBSHELL_START ||
-         token->type == SHELL_TOKEN_SUBSHELL_END ||
-         token->type == SHELL_TOKEN_HEREDOC ||
-         token->type == SHELL_TOKEN_HERESTRING;
-}
-
-static bool is_redirection_token(const shell_token_t *token) {
-  return token->type == SHELL_TOKEN_REDIRECT_IN ||
-         token->type == SHELL_TOKEN_REDIRECT_OUT ||
-         token->type == SHELL_TOKEN_REDIRECT_ERR ||
-         token->type == SHELL_TOKEN_REDIRECT_APPEND ||
-         token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
-         token->type == SHELL_TOKEN_HEREDOC ||
-         token->type == SHELL_TOKEN_HERESTRING;
-}
 
 shell_process_status_t
 shell_process_cstring_allocation_size(size_t content_length,
@@ -466,7 +429,7 @@ static bool validate_legacy_output_redirects(const shell_command_t *commands,
         continue;
       size_t operand_index = token_index + 1;
       if (operand_index == command->token_count ||
-          is_shell_operator_token(&command->tokens[operand_index]))
+          shell_token_type_is_syntax(command->tokens[operand_index].type))
         return false;
       const shell_token_t *first = &command->tokens[operand_index];
       if (first->position > SIZE_MAX - first->length)
@@ -474,7 +437,7 @@ static bool validate_legacy_output_redirects(const shell_command_t *commands,
       size_t operand_end = first->position + first->length;
       while (++operand_index < command->token_count) {
         const shell_token_t *next = &command->tokens[operand_index];
-        if (is_shell_operator_token(next) ||
+        if (shell_token_type_is_syntax(next->type) ||
             next->position > SIZE_MAX - next->length ||
             !shell_tokenizer_token_continues_word(next, operand_end))
           break;
@@ -618,9 +581,10 @@ bool shell_processed_word_iterator_next(
   const shell_command_t *command = iterator->command;
   while (iterator->token_index < command->token_count) {
     const shell_token_t *token = &command->tokens[iterator->token_index++];
-    if (is_shell_operator_token(token)) {
+    if (shell_token_type_is_syntax(token->type)) {
       iterator->consume_redirection_operand =
-          is_redirection_token(token) && redirection_consumes_next_token(token);
+          shell_token_type_is_redirection(token->type) &&
+          redirection_consumes_next_token(token);
       iterator->redirection_operand_end = 0;
       continue;
     }
@@ -637,7 +601,7 @@ bool shell_processed_word_iterator_next(
     shell_token_t merged = *token;
     while (iterator->token_index < command->token_count) {
       const shell_token_t *next = &command->tokens[iterator->token_index];
-      if (is_shell_operator_token(next) ||
+      if (shell_token_type_is_syntax(next->type) ||
           !shell_tokenizer_token_continues_word(next, merged.position +
                                                           merged.length))
         break;
@@ -865,30 +829,14 @@ static SHELL_NONNULL(1, 3, 4) bool anomaly_collect_command_substitutions(
       heredoc_after = after;
       continue;
     }
-    if (token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
-      shell_conditional_t condition =
-          shell_conditional_parse(token->start, token->length, 0);
-      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
-        if (!anomaly_collect_substitutions(
-                token->start + condition.operands[operand],
-                condition.operand_lengths[operand], false, collect))
-          return false;
-      continue;
-    }
-    if (token->type == SHELL_TOKEN_ARITHMETIC ||
-        token->type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
-      const char *content;
-      size_t content_length;
-      shell_tokenizer_arithmetic_content(token, true, &content,
-                                         &content_length);
-      if (!anomaly_collect_substitutions(content, content_length, true,
-                                         collect))
+    shell_token_regions_t regions = shell_token_regions(token, true);
+    for (unsigned i = 0; i < regions.count; ++i) {
+      const shell_token_region_t *region = &regions.regions[i];
+      if (!anomaly_collect_substitutions(
+              region->text, region->length,
+              region->context == SHELL_TOKEN_REGION_ARITHMETIC, collect))
         return false;
-      continue;
     }
-    if (!anomaly_collect_substitutions(token->start, token->length, false,
-                                       collect))
-      return false;
   }
   return true;
 }
@@ -1012,7 +960,7 @@ bool shell_processed_command_has_dangerous_features(
       command->pipeline_negation_count != 0)
     return true;
   for (size_t i = 0; i < command->token_count; i++) {
-    if (is_shell_operator_token(&command->tokens[i]))
+    if (shell_token_type_is_syntax(command->tokens[i].type))
       return true;
   }
   shell_processed_word_iterator_t iterator;
@@ -1034,369 +982,6 @@ bool shell_processed_command_has_pipe_output(const shell_command_t *command) {
       return true;
   }
   return false;
-}
-
-typedef struct {
-  char *destination;
-  size_t destination_size;
-  size_t output_length;
-  shell_decoded_word_visitor_t visitor;
-  void *visitor_context;
-  bool stopped;
-  shell_process_status_t error;
-} decoded_word_sink_t;
-
-static shell_process_status_t decoded_word_emit(decoded_word_sink_t *sink,
-                                                unsigned char value) {
-  if (sink->stopped)
-    return SHELL_PROCESS_OK;
-  if (sink->output_length == SIZE_MAX)
-    return SHELL_PROCESS_EOVERFLOW;
-  if (sink->destination) {
-    if (sink->output_length >= sink->destination_size)
-      return SHELL_PROCESS_EOUTPUT_LIMIT;
-    sink->destination[sink->output_length] = (char)value;
-  }
-  size_t offset = sink->output_length++;
-  if (sink->visitor && !sink->visitor(value, offset, sink->visitor_context))
-    sink->stopped = true;
-  return SHELL_PROCESS_OK;
-}
-
-static bool ansi_decode_emit(unsigned char byte, void *context) {
-  decoded_word_sink_t *sink = context;
-  sink->error = decoded_word_emit(sink, byte);
-  return sink->error == SHELL_PROCESS_OK;
-}
-
-/* Byte decoders retain binary payloads; semantic word consumers use Bash's
- * fragment-local NUL truncation. Both modes share escape and framing rules. */
-static SHELL_NONNULL(1, 3, 4) shell_process_status_t
-    ansi_decode_quote(const char *text, size_t length, size_t *position,
-                      decoded_word_sink_t *sink,
-                      shell_source_ansi_mode_t mode) {
-  sink->error = SHELL_PROCESS_OK;
-  shell_source_ansi_facts_t facts;
-  if (shell_source_decode_ansi_c_quote_impl(
-          text, length, position, ansi_decode_emit, sink, mode, &facts) &&
-      !facts.locale_dependent)
-    return SHELL_PROCESS_OK;
-  return sink->error == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE : sink->error;
-}
-
-static SHELL_NONNULL(1, 3) shell_process_status_t
-    decode_shell_word(const char *text, size_t length,
-                      decoded_word_sink_t *sink,
-                      shell_source_ansi_mode_t mode) {
-  char quote = 0;
-  for (size_t i = 0; i < length; i++) {
-    char c = text[i];
-    size_t after;
-    if (!quote && (c == '<' || c == '>') &&
-        shell_source_empty_process_fragment(text, length, i, &after)) {
-      i = after - 1;
-      continue;
-    }
-    if (quote == 0 && c == '$' &&
-        shell_source_logical_next_is(text, length, i, '\'', NULL)) {
-      size_t position = i;
-      shell_process_status_t status =
-          ansi_decode_quote(text, length, &position, sink, mode);
-      if (sink->stopped)
-        return SHELL_PROCESS_OK;
-      if (status != SHELL_PROCESS_OK)
-        return status;
-      i = position - 1;
-      continue;
-    }
-    if (quote == 0 && (c == '\'' || c == '"')) {
-      quote = c;
-      continue;
-    }
-    if (quote != 0 && c == quote) {
-      quote = 0;
-      continue;
-    }
-    if (c == '\\' && quote != '\'' && i + 1 < length) {
-      char next = text[i + 1];
-      if (quote == 0 || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        if (next != '\n') {
-          shell_process_status_t status = decoded_word_emit(sink, next);
-          if (status != SHELL_PROCESS_OK)
-            return status;
-          if (sink->stopped)
-            return SHELL_PROCESS_OK;
-        }
-        i++;
-        continue;
-      }
-    }
-    shell_process_status_t status = decoded_word_emit(sink, (unsigned char)c);
-    if (status != SHELL_PROCESS_OK)
-      return status;
-    if (sink->stopped)
-      return SHELL_PROCESS_OK;
-  }
-  return SHELL_PROCESS_OK;
-}
-
-static SHELL_NONNULL(1, 5) shell_process_status_t
-    visit_word_mode(const char *text, size_t length,
-                    shell_decoded_word_visitor_t visitor, void *context,
-                    size_t *decoded_length, shell_source_ansi_mode_t mode) {
-  *decoded_length = 0;
-
-  decoded_word_sink_t sink = {
-      .visitor = visitor,
-      .visitor_context = context,
-  };
-  shell_process_status_t status = decode_shell_word(text, length, &sink, mode);
-  *decoded_length = sink.output_length;
-  return status;
-}
-
-shell_process_status_t
-shell_visit_decoded_word(const char *text, size_t length,
-                         shell_decoded_word_visitor_t visitor, void *context,
-                         size_t *decoded_length) {
-  return visit_word_mode(text, length, visitor, context, decoded_length,
-                         SHELL_SOURCE_ANSI_BYTES);
-}
-
-shell_process_status_t
-shell_process_visit_word_value(const char *text, size_t length,
-                               shell_decoded_word_visitor_t visitor,
-                               void *context, size_t *decoded_length) {
-  return visit_word_mode(text, length, visitor, context, decoded_length,
-                         SHELL_SOURCE_ANSI_WORD);
-}
-
-bool shell_visit_static_word(const char *text, size_t length,
-                             shell_decoded_word_visitor_t visitor,
-                             void *context, size_t *decoded_length) {
-  *decoded_length = 0;
-  if (shell_source_word_has_dynamic_syntax(text, length))
-    return false;
-  return shell_process_visit_word_value(text, length, visitor, context,
-                                        decoded_length) == SHELL_PROCESS_OK;
-}
-
-shell_process_status_t shell_measure_decoded_word(const char *text,
-                                                  size_t length,
-                                                  size_t *decoded_length) {
-  return shell_visit_decoded_word(text, length, NULL, NULL, decoded_length);
-}
-
-shell_process_status_t
-shell_process_measure_word_value(const char *text, size_t length,
-                                 size_t *decoded_length) {
-  return shell_process_visit_word_value(text, length, NULL, NULL,
-                                        decoded_length);
-}
-
-shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
-                                                char *destination,
-                                                size_t destination_size,
-                                                size_t *written) {
-  *written = 0;
-
-  size_t decoded_length = 0;
-  shell_process_status_t status =
-      shell_measure_decoded_word(text, length, &decoded_length);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (destination_size < decoded_length)
-    return SHELL_PROCESS_EOUTPUT_LIMIT;
-  decoded_word_sink_t sink = {
-      .destination = destination,
-      .destination_size = destination_size,
-  };
-  status = decode_shell_word(text, length, &sink, SHELL_SOURCE_ANSI_BYTES);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  *written = sink.output_length;
-  return SHELL_PROCESS_OK;
-}
-
-shell_process_status_t shell_process_write_word_value(const char *text,
-                                                      size_t length,
-                                                      char *destination,
-                                                      size_t destination_size,
-                                                      size_t *written) {
-  *written = 0;
-  decoded_word_sink_t sink = {
-      .destination = destination,
-      .destination_size = destination_size,
-  };
-  shell_process_status_t status =
-      decode_shell_word(text, length, &sink, SHELL_SOURCE_ANSI_WORD);
-  if (status == SHELL_PROCESS_OK)
-    *written = sink.output_length;
-  return status;
-}
-
-static shell_process_status_t
-render_processed_word(const char *text, size_t length, char *destination,
-                      size_t destination_size, size_t *written) {
-  *written = 0;
-  if ((destination == NULL) && (destination_size != 0))
-    return SHELL_PROCESS_EINPUT;
-
-  size_t out = 0;
-  char quote = '\0';
-  for (size_t i = 0; i < length;) {
-    char c = text[i];
-    size_t empty_after;
-    if (!quote && (c == '<' || c == '>') &&
-        shell_source_empty_process_fragment(text, length, i, &empty_after)) {
-      i = empty_after;
-      continue;
-    }
-    if (quote == '\0' && c == '$' &&
-        shell_source_logical_next_is(text, length, i, '\'', NULL)) {
-      decoded_word_sink_t sink = {
-          .destination = destination,
-          .destination_size = destination_size,
-          .output_length = out,
-      };
-      shell_process_status_t status =
-          ansi_decode_quote(text, length, &i, &sink, SHELL_SOURCE_ANSI_WORD);
-      if (status != SHELL_PROCESS_OK)
-        return status;
-      out = sink.output_length;
-      continue;
-    }
-    if (quote == '\0' && (c == '\'' || c == '"')) {
-      quote = c;
-      i++;
-      continue;
-    }
-    if (quote != '\0' && c == quote) {
-      quote = '\0';
-      i++;
-      continue;
-    }
-
-    size_t dynamic_after = i;
-    bool dynamic = false;
-    if (quote != '\'' && c == '$' &&
-        shell_source_dollar_parentheses_open(text, length, i, NULL)) {
-      if (shell_source_dollar_arithmetic_open(text, length, i, NULL)) {
-        dynamic = shell_source_skip_arithmetic_expansion(text, length, i,
-                                                         &dynamic_after);
-      } else {
-        size_t open = 0;
-        dynamic =
-            shell_source_dollar_parentheses_open(text, length, i, &open) &&
-            shell_source_find_balanced_parentheses(text, length, open,
-                                                   &dynamic_after);
-      }
-    } else if (quote == '\0' && (c == '<' || c == '>')) {
-      size_t open = 0;
-      dynamic =
-          shell_source_process_substitution_open(text, length, i, &open) &&
-          shell_source_find_balanced_parentheses(text, length, open,
-                                                 &dynamic_after);
-    } else if (quote != '\'' && c == '`') {
-      dynamic_after = shell_source_skip_quoted_text(text, length, i, '`');
-      dynamic = dynamic_after > i + 1 && dynamic_after <= length &&
-                text[dynamic_after - 1] == '`';
-    }
-    if (dynamic) {
-      size_t dynamic_length = dynamic_after - i;
-      if (out > SIZE_MAX - dynamic_length)
-        return SHELL_PROCESS_EOVERFLOW;
-      if (destination) {
-        if (out > destination_size || dynamic_length > destination_size - out)
-          return SHELL_PROCESS_EOUTPUT_LIMIT;
-        memcpy(destination + out, text + i, dynamic_length);
-      }
-      out += dynamic_length;
-      i = dynamic_after;
-      continue;
-    }
-    if (c == '\\' && quote != '\'' && i + 1 < length) {
-      char next = text[i + 1];
-      if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        if (next != '\n') {
-          if (out == SIZE_MAX)
-            return SHELL_PROCESS_EOVERFLOW;
-          if (destination) {
-            if (out == destination_size)
-              return SHELL_PROCESS_EOUTPUT_LIMIT;
-            destination[out] = next;
-          }
-          out++;
-        }
-        i += 2;
-        continue;
-      }
-    }
-    if (out == SIZE_MAX)
-      return SHELL_PROCESS_EOVERFLOW;
-    if (destination) {
-      if (out == destination_size)
-        return SHELL_PROCESS_EOUTPUT_LIMIT;
-      destination[out] = c;
-    }
-    out++;
-    i++;
-  }
-  *written = out;
-  return SHELL_PROCESS_OK;
-}
-
-shell_process_status_t shell_measure_processed_word(const char *text,
-                                                    size_t length,
-                                                    size_t *processed_length) {
-  return render_processed_word(text, length, NULL, 0, processed_length);
-}
-
-shell_process_status_t
-shell_write_processed_word(const char *text, size_t length, char *destination,
-                           size_t destination_size, size_t *written) {
-  *written = 0;
-
-  return render_processed_word(text, length, destination, destination_size,
-                               written);
-}
-
-shell_process_status_t shell_decode_word(const char *text, size_t length,
-                                         char **decoded,
-                                         size_t *decoded_length) {
-  *decoded = NULL;
-  *decoded_length = 0;
-
-  shell_process_status_t status =
-      shell_measure_decoded_word(text, length, decoded_length);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (*decoded_length == SIZE_MAX) {
-    *decoded_length = 0;
-    return SHELL_PROCESS_EOVERFLOW;
-  }
-  *decoded = malloc(*decoded_length + 1);
-  if (!*decoded) {
-    *decoded_length = 0;
-    return SHELL_PROCESS_ENOMEM;
-  }
-  /* The private destination is sized from the preceding measure. Decode
-   * directly rather than invoking the public preflight-and-write API again. */
-  decoded_word_sink_t sink = {
-      .destination = *decoded,
-      .destination_size = *decoded_length,
-  };
-  status = decode_shell_word(text, length, &sink, SHELL_SOURCE_ANSI_BYTES);
-  if (status != SHELL_PROCESS_OK) {
-    free(*decoded);
-    *decoded = NULL;
-    *decoded_length = 0;
-    return status;
-  }
-  (*decoded)[sink.output_length] = '\0';
-  return SHELL_PROCESS_OK;
 }
 
 static bool process_single_command_internal(shell_command_t *basic_cmd,
@@ -1453,7 +1038,7 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   for (size_t i = 0; i < basic_cmd->token_count; i++) {
     const shell_token_t *token = &basic_cmd->tokens[i];
 
-    if (is_shell_operator_token(token)) {
+    if (shell_token_type_is_syntax(token->type)) {
       shell_count++;
 
       switch (token->type) {
@@ -1486,7 +1071,8 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
         break;
       }
       consume_redirection_operand =
-          is_redirection_token(token) && redirection_consumes_next_token(token);
+          shell_token_type_is_redirection(token->type) &&
+          redirection_consumes_next_token(token);
       redirection_operand_end = 0;
     } else if (consume_redirection_operand) {
       if (redirection_operand_end == 0 || shell_tokenizer_token_continues_word(
@@ -1540,7 +1126,7 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   redirection_operand_end = 0;
   for (size_t i = 0; i < basic_cmd->token_count; i++) {
     const shell_token_t *token = &basic_cmd->tokens[i];
-    if (is_shell_operator_token(token)) {
+    if (shell_token_type_is_syntax(token->type)) {
       /* The preceding count/allocation pass used these same immutable tokens.
        * The analyzer cannot correlate the two loops; no runtime recheck is
        * appropriate for their established exact capacities. */
@@ -1549,7 +1135,8 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
 #endif
       shell_tokens[shell_index++] = *token;
       consume_redirection_operand =
-          is_redirection_token(token) && redirection_consumes_next_token(token);
+          shell_token_type_is_redirection(token->type) &&
+          redirection_consumes_next_token(token);
       redirection_operand_end = 0;
     } else if (consume_redirection_operand) {
       if (redirection_operand_end == 0 || shell_tokenizer_token_continues_word(

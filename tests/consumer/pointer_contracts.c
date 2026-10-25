@@ -6,8 +6,10 @@
 #include "../../shellsplit/src/shell_depgraph_internal.h"
 #include "../../shellsplit/src/shell_keywords_internal.h"
 #include "../../shellsplit/src/shell_pipeline_internal.h"
+#include "../../shellsplit/src/shell_semantics_internal.h"
 #include "../../shellsplit/src/shell_source_admission_internal.h"
 #include "../../shellsplit/src/shell_source_internal.h"
+#include "../../shellsplit/src/shell_token_regions_internal.h"
 #include "../../shellsplit/src/shell_tokenizer_full_internal.h"
 #include "../../shelltype/src/io.h"
 #include "../../shelltype/src/policy_ctx.h"
@@ -23,7 +25,7 @@
 #if TEST_BAD >= 29 && TEST_BAD <= 38
 #include "../../shellsplit/src/shell_arithmetic.c"
 #elif TEST_BAD >= 39 && TEST_BAD <= 46
-#include "../../shellsplit/src/shell_tokenizer_full.c"
+#include "../../shellsplit/src/shell_semantics.c"
 #elif (TEST_BAD >= 51 && TEST_BAD <= 53) ||                                    \
     (TEST_BAD >= 56 && TEST_BAD <= 75) || TEST_BAD == 148
 #include "../../shellsplit/src/shell_processor.c"
@@ -615,6 +617,35 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   shell_conditional_value_t values[2] = {0};
   bool truth;
   (void)shell_conditional_evaluate("x", &condition, values, NULL);
+#elif TEST_BAD == 216
+  (void)shell_token_regions(NULL, true);
+#elif TEST_BAD == 217
+  shell_conditional_t condition = {0};
+  (void)shell_conditional_regions(NULL, &condition);
+#elif TEST_BAD == 218
+  (void)shell_conditional_regions("x", NULL);
+#elif TEST_BAD == 219
+  char quote = 0;
+  unsigned char byte;
+  bool protected_byte;
+  shell_word_literal_step(NULL, 1, &start, &quote, &byte, &protected_byte);
+#elif TEST_BAD == 220
+  char quote = 0;
+  unsigned char byte;
+  bool protected_byte;
+  shell_word_literal_step("x", 1, NULL, &quote, &byte, &protected_byte);
+#elif TEST_BAD == 221
+  unsigned char byte;
+  bool protected_byte;
+  shell_word_literal_step("x", 1, &start, NULL, &byte, &protected_byte);
+#elif TEST_BAD == 222
+  char quote = 0;
+  bool protected_byte;
+  shell_word_literal_step("x", 1, &start, &quote, NULL, &protected_byte);
+#elif TEST_BAD == 223
+  char quote = 0;
+  unsigned char byte;
+  shell_word_literal_step("x", 1, &start, &quote, &byte, NULL);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);

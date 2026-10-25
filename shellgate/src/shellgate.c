@@ -18,6 +18,7 @@
 #include "shell_source_runtime_internal.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full_internal.h"
+#include "shell_word_internal.h"
 #include "shelltype.h"
 #include <math.h>
 #include <stdarg.h>

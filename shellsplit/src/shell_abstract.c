@@ -8,8 +8,11 @@
 #include "shell_processor_internal.h"
 #include "shell_sequence.h"
 #include "shell_source_internal.h"
+#include "shell_token_regions_internal.h"
+#include "shell_token_traits_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
+#include "shell_word_internal.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -297,17 +300,6 @@ static bool is_long_option(const char *s, size_t len) {
   if (len < 3)
     return false;
   return s[0] == '-' && s[1] == '-' && s[2] != '-';
-}
-
-static bool is_redirection_token(shell_token_type_t type) {
-  return type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
-         type == SHELL_TOKEN_REDIRECT_ERR ||
-         type == SHELL_TOKEN_REDIRECT_APPEND ||
-         type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         type == SHELL_TOKEN_REDIRECT_BOTH ||
-         type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
-         type == SHELL_TOKEN_HEREDOC || type == SHELL_TOKEN_HERESTRING;
 }
 
 static bool redirection_consumes_operand(const shell_token_t *token) {
@@ -862,47 +854,45 @@ static SHELL_NONNULL(1, 2, 3, 4, 8) bool compound_abstract_append_fragment(
   return true;
 }
 
-/* Tokenization has validated this immutable word or arithmetic token. Collect
- * features under its lexical expansion rules, so comparisons and shifts stay
- * arithmetic even when their punctuation has a shell-substitution spelling.
- * Features are independent of the display element which owns their source;
- * nested executable command bodies remain separate shell inspections. */
+/* Features use the construct's borrowed expansion regions. Redirect operands
+ * retain ordinary-word context even when their diagnostic token has a special
+ * type. Each executable child remains a separate shell inspection. */
 static SHELL_NONNULL(1, 2) void abstract_word_features(
     shell_abstract_command_t *command, const shell_token_t *token,
     bool redirect_operand) {
-  shell_source_substitution_scan_t scan = {0};
-  const char *content = token->start;
-  size_t content_length = token->length;
-  if (!redirect_operand && (token->type == SHELL_TOKEN_ARITHMETIC ||
-                            token->type == SHELL_TOKEN_ARITHMETIC_COMMAND)) {
-    shell_tokenizer_arithmetic_content(token, true, &content, &content_length);
-    scan.scope.arithmetic_scope = true;
-    scan.scope.suppress_process = true;
-    command->has_arithmetic = true;
-  }
+  shell_token_regions_t regions;
   if (!redirect_operand && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
     shell_conditional_t condition =
-        shell_conditional_parse(content, content_length, 0);
-    command->has_globs |= shell_conditional_pattern(condition.predicate);
-    for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
-      shell_token_t word = {.type = SHELL_TOKEN_ARGUMENT,
-                            .start = content + condition.operands[operand],
-                            .length = condition.operand_lengths[operand]};
-      abstract_word_features(command, &word, false);
-    }
-    return;
+        shell_conditional_parse(token->start, token->length, 0);
+    command->has_globs |= (shell_conditional_features(condition.predicate) &
+                           SHELL_FEAT_GLOBS) != 0;
+    regions = shell_conditional_regions(token->start, &condition);
+  } else if (!redirect_operand) {
+    regions = shell_token_regions(token, true);
+  } else {
+    regions = (shell_token_regions_t){
+        .regions = {{token->start, token->length, SHELL_TOKEN_REGION_WORD}},
+        .count = 1};
   }
-  size_t start, after;
-  shell_source_substitution_kind_t kind;
-  while (shell_source_next_executable_substitution(
-             content, content_length, &scan, &start, &after, &kind) ==
-         SHELL_SOURCE_SCAN_FOUND)
-    command->has_cmd_subst = true;
-  if (!redirect_operand) {
-    command->has_variables |= scan.has_variables;
-    command->has_pos_vars |= scan.has_positional;
-    command->has_special_vars |= scan.has_special;
-    command->has_arithmetic |= scan.has_arithmetic;
+  for (unsigned i = 0; i < regions.count; ++i) {
+    const shell_token_region_t *region = &regions.regions[i];
+    bool arithmetic = region->context == SHELL_TOKEN_REGION_ARITHMETIC;
+    shell_source_substitution_scan_t scan = {
+        .scope = {.arithmetic_scope = arithmetic,
+                  .suppress_process = arithmetic}};
+    command->has_arithmetic |= arithmetic;
+    size_t start, after;
+    shell_source_substitution_kind_t kind;
+    while (shell_source_next_executable_substitution(
+               region->text, region->length, &scan, &start, &after, &kind) ==
+           SHELL_SOURCE_SCAN_FOUND)
+      command->has_cmd_subst = true;
+    if (!redirect_operand) {
+      command->has_variables |= scan.has_variables;
+      command->has_pos_vars |= scan.has_positional;
+      command->has_special_vars |= scan.has_special;
+      command->has_arithmetic |= scan.has_arithmetic;
+    }
   }
 }
 
@@ -1099,7 +1089,7 @@ abstract_command_parse_impl(const char *command, size_t command_length,
       shell_token_t *tok = &cmd->tokens[i];
       shell_token_t redirect_word;
 
-      if (is_redirection_token(tok->type)) {
+      if (shell_token_type_is_redirection(tok->type)) {
         abst->has_redirects = true;
         redirect_operand = redirection_consumes_operand(tok);
         continue;

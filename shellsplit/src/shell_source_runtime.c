@@ -1,4 +1,5 @@
 #include "alloc.h"
+#include "shell_heredoc_storage_internal.h"
 #include "shell_source.h"
 #include "shell_source_lexical_internal.h"
 #include "shell_source_runtime_internal.h"
@@ -13,6 +14,23 @@ static _Thread_local shell_source_operation_t source_operation;
 static _Thread_local shell_source_index_t default_index;
 static _Thread_local unsigned default_generation;
 static _Thread_local bool default_index_borrowed;
+
+/* Shared source arena bound. Printer pieces, live nested delimiter values,
+ * decoded subjects and conditional pattern storage use the front. Persistent
+ * subscript facts and iterator continuation records use the tail. The value
+ * allowance covers pattern units, the longest literal run's size_t prefix
+ * table, a decoded subject and alignment. This bounds storage independently
+ * of syntax/depth/output capacities and does not inspect source bytes. */
+bool shell_source_workspace_size(size_t length, size_t *size) {
+  const size_t factor = SHELL_HEREDOC_PIECE_FACTOR +
+                        SHELL_SOURCE_VALUE_SCRATCH_FACTOR +
+                        sizeof(shell_source_array_boundary_t) + 64;
+  *size = 0;
+  if (length > SIZE_MAX / factor)
+    return false;
+  *size = length * factor;
+  return true;
+}
 
 void shell_source_operation_begin(const char *input, size_t length) {
   if (source_operation.depth++ != 0)
@@ -241,10 +259,11 @@ bool shell_source_scratch_exhausted(void) {
          (source_operation.depth && !source_operation.index);
 }
 
-/* Reserve persistent facts from the arena's tail. Temporary delimiter marks
- * release only its front; they cannot overwrite the index while unwinding.
- * Counting and filling are two linear storage-preparation passes, not syntax
- * validation. Ordinary bracket data is deliberately allowed to overreserve. */
+/* Reserve persistent facts from the arena's tail. Temporary source-scratch
+ * marks release only its front; they cannot overwrite the index while
+ * unwinding. Counting and filling are two linear storage-preparation passes,
+ * not syntax validation. Ordinary bracket data is deliberately allowed to
+ * overreserve. */
 static void source_array_index_prepare(void) {
   shell_source_array_index_t *index = &source_operation.arrays;
   if (index->prepared)

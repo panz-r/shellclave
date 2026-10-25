@@ -1,4 +1,5 @@
 #include "../src/shell_processor_internal.h"
+#include "../src/shell_semantics_internal.h"
 #include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 #include "control_word_cases.h"

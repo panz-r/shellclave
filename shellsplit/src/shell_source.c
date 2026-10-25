@@ -5,6 +5,8 @@
 #include "shell_source_admission_internal.h"
 #include "shell_source_draft_internal.h"
 #include "shell_source_internal.h"
+#include "shell_token_regions_internal.h"
+#include "shell_token_traits_internal.h"
 #include "shell_tokenizer_full_internal.h"
 #include <string.h>
 
@@ -356,21 +358,25 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
         header->complete = false;
         need(body, SHELL_SOURCE_NEEDS_CONDITIONAL, base + start);
       }
-      for (unsigned operand = 0; operand < condition.operand_count; ++operand)
-        if (condition.operand_lengths[operand] &&
+      shell_token_regions_t regions =
+          shell_conditional_regions(source, &condition);
+      for (unsigned operand = 0; operand < regions.count; ++operand) {
+        const shell_token_region_t *region = &regions.regions[operand];
+        if (region->length &&
             !collect_expansions(
-                collector, body, base + condition.operands[operand],
-                condition.operand_lengths[operand], depth + group_count, false,
+                collector, body, base + (size_t)(region->text - source),
+                region->length, depth + group_count, false,
                 condition.frame == SHELL_CONDITIONAL_INCOMPLETE, false))
           return false;
+      }
       covered = condition.after;
       continue;
     }
     if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
-      const char *expression;
-      size_t expression_length;
-      shell_tokenizer_arithmetic_content(&token, !lexer.in_arithmetic,
-                                         &expression, &expression_length);
+      shell_token_regions_t regions =
+          shell_token_regions(&token, !lexer.in_arithmetic);
+      const char *expression = regions.regions[0].text;
+      size_t expression_length = regions.regions[0].length;
       size_t content = (size_t)(expression - source);
       size_t after = start + token.length;
       out->headers[current].kind = SHELL_COMMAND_ARITHMETIC;
@@ -400,7 +406,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
      * later grammar, not an invented argv word, diagnoses the missing word. */
     if (!process_word && redirect_end == start &&
         token.type != SHELL_TOKEN_HEREDOC &&
-        full_token_is_redirection(&token)) {
+        shell_token_type_is_redirection(token.type)) {
       out->headers[current].complete = false;
       covered = end;
       continue;

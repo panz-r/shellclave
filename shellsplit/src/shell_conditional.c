@@ -93,6 +93,12 @@ typedef struct {
   bool star;
 } pattern_unit_t;
 
+/* Source spelling includes quote/operator delimiters, covering the fixed
+ * alignment padding in addition to these per-byte value reservations. */
+_Static_assert(sizeof(pattern_unit_t) + sizeof(size_t) + 1 <=
+                   SHELL_SOURCE_VALUE_SCRATCH_FACTOR,
+               "conditional values must fit source scratch sizing");
+
 /* units is NULL during measurement, which determines the required capacity.
  * Before emission, checked scratch reservations validate allocation arithmetic
  * and available space; units then has room for the measured projection.

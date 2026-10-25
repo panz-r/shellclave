@@ -1,29 +1,10 @@
 /* Lexical spelling of delimiter-only dollar fragments. These fragments are
  * parsed, but not expanded or executed. In particular Bash prints a parsed
  * $(...) back into the delimiter word before applying quote removal. */
+#include "shell_heredoc_storage_internal.h"
 #include "shell_keywords_internal.h"
 #include "shell_source_internal.h"
 #include <stdio.h>
-
-typedef enum {
-  LIT_BYTES,
-  LIT_SINGLE_BYTES,
-  LIT_ANSI,
-  LIT_ANSI_RAW,
-  LIT_CHILD,
-  LIT_WORD,
-  LIT_DOCUMENT,
-  LIT_QUOTED_CHILD,
-} literal_kind_t;
-
-typedef struct literal_piece literal_piece_t;
-struct literal_piece {
-  literal_piece_t *next, *child;
-  const char *text;
-  size_t length;
-  literal_kind_t kind;
-  bool strip_tabs, join_lines;
-};
 
 typedef struct {
   unsigned char previous, last;
@@ -63,28 +44,6 @@ typedef struct {
   literal_byte_t byte;
   void *context;
 } literal_output_t;
-
-/* Two pieces per source byte cover words, operators, and wrappers. Each
- * allocation permits arbitrary caller alignment. The remaining 16 bytes per
- * source byte cover printed spelling, live decoded nested delimiters and
- * conditional matching. A pattern uses at most two bytes per projected unit,
- * sizeof(size_t) per byte of its longest literal run, one decoded subject,
- * and size_t alignment padding; together these fit the 16-byte source factor.
- * These temporary spans share operation scratch.
- * Subscript facts and the public iterator's private continuation record use
- * an additional boundary entry plus 64 bytes per source byte. This covers
- * arbitrary alignment and keeps persistent facts outside delimiter marks.
- * This intentionally bounds storage, not semantic/parser capacities. */
-bool shell_source_workspace_size(size_t length, size_t *size) {
-  const size_t factor =
-      2 * (sizeof(literal_piece_t) + _Alignof(literal_piece_t) - 1) + 16 +
-      sizeof(shell_source_array_boundary_t) + 64;
-  *size = 0;
-  if (length > SIZE_MAX / factor)
-    return false;
-  *size = length * factor;
-  return true;
-}
 
 static void literal_emit(literal_piece_t *piece, literal_output_t output);
 static void literal_emit_word(literal_piece_t *piece, literal_output_t output);

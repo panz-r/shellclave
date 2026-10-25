@@ -36,6 +36,30 @@ shell_conditional_pattern(shell_conditional_predicate_t predicate) {
          predicate == SHELL_CONDITIONAL_PATTERN_NOT_MATCH;
 }
 
+/* Zero denotes an invalid/no predicate. Arity is a semantic property, not an
+ * ordering relationship between public enum values. */
+static inline unsigned
+shell_conditional_arity(shell_conditional_predicate_t predicate) {
+  switch (predicate) {
+  case SHELL_CONDITIONAL_STRING_NONEMPTY:
+  case SHELL_CONDITIONAL_STRING_EMPTY:
+    return 1;
+  case SHELL_CONDITIONAL_STRING_EQUAL:
+  case SHELL_CONDITIONAL_STRING_NOT_EQUAL:
+  case SHELL_CONDITIONAL_PATTERN_MATCH:
+  case SHELL_CONDITIONAL_PATTERN_NOT_MATCH:
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+static inline uint32_t
+shell_conditional_features(shell_conditional_predicate_t predicate) {
+  return SHELL_FEAT_CONDITIONALS |
+         (shell_conditional_pattern(predicate) ? SHELL_FEAT_GLOBS : 0);
+}
+
 shell_conditional_t shell_conditional_parse(const char *source, size_t length,
                                             size_t start) SHELL_NONNULL(1);
 

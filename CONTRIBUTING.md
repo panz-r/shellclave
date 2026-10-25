@@ -91,23 +91,60 @@ the pull request.
 
 ## Shellsplit frontend ownership
 
-Shared source operations, scratch storage, lexical indexes, and iterator
-workspace lifetimes belong to `shell_source_runtime.c` and its private header.
-Runtime-only consumers include that header rather than the recursive scanner.
-The runtime keeps the operation state private; tokenizers use its iterator
-scopes instead of accessing storage fields.
+The implementation owners and private interfaces are:
 
-Source-byte admission belongs to `shell_source_admission.c`. It owns both the
-whole-source byte check and scoped admission of words, comments, substitutions,
-and heredocs. Retained draft collection remains in `shell_source.c`; lexical
-iteration and list grammar retain their own responsibilities.
+| Responsibility | Owner and interface |
+|---|---|
+| Source operations, scratch sizing/storage, lexical indexes and iterator lifetimes | `shell_source_runtime.c`, `shell_source_runtime_internal.h` |
+| Whole-source and scoped byte admission | `shell_source_admission.c`, `shell_source_admission_internal.h` |
+| Lexical iteration, control/list/draft grammar and borrowed command construction | `shell_tokenizer_full.c`, `shell_tokenizer_full_internal.h`, `shell_source_draft_internal.h` |
+| Retained source/draft collection | `shell_source.c` |
+| Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
+| Conditional framing, predicate properties, ordered operands, pattern admission and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Supported-operation inspection, builtin roles and semantic observers | `shell_semantics.c`, `shell_semantics_internal.h` |
+| Word-value operations, public decoding adapters and diagnostic word rendering | `shell_word.c`, `shell_word_internal.h` |
+| Heredoc delimiter spelling and printer storage layout | `shell_heredoc.c`, `shell_heredoc_storage_internal.h` |
 
-`shell_conditional.c` owns string-condition framing, unary/comparison grammar,
-ordered operand spans, pattern admission and static predicate evaluation.
-It owns the linear star-pattern matcher; the shared source-word projection
-owns decoding and quote provenance. Consumers reuse those facts and the
-shared word-expansion primitives. Descriptor snapshots distinguish body-word
-expansion after compound setup from simple-command argv expansion before setup.
+Shared inline interfaces have narrower responsibilities:
+
+- `shell_token_traits_internal.h` defines lexical token categories. Consumers
+  retain their own policy and rendering decisions, including process-substitution
+  treatment.
+- `shell_token_context_internal.h` shares lexical word, redirect and pipeline
+  context helpers between grammar and semantic inspection. Observer state stays
+  in the semantic module.
+- `shell_token_regions_internal.h` selects borrowed expansion-bearing spans from
+  parsed conditional facts or lexer-framed arithmetic. Conditional grammar and
+  comments stay outside operand regions. Region selection does not qualify
+  syntax, completeness or semantic support.
+- `shell_word_fragment_internal.h` owns nonrecursive quote/escape processing,
+  ANSI-C decoding, effective fragment values and quote provenance.
+- `shell_word_decode_internal.h` supplies sinks and decoding loops for direct
+  emission into canonical buffers. Only the word implementation and processor's
+  direct emitter include it; declaration-only callers use `shell_word_internal.h`.
+
+Share selection and context facts that consumers interpret identically. Keep
+syntax recovery, borrowed-to-owned rebasing, graph execution effects and policy
+decisions with their respective owners: these operations have different
+contracts even when they inspect the same construct.
+
+The source runtime keeps operation state private. Runtime-only consumers use
+its narrow header; tokenizers use iterator scopes rather than storage fields.
+Runtime sizing composes the arena bound from the delimiter printer's actual
+private layout and the shared value/bookkeeping allowances. The storage header
+keeps the printer and sizing calculation in agreement without a runtime query.
+
+Retained collection uses the existing list/draft grammar. Recursive expansion
+framing and context-sensitive dynamic-word classification remain with the source
+scanners because they need nested lexical facts. Raw binary decoding, effective
+shell-word projection and diagnostic rendering preserve their distinct contracts.
+Public word APIs remain declared in `shell_processor.h`; their implementation is
+in the word module. Descriptor snapshots distinguish body-word expansion after
+compound setup from simple-command argv expansion before setup.
+
+Keep token facts, region initializers and fragment/decoder cores inline. Consume
+existing parse facts where available and retain each consumer's source traversal,
+resource accounting and ownership rules when extending a syntax family.
 
 `shell_keywords.c` defines keyword spellings and classification facts once.
 Its consumers separately interpret grammar eligibility, feature presence, and
