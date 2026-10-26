@@ -43,6 +43,7 @@ shell_conditional_arity(shell_conditional_predicate_t predicate) {
   switch (predicate) {
   case SHELL_CONDITIONAL_STRING_NONEMPTY:
   case SHELL_CONDITIONAL_STRING_EMPTY:
+  case SHELL_CONDITIONAL_VARIABLE_SET:
     return 1;
   case SHELL_CONDITIONAL_STRING_EQUAL:
   case SHELL_CONDITIONAL_STRING_NOT_EQUAL:

@@ -2,3 +2,10 @@
 [[ "$(printf value)" == "value" ]] && printf ok
 
 [[ "report.txt" == "report"*.txt ]] && printf matched
+unset CONFIG; CONFIG=; test -v CONFIG -a ! -v OTHER && printf present
+[[ -v CONFIG ]] || :; printf '%s' "$(test -v CONFIG)"
+CONFIG=; test -t -o -v CONFIG
+test -t invalid -o -v CONFIG || printf invalid
+test '' -o '(' x ')' || printf failure
+test x -a '(' '' ')' && printf success
+test '(' -t -o ')' -o -v 'a[$(printf marker >&2)]' || cat <important.txt

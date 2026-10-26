@@ -1,7 +1,9 @@
 #ifndef SHELL_BUILTIN_INTERNAL_H
 #define SHELL_BUILTIN_INTERNAL_H
 
+#include "shell_builtin_word_internal.h"
 #include "shell_source_internal.h"
+#include "shell_test_internal.h"
 #include <limits.h>
 
 /* Private operand roles shared by source validation and named-FD mutation
@@ -62,6 +64,7 @@ typedef enum {
   SHELL_BUILTIN_VARIABLE_READONLY,
   SHELL_BUILTIN_VARIABLE_FROZEN,
   SHELL_BUILTIN_VARIABLE_ARITHMETIC,
+  SHELL_BUILTIN_VARIABLE_NOASSIGN,
 } shell_builtin_variable_t;
 
 /* Fresh-shell capabilities, not a complete shell-variable attribute table.
@@ -80,6 +83,8 @@ enum {
   SHELL_VARIABLE_DESPECIALIZES_ON_UNSET = 32u,
   /* Whole-variable unset fails and leaves the predefined array in place. */
   SHELL_VARIABLE_UNSET_REJECTED = 64u,
+  /* Bash rejects assignment without readonly's input-unit abort semantics. */
+  SHELL_VARIABLE_NOASSIGN = 128u,
 };
 static const struct {
   const char *name;
@@ -124,20 +129,26 @@ static const struct {
                                         SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
     SHELL_VARIABLE("LINENO", SHELL_VARIABLE_UNSTABLE |
                                  SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
-    SHELL_VARIABLE("BASH_ARGC",
-                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
-    SHELL_VARIABLE("BASH_ARGV",
-                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
-    SHELL_VARIABLE("BASH_LINENO",
-                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
-    SHELL_VARIABLE("BASH_SOURCE",
-                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
+    SHELL_VARIABLE("BASH_ARGC", SHELL_VARIABLE_ARRAY |
+                                    SHELL_VARIABLE_UNSET_REJECTED |
+                                    SHELL_VARIABLE_NOASSIGN),
+    SHELL_VARIABLE("BASH_ARGV", SHELL_VARIABLE_ARRAY |
+                                    SHELL_VARIABLE_UNSET_REJECTED |
+                                    SHELL_VARIABLE_NOASSIGN),
+    SHELL_VARIABLE("BASH_LINENO", SHELL_VARIABLE_ARRAY |
+                                      SHELL_VARIABLE_UNSET_REJECTED |
+                                      SHELL_VARIABLE_NOASSIGN),
+    SHELL_VARIABLE("BASH_SOURCE", SHELL_VARIABLE_ARRAY |
+                                      SHELL_VARIABLE_UNSET_REJECTED |
+                                      SHELL_VARIABLE_NOASSIGN),
     SHELL_VARIABLE("DIRSTACK", SHELL_VARIABLE_ARRAY |
                                    SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
     SHELL_VARIABLE("FUNCNAME", SHELL_VARIABLE_ARRAY |
-                                   SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+                                   SHELL_VARIABLE_DESPECIALIZES_ON_UNSET |
+                                   SHELL_VARIABLE_NOASSIGN),
     SHELL_VARIABLE("GROUPS", SHELL_VARIABLE_ARRAY |
-                                 SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+                                 SHELL_VARIABLE_DESPECIALIZES_ON_UNSET |
+                                 SHELL_VARIABLE_NOASSIGN),
     SHELL_VARIABLE("PIPESTATUS",
                    SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSTABLE),
     SHELL_VARIABLE("BASH_ALIASES", SHELL_VARIABLE_ARRAY |
@@ -232,6 +243,15 @@ static inline SHELL_NONNULL(1) uint8_t
   return shell_builtin_variable_index(&scan);
 }
 
+/* Source preparation retains candidate writes to resettable special names;
+ * only the execution version knows whether a preceding unset removed their
+ * assignment restriction. Permanent restrictions can be resolved here. */
+static inline bool shell_builtin_variable_candidate_write(unsigned properties) {
+  return !(properties & SHELL_VARIABLE_READONLY) &&
+         (!(properties & SHELL_VARIABLE_NOASSIGN) ||
+          (properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET));
+}
+
 /* Classify a quote-removed scalar target. Static invalid names cannot mutate
  * unrelated bindings; unresolved expansion can. Ordinary readonly targets
  * have builtin-specific effects: read stops, but printf/declarations can keep
@@ -254,6 +274,9 @@ static inline SHELL_NONNULL(1) shell_builtin_variable_t
     return SHELL_BUILTIN_VARIABLE_ARITHMETIC;
   if (properties & SHELL_VARIABLE_FROZEN)
     return SHELL_BUILTIN_VARIABLE_FROZEN;
+  if ((properties & SHELL_VARIABLE_NOASSIGN) &&
+      !(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
+    return SHELL_BUILTIN_VARIABLE_NOASSIGN;
   return properties & SHELL_VARIABLE_READONLY ? SHELL_BUILTIN_VARIABLE_READONLY
                                               : SHELL_BUILTIN_VARIABLE_STATIC;
 }
@@ -576,8 +599,8 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_declaration_word(
     return SHELL_BUILTIN_ROLE_UNSUPPORTED;
   if (state->readonly || state->kind == SHELL_SOURCE_BUILTIN_READONLY)
     return SHELL_BUILTIN_ROLE_UNSUPPORTED;
-  bool writable = assigned && (shell_builtin_variable_properties(&target) &
-                               SHELL_VARIABLE_READONLY) == 0;
+  bool writable = assigned && shell_builtin_variable_candidate_write(
+                                  shell_builtin_variable_properties(&target));
   return SHELL_BUILTIN_ROLE_TARGET | (writable ? SHELL_BUILTIN_ROLE_WRITE : 0) |
          (state->promotes_prefix ? SHELL_BUILTIN_ROLE_PROMOTES_PREFIX : 0);
 }
@@ -852,177 +875,6 @@ static inline SHELL_NONNULL(2) bool shell_builtin_read_option_byte(
   return true;
 }
 
-/* Visit literal and opaque scalar/substitution fragments of a complete word.
- * With allow_unquoted=false, success proves one argv entry, including empty.
- * With it true, unquoted scalar cardinality remains the caller's concern.
- * List selectors are not projected; callbacks may have seen a prefix before
- * failure. The source boundary separately checks nested expansion semantics.
- * Visitors consume every fragment; context may be NULL if they allow it. */
-typedef void (*shell_builtin_word_dynamic_fn)(const char *word, size_t length,
-                                              bool quoted, void *context);
-/* NULL rejects nonempty process fragments. A visitor receives their guaranteed
- * pathname contribution, not an evaluated pathname or the child source. */
-typedef void (*shell_builtin_word_process_fn)(void *context);
-
-/* The source scanner has isolated a complete parameter expansion. Prove
- * scalar cardinality without resolving its value or copying its identifier.
- * Complex operators and list selectors remain unknown; length selectors are
- * scalar even for @. Logical continuations do not change that proof. */
-static inline SHELL_NONNULL(1) bool shell_builtin_parameter_is_scalar(
-    const char *word, size_t length) {
-  size_t position = shell_source_skip_escaped_line_endings(word, length, 1);
-  size_t end = length;
-  if (word[position] == '{') {
-    position++;
-    end--;
-  }
-  position = shell_source_skip_escaped_line_endings(word, end, position);
-  if (position == end)
-    return false;
-  unsigned char first = (unsigned char)word[position];
-  size_t next = shell_source_skip_escaped_line_endings(word, end, position + 1);
-  bool length_selector = first == '#' && next < end;
-  if (length_selector) {
-    position = next;
-    first = (unsigned char)word[position];
-    next = shell_source_skip_escaped_line_endings(word, end, position + 1);
-  }
-  if (strchr("#?$!-*@", first))
-    return next == end && (first != '@' || length_selector);
-  bool positional = shell_ascii_digit(first) != 0;
-  if (!positional && !(shell_ascii_alpha(first) || first == '_'))
-    return false;
-  for (position = next; position < end;) {
-    unsigned char byte = (unsigned char)word[position];
-    if (positional ? !shell_ascii_digit(byte)
-                   : !(shell_ascii_alnum(byte) || byte == '_'))
-      return false;
-    position = shell_source_skip_escaped_line_endings(word, end, position + 1);
-  }
-  return true;
-}
-
-static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_word_impl(
-    const char *word, size_t length, shell_source_byte_visitor_t literal,
-    shell_builtin_word_dynamic_fn dynamic, void *context, bool allow_unquoted,
-    shell_builtin_word_process_fn process) {
-  char quote = 0;
-  bool start = true;
-  shell_source_brace_scan_t braces = {0};
-  shell_source_glob_scan_t glob = {0};
-  for (size_t position = 0; position < length;) {
-    unsigned char byte = (unsigned char)word[position];
-    size_t empty_after;
-    if (!quote && (byte == '<' || byte == '>') &&
-        shell_source_empty_process_fragment(word, length, position,
-                                            &empty_after)) {
-      position = empty_after;
-      start = false;
-      continue;
-    }
-    if (byte == '\\' && quote != '\'' && position + 1 < length) {
-      unsigned char next = (unsigned char)word[position + 1];
-      if (!quote || next == '$' || next == '`' || next == '"' || next == '\\' ||
-          next == '\n') {
-        position += 2;
-        if (next != '\n') {
-          shell_source_brace_scan_literal(&braces);
-          shell_source_glob_scan_step(&glob, next, true);
-          literal(next, context);
-          start = false;
-        }
-        continue;
-      }
-    }
-    if (!quote && byte == '$' &&
-        shell_source_logical_next_is(word, length, position, '\'', NULL)) {
-      shell_source_brace_scan_literal(&braces);
-      if (!shell_source_decode_ansi_c_word(word, length, &position, literal,
-                                           context))
-        return false;
-      start = false;
-      continue;
-    }
-    if (!quote && (byte == '\'' || byte == '"')) {
-      shell_source_brace_scan_literal(&braces);
-      quote = (char)byte;
-      start = false;
-      position++;
-      continue;
-    }
-    if (quote && byte == (unsigned char)quote) {
-      quote = 0;
-      position++;
-      continue;
-    }
-    if (quote != '\'' && (byte == '`' || shell_source_dollar_has_dynamic_syntax(
-                                             word, length, position))) {
-      if (quote != '"' && !allow_unquoted)
-        return false;
-      size_t after = 0, open = 0;
-      if (byte == '`') {
-        if (!shell_source_skip_complete_backtick(word, length, position,
-                                                 &after))
-          return false;
-      } else if (shell_source_dollar_arithmetic_open(word, length, position,
-                                                     &open)) {
-        if (!shell_source_skip_arithmetic_expansion(word, length, position,
-                                                    &after))
-          return false;
-      } else if (shell_source_dollar_parentheses_open(word, length, position,
-                                                      &open)) {
-        if (!shell_source_find_balanced_parentheses(word, length, open, &after))
-          return false;
-      } else {
-        if (!shell_source_skip_variable_expansion(word, length, position,
-                                                  &after) ||
-            !shell_builtin_parameter_is_scalar(word + position,
-                                               after - position))
-          return false;
-      }
-      dynamic(word + position, after - position, quote == '"', context);
-      position = after;
-      start = false;
-      continue;
-    }
-    if (!quote) {
-      size_t open, after;
-      if ((byte == '<' || byte == '>') &&
-          shell_source_process_substitution_open(word, length, position,
-                                                 &open)) {
-        if (!process ||
-            !shell_source_find_balanced_parentheses(word, length, open, &after))
-          return false;
-        process(context);
-        shell_source_brace_scan_literal(&braces);
-        shell_source_glob_scan_step(&glob, '/', true);
-        position = after;
-        start = false;
-        continue;
-      }
-      if (((byte == '?' || byte == '*' || byte == '+' || byte == '@' ||
-            byte == '!') &&
-           shell_source_logical_next_is(word, length, position, '(', NULL)) ||
-          byte == '*' || byte == '?' || (byte == '~' && start) ||
-          shell_source_glob_scan_step(&glob, byte, false) ||
-          shell_source_brace_scan_step(&braces, byte))
-        return false;
-    } else
-      shell_source_glob_scan_step(&glob, byte, true);
-    literal(byte, context);
-    start = false;
-    position++;
-  }
-  return quote == 0;
-}
-
-static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
-    const char *word, size_t length, shell_source_byte_visitor_t literal,
-    shell_builtin_word_dynamic_fn dynamic, void *context) {
-  return shell_builtin_visit_word_impl(word, length, literal, dynamic, context,
-                                       false, NULL);
-}
-
 /* word is one complete, supported parameter expansion, excluding its outer
  * quotes. Prove at least one argument when double quoted and expansion
  * succeeds; an error is not an empty argv alternative. This is deliberately
@@ -1165,6 +1017,12 @@ enum {
 
 typedef struct {
   unsigned phases;
+  /* A dynamic leading option word can fail before the implicit state or
+   * destination is written. Keep that path distinct from a definite write. */
+  bool may_fail_before_data;
+  /* A possible optstring without a leading colon permits error paths which
+   * clear OPTARG after assigning the destination, regardless of OPTERR. */
+  bool may_clear_optarg_after_target;
 } shell_builtin_getopts_t;
 
 typedef struct {
@@ -1205,6 +1063,8 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_getopts_word(
   unsigned next = state->phases & SHELL_GETOPTS_DATA;
   unsigned roles = 0;
   if (pending & SHELL_GETOPTS_OPTIONS) {
+    if (scan.dynamic && (!scan.length || scan.prefix[0] == '-'))
+      state->may_fail_before_data = true;
     if (!scan.dynamic) {
       if (scan.length == 2 && scan.prefix[0] == '-' && scan.prefix[1] == '-')
         next |= SHELL_GETOPTS_OPTSTRING;
@@ -1219,6 +1079,8 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_getopts_word(
   }
   if (pending & SHELL_GETOPTS_OPTSTRING)
     next |= SHELL_GETOPTS_TARGET;
+  if ((next & SHELL_GETOPTS_TARGET) && (!scan.length || scan.prefix[0] != ':'))
+    state->may_clear_optarg_after_target = true;
   if (pending & SHELL_GETOPTS_TARGET) {
     shell_builtin_variable_t target = shell_builtin_variable(word, length);
     roles = SHELL_BUILTIN_ROLE_TARGET;
@@ -1297,337 +1159,6 @@ static inline SHELL_NONNULL(1, 3) bool shell_builtin_read_scan_word(
       scan, false, shell_builtin_read_process);
 }
 
-/* `test`/`[` variable-existence operands can re-evaluate an array subscript,
- * even when no array was declared. Classify each complete word once, retaining
- * only operator roles and lookup safety, not copies of source/value strings.
- * Unknown argv cardinality cannot establish expression roles and is rejected.
- * Quoted scalar data still has a known one-word cardinality. */
-enum {
-  SHELL_TEST_NOT = 1u,
-  SHELL_TEST_OPEN = 2u,
-  SHELL_TEST_CLOSE = 4u,
-  SHELL_TEST_UNARY = 8u,
-  SHELL_TEST_LOOKUP = 16u,
-  SHELL_TEST_BINARY = 32u,
-  SHELL_TEST_JOIN = 64u,
-  SHELL_TEST_END = 128u,
-};
-
-typedef struct {
-  unsigned roles;
-  bool dynamic, unsafe_lookup;
-} shell_builtin_test_word_t;
-
-typedef struct {
-  char spelling[4];
-  size_t length;
-  bool dynamic, subscript;
-} shell_builtin_test_scan_t;
-
-static inline SHELL_NONNULL(2) bool shell_builtin_test_byte(unsigned char byte,
-                                                            void *context) {
-  SHELL_SOURCE_WORD_SCAN(1);
-  shell_builtin_test_scan_t *scan = context;
-  if (scan->length < sizeof(scan->spelling) - 1)
-    scan->spelling[scan->length] = (char)byte;
-  scan->length++;
-  scan->subscript |= byte == '[';
-  return true;
-}
-
-static inline SHELL_NONNULL(4) void shell_builtin_test_dynamic(const char *word,
-                                                               size_t length,
-                                                               bool quoted,
-                                                               void *context) {
-  (void)word;
-  (void)length;
-  (void)quoted;
-  shell_builtin_test_scan_t *scan = context;
-  scan->dynamic = true;
-}
-
-/* A forward recognizer for the general (>3 argument) expression grammar.
- * One-word lookahead distinguishes binary operands from unary operators.
- * Parentheses need a depth, not a tree or rescanning. Truth and short-circuit
- * values are not inferred: every syntactically reached lookup is checked.
- * Unresolved operator positions remain unsupported; unresolved ordinary data
- * operands of a known unary/binary test do not select another operation. */
-typedef enum {
-  SHELL_TEST_PRIMARY,
-  SHELL_TEST_LOOKAHEAD,
-  SHELL_TEST_BINARY_VALUE,
-  SHELL_TEST_AFTER_PRIMARY,
-  SHELL_TEST_ERROR,
-} shell_builtin_test_phase_t;
-
-/* An unknown primary followed by a binary operator normally becomes data.
- * If its runtime value is ! or (, Bash instead enters another primary before
- * consuming that operator. Keep those alternatives alive until their grammar
- * fails; an error in the ordinary-data path does not prove they also failed.
- * Six role states, each retaining only the largest reachable parenthesis
- * depth, bound both storage and work independently of expression length. */
-enum {
-  SHELL_TEST_ALT_PRIMARY,
-  SHELL_TEST_ALT_STRING,
-  SHELL_TEST_ALT_UNARY,
-  SHELL_TEST_ALT_LOOKUP,
-  SHELL_TEST_ALT_BINARY_VALUE,
-  SHELL_TEST_ALT_AFTER,
-  SHELL_TEST_ALT_COUNT,
-};
-
-typedef struct {
-  unsigned active;
-  size_t depth[SHELL_TEST_ALT_COUNT];
-} shell_builtin_test_alternatives_t;
-
-static inline SHELL_NONNULL(1) void shell_builtin_test_alternative_add(
-    shell_builtin_test_alternatives_t *states, unsigned phase, size_t depth) {
-  states->active |= 1u << phase;
-  if (depth > states->depth[phase])
-    states->depth[phase] = depth;
-}
-
-static inline SHELL_NONNULL(1) void shell_builtin_test_alternative_after(
-    shell_builtin_test_alternatives_t *next, shell_builtin_test_word_t word,
-    size_t depth) {
-  if (word.dynamic || (word.roles & SHELL_TEST_JOIN))
-    shell_builtin_test_alternative_add(next, SHELL_TEST_ALT_PRIMARY, depth);
-  if (depth && (word.dynamic || (word.roles & SHELL_TEST_CLOSE)))
-    shell_builtin_test_alternative_add(next, SHELL_TEST_ALT_AFTER, depth - 1);
-}
-
-static inline SHELL_NONNULL(1) bool shell_builtin_test_alternatives_word(
-    shell_builtin_test_alternatives_t *states, shell_builtin_test_word_t word) {
-  shell_builtin_test_alternatives_t next = {0};
-  bool unsupported = false;
-  for (unsigned phase = 0; phase < SHELL_TEST_ALT_COUNT; phase++) {
-    SHELL_SOURCE_WORD_SCAN(1);
-    if (!(states->active & (1u << phase)))
-      continue;
-    size_t depth = states->depth[phase];
-    if (phase == SHELL_TEST_ALT_PRIMARY) {
-      if (word.dynamic || (word.roles & SHELL_TEST_NOT))
-        shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_PRIMARY,
-                                           depth);
-      if (word.dynamic || (word.roles & SHELL_TEST_OPEN))
-        shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_PRIMARY,
-                                           depth + 1);
-      if (word.dynamic || !(word.roles & (SHELL_TEST_NOT | SHELL_TEST_OPEN))) {
-        unsigned head = word.roles & SHELL_TEST_LOOKUP  ? SHELL_TEST_ALT_LOOKUP
-                        : word.roles & SHELL_TEST_UNARY ? SHELL_TEST_ALT_UNARY
-                                                        : SHELL_TEST_ALT_STRING;
-        shell_builtin_test_alternative_add(&next, head, depth);
-        if (word.dynamic) {
-          shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_LOOKUP,
-                                             depth);
-          shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_UNARY,
-                                             depth);
-        }
-      }
-    } else if (phase == SHELL_TEST_ALT_BINARY_VALUE) {
-      shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_AFTER, depth);
-    } else if (phase == SHELL_TEST_ALT_AFTER) {
-      shell_builtin_test_alternative_after(&next, word, depth);
-    } else {
-      bool binary = !word.dynamic && (word.roles & SHELL_TEST_BINARY) &&
-                    !(word.roles & SHELL_TEST_JOIN);
-      if (word.dynamic || binary)
-        shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_BINARY_VALUE,
-                                           depth);
-      if (!binary) {
-        if (phase == SHELL_TEST_ALT_STRING)
-          shell_builtin_test_alternative_after(&next, word, depth);
-        else {
-          unsupported |= phase == SHELL_TEST_ALT_LOOKUP && word.unsafe_lookup;
-          shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_AFTER,
-                                             depth);
-        }
-      }
-    }
-  }
-  *states = next;
-  return unsupported;
-}
-
-typedef struct {
-  shell_builtin_test_word_t first[4], last, head;
-  size_t count, depth;
-  shell_builtin_test_phase_t phase;
-  shell_builtin_test_alternatives_t alternatives;
-  bool bracket, have_last, unresolved_arity, unsupported;
-} shell_builtin_test_t;
-
-static inline SHELL_NONNULL(1) void shell_builtin_test_expression_word(
-    shell_builtin_test_t *state, shell_builtin_test_word_t word) {
-  state->unsupported |=
-      shell_builtin_test_alternatives_word(&state->alternatives, word);
-  for (;;) {
-    switch (state->phase) {
-    case SHELL_TEST_PRIMARY:
-      if (word.roles & SHELL_TEST_NOT)
-        return;
-      if (word.roles & SHELL_TEST_OPEN) {
-        state->depth++;
-        return;
-      }
-      state->head = word;
-      state->phase = SHELL_TEST_LOOKAHEAD;
-      return;
-    case SHELL_TEST_LOOKAHEAD:
-      if (!word.dynamic && (word.roles & SHELL_TEST_BINARY) &&
-          !(word.roles & SHELL_TEST_JOIN)) {
-        /* The ordinary interpretation consumes the saved word as data.
-         * A !/( value makes this operator the next primary's first word.
-         * Both structural alternatives have a plain head; retain their
-         * maximum depth until subsequent words establish their roles. */
-        if (state->head.dynamic)
-          shell_builtin_test_alternative_add(
-              &state->alternatives, SHELL_TEST_ALT_STRING, state->depth + 1);
-        state->phase = SHELL_TEST_BINARY_VALUE;
-        return;
-      }
-      if (state->head.dynamic) {
-        state->unsupported = true;
-        state->phase = SHELL_TEST_ERROR;
-        return;
-      }
-      state->phase = SHELL_TEST_AFTER_PRIMARY;
-      if (state->head.roles & SHELL_TEST_UNARY) {
-        state->unsupported |=
-            (state->head.roles & SHELL_TEST_LOOKUP) && word.unsafe_lookup;
-        return;
-      }
-      /* The saved head was a one-word string test. Process this lookahead
-       * as its connector/closing delimiter, without revisiting source bytes. */
-      break;
-    case SHELL_TEST_BINARY_VALUE:
-      state->phase = SHELL_TEST_AFTER_PRIMARY;
-      return;
-    case SHELL_TEST_AFTER_PRIMARY:
-      if (word.dynamic)
-        state->unsupported = true;
-      else if (word.roles & SHELL_TEST_JOIN)
-        state->phase = SHELL_TEST_PRIMARY;
-      else if ((word.roles & SHELL_TEST_CLOSE) && state->depth)
-        state->depth--;
-      else
-        state->phase = SHELL_TEST_ERROR;
-      return;
-    case SHELL_TEST_ERROR:
-      return;
-    }
-  }
-}
-
-static inline SHELL_NONNULL(1) void shell_builtin_test_append(
-    shell_builtin_test_t *state, shell_builtin_test_word_t word) {
-  if (state->count < sizeof(state->first) / sizeof(state->first[0]))
-    state->first[state->count] = word;
-  state->count++;
-  shell_builtin_test_expression_word(state, word);
-}
-
-/* State was initialized once for the effective builtin. A bracket form delays
- * its last word so the required closing `]` never becomes an expression word.
- * Finish at the simple-command boundary, not after an arbitrary word: Bash's
- * 0..4-argument disambiguation can make a spelling such as `-v` ordinary data.
- */
-static inline SHELL_NONNULL(1, 2) void shell_builtin_test_word(
-    shell_builtin_test_t *state, const char *word, size_t length) {
-  shell_builtin_test_scan_t scan = {0};
-  state->unresolved_arity |= !shell_builtin_visit_single_word(
-      word, length, shell_builtin_test_byte, shell_builtin_test_dynamic, &scan);
-  shell_builtin_test_word_t classified = {
-      .dynamic = scan.dynamic,
-      .unsafe_lookup = scan.dynamic || scan.subscript,
-  };
-  if (!scan.dynamic && scan.length < sizeof(scan.spelling)) {
-    const char *spelling = scan.spelling;
-    if (scan.length == 1) {
-      classified.roles =
-          spelling[0] == '!'   ? SHELL_TEST_NOT
-          : spelling[0] == '(' ? SHELL_TEST_OPEN
-          : spelling[0] == ')' ? SHELL_TEST_CLOSE
-          : spelling[0] == ']' ? SHELL_TEST_END
-          : spelling[0] == '=' || spelling[0] == '<' || spelling[0] == '>'
-              ? SHELL_TEST_BINARY
-              : 0;
-    } else if (scan.length == 2) {
-      if (spelling[0] == '-' &&
-          strchr("abcdefghkLnNoOprRsStuvwxzG", spelling[1]))
-        classified.roles |= SHELL_TEST_UNARY;
-      if (spelling[0] == '-' && spelling[1] == 'v')
-        classified.roles |= SHELL_TEST_LOOKUP;
-      if (!strcmp(spelling, "==") || !strcmp(spelling, "!=") ||
-          !strcmp(spelling, "-a") || !strcmp(spelling, "-o"))
-        classified.roles |= SHELL_TEST_BINARY;
-      if (!strcmp(spelling, "-a") || !strcmp(spelling, "-o"))
-        classified.roles |= SHELL_TEST_JOIN;
-    } else if (!strcmp(spelling, "-eq") || !strcmp(spelling, "-ne") ||
-               !strcmp(spelling, "-lt") || !strcmp(spelling, "-le") ||
-               !strcmp(spelling, "-gt") || !strcmp(spelling, "-ge") ||
-               !strcmp(spelling, "-nt") || !strcmp(spelling, "-ot") ||
-               !strcmp(spelling, "-ef"))
-      classified.roles |= SHELL_TEST_BINARY;
-  }
-  if (state->bracket) {
-    if (state->have_last)
-      shell_builtin_test_append(state, state->last);
-    state->last = classified;
-    state->have_last = true;
-  } else
-    shell_builtin_test_append(state, classified);
-}
-
-static inline bool shell_builtin_test_two(shell_builtin_test_word_t first,
-                                          shell_builtin_test_word_t second) {
-  return !(first.roles & SHELL_TEST_NOT) &&
-         (first.dynamic || (first.roles & SHELL_TEST_LOOKUP)) &&
-         second.unsafe_lookup;
-}
-
-/* Three-argument binary tests take precedence over ! and parentheses. Other
- * static three-word forms fail before evaluating a unary variable lookup. */
-static inline bool shell_builtin_test_three(shell_builtin_test_word_t first,
-                                            shell_builtin_test_word_t second,
-                                            shell_builtin_test_word_t third) {
-  if (!second.dynamic && (second.roles & SHELL_TEST_BINARY))
-    return false;
-  return (first.dynamic || (first.roles & SHELL_TEST_NOT)) &&
-         shell_builtin_test_two(second, third);
-}
-
-static inline SHELL_NONNULL(1) bool shell_builtin_test_unsupported(
-    const shell_builtin_test_t *state) {
-  if (state->unresolved_arity)
-    return true;
-  if (state->bracket) {
-    if (!state->have_last)
-      return false;
-    if (state->last.dynamic)
-      return true;
-    if (!(state->last.roles & SHELL_TEST_END))
-      return false;
-  }
-  const shell_builtin_test_word_t *words = state->first;
-  if (state->count <= 1)
-    return false;
-  if (state->count == 2)
-    return shell_builtin_test_two(words[0], words[1]);
-  if (state->count == 3)
-    return shell_builtin_test_three(words[0], words[1], words[2]);
-  if (state->count == 4) {
-    if (!words[0].dynamic && (words[0].roles & SHELL_TEST_NOT))
-      return shell_builtin_test_three(words[1], words[2], words[3]);
-    if (!words[0].dynamic && (words[0].roles & SHELL_TEST_OPEN) &&
-        !words[3].dynamic && (words[3].roles & SHELL_TEST_CLOSE))
-      return shell_builtin_test_two(words[1], words[2]);
-  }
-  return state->unsupported ||
-         (state->phase == SHELL_TEST_LOOKAHEAD && state->head.dynamic);
-}
-
 /* Consume complete logical argv words once. Callers omit redirects and wholly
  * elided words; quoted empty arguments remain. TARGET records
  * -v or %n operands (ATTACHED skips two decoded option bytes). FORMAT|WRITE
@@ -1697,7 +1228,8 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
   }
   if (state->phase == SHELL_PRINTF_TARGET) {
     shell_builtin_variable_t variable = shell_builtin_variable(word, length);
-    state->has_target = variable != SHELL_BUILTIN_VARIABLE_READONLY;
+    state->has_target = variable != SHELL_BUILTIN_VARIABLE_READONLY &&
+                        variable != SHELL_BUILTIN_VARIABLE_NOASSIGN;
     state->phase = variable == SHELL_BUILTIN_VARIABLE_INVALID
                        ? SHELL_PRINTF_ERROR
                        : SHELL_PRINTF_OPTIONS;
@@ -1724,8 +1256,8 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
       else if (scan.v && scan.length == 2)
         state->phase = SHELL_PRINTF_TARGET;
       else if (scan.v) {
-        state->has_target = (shell_builtin_variable_properties(&scan.target) &
-                             SHELL_VARIABLE_READONLY) == 0;
+        state->has_target = shell_builtin_variable_candidate_write(
+            shell_builtin_variable_properties(&scan.target));
         state->phase =
             scan.target.valid ? SHELL_PRINTF_OPTIONS : SHELL_PRINTF_ERROR;
         return SHELL_BUILTIN_ROLE_TARGET | SHELL_BUILTIN_ROLE_ATTACHED |
@@ -1780,7 +1312,8 @@ static inline SHELL_NONNULL(3) unsigned shell_builtin_read_target(
   if (!mode && variable == SHELL_BUILTIN_VARIABLE_ARITHMETIC)
     return roles | SHELL_BUILTIN_ROLE_UNSUPPORTED;
   /* Polling returns before target validation/assignment. A writing path
-   * stops at its first proven bad/readonly target, preserving earlier writes.
+   * stops at its first invalid or nonassignable target, preserving earlier
+   * writes. Resettable restrictions remain candidates until graph evaluation.
    */
   if (mode || variable == SHELL_BUILTIN_VARIABLE_STATIC ||
       variable == SHELL_BUILTIN_VARIABLE_DYNAMIC) {

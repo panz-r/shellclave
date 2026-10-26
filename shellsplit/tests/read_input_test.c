@@ -897,6 +897,46 @@ static void predefined_variable_lifecycle(void) {
   parse("unset OPTIND; getopts a OPTIND -a");
   parse("unset SECONDS; declare SECONDS='other=2'");
   parse("unset OPTIND; OPTIND='other=2'");
+  /* Nonassignable predefined targets reject writes after consuming input.
+   * Earlier targets remain assigned; polling and zero-character reads retain
+   * their separate input contracts. Rejection is an ordinary builtin failure.
+   */
+  parse("read first FUNCNAME IFS last <<<payload && printf accepted >accepted; "
+        "printf continued >continued");
+  CHECK(document_input(command("read"), "payload"));
+  CHECK(!document_write(command("accepted"), "accepted"));
+  CHECK(document_write(command("continued"), "continued"));
+  parse("read -n0 first FUNCNAME IFS last <<<payload && "
+        "printf accepted >accepted");
+  CHECK(!document_input(command("read"), "payload"));
+  CHECK(!document_write(command("accepted"), "accepted"));
+  parse("read -t0 first FUNCNAME IFS last <<<payload");
+  CHECK(!document_input(command("read"), "payload"));
+  parse("unset FUNCNAME; read FUNCNAME <<<payload");
+  CHECK(document_input(command("read"), "payload"));
+  parse("name=unused; unset -- \"$name\" FUNCNAME; "
+        "read FUNCNAME <<<payload && printf accepted >accepted");
+  CHECK(document_input(command("read"), "payload"));
+  CHECK(document_write(command("accepted"), "accepted"));
+  parse("FUNCNAME=value unset FUNCNAME; "
+        "read FUNCNAME <<<payload && printf accepted >accepted");
+  CHECK(document_input(command("read"), "payload"));
+  CHECK(document_write(command("accepted"), "accepted"));
+  parse("unset -- \"$name\"; read first FUNCNAME IFS last <<<payload");
+  CHECK(document_input(command("read"), "payload"));
+  parse("unset -- \"$name\"; read -t0 FUNCNAME <<<payload");
+  CHECK(!document_input(command("read"), "payload"));
+  parse("IFS=0123456789; unset -- \"$name\" IFS; "
+        "exec {fd}<input && cat <&$fd");
+  CHECK(document_input(command("cat"), "input"));
+  parse("IFS=0123456789; unset -- IFS \"$name\"; "
+        "exec {fd}<input && cat <&$fd");
+  CHECK(document_input(command("cat"), "input"));
+  parse("unset FUNCNAME; exec {FUNCNAME}>funcname; "
+        "printf payload >&$FUNCNAME");
+  CHECK(document_write(command("payload"), "funcname"));
+  parse("unset GROUPS; exec {GROUPS}>groups; printf payload >&$GROUPS");
+  CHECK(document_write(command("payload"), "groups"));
   parse("unset DIRSTACK; exec {DIRSTACK}>dirstack; "
         "printf payload >&$DIRSTACK");
   CHECK(document_write(command("payload"), "dirstack"));
@@ -2596,9 +2636,10 @@ static void semantic_process_inventory(void) {
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     current_source = cases[i].source;
     process_census_t census = {0};
-    CHECK(!shell_tokenizer_inspect_semantics(
-        current_source, strlen(current_source), observe_process_token,
-        observe_process_read, observe_process_expansion, &census));
+    CHECK(shell_tokenizer_inspect_semantics(
+              current_source, strlen(current_source), observe_process_token,
+              observe_process_read, observe_process_expansion, NULL, NULL,
+              &census) == SHELL_SEMANTIC_OK);
     CHECK(census.count == cases[i].count);
     CHECK(census.nonempty == cases[i].nonempty);
   }

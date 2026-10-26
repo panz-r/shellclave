@@ -182,13 +182,23 @@ purpose to supply a final string value. Redirects are
 installed before nested operand substitutions; the condition body has no
 stdin/stdout byte use. See [conditional semantics](../docs/shell-model.md#string-conditions).
 
+Scalar-presence conditions (`[[ -v CONFIG ]]` and lexical negation) use the
+VARIABLE_SET predicate. Static scalar names can contain quoted, escaped and
+concatenated fragments. The graph uses execution-state facts, with empty
+assigned values counting as set; inherited names can remain UNKNOWN. These
+lookups make no expansion callback and do not read a descriptor's bytes.
+The `test` and `[` builtins use the same presence facts and evaluate compound
+expressions with `!`, `-a`, `-o` and parentheses. They retain ordinary argv and
+policy subjects. See [variable presence](../docs/shell-model.md#scalar-variable-presence).
+
 ## Dependency-graph workspace
 
 Graph construction uses one temporary workspace. Allocating processor/tokenizer,
 abstraction, transformation, and sequence APIs manage their own source scratch.
 Allocation-free APIs accept caller scratch for delimiter normalization,
-non-evicting indexed-subscript boundary records and conditional-pattern
-evaluation. Obtain the sufficient capacity from `shell_source_workspace_size()`
+non-evicting indexed-subscript boundary records, conditional-pattern
+evaluation and compiled builtin-test expressions. Obtain the sufficient capacity
+from `shell_source_workspace_size()`
 rather than estimating bytes. A public tokenizer retains facts between calls
 in its supplied buffer; independent live iterators require distinct buffers.
 
@@ -236,7 +246,8 @@ alignment; the example rounds up after adding source scratch. Applications
 with a different allocator can over-allocate and align manually. An absent,
 misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Use
 `shell_source_workspace_size()` to cover delimiter normalization, persistent
-subscript facts and temporary conditional-pattern storage in the same tail.
+subscript facts, conditional-pattern storage and compiled builtin-test arguments
+and expressions in the same tail.
 Command bytes, configuration, workspace, and graph output must obey the
 non-overlap requirements documented by the API.
 

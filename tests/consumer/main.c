@@ -311,6 +311,19 @@ static bool check_depgraph_workspace_api(void) {
            draft->headers[0].conditional_operand_count == 2 &&
            graph.nodes[0].cmd.conditional_operand_lengths[1] == 5 &&
            graph.nodes[0].cmd.token_count == 0;
+      const char presence[] = "[[ -v UID ]]";
+      ok = ok &&
+           shell_parse_draft(presence, sizeof(presence) - 1, NULL, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           draft->headers[0].conditional_predicate ==
+               SHELL_CONDITIONAL_VARIABLE_SET &&
+           shell_dep_graph_parse_with_fast(presence, sizeof(presence) - 1, ".",
+                                           &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.conditional_predicate ==
+               SHELL_CONDITIONAL_VARIABLE_SET &&
+           graph.nodes[0].cmd.conditional_operand_count == 1 &&
+           graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_TRUE;
     }
     free(draft);
   }

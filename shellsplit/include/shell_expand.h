@@ -20,6 +20,7 @@ extern "C" {
  * values are ignored for other statuses. Failed or malformed results fail the
  * enclosing operation.
  *
+ * Static-name [[ -v name ]] lookups use graph state and make no callback.
  * CONDITIONAL requests instead require one final NUL-free string record,
  * including 0:, for empty; suppress splitting, pathname and brace expansion.
  * Join positional expansion results according to Bash conditional semantics.

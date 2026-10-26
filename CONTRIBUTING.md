@@ -101,6 +101,8 @@ The implementation owners and private interfaces are:
 | Retained source/draft collection | `shell_source.c` |
 | Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
 | Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Builtin test argument roles, argument-count grammar and eager expression evaluation | `shell_test.c`, `shell_test_internal.h` |
+| Shared builtin word projection and scalar cardinality | `shell_builtin_word_internal.h` |
 | Whole-word expansion requests, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
 | Supported-operation inspection, builtin roles and semantic observers | `shell_semantics.c`, `shell_semantics_internal.h` |
 | Word-value operations, public decoding adapters and diagnostic word rendering | `shell_word.c`, `shell_word_internal.h` |
@@ -152,6 +154,75 @@ rules stay aligned. Complete quote framing remains with the recursive source
 scanners; conditional admission uses those boundaries to skip nested syntax.
 The expansion module requests and validates whole-word callback values, while
 the conditional evaluator consumes those values to determine predicate truth.
+
+Variable presence belongs to graph execution state, independently of descriptor
+bindings and empty scalar values. Prepare observed names and mutation targets
+once, then carry immutable presence facts through the existing outcome and
+scope machinery. Conditional parsing supplies static-name queries; builtin test
+programs use the same facts while preserving their separate argument grammar.
+Collect only grammar-selected lookup targets after each complete test expression
+has been compiled. The root semantic traversal prepares programs once; graph
+snapshots and nested bodies borrow their source-operation values and nodes.
+Presence lives in an immutable submap whose root participates in scalar-import
+equivalence, preserving epochs and writer identities across recursive imports.
+Route-state transforms inherit correlation and sticky truncation metadata through
+`dep_route_state_inherit`, including individual versions before a merge and the
+completed result. A single surviving root can still carry correlation.
+Establish named-allocation presence at the successful setup operation, so later
+setup failures inherit that same fact. Prepare implicit and explicit builtin
+writes in their actual commit order, or normalize their possible final effects
+before graph transfer. In particular, getopts writes its destination and OPTARG
+in different orders depending on its option outcome; coalesce an OPTARG
+destination with the implicit final presence effect.
+Apply each complete explicit mutation bundle within one execution version
+before merging results. Dependent writes use that version's immutable entry;
+iteration order cannot establish correspondence between rebuilt version sets.
+Keep attempted writes to resettable predefined variables in the prepared
+effects. Resolve their effective assignment capabilities per execution version
+before publishing presence, bindings or writer identity. Ignored assignments
+must also leave prefix visibility and recursive RHS overlays unchanged.
+`SHELL_VARIABLE_NOASSIGN` is distinct from readonly: successful unset can remove
+it for `FUNCNAME` and `GROUPS`, and rejection must not inherit readonly's
+input-unit abort behavior. Builtin target failures retain earlier writes and
+independent implicit effects according to that builtin's commit rules.
+Opaque mutations are ordered effects, not a bundle-wide early return. Classify
+them as value writes or possible unsets, and preserve surrounding known effects.
+The capability marker stores separate definite and possible despecialization
+masks as four positional words. Read that snapshot directly; route unions
+deduplicate equal words and cannot represent its layout. Resolve uncertain
+assignment restrictions into bounded execution versions when needed, retaining
+their correlation through read outcomes, prefix visibility and scalar imports.
+Determine prefix installation from the immutable command-entry version. Later
+effects cannot retroactively create or remove its restoration obligation.
+Keep predicate errors distinct during eager Boolean composition. Unresolved
+presence is not an unresolved word-expansion result.
+Test admission and compilation share the distinct terminal-predicate role and
+its numeric/implicit-operand rules. `shell_test_dispatch` owns the 0..4-argument
+precedence and recursive negation/parenthesis shortcuts for both consumers.
+Admission buffers an opener, at most four interior projected facts and a
+candidate closer before selecting a nested small expression. Search from the
+second interior argument, as pinned Bash does; larger or ambiguous groups use
+the general recognizer. Apply the same dispatch to each primary alternative,
+while advancing other paths independently. A proven error on every path also
+sets the compiled test outcome without discarding its observed lookups. This
+bounded lookahead never decodes source again or
+compiles a program for source-only callers. Use global expression arity for
+`-t`, even inside a small parenthesized expression. An implicit descriptor leaves
+its connector unconsumed and can make the counted group fail before a later
+lookup. Preserve checks for lookups already reached, and retain dynamic-role
+alternatives when their grammar can still reach an unsupported operation.
+Preserve pinned Bash's argument base in small-expression dispatch: posixtest(1)
+reads invocation-wide argv[1], while the three-argument parenthesis shortcut
+reads the local operand. Compile that reference into the existing prepared word
+table; do not copy argument tables or repair reachability in the graph adapter.
+Prepare each owner's expression before classifying its construction status,
+including literal tests that request no expansion or redirect snapshot. Later
+control consumers must see the completed status, not provisional uncertainty.
+Semantic variable-name and test-program observers are independently optional.
+Either requests compilation; neither adds compilation work for source-only
+inspection. Inspection reports unsupported semantics, exhausted workspace and
+truncated inventories separately. Callbacks describe completed products, but a
+failed inspection can have delivered a partial inventory which must be discarded.
 
 Keep token facts, region initializers and fragment/decoder cores inline. Consume
 existing parse facts where available and retain each consumer's source traversal,

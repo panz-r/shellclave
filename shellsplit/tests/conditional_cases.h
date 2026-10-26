@@ -34,6 +34,11 @@ static const struct {
     {"[[ 日本.txt == 日本* ]]", 2},
     {"[[ $'\\xc3\\xa9' == *$'\\xa9' ]]", 2},
     {"[[ $'\\xc3\\xa9' == $'\\xc3'*$'\\xa9' ]]", 2},
+    {"[[ -v CONFIG ]]", 0},
+    {"[[ -v LC_ALL ]]", 2},
+    {"[[ ! -v UID ]]", 1},
+    {"[[ -v \"CON\"FIG ]]", 0},
+    {"[[ -v CONFIG # $ignored\n]]", 0},
     {"[[ $value == *.txt ]]", 0},
     {"[[ x == \"x\" ]]", 2},
     {"[[ x = 'x' ]]", 2},
@@ -182,6 +187,8 @@ static const struct {
 };
 
 static const char *const conditional_invalid[] = {
+    "[[ -v ]]",
+    "[[ -v CONFIG extra ]]",
     "[[ x == \"x\" ] ]]",
     "[[ -n x ] ]]",
     "[[ x ]x",
@@ -228,6 +235,9 @@ static const char *const conditional_invalid[] = {
     "[[ x # $(|)\n]]",
 };
 static const char *const conditional_unsupported[] = {
+    "[[ -v \"$name\" ]]",
+    "[[ -v 'a[0]' ]]",
+    "[[ -v 1 ]]",
     "[[ x ! ",
     "[[ x =~",
     "[[ x == \"x\" &&",

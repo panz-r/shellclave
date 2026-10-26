@@ -1,5 +1,6 @@
 #include "shell_conditional_internal.h"
 #include "shell_source_internal.h"
+#include "shell_test_internal.h"
 #include <string.h>
 
 /* Newlines/comments are grammar trivia before a primary, after lexical !,
@@ -252,10 +253,14 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
   }
   if (p == n)
     return r;
-  bool unary = plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z");
+  bool variable = plain(s, n, p, end, "-v");
+  bool unary =
+      variable || plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z");
   r.predicate = SHELL_CONDITIONAL_STRING_NONEMPTY;
   if (unary) {
-    if (plain(s, n, p, end, "-z"))
+    if (variable)
+      r.predicate = SHELL_CONDITIONAL_VARIABLE_SET;
+    else if (plain(s, n, p, end, "-z"))
       r.predicate = SHELL_CONDITIONAL_STRING_EMPTY;
     r.operand_count = 0;
     r.operands[0] = r.operand_lengths[0] = 0;
@@ -269,6 +274,12 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
     }
     if (!operand(s, n, p, 0, &r, &end))
       return r;
+    if (variable) {
+      if (!shell_test_static_scalar(s + p, end - p)) {
+        r.frame = SHELL_CONDITIONAL_UNSUPPORTED;
+        return r;
+      }
+    }
   } else {
     /* Bash gives lexical unary operators precedence over a possible binop. */
     for (const char *letter = "abcdefghkLoOprRsStuvwxGN"; *letter; ++letter) {
@@ -489,6 +500,8 @@ bool shell_conditional_evaluate(const char *source,
                                 const shell_conditional_t *condition,
                                 const shell_conditional_value_t values[2],
                                 bool *truth) {
+  if (condition->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
+    return false; /* Presence is a path-local graph fact, not a string value. */
   bool unary = condition->operand_count == 1;
   if (unary) {
     bool empty;

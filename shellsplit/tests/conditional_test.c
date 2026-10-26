@@ -519,6 +519,7 @@ static void check_patterns(void) {
       {"[[ x == * ]]", SHELL_CONDITIONAL_PATTERN_MATCH},
       {"[[ x != x* ]]", SHELL_CONDITIONAL_PATTERN_NOT_MATCH},
       {"[[ x == \"\"* ]]", SHELL_CONDITIONAL_PATTERN_MATCH},
+      {"[[ -v UID ]]", SHELL_CONDITIONAL_VARIABLE_SET},
   };
   for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); ++i) {
     parse(forms[i].source);

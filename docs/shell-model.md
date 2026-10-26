@@ -285,6 +285,146 @@ values in either operand set `SG_EXPANSION_UNRESOLVED_CONDITION`, independently 
 argv/paths and substitution-inspection requirements. Anomaly sequences retain
 one empty executable with the `CT` marker per conditional stage.
 
+### Scalar variable presence
+
+`[[ -v CONFIG ]]` tests whether the statically named variable has an assigned
+value. Empty strings count as set: `CONFIG=; [[ -v CONFIG ]]` is true, while
+`unset CONFIG; [[ -v CONFIG ]]` is false. Static ASCII identifiers may combine
+quotes, escapes and literal fragments. Dynamic names, positional-number
+operands and subscript syntax remain outside this conditional increment.
+An unquoted lexical `-v` selects VARIABLE_SET; `[[ '-v' ]]` retains its ordinary
+string meaning. Existing negation, comments, continuation and draft rules apply.
+
+The graph tracks SET, UNSET and UNKNOWN independently of variable contents and
+physical descriptors. Successful assignments and named-descriptor allocations
+establish SET.
+Attempted writes to Bash's nonassignable predefined arrays (`FUNCNAME`,
+`GROUPS`, `BASH_ARGC`, `BASH_ARGV`, `BASH_SOURCE` and `BASH_LINENO`) preserve
+their prior presence, including UNKNOWN. Temporary prefixes and earlier
+assignment RHS overlays follow the same rule. `read` can consume input and
+complete earlier assignments before stopping at such a target; later targets
+remain unchanged. `printf` format writes and `getopts` implicit updates retain
+their independent effects. This assignment restriction is distinct from
+`readonly` and does not imply an input-unit abort.
+Successful whole-variable `unset` removes the special capabilities of
+`FUNCNAME` and `GROUPS`, so later writes create ordinary scalars. Bash rejects
+whole-variable unsets of the other four names. These capabilities follow each
+execution path and the existing isolated-scope rules.
+Unknown-target unsets retain uncertainty about removal of resettable
+capabilities. Known operands in the same invocation still apply in argument
+order, so `unset -- "$name" FUNCNAME` makes FUNCNAME an ordinary scalar regardless
+of which variable the unknown operand names. When later behavior depends on
+an uncertain restriction, the graph retains the assignable and nonassignable
+alternatives with their corresponding continuations. Arbitrary value writes
+through `read` or `printf` do not remove these capabilities.
+An unknown operand in option position can instead select function unsetting
+or fail option parsing; later variable unsets then remain possible effects.
+Only installed temporary bindings are restored after a builtin. For example,
+the ignored prefix in `FUNCNAME=value unset FUNCNAME` creates no temporary
+binding, so the unset removes the original special variable. The same prefix
+after successful despecialization installs an ordinary temporary scalar and
+retains the existing restoration rules.
+Declarations without values preserve prior presence. Existing per-outcome
+write rules apply to `read`, `printf`, `getopts`, declaration assignments and
+implicit state updates. In particular, `cd` assigns OLDPWD from the previous
+presence of PWD on each successful execution path, and getopts can assign or
+unset OPTARG. When paths with different PWD presence reach `cd`, their OLDPWD
+results retain those differences and their correlations with other variables.
+A temporary `PWD=` prefix supplies a set entry value to that invocation.
+`getopts` updates OPTIND before assigning its destination. Its OPTARG update
+comes before the destination assignment for normal options and end-of-options,
+but after it for invalid options and missing arguments. Non-silent error paths
+unset OPTARG after assigning the destination, including when the destination is
+OPTARG itself. The graph summarizes final presence without simulating runtime
+option scanning: a definite OPTARG destination is SET when every possible
+optstring has a provable leading `:`, and UNKNOWN otherwise. This conservative
+result also applies to non-silent invocations whose concrete outcome leaves
+OPTARG set. Invalid destinations still permit implicit updates. Dynamic option
+strings can fail before any update or select another destination position;
+possible writes join the prior presence rather than establishing an
+unconditional SET fact.
+A successful named allocation establishes
+SET during redirect setup, including on a continuation after a later redirect
+fails. Closing the descriptor preserves that presence; unsetting its variable
+removes it. Existing isolated-scope rules still determine publication.
+
+Initial presence is SET for LC_ALL, UID, EUID, PPID, SHELLOPTS and BASHOPTS.
+The executor clears POSIXLY_CORRECT, BASH_COMPAT and BASH_XTRACEFD before freezing
+them, so they start UNSET. Other inherited scalar names start UNKNOWN.
+Subsequent operations use their modeled mutation rules. Bare predefined array
+names retain uncertainty about Bash's default-element test; this adds no
+array-subscript evaluation.
+Temporary command-prefix bindings are visible to a builtin and are restored
+according to existing declaration-promotion rules. Brace groups share state;
+isolated scopes inherit presence without publishing their writes to the parent.
+The selected outcome of a presence test refines later continuations when it
+implies a fact about an unchanged binding.
+
+VARIABLE_SET retains the original operand in conditional metadata. Its
+TRUE/FALSE/UNKNOWN truth comes from graph state and makes no expansion callback.
+Unknown presence does not set SG_EXPANSION_UNRESOLVED_CONDITION: that flag
+continues to describe unresolved expanded strings. Applications inspect the
+graph's truth when they need presence certainty.
+
+The Bash `test` and `[` builtins use these same presence facts, including
+compound expressions with `!`, `-a`, `-o` and parentheses. Their grammar follows
+argument count and effective argv bytes, so a quoted `'-v'` can still be an
+operator. The required final `]` and the reference Bash's special handling of
+small parenthesized expressions remain significant. They retain SIMPLE command
+kind, argv and ordinary policy subjects; conditional metadata is not populated
+for them. Internal Boolean combinations in `[[ … ]]` remain unsupported.
+
+Pinned Bash 5.3.20's one-argument dispatch uses the invocation's first argument,
+even when a parenthesized subexpression selected that dispatch. Consequently,
+`test '' -o '(' x ')'` is false and `test x -a '(' '' ')'` is true. The separate
+three-argument parenthesis shortcut uses its local operand: `test '(' '' ')'`
+is false. The graph follows these distinctions when selecting continuations
+and retaining their I/O dependencies. Literal tests establish their result
+before successor construction, including when no expansion or redirect needs
+a state snapshot. The same rules apply to `[ … ]`.
+
+Builtin test evaluation is eager. Argument substitutions and reached predicates
+remain represented even when another operand determines a Boolean result.
+Possible predicate errors are separate from false values: `test x -o 1 -eq
+invalid` fails with an argument error despite its nonempty first operand.
+Known string tests and literal comparisons contribute truth; other supported
+predicates remain conservative, including error alternatives where applicable.
+Uncertain operator roles never produce a truth proof. Existing rejection of
+potential array-subscript re-evaluation applies throughout these expressions.
+
+The terminal predicate `test -t fd` validates a signed decimal integer, with
+surrounding ASCII whitespace allowed. Invalid or overflowing operands cause a
+builtin argument error; terminal status remains UNKNOWN. In general expressions
+with at least four effective arguments, `-t` immediately before `-a` or `-o`
+tests fd 1 and leaves that word as a connector. The full expression's argument
+count controls this rule even inside parentheses; `[` excludes its closing
+`]`. The ordinary small-argument dispatch and binary-operator precedence still
+apply. For example, `CONFIG=; test -t -o -v CONFIG` succeeds, whereas
+`CONFIG=; test -t invalid -o -v CONFIG` fails with an argument error. Dynamic
+operands retain possible error and grammar alternatives, including admission's
+checks for any reachable subscript reevaluation.
+
+Small parenthesized expressions apply the same argument-count dispatch during
+admission and evaluation. For example,
+`test '(' -t -o ')' -o -v 'a[$(printf marker)]'` fails while requiring the inner
+closing parenthesis, before evaluating `-v`; its quoted operand remains literal.
+The graph accepts this source with a failure-only builtin outcome. An unsafe
+lookup reached before a later argument error remains unsupported. Ordinary
+argument substitutions still execute before the builtin examines its arguments,
+so their dependencies remain represented even when that builtin must fail.
+The same dispatch applies when a dynamic terminal operand can make the group
+an alternative primary. A lookup is rejected if any viable interpretation
+reaches its unsupported operand; an error proved on every path yields only a
+failure continuation.
+
+Presence queries and builtin test bodies consume no input bytes and produce
+no ordinary stdout. Redirect setup, nested substitutions and possible stderr
+diagnostics retain their own effects. Neither an unset variable nor a variable
+holding a closed descriptor causes a synthetic fd-0 READ edge.
+Filtering, read effects and scope cleanup preserve associations between presence
+and descriptor facts, including when only one execution version survives.
+Resource truncation remains sticky through those transformations.
+
 ## Source bytes, words, and canonical values
 
 Source offsets count bytes. The source API classifies literal NUL as
@@ -900,8 +1040,9 @@ Bounded parsing and graph construction use caller-provided or documented small
 private scratch. `shell_source_workspace_size()` supplies a checked capacity
 bound for source analysis: delimiter normalization, persistent subscript
 boundaries and conditional-pattern evaluation. Graph construction adds that
-scratch to the fixed aligned `shell_dep_workspace_size()` prefix. Pattern
-comparisons can require this tail even without heredocs. Use
+scratch, including decoded builtin-test arguments and compiled expressions,
+to the fixed aligned `shell_dep_workspace_size()` prefix. Patterns and builtin
+tests can require this tail even without heredocs. Use
 `shell_dep_resolved_workspace_size()` when resolving words. Allocating
 higher-level APIs reserve their own temporary workspace and retain their
 failure-atomic output contracts.

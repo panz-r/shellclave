@@ -63,8 +63,9 @@ static void ignore_semantic_process(const char *word, size_t length,
 static bool inspected_unsupported_semantics(const char *source, size_t length) {
   unsigned context = 0;
   return shell_tokenizer_inspect_semantics(
-      source, length, ignore_semantic_token, ignore_semantic_read,
-      ignore_semantic_process, &context);
+             source, length, ignore_semantic_token, ignore_semantic_read,
+             ignore_semantic_process, NULL, NULL,
+             &context) == SHELL_SEMANTIC_UNSUPPORTED;
 }
 
 static void parse(const char *source) {

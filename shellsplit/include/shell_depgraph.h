@@ -72,7 +72,7 @@ typedef enum {
   /* Dependency-analysis workspace was absent, misaligned, or too small, or a
    * source-scratch reservation overflowed. Workspace supports compound-group
    * descriptor snapshots, descriptor-route resolution and source analysis,
-   * including conditional-pattern evaluation. */
+   * including conditional-pattern evaluation and builtin-test programs. */
   SHELL_DEP_EWORKSPACE = -4,
   /* The expansion callback failed or returned malformed canonical bytes. */
   SHELL_DEP_EEXPAND = -5,
@@ -225,8 +225,8 @@ typedef enum {
  * is never retained by the graph and need not be initialized or cleared by
  * the caller between parses.
  * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as source
- * scratch for delimiter normalization, non-evicting subscript boundaries and
- * conditional-pattern evaluation.
+ * scratch for delimiter normalization, non-evicting subscript boundaries,
+ * conditional-pattern evaluation and compiled builtin-test programs.
  * shell_source_workspace_size(command_length, &bytes) gives a sufficient
  * extra capacity. Without this tail, source analysis can return EWORKSPACE
  * even for inputs without heredocs; retry with sufficient source scratch.
@@ -332,7 +332,9 @@ typedef struct {
   /* Borrowed CONDITIONAL spans in source/expansion order; never argv or
    * pathname operands. Predicate truth includes lexical negation. EQUAL and
    * NOT_EQUAL compare literal strings; PATTERN_MATCH and PATTERN_NOT_MATCH use
-   * static RHS patterns with active stars. nocasematch must be disabled. */
+   * static RHS patterns with active stars. VARIABLE_SET queries scalar presence
+   * from execution state, independently of string length or descriptor access;
+   * a static name needs no expansion callback. nocasematch must be disabled. */
   const char *conditional_expression;
   uint32_t conditional_expression_length;
   const char *conditional_operands[2];
@@ -1164,7 +1166,7 @@ shell_dep_error_t shell_dep_graph_parse_with_fast(
  * false and clears size on arithmetic overflow; no source bytes are inspected.
  * The extra reservation includes bounded metadata, a source-offset index and
  * shell_source_workspace_size() bytes for source-analysis scratch, including
- * conditional-pattern evaluation.
+ * conditional-pattern evaluation and builtin-test programs.
  * Source and expansion payloads otherwise remain borrowed. */
 bool shell_dep_resolved_workspace_size(size_t command_length,
                                        const shell_dep_limits_t *limits,

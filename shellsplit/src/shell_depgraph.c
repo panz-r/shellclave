@@ -2416,9 +2416,11 @@ typedef enum {
   DEP_OBSERVATION_VALUE,
   DEP_OBSERVATION_IDENTITY,
   DEP_OBSERVATION_ACCESS,
+  DEP_OBSERVATION_PRESENCE,
 } dep_observation_kind_t;
 
-/* Portable predicates over imported descriptors and captured argument values,
+/* Portable predicates over imported descriptors, scalar presence and captured
+ * argument values,
  * never journal-local roots. Allocation sites borrow the original source;
  * clauses are alternatives and conditions within a clause are conjunctive. */
 typedef struct {
@@ -2486,6 +2488,38 @@ typedef struct dep_import_join {
 #define DEP_OBSERVATION_ROOT_EVENT DEP_EXECUTION_EVENT_CAPACITY
 #define DEP_SCALAR_IMPORT_EVENT (DEP_OBSERVATION_ROOT_EVENT + 2)
 #define DEP_VARIABLE_STATE_EVENT (DEP_OBSERVATION_ROOT_EVENT + 3)
+/* The root semantic traversal compiles each test once, including nested
+ * bodies. Source-operation scratch owns values/nodes; this index borrows them
+ * until all snapshots and recursive parses finish. */
+typedef struct {
+  const char *commands[SHELL_DEP_MAX_NODES];
+  shell_test_program_t programs[SHELL_DEP_MAX_NODES];
+  dep_index_node_t index[SHELL_DEP_MAX_NODES];
+  uint32_t root, count;
+} dep_test_programs_t;
+
+static SHELL_NONNULL(1, 3) int dep_test_program_compare(const void *context,
+                                                        uint32_t index,
+                                                        const void *key) {
+  const dep_test_programs_t *tests = context;
+  uintptr_t left = (uintptr_t)tests->commands[index], right = (uintptr_t)key;
+  return left < right ? -1 : left != right;
+}
+
+/* command is the effective builtin source start reported during the root
+ * semantic traversal. Successful inventory preparation guarantees its entry. */
+static SHELL_NONNULL(1, 2) shell_test_program_t
+    dep_test_program(const dep_test_programs_t *tests, const char *command) {
+  uint32_t cursor = tests->root;
+  for (;;) {
+    int order = dep_test_program_compare(tests, cursor - 1, command);
+    if (!order)
+      return tests->programs[cursor - 1];
+    cursor = order > 0 ? tests->index[cursor - 1].left
+                       : tests->index[cursor - 1].right;
+  }
+}
+
 typedef struct {
   /* Zero means synchronous. Otherwise names the first event, biased by one.
    * Only direct stages participate; compound descendants use their own scope.
@@ -2580,9 +2614,9 @@ static bool dep_fd_op_copies(dep_fd_op_kind_t kind) {
   return kind == DEP_FD_OP_DUP || kind == DEP_FD_OP_MOVE;
 }
 
-/* Journal access kinds are unsigned single-bit masks, including bit 31.
+/* Journal access kinds are unsigned single-bit masks, including bit 33.
  * Do not depend on a compiler's choice of enum signedness for ordering them. */
-typedef uint32_t dep_fd_access_t;
+typedef uint64_t dep_fd_access_t;
 enum {
   DEP_FD_ACCESS_READ = 1 << 0,
   DEP_FD_ACCESS_WRITE = 1 << 1,
@@ -2650,6 +2684,14 @@ enum {
  * and INHERITED (baseline) or DYNAMIC (unknown) fallback. Physical descriptor
  * facts and allocation occupancy stay in the outer map. */
 #define DEP_FD_ACCESS_NAMED_BINDINGS ((dep_fd_access_t)UINT32_C(0x80000000))
+/* Scalar presence is independent of value/descriptor facts. Numeric key zero
+ * holds a bulk-invalidation generation; named facts carry that generation.
+ * Existing packed journal keys have room for this private access kind. */
+#define DEP_FD_ACCESS_VARIABLE_PRESENCE (UINT64_C(1) << 32)
+/* An immutable presence-only submap makes scalar-import equivalence a root
+ * comparison, independent of physical descriptor changes. Its numeric-zero
+ * entry is the invalidation epoch; named entries retain presence and writer. */
+#define DEP_FD_ACCESS_PRESENCE_MAP (UINT64_C(1) << 33)
 
 typedef enum {
   DEP_MOVE_SOURCE_UNSAVED,
@@ -2788,6 +2830,8 @@ typedef enum {
   DEP_NAMED_EFFECT_STATIC_ASSIGNMENT,
   DEP_NAMED_EFFECT_PRINTF_ATTACHED,
   DEP_NAMED_EFFECT_UNSET,
+  DEP_NAMED_EFFECT_OPAQUE_WRITE,
+  DEP_NAMED_EFFECT_OPAQUE_UNSET,
 } dep_named_effect_kind_t;
 
 typedef struct {
@@ -2799,6 +2843,11 @@ typedef struct {
   uint8_t variable;
   /* Fresh-shell properties which require ordinary-scalar state. */
   uint8_t prohibited_properties;
+  /* Zero derives SET/UNSET from kind. Some implicit writes can also remove
+   * the value; cd's OLDPWD copies the entry presence of PWD. */
+  uint8_t presence;
+  bool presence_from_pwd;
+  bool presence_may_skip;
 } dep_named_effect_t;
 
 /* Cumulative IFS assignment effects, ordered by commit boundary. An RHS
@@ -2843,7 +2892,7 @@ typedef struct {
 typedef struct {
   dep_named_effect_t effects[SHELL_DEP_MAX_TOKENS];
   uint32_t count;
-  bool clear;
+  const char *operation; /* Borrowed command identity for idempotent writes. */
   bool before_redirect;
   /* Pre-change cd failures do not write. Reporting/physical failures can
    * instead follow a successful chdir, joining changed and unchanged states. */
@@ -2854,6 +2903,7 @@ typedef struct {
   /* NULL means arbitrary writes can affect every visible binding. A retained
    * index excludes command-prefix bindings restored after this builtin. */
   const dep_prefix_assignment_set_t *restored_prefixes;
+  const dep_prefix_assignment_set_t *presence_prefixes;
   bool ifs_write, ifs_append;
   bool ifs_maybe_unset;
   uint32_t ifs;
@@ -2862,7 +2912,9 @@ typedef struct {
 /* cd changes variable contents, not the open descriptors they used to name. */
 static const dep_named_mutations_t dep_cd_mutations = {
     .effects = {{.token = {"PWD", 3}, .kind = DEP_NAMED_EFFECT_TOKEN},
-                {.token = {"OLDPWD", 6}, .kind = DEP_NAMED_EFFECT_TOKEN}},
+                {.token = {"OLDPWD", 6},
+                 .kind = DEP_NAMED_EFFECT_TOKEN,
+                 .presence_from_pwd = true}},
     .count = 2,
     .success_only = true};
 
@@ -2891,7 +2943,7 @@ typedef struct {
   uint16_t snapshot : 11, height : 5;
   uint16_t left, right;
   /* Descriptor facts are single-bit access kinds, stored as their bit index. */
-  /* Access keys use 0..31; 63 marks a cleanup-index sentinel. One reclaimed
+  /* Access keys use 0..33; 63 marks a cleanup-index sentinel. One reclaimed
    * bit summarizes visible named bindings, allowing materialization to skip
    * proof-only submaps without increasing the journal byte budget. */
   uint8_t access_key : 6, named_live : 1, interned : 1;
@@ -3017,11 +3069,18 @@ struct dep_process_domain_pool {
   uint16_t import_cache[DEP_PROCESS_DOMAIN_CAPACITY];
   uint32_t import_count;
 };
-#define DEP_READ_OBSERVATION_CAPACITY DEP_ROUTE_OPERATION_CAPACITY
+/* Presence queries need no graph edge. Budget one name per retained token,
+ * plus PWD when OLDPWD is queried, independently of descriptor observations. */
+#define DEP_READ_OBSERVATION_CAPACITY                                          \
+  (DEP_ROUTE_OPERATION_CAPACITY + SHELL_DEP_MAX_NODES * SHELL_DEP_MAX_TOKENS + \
+   1)
+_Static_assert(DEP_READ_OBSERVATION_CAPACITY <= UINT16_MAX,
+               "observation indexes fit private AVL links");
 enum {
   DEP_READ_OBSERVE_VALUE = 1u,
   DEP_READ_OBSERVE_IDENTITY = 2u,
   DEP_READ_OBSERVE_ACCESS = 4u,
+  DEP_READ_OBSERVE_PRESENCE = 8u,
 };
 typedef struct {
   dep_fd_ref_t fd;
@@ -3038,8 +3097,25 @@ typedef struct {
   uint32_t root, count;
   /* Key-only named allocations support prepared mutation lookup; they do
    * not request observation capture or retain read-version correlations. */
-  bool active, identity;
+  bool active, identity, presence;
 } dep_read_observations_t;
+
+/* Prepared entries are immutable. Copy their live prefix once per journal,
+ * keeping unused node/token capacity out of the ordinary parse's work. */
+static SHELL_NONNULL(1, 2) void dep_read_observations_copy(
+    dep_read_observations_t *destination,
+    const dep_read_observations_t *source) {
+  destination->root = source->root;
+  destination->count = source->count;
+  destination->active = source->active;
+  destination->identity = source->identity;
+  destination->presence = source->presence;
+  memcpy(destination->entries, source->entries,
+         source->count * sizeof(source->entries[0]));
+  memcpy(destination->index, source->index,
+         source->count * sizeof(source->index[0]));
+}
+
 typedef enum {
   DEP_ALLOCATION_BINDING,
   DEP_ALLOCATION_TARGET_UNDO,
@@ -3091,6 +3167,15 @@ typedef struct {
   uint32_t root, count;
 } dep_diagnostics_t;
 
+typedef struct {
+  const char *operation;
+  dep_fd_ref_t name;
+} dep_presence_writer_t;
+#define DEP_PRESENCE_WRITER_CAPACITY                                           \
+  (DEP_ROUTE_OPERATION_CAPACITY * SHELL_DEP_MAX_TOKENS)
+_Static_assert(DEP_PRESENCE_WRITER_CAPACITY <= UINT16_MAX,
+               "presence writer indexes fit private AVL links");
+
 struct dep_route_journal {
   dep_route_change_t entries[DEP_ROUTE_CHANGE_CAPACITY];
   const char *entry_names[DEP_ROUTE_CHANGE_CAPACITY];
@@ -3132,6 +3217,9 @@ struct dep_route_journal {
    * after the corresponding journal-local allocation keys retire. */
   uint32_t *next_selector;
   dep_read_observations_t read_observations;
+  dep_presence_writer_t presence_writers[DEP_PRESENCE_WRITER_CAPACITY];
+  dep_index_node_t presence_writer_index[DEP_PRESENCE_WRITER_CAPACITY];
+  uint32_t presence_writer_root, presence_writer_count;
   bool scratch_observable;
   bool named_closes;
   bool ifs_seen;
@@ -3182,12 +3270,12 @@ static SHELL_NONNULL(1, 2) void dep_route_change_set_fd(
 
 /* Descriptor-map callers supply one access bit. */
 static uint8_t dep_fd_access_key(dep_fd_access_t access) {
-  return (uint8_t)__builtin_ctz((uint32_t)access);
+  return (uint8_t)__builtin_ctzll(access);
 }
 
 static SHELL_NONNULL(1) dep_fd_access_t
     dep_route_change_access(const dep_route_change_t *change) {
-  return (dep_fd_access_t)(UINT32_C(1) << change->access_key);
+  return (dep_fd_access_t)(UINT64_C(1) << change->access_key);
 }
 
 static SHELL_NONNULL(1, 3) int dep_route_tree_node_compare(const void *context,
@@ -3224,9 +3312,27 @@ typedef struct {
   uint32_t alternative_head;
   uint32_t membership_root;
   uint8_t alternative_count;
+  /* Transforms preserve both flags even when filtering leaves one root.
+   * Recursive imports use correlated to select distinct scalar/FD versions. */
   bool truncated;
   bool correlated;
 } dep_route_state_t;
+
+static SHELL_NONNULL(2, 3) unsigned dep_presence_root(
+    uint32_t root, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t name);
+static SHELL_NONNULL(1, 2, 5) bool dep_presence_store(
+    dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t name,
+    unsigned presence, const char *operation);
+static SHELL_NONNULL(1, 2, 3, 6) bool dep_presence_assume(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t name, unsigned presence,
+    bool *possible);
+static SHELL_NONNULL(1, 2, 3, 5) bool dep_presence_clear(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline,
+    const dep_prefix_assignment_set_t *restored, const char *operation,
+    uint32_t entry);
 
 static SHELL_NONNULL(1) uint32_t
     dep_route_state_count(const dep_route_state_t *state) {
@@ -3381,6 +3487,14 @@ static dep_route_state_t dep_route_state_single(uint32_t root) {
   return (dep_route_state_t){.root = root};
 }
 
+/* Rebuilding/filtering versions cannot clear prior loss or correlation. Apply
+ * before a merge as well as when publishing a rebuilt state. */
+static SHELL_NONNULL(1, 2) void dep_route_state_inherit(
+    dep_route_state_t *result, const dep_route_state_t *input) {
+  result->correlated |= input->correlated;
+  result->truncated |= input->truncated;
+}
+
 enum { DEP_PARSE_DEPTH_LIMIT = SHELL_SOURCE_MAX_EXECUTABLE_NESTING };
 #define DEP_SNAPSHOT_TABLE_CAPACITY                                            \
   (2 * SHELL_DEP_MAX_NODES + 3 * (DEP_PARSE_DEPTH_LIMIT + 1))
@@ -3416,9 +3530,10 @@ typedef struct {
 typedef struct {
   dep_read_word_t words[SHELL_DEP_MAX_TOKENS];
   dep_named_effect_t default_effect;
+  const char *operation;
   uint32_t count;
   /* Only dynamic/captured argv needs per-version entry interpretation. */
-  bool active, default_restored, ifs_restored, entry_dependent;
+  bool active, ifs_restored, entry_dependent;
 } dep_read_plan_t;
 
 enum {
@@ -3446,6 +3561,7 @@ struct dep_snapshot_source {
   dep_prefix_assignment_set_t prefix_assignments;
   dep_exec_analysis_t exec;
   dep_read_plan_t read;
+  shell_test_program_t test;
   uint32_t observation_first[DEP_SNAPSHOT_SETUP],
       observation_last[DEP_SNAPSHOT_SETUP];
   dep_assignment_ifs_t assignment_ifs[SHELL_DEP_MAX_TOKENS];
@@ -3607,6 +3723,7 @@ struct dep_route_workspace {
   uint32_t next_selector;
   dep_import_join_t import_join;
   dep_observation_program_t observations;
+  dep_test_programs_t tests;
   dep_diagnostics_t diagnostics;
   /* Snapshot and final-route cleanup walks do not overlap. Both journals
    * borrow this one scratch pool; no retained flow owns a cleanup program. */
@@ -3641,6 +3758,7 @@ struct dep_route_workspace {
   /* Recognized read bodies publish their selected input separately. A group
    * only needs generic input exposure for an opaque descendant body. */
   bool generic_read[SHELL_DEP_MAX_NODES];
+  bool test_body[SHELL_DEP_MAX_NODES];
   dep_owner_routes_t scoped_routes[SHELL_MAX_GROUPS];
   bool scoped_routes_active[SHELL_MAX_GROUPS];
   /* Recursive expansion and final resolution use these at different times
@@ -4029,6 +4147,7 @@ static SHELL_NONNULL(1) bool dep_read_observe(
   else
     observations->entries[match - 1].role |= role;
   observations->active |= role != 0;
+  observations->presence |= (role & DEP_READ_OBSERVE_PRESENCE) != 0;
   observations->identity |=
       fd.value == SHELL_DEP_FD_NAMED && (role & DEP_READ_OBSERVE_IDENTITY);
   return true;
@@ -5318,14 +5437,17 @@ static SHELL_NONNULL(1, 2) bool dep_prefix_assignment_contains(
   return dep_prefix_assignment_contains_kind(assignments, name, false);
 }
 
-static SHELL_NONNULL(1,
-                     2) void dep_remove_named_target(dep_owner_routes_t *routes,
-                                                     const dep_token_t *token,
-                                                     bool assignment,
-                                                     unsigned skip) {
+static SHELL_NONNULL(1, 2) void dep_remove_named_target(
+    dep_owner_routes_t *routes, const dep_token_t *token, bool assignment,
+    unsigned skip, const dep_prefix_assignment_set_t *restored) {
   const dep_fd_route_entry_t *target =
       dep_find_named_target(routes, token, assignment, skip);
-  if (target)
+  /* Representative views retain possible restored bindings; execution
+   * versions decide installation and persistence. NULL means no restoration. */
+  if (target &&
+      !(restored &&
+        dep_prefix_assignment_contains(
+            restored, &(dep_token_t){target->fd.name, target->fd.name_len})))
     dep_route_remove(routes, (uint32_t)(target - routes->fd));
 }
 
@@ -5344,6 +5466,9 @@ static SHELL_NONNULL(1, 2) const dep_fd_route_entry_t *dep_named_effect_target(
  * versions need neither decoded strings nor another source lookup. */
 static SHELL_NONNULL(1, 2) void dep_prepare_observed_effect(
     dep_named_effect_t *effect, const dep_read_observations_t *observations) {
+  if (effect->kind == DEP_NAMED_EFFECT_OPAQUE_WRITE ||
+      effect->kind == DEP_NAMED_EFFECT_OPAQUE_UNSET)
+    return;
   effect->variable = dep_named_effect_variable(effect);
   uint32_t root = observations->root;
   while (root) {
@@ -5652,6 +5777,7 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_read_prepare(
           SHELL_SOURCE_BUILTIN_READ)
     return;
   plan->active = true;
+  plan->operation = builtin->start;
   plan->default_effect = (dep_named_effect_t){.token = {"REPLY", 5},
                                               .kind = DEP_NAMED_EFFECT_TOKEN};
   dep_prepare_observed_effect(&plan->default_effect, observations);
@@ -5771,9 +5897,6 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_read_prepare(
   if (dynamic_target)
     plan->ifs_restored =
         dep_prefix_assignment_contains(prefixes, &(dep_token_t){"IFS", 3});
-  if (shell_builtin_read_default_write(&roles))
-    plan->default_restored =
-        dep_prefix_assignment_contains(prefixes, &(dep_token_t){"REPLY", 5});
 }
 
 /* Prepared tokens are source-ordered, preclassified command words (at most
@@ -5839,7 +5962,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
   const dep_token_t *builtin = dep_effective_static_builtin(
       &tokens, command, &effective_command, &dynamic_builtin, NULL, NULL, NULL);
   if (dynamic_builtin) {
-    mutations->clear = true;
+    mutations->effects[mutations->count++] = (dep_named_effect_t){
+        .token = tokens.tokens[command], .kind = DEP_NAMED_EFFECT_OPAQUE_UNSET};
     dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
     return;
   }
@@ -5851,6 +5975,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
      * same-name temporary prefixes. cd argument validity was prepared once
      * during construction, before either route stream consumes its effects. */
     *mutations = dep_cd_mutations;
+    mutations->presence_prefixes = prefix_assignments;
     mutations->failure_alternative = cd_failure_writes;
     return;
   }
@@ -5859,27 +5984,34 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
   if (builtin_kind == SHELL_SOURCE_BUILTIN_UNSET) {
     mutations->restored_prefixes = prefix_assignments;
     shell_builtin_unset_t state = {.options = true};
+    bool conditional_unsets = false;
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
       if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *target = &tokens.tokens[i];
+      bool option_position = state.options;
       unsigned roles =
           shell_builtin_unset_word(&state, target->start, target->len);
       if (!(roles & SHELL_BUILTIN_ROLE_WRITE))
         continue;
       if (roles & SHELL_BUILTIN_ROLE_DYNAMIC) {
+        /* An unresolved leading option can select -f/-n or fail parsing.
+         * Retain later variable unsets as possible until argv is fixed. */
+        conditional_unsets |= option_position;
         /* Only unresolved runtime expansion can name an unrelated binding.
          * Static invalid targets fail individually; unset continues with its
          * remaining operands. */
-        mutations->clear = true;
+        mutations->effects[mutations->count++] = (dep_named_effect_t){
+            .token = *target, .kind = DEP_NAMED_EFFECT_OPAQUE_UNSET};
         mutations->ifs_maybe_unset = !prefix_ifs.ifs_write;
         continue;
       }
-      if (!dep_prefix_assignment_contains(prefix_assignments, target)) {
+      {
         unsigned properties =
             shell_builtin_name_properties(target->start, target->len);
         dep_named_effect_t effect = {
             .token = *target,
+            .presence_may_skip = conditional_unsets,
             .kind =
                 (properties & SHELL_VARIABLE_UNSTABLE) &&
                         !(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET)
@@ -5887,8 +6019,15 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
                     : DEP_NAMED_EFFECT_UNSET};
         mutations->effects[mutations->count++] = effect;
         if (dep_effect_is_ifs(effect.token.start, effect.token.len,
-                              effect.kind))
-          dep_ifs_note(mutations, 0, false);
+                              effect.kind) &&
+            !dep_prefix_assignment_contains(prefix_assignments, target)) {
+          if (conditional_unsets)
+            mutations->ifs_maybe_unset = true;
+          else {
+            dep_ifs_note(mutations, 0, false);
+            mutations->ifs_maybe_unset = false;
+          }
+        }
       }
     }
     return;
@@ -5906,25 +6045,25 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
       if (!(roles & SHELL_BUILTIN_ROLE_WRITE))
         continue;
       if (roles & SHELL_BUILTIN_ROLE_DYNAMIC) {
-        mutations->clear = true;
+        mutations->effects[mutations->count++] = (dep_named_effect_t){
+            .token = *target, .kind = DEP_NAMED_EFFECT_OPAQUE_WRITE};
         if (!prefix_ifs.ifs_write)
           dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
-        return;
+        continue;
       }
-      if (!dep_prefix_assignment_contains(prefix_assignments, target)) {
+      {
         dep_named_effect_t effect = {.token = *target,
                                      .kind = DEP_NAMED_EFFECT_TOKEN};
         mutations->effects[mutations->count++] = effect;
         if (dep_effect_is_ifs(effect.token.start, effect.token.len,
-                              effect.kind))
+                              effect.kind) &&
+            !dep_prefix_assignment_contains(prefix_assignments, target))
           dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
       }
     }
     /* Only a surviving writing path with no target can assign REPLY. Missing
      * operands, proven errors and timeout-zero polling cannot. */
-    if (shell_builtin_read_default_write(&state) &&
-        !dep_prefix_assignment_contains(prefix_assignments,
-                                        &(dep_token_t){"REPLY", 5}))
+    if (shell_builtin_read_default_write(&state))
       mutations->effects[mutations->count++] =
           (dep_named_effect_t){.token = {.start = "REPLY", .len = 5},
                                .kind = DEP_NAMED_EFFECT_TOKEN};
@@ -5934,6 +6073,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
   if (builtin_kind == SHELL_SOURCE_BUILTIN_PRINTF) {
     shell_builtin_printf_t state = {0};
     dep_named_effect_t pending = {0};
+    bool commit_target = false, target_ifs_write = false;
+    uint32_t target_ifs = 0;
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
       if (dep_skip_nonargument(&tokens, &i))
         continue;
@@ -5941,7 +6082,12 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
       unsigned roles =
           shell_builtin_printf_word(&state, word->start, word->len);
       if (roles & SHELL_BUILTIN_ROLE_DYNAMIC) {
-        mutations->clear = true;
+        mutations->effects[mutations->count++] = (dep_named_effect_t){
+            .token = *word, .kind = DEP_NAMED_EFFECT_OPAQUE_WRITE};
+        if (commit_target) {
+          pending.presence_may_skip = true;
+          mutations->effects[mutations->count++] = pending;
+        }
         dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
         return;
       }
@@ -5959,7 +6105,10 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
                 ? pending
                 : (dep_named_effect_t){.token = *word,
                                        .kind = DEP_NAMED_EFFECT_TOKEN};
-        mutations->effects[mutations->count++] = effect;
+        if (roles & SHELL_BUILTIN_ROLE_FORMAT)
+          commit_target = true;
+        else
+          mutations->effects[mutations->count++] = effect;
         bool writes_ifs;
         /* FORMAT writes require printf's earlier TARGET event. The shared
          * builtin state machine guarantees pending has that target; symbolic
@@ -5979,12 +6128,20 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
                            word->start, word->len, dep_ifs_value_byte, &scan,
                            &ignored) == SHELL_PROCESS_OK &&
                        !scan.format;
-          dep_ifs_note(mutations,
-                       known ? dep_ifs_known(scan.digits) : DEP_IFS_DIGITS,
-                       false);
+          uint32_t value = known ? dep_ifs_known(scan.digits) : DEP_IFS_DIGITS;
+          if (roles & SHELL_BUILTIN_ROLE_FORMAT) {
+            target_ifs_write = true;
+            target_ifs = value;
+          } else
+            dep_ifs_note(mutations, value, false);
         }
       }
     }
+    /* %n writes happen while formatting; -v commits the completed output. */
+    if (commit_target)
+      mutations->effects[mutations->count++] = pending;
+    if (target_ifs_write)
+      dep_ifs_note(mutations, target_ifs, false);
     return;
   }
 
@@ -6038,32 +6195,58 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
 
   if (builtin_kind == SHELL_SOURCE_BUILTIN_GETOPTS) {
     shell_builtin_getopts_t state = {.phases = SHELL_GETOPTS_OPTIONS};
+    bool definite_optarg_destination = false;
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
       if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *target = &tokens.tokens[i];
+      bool definite =
+          state.phases == SHELL_GETOPTS_TARGET && !state.may_fail_before_data;
       unsigned roles =
           shell_builtin_getopts_word(&state, target->start, target->len);
       if (roles & SHELL_BUILTIN_ROLE_WRITE) {
+        /* Normalize writes to OPTARG into its single final presence effect.
+         * Bash's destination/OPTARG order depends on the option outcome. */
+        if (dep_token_static_equals(target, "OPTARG")) {
+          definite_optarg_destination |= definite;
+          continue;
+        }
         mutations->effects[mutations->count++] = (dep_named_effect_t){
             .token = *target,
             .kind = DEP_NAMED_EFFECT_TOKEN,
+            .presence_may_skip = !definite,
             .prohibited_properties = SHELL_VARIABLE_INTEGER};
         if (dep_effect_is_ifs(target->start, target->len,
                               DEP_NAMED_EFFECT_TOKEN))
           dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
       }
     }
-    /* getopts updates its implicit state before assigning the destination,
-     * even if that destination is invalid or readonly. These writes persist
-     * through temporary command prefixes, just like its explicit assignment.
+    /* These are final effects, not a universal runtime write order. Normal
+     * options and end-of-options assign the destination after OPTARG; option
+     * errors assign it first, then set or clear OPTARG. A definite OPTARG
+     * destination stays set only when every possible optstring is silent.
+     * These writes persist through temporary command prefixes, including
+     * implicit updates when the destination is invalid or readonly.
      * A completed invocation has at least a command, optstring and target,
      * leaving two effect slots beyond its possible destination words. */
     if (state.phases & SHELL_GETOPTS_DATA) {
-      mutations->effects[mutations->count++] = (dep_named_effect_t){
-          .token = {"OPTIND", 6}, .kind = DEP_NAMED_EFFECT_TOKEN};
-      mutations->effects[mutations->count++] = (dep_named_effect_t){
-          .token = {"OPTARG", 6}, .kind = DEP_NAMED_EFFECT_TOKEN};
+      bool maybe =
+          state.may_fail_before_data || state.phases != SHELL_GETOPTS_DATA;
+      memmove(mutations->effects + 2, mutations->effects,
+              mutations->count * sizeof(mutations->effects[0]));
+      mutations->effects[0] =
+          (dep_named_effect_t){.token = {"OPTIND", 6},
+                               .kind = DEP_NAMED_EFFECT_TOKEN,
+                               .presence_may_skip = maybe};
+      mutations->effects[1] = (dep_named_effect_t){
+          .token = {"OPTARG", 6},
+          .kind = DEP_NAMED_EFFECT_TOKEN,
+          .presence = definite_optarg_destination &&
+                              !state.may_clear_optarg_after_target
+                          ? SHELL_TEST_TRUE
+                          : SHELL_TEST_FALSE | SHELL_TEST_TRUE,
+          .presence_may_skip = maybe};
+      mutations->count += 2;
     }
   }
 }
@@ -6076,23 +6259,26 @@ static SHELL_NONNULL(1, 2) void dep_apply_named_mutations(
   if (mutations->before_redirect !=
       (phase == DEP_NAMED_MUTATION_BEFORE_REDIRECT))
     return;
-  if (mutations->clear) {
-    dep_clear_named_routes(routes, mutations);
-    return;
-  }
   for (uint32_t i = 0; i < mutations->count; i++) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION);
     const dep_named_effect_t *effect = &mutations->effects[i];
     switch (effect->kind) {
+    case DEP_NAMED_EFFECT_OPAQUE_WRITE:
+    case DEP_NAMED_EFFECT_OPAQUE_UNSET:
+      dep_clear_named_routes(routes, mutations);
+      break;
     case DEP_NAMED_EFFECT_TOKEN:
     case DEP_NAMED_EFFECT_UNSET:
-      dep_remove_named_target(routes, &effect->token, false, 0);
+      dep_remove_named_target(routes, &effect->token, false, 0,
+                              mutations->restored_prefixes);
       break;
     case DEP_NAMED_EFFECT_STATIC_ASSIGNMENT:
-      dep_remove_named_target(routes, &effect->token, true, 0);
+      dep_remove_named_target(routes, &effect->token, true, 0,
+                              mutations->restored_prefixes);
       break;
     case DEP_NAMED_EFFECT_PRINTF_ATTACHED:
-      dep_remove_named_target(routes, &effect->token, false, 2);
+      dep_remove_named_target(routes, &effect->token, false, 2,
+                              mutations->restored_prefixes);
       break;
     }
   }
@@ -6300,17 +6486,33 @@ static SHELL_NONNULL(1) uint8_t
   return incoming;
 }
 
+/* Resettable assignment restrictions need the execution version to decide
+ * success. Static status must retain failure even when the RHS succeeds;
+ * unlike readonly rejection, this is an ordinary returning outcome. */
+static SHELL_NONNULL(1) bool dep_assignments_may_reject(
+    const dep_named_mutations_t *mutations) {
+  for (uint32_t i = 0; i < mutations->count; ++i)
+    if (shell_builtin_variable_index_properties(
+            mutations->effects[i].variable) &
+        SHELL_VARIABLE_NOASSIGN)
+      return true;
+  return false;
+}
+
 /* All assignment/redirect phases have been analyzed. A null-command child
  * returns the result of setup, not the status of its last substitution.
  * File/descriptor failures are composed separately by the setup machinery. */
-static SHELL_NONNULL(1) uint8_t
-    dep_null_command_status(const dep_parse_context_t *context,
-                            uint32_t event) {
+static SHELL_NONNULL(1, 3) uint8_t
+    dep_null_command_status(const dep_parse_context_t *context, uint32_t event,
+                            const dep_named_mutations_t *mutations) {
   const dep_expansion_status_t *expansion = &context->expansion_status[event];
+  uint8_t rejection =
+      dep_assignments_may_reject(mutations) ? DEP_STATUS_MAY_FAIL : 0;
   if (expansion->isolated_setup)
-    return DEP_STATUS_MAY_SUCCEED |
+    return DEP_STATUS_MAY_SUCCEED | rejection |
            (expansion->setup_expansion_failure ? DEP_STATUS_MAY_FAIL : 0);
-  return dep_expansion_status(context, event, DEP_STATUS_MAY_SUCCEED);
+  return dep_expansion_status(context, event, DEP_STATUS_MAY_SUCCEED) |
+         rejection;
 }
 
 /* A child terminates locally: exit/expansion abort becomes a return from its
@@ -6323,13 +6525,19 @@ static uint8_t dep_substitution_status(uint8_t status) {
               : 0);
 }
 
+static SHELL_NONNULL(2, 3, 4) unsigned dep_variable_properties(
+    uint8_t variable, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline);
+
 /* The existing prefix-name index retains each name's first assignment. Both
  * temporary and assignment-only prefixes are visible to later RHS expansions;
  * no second effects index or replay of those assignments is needed. position
- * is an RHS boundary in the original source. */
-static SHELL_NONNULL(1, 2) bool dep_assignment_precedes(
+ * is an RHS boundary in the original source. Rejected writes do not shadow
+ * the inherited binding; successful unset can remove that restriction. */
+static SHELL_NONNULL(1, 2, 6, 7) bool dep_assignment_precedes(
     const dep_snapshot_source_t *source, const char *cmd, dep_fd_ref_t fd,
-    uint32_t position) {
+    uint32_t position, uint32_t entry, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline) {
   const dep_prefix_assignment_set_t *assignments = &source->prefix_assignments;
   uint32_t root = assignments->root;
   while (root) {
@@ -6339,8 +6547,14 @@ static SHELL_NONNULL(1, 2) bool dep_assignment_precedes(
                                                   .value = SHELL_DEP_FD_NAMED,
                                                   .name_len = name->len},
                                    fd);
-    if (!order)
-      return (uint32_t)(name->start - cmd) < position;
+    if (!order) {
+      dep_route_state_t state = dep_route_state_single(entry);
+      return (uint32_t)(name->start - cmd) < position &&
+             !(name->variable &&
+               (dep_variable_properties(name->variable, &state, journal,
+                                        baseline) &
+                SHELL_VARIABLE_NOASSIGN));
+    }
     root = order > 0 ? assignments->index[root - 1].left
                      : assignments->index[root - 1].right;
   }
@@ -6596,6 +6810,8 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
           context->range_cd_writes[context->node_range[owner]],
           context->range_cd_failure_writes[context->node_range[owner]],
           source->argv_presence);
+      source->mutations.operation = source->null_mutations.operation =
+          source->tokens.count ? source->tokens.tokens[0].start : NULL;
       uint32_t event = context->node_group[owner] != UINT32_MAX
                            ? context->node_group[owner]
                            : SHELL_MAX_GROUPS + context->node_range[owner];
@@ -6620,6 +6836,16 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
       dep_read_prepare(&source->read, &source->tokens,
                        &source->prefix_assignments,
                        &context->workspace->snapshot_journal.read_observations);
+      if (graph->nodes[owner].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+          graph->nodes[owner].cmd.conditional_predicate ==
+              SHELL_CONDITIONAL_VARIABLE_SET) {
+        const shell_dep_cmd_t *command = &graph->nodes[owner].cmd;
+        if (!shell_test_compile_presence(
+                command->conditional_operands[0],
+                command->conditional_operand_lengths[0],
+                command->conditional_negated, &source->test))
+          return false;
+      }
     }
     source->undo_observable = dep_owner_observes_undo(
         graph, context, owner, &source->tokens, source->ops, source->op_count);
@@ -6826,6 +7052,11 @@ static SHELL_NONNULL(1) bool dep_effect_state_has(const dep_route_set_t *state,
   return false;
 }
 
+static SHELL_NONNULL(1, 2, 3) dep_route_set_t
+    dep_variable_state(const dep_route_state_t *state,
+                       const dep_route_journal_t *journal,
+                       const dep_owner_routes_t *baseline);
+
 /* Return every predefined capability still possible at this execution point.
  * Successful whole-variable unsets record a compact registry mask in the same
  * immutable version as descriptor bindings. Unlike descriptor-orphan state,
@@ -6844,13 +7075,97 @@ static SHELL_NONNULL(2, 3, 4) unsigned dep_variable_properties(
   uint32_t root;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    dep_route_set_t marker = dep_fd_raw_fact(
-        &one, journal, baseline, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
-        DEP_FD_ACCESS_EFFECT_STATE);
-    if (!marker.count || !(marker.routes[word].value & bit))
+    dep_route_set_t marker = dep_variable_state(&one, journal, baseline);
+    if (!(marker.routes[word].value & bit))
       properties |= initial;
   }
   return properties;
+}
+
+static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
+    dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
+    dep_fd_access_t access, dep_route_set_t routes);
+
+/* Two registry words each for definite and possible despecialization. The
+ * marker is analytic state, independent of scalar values and presence epochs.
+ * state contains one execution version. Read the positional snapshot directly;
+ * a route union would deduplicate equal words and lose their mask positions. */
+static SHELL_NONNULL(1, 2, 3) dep_route_set_t
+    dep_variable_state(const dep_route_state_t *state,
+                       const dep_route_journal_t *journal,
+                       const dep_owner_routes_t *baseline) {
+  (void)baseline;
+  const dep_route_change_t *entry = dep_route_state_change(
+      state, journal, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+      DEP_FD_ACCESS_EFFECT_STATE);
+  dep_route_set_t marker = {0};
+  if (entry)
+    marker = journal->snapshots[entry->snapshot - 1];
+  else {
+    marker.count = 4;
+    for (unsigned i = 0; i < 4; ++i)
+      marker.routes[i] = (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+  }
+  return marker;
+}
+
+/* Resolve only requested resettable assignment restrictions, retaining both
+ * versions when an opaque unset may have removed one. No variable/source
+ * inventory is traversed, and ordinary writes take the unchanged fast path. */
+static SHELL_NONNULL(1, 2, 3) bool dep_variable_resolve(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint8_t variable) {
+  unsigned initial = shell_builtin_variable_index_properties(variable);
+  if ((initial &
+       (SHELL_VARIABLE_NOASSIGN | SHELL_VARIABLE_DESPECIALIZES_ON_UNSET)) !=
+      (SHELL_VARIABLE_NOASSIGN | SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
+    return true;
+  unsigned word = (variable - 1u) / 32u;
+  uint32_t bit = UINT32_C(1) << ((variable - 1u) % 32u);
+  dep_route_state_t result = {0};
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  bool ready = false, split = false;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t marker = dep_variable_state(&one, journal, baseline);
+    bool uncertain = !(marker.routes[word].value & bit) &&
+                     (marker.routes[word + 2].value & bit);
+    for (unsigned branch = 0; branch < (uncertain ? 2u : 1u); ++branch) {
+      dep_route_state_t selected = one;
+      if (uncertain) {
+        dep_route_set_t assumed = marker;
+        if (branch)
+          assumed.routes[word].value |= bit;
+        else
+          assumed.routes[word + 2].value &= ~bit;
+        if (!dep_route_state_store_access(
+                &selected, journal, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+                DEP_FD_ACCESS_EFFECT_STATE, assumed))
+          return false;
+        split = true;
+      }
+      if (!ready)
+        result = selected;
+      else if (!dep_route_state_add_root(&result, journal, selected.root))
+        return false;
+      ready = true;
+    }
+  }
+  dep_route_state_inherit(&result, state);
+  result.correlated |= split;
+  *state = result;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_prefixes_resolve(
+    dep_route_state_t *state, const dep_prefix_assignment_set_t *prefixes,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+  for (uint32_t i = 0; i < prefixes->count; ++i)
+    if (!dep_variable_resolve(state, journal, baseline,
+                              prefixes->names[i].variable))
+      return false;
+  return true;
 }
 
 static SHELL_NONNULL(2, 3, 4) shell_builtin_variable_t
@@ -6864,8 +7179,43 @@ static SHELL_NONNULL(2, 3, 4) shell_builtin_variable_t
     return SHELL_BUILTIN_VARIABLE_ARITHMETIC;
   if (properties & SHELL_VARIABLE_FROZEN)
     return SHELL_BUILTIN_VARIABLE_FROZEN;
+  if (properties & SHELL_VARIABLE_NOASSIGN)
+    return SHELL_BUILTIN_VARIABLE_NOASSIGN;
   return properties & SHELL_VARIABLE_READONLY ? SHELL_BUILTIN_VARIABLE_READONLY
                                               : SHELL_BUILTIN_VARIABLE_STATIC;
+}
+
+/* The lexical prefix index includes attempted assignments. Visibility depends
+ * on whether this execution version can actually install that binding. */
+static SHELL_NONNULL(1, 2, 3, 4, 5) unsigned dep_prefix_assignment_visible(
+    const dep_prefix_assignment_set_t *assignments, const dep_token_t *word,
+    const dep_route_state_t *state, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline) {
+  uint32_t root = assignments->root;
+  while (root) {
+    int order =
+        dep_prefix_assignment_compare_word(assignments, root - 1, word, false);
+    if (!order) {
+      uint8_t variable = assignments->names[root - 1].variable;
+      unsigned properties =
+          dep_variable_properties(variable, state, journal, baseline);
+      if (properties & SHELL_VARIABLE_READONLY)
+        return SHELL_TEST_FALSE;
+      if (!(properties & SHELL_VARIABLE_NOASSIGN))
+        return SHELL_TEST_TRUE;
+      if (!(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
+        return SHELL_TEST_FALSE;
+      dep_route_set_t marker = dep_variable_state(state, journal, baseline);
+      unsigned word = (variable - 1u) / 32u;
+      uint32_t bit = UINT32_C(1) << ((variable - 1u) % 32u);
+      return marker.routes[word + 2].value & bit
+                 ? SHELL_TEST_FALSE | SHELL_TEST_TRUE
+                 : SHELL_TEST_FALSE;
+    }
+    root = order > 0 ? assignments->index[root - 1].left
+                     : assignments->index[root - 1].right;
+  }
+  return SHELL_TEST_FALSE;
 }
 
 static SHELL_NONNULL(1, 2, 3, 4) bool dep_effects_supported(
@@ -7142,6 +7492,7 @@ static SHELL_NONNULL(1, 2,
       return false;
   }
   result.correlated = true;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -7309,7 +7660,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
     } else if (!dep_route_state_add_root(&result, journal, one.root))
       return SHELL_DEP_ETRUNC;
   }
-  result.correlated = state->correlated;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return SHELL_DEP_OK;
 }
@@ -7483,11 +7834,12 @@ static SHELL_NONNULL(1, 2, 3) bool dep_observation_require(
                                         DEP_FD_ACCESS_PRIVATE_ENTRY, origin);
   }
   const dep_fd_access_t accesses[] = {
-      DEP_FD_ACCESS_READ_ARGUMENT, DEP_FD_ACCESS_SELECTOR, DEP_FD_ACCESS_READ};
-  const unsigned requests[] = {DEP_READ_OBSERVE_VALUE,
-                               DEP_READ_OBSERVE_IDENTITY,
-                               DEP_READ_OBSERVE_ACCESS};
-  for (unsigned i = 0; i < 3; i++) {
+      DEP_FD_ACCESS_READ_ARGUMENT, DEP_FD_ACCESS_SELECTOR, DEP_FD_ACCESS_READ,
+      DEP_FD_ACCESS_VARIABLE_PRESENCE};
+  const unsigned requests[] = {
+      DEP_READ_OBSERVE_VALUE, DEP_READ_OBSERVE_IDENTITY,
+      DEP_READ_OBSERVE_ACCESS, DEP_READ_OBSERVE_PRESENCE};
+  for (unsigned i = 0; i < 4; i++) {
     if (!(roles & requests[i]))
       continue;
     dep_route_set_t recorded =
@@ -7502,7 +7854,12 @@ static SHELL_NONNULL(1, 2, 3) bool dep_observation_require(
     dep_route_set_t binding =
         dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
     dep_route_set_t fact = {.ready = true};
-    if (requests[i] == DEP_READ_OBSERVE_VALUE) {
+    if (requests[i] == DEP_READ_OBSERVE_PRESENCE) {
+      unsigned presence = dep_presence_root(state->root, journal, baseline, fd);
+      if (presence != 3u)
+        dep_route_set_set(&fact,
+                          (dep_fd_route_t){DEP_ROUTE_INHERITED, presence});
+    } else if (requests[i] == DEP_READ_OBSERVE_VALUE) {
       const dep_read_observation_t *use =
           dep_read_observation_find(&journal->read_observations, fd);
       unsigned value = dep_read_value_class(&binding);
@@ -7555,7 +7912,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_observation_leave(
   uint32_t root;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    one.correlated = state->correlated;
+    dep_route_state_inherit(&one, state);
     for (const dep_process_guard_t *guard = previous; guard != common;
          guard = guard->parent) {
       if (guard->observed)
@@ -7573,6 +7930,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_observation_leave(
       return false;
     ready = true;
   }
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -7598,6 +7956,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
   uint32_t root;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t entry = dep_route_state_single(root);
+    dep_route_state_inherit(&entry, state);
     bool executes = !operation->guard ||
                     dep_fd_raw_fact(&entry, journal, baseline,
                                     dep_fd_numeric(dep_process_guard_key(
@@ -7637,11 +7996,19 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
             &program->transfer.conditions[condition - 1];
         if (test->fd.value == SHELL_DEP_FD_NAMED &&
             !dep_observation_require(&one, journal, baseline, test->fd,
-                                     test->kind == DEP_OBSERVATION_VALUE
+                                     test->kind == DEP_OBSERVATION_PRESENCE
+                                         ? DEP_READ_OBSERVE_PRESENCE
+                                     : test->kind == DEP_OBSERVATION_VALUE
                                          ? DEP_READ_OBSERVE_VALUE
                                          : DEP_READ_OBSERVE_IDENTITY |
                                                DEP_READ_OBSERVE_ACCESS))
           return false;
+        if (test->kind == DEP_OBSERVATION_PRESENCE) {
+          if (!dep_presence_assume(&one, journal, baseline, test->fd,
+                                   test->value, &possible))
+            return false;
+          continue;
+        }
         if (test->kind != DEP_OBSERVATION_BINDING) {
           dep_route_set_t binding = dep_fd_raw_fact(
               &one, journal, baseline, test->fd, DEP_FD_ACCESS_BINDING);
@@ -7695,6 +8062,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
   }
   if (!ready)
     return false;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -7781,7 +8149,8 @@ static SHELL_NONNULL(1, 2, 3, 6) bool dep_observation_export_conditions(
     return dep_observation_export_conditions(transfer, clause, journal,
                                              node->right, capture_mask, index);
   dep_fd_access_t access = dep_route_change_access(node);
-  if (access == DEP_FD_ACCESS_NAMED_BINDINGS)
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS ||
+      access == DEP_FD_ACCESS_PRESENCE_MAP)
     return dep_observation_export_conditions(transfer, clause, journal,
                                              fact->routes[0].value,
                                              capture_mask, index) &&
@@ -7789,7 +8158,9 @@ static SHELL_NONNULL(1, 2, 3, 6) bool dep_observation_export_conditions(
                                              node->right, capture_mask, index);
   dep_observation_condition_t condition = {
       .fd = fd, .next = clause->conditions, .value = fact->routes[0].value};
-  if (access == DEP_FD_ACCESS_READ_ARGUMENT)
+  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE)
+    condition.kind = DEP_OBSERVATION_PRESENCE;
+  else if (access == DEP_FD_ACCESS_READ_ARGUMENT)
     condition.kind = DEP_OBSERVATION_VALUE;
   else if (access == DEP_FD_ACCESS_READ)
     condition.kind = DEP_OBSERVATION_ACCESS;
@@ -7882,6 +8253,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_read_note_write(
   bool ready = false;
   while (dep_route_next(&paths, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
+    dep_route_state_inherit(&one, state);
     dep_route_set_t effects = dep_fd_raw_fact(&one, journal, baseline,
                                               dep_fd_numeric(SHELL_DEP_FD_NONE),
                                               DEP_FD_ACCESS_EFFECT_STATE);
@@ -7899,6 +8271,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_read_note_write(
       return false;
     ready = true;
   }
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -8079,7 +8452,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_builtin_variable_t
  * refined terminal/input versions. The caller pins those versions across any
  * subsequent collection; only the frontier scratch can be reused immediately.
  */
-static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate(
+static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate_version(
     const dep_read_plan_t *plan, const dep_route_state_t *state,
     dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
     dep_read_versions_t *observations, dep_read_frontier_t *frontier) {
@@ -8366,6 +8739,69 @@ static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate(
 #undef READ_NEXT
 #undef READ_FAIL
 #undef READ_STOP
+  return result;
+exhausted:
+  result.exhausted = true;
+  return result;
+}
+
+/* Capability alternatives must be interpreted independently, including status
+ * queries which do not request observation storage. Each result retains its
+ * completed-write signature and input provenance through subsequent merging. */
+static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate(
+    const dep_read_plan_t *plan, const dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    dep_read_versions_t *observations, dep_read_frontier_t *frontier) {
+  dep_route_state_t entries = *state;
+  if (plan->entry_dependent)
+    for (uint32_t i = 0; i < plan->count; ++i)
+      if (!dep_variable_resolve(&entries, journal, baseline,
+                                plan->words[i].effect.variable) ||
+          !dep_variable_resolve(&entries, journal, baseline,
+                                plan->words[i].empty_effect.variable))
+        return (dep_read_result_t){.exhausted = true};
+  if (dep_route_state_count(&entries) == 1)
+    return dep_read_evaluate_version(plan, &entries, journal, baseline,
+                                     observations, frontier);
+  dep_read_result_t result = {0};
+  if (observations)
+    *observations = (dep_read_versions_t){0};
+  dep_route_iterator_t versions = dep_route_iterator(&entries);
+  uint32_t root;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_state_inherit(&one, &entries);
+    dep_read_versions_t local;
+    dep_read_result_t read = dep_read_evaluate_version(
+        plan, &one, journal, baseline, observations ? &local : NULL, frontier);
+    result.input |= read.input;
+    result.targets |= read.targets;
+    result.status |= read.status;
+    result.default_target |= read.default_target;
+    result.unsupported |= read.unsupported;
+    result.assigned_failure |= read.assigned_failure;
+    result.unassigned_failure |= read.unassigned_failure;
+    result.exhausted |= read.exhausted;
+    if (result.exhausted)
+      return result;
+    if (!observations)
+      continue;
+    for (unsigned i = 0; i < DEP_READ_OUTCOMES; ++i)
+      if ((local.mask & (1u << i)) &&
+          !dep_read_outcome_add(observations, i, &local.outcomes[i], journal,
+                                baseline))
+        goto exhausted;
+    for (uint32_t i = 0; i <= plan->count; ++i) {
+      uint64_t bit = UINT64_C(1) << i;
+      if (!(local.input_mask & bit))
+        continue;
+      if (!dep_read_state_add(&observations->inputs[i],
+                              (observations->input_mask & bit) != 0,
+                              &local.inputs[i], journal, baseline))
+        goto exhausted;
+      observations->input_mask |= bit;
+    }
+  }
   return result;
 exhausted:
   result.exhausted = true;
@@ -9479,7 +9915,7 @@ static SHELL_NONNULL(1, 3, 4, 5) bool dep_fd_retire_owner_facts(
   bool ready = false;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    one.correlated = state->correlated;
+    dep_route_state_inherit(&one, state);
     for (uint32_t i = 0; i < source->read.count; i++) {
       const dep_read_word_t *word = &source->read.words[i];
       if (word->capture && word->parameter.value == SHELL_DEP_FD_NAMED &&
@@ -9506,6 +9942,7 @@ static SHELL_NONNULL(1, 3, 4, 5) bool dep_fd_retire_owner_facts(
       return false;
     ready = true;
   }
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -10531,6 +10968,11 @@ static SHELL_NONNULL(1, 3, 7, 9) shell_dep_error_t dep_snapshot_fd_imports(
       }
     }
   }
+  if (assignment_source &&
+      !dep_prefixes_resolve(&alternatives,
+                            &assignment_source->prefix_assignments, changes,
+                            baseline))
+    return SHELL_DEP_ETRUNC;
   uint32_t base_paths =
       alternatives.correlated ? dep_route_state_count(&alternatives) : 1;
   uint32_t variants = null_path && command_path ? 2 : 1;
@@ -10577,7 +11019,7 @@ static SHELL_NONNULL(1, 3, 7, 9) shell_dep_error_t dep_snapshot_fd_imports(
         continue;
       if (assignment_only &&
           dep_assignment_precedes(assignment_source, context->cmd, item->fd,
-                                  position))
+                                  position, selected.root, changes, baseline))
         continue;
       for (uint32_t access = DEP_FD_ACCESS_READ;
            access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
@@ -10635,6 +11077,149 @@ static SHELL_NONNULL(1, 3, 7, 9) shell_dep_error_t dep_snapshot_fd_imports(
   }
   return SHELL_DEP_OK;
 }
+typedef struct {
+  dep_route_state_t *state;
+  dep_route_journal_t *journal;
+  const dep_owner_routes_t *baseline;
+  const dep_prefix_assignment_set_t *prefixes;
+  bool impossible;
+} dep_test_context_t;
+
+static SHELL_NONNULL(1, 3) unsigned dep_test_lookup(const char *name,
+                                                    size_t length,
+                                                    void *context) {
+  dep_test_context_t *test = context;
+  dep_token_t word = {name, (uint32_t)length};
+  unsigned result = 0;
+  dep_route_iterator_t iterator = dep_route_iterator(test->state);
+  uint32_t root;
+  while (dep_route_next(&iterator, test->journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    unsigned prefix =
+        test->prefixes
+            ? dep_prefix_assignment_visible(test->prefixes, &word, &one,
+                                            test->journal, test->baseline)
+            : SHELL_TEST_FALSE;
+    if (prefix & SHELL_TEST_TRUE)
+      result |= SHELL_TEST_TRUE;
+    if (prefix & SHELL_TEST_FALSE)
+      result |= dep_presence_root(root, test->journal, test->baseline,
+                                  (dep_fd_ref_t){.name = name,
+                                                 .name_len = (uint32_t)length,
+                                                 .value = SHELL_DEP_FD_NAMED});
+  }
+  return result ? result : 3u;
+}
+
+static SHELL_NONNULL(1, 4) bool dep_test_assume(const char *name, size_t length,
+                                                unsigned presence,
+                                                void *context) {
+  dep_test_context_t *test = context;
+  if (!(dep_test_lookup(name, length, test) & presence)) {
+    test->impossible = true;
+    return true;
+  }
+  dep_token_t word = {name, (uint32_t)length};
+  if (test->prefixes && dep_prefix_assignment_visible(
+                            test->prefixes, &word, test->state, test->journal,
+                            test->baseline) == SHELL_TEST_TRUE)
+    return true;
+  bool possible;
+  bool stored = dep_presence_assume(test->state, test->journal, test->baseline,
+                                    (dep_fd_ref_t){.name = name,
+                                                   .name_len = (uint32_t)length,
+                                                   .value = SHELL_DEP_FD_NAMED},
+                                    presence, &possible);
+  test->impossible |= !possible;
+  return stored;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 8) bool dep_test_select(
+    const dep_snapshot_source_t *source, const dep_route_state_t *input,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    dep_route_state_t *output, bool *ready, unsigned desired, bool *failed) {
+  *output = (dep_route_state_t){0};
+  *ready = false;
+  dep_route_state_t entries = *input;
+  if (!dep_prefixes_resolve(&entries, &source->prefix_assignments, journal,
+                            baseline))
+    return false;
+  dep_route_iterator_t iterator = dep_route_iterator(&entries);
+  uint32_t root;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_test_context_t test = {.state = &one,
+                               .journal = journal,
+                               .baseline = baseline,
+                               .prefixes = &source->prefix_assignments};
+    unsigned result =
+        shell_test_evaluate(&source->test, dep_test_lookup, &test);
+    if (!(result & (desired == SHELL_TEST_FALSE
+                        ? SHELL_TEST_FALSE | SHELL_TEST_ERROR_RESULT
+                        : desired)))
+      continue;
+    if (!shell_test_require(&source->test, desired, dep_test_lookup,
+                            dep_test_assume, &test)) {
+      *failed = true;
+      return false;
+    }
+    if (test.impossible)
+      continue;
+    if (!*ready)
+      *output = one;
+    else if (!dep_route_state_add_root(output, journal, one.root))
+      return false;
+    *ready = true;
+  }
+  output->correlated |= input->correlated;
+  output->correlated |= entries.correlated;
+  output->truncated |= input->truncated;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 3, 5) shell_dep_error_t
+    dep_test_body_status(const shell_dep_graph_t *graph,
+                         const dep_subgraph_streams_t *streams,
+                         const dep_parse_context_t *context, uint32_t owner,
+                         uint8_t *status) {
+  const dep_snapshot_source_t *source =
+      &context->workspace
+           ->snapshot_sources[context->snapshot->prepared_source[owner]];
+  uint32_t table;
+  shell_dep_error_t error =
+      dep_snapshot_phase_table(graph, streams, context, owner, UINT32_MAX,
+                               DEP_SNAPSHOT_BODY_WORD, &table);
+  if (error != SHELL_DEP_OK)
+    return error;
+  dep_route_state_t state =
+      dep_snapshot_alternatives(&context->workspace->snapshot_tables[table]);
+  const dep_owner_routes_t *baseline =
+      &context->workspace->snapshot_tables[context->snapshot->persistent[0]]
+           .routes;
+  unsigned result = 0;
+  dep_route_iterator_t iterator = dep_route_iterator(&state);
+  uint32_t root;
+  while (
+      dep_route_next(&iterator, &context->workspace->snapshot_journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    for (unsigned wanted = SHELL_TEST_FALSE; wanted <= SHELL_TEST_TRUE;
+         ++wanted) {
+      dep_route_state_t selected;
+      bool ready, failed = false;
+      if (!dep_test_select(source, &one, &context->workspace->snapshot_journal,
+                           baseline, &selected, &ready, wanted, &failed))
+        return SHELL_DEP_ETRUNC;
+      if (ready)
+        result |= wanted;
+    }
+  }
+  *status = (result & SHELL_TEST_TRUE ? DEP_STATUS_MAY_SUCCEED : 0) |
+            (result & (SHELL_TEST_FALSE | SHELL_TEST_ERROR_RESULT)
+                 ? DEP_STATUS_MAY_FAIL
+                 : 0);
+  return SHELL_DEP_OK;
+}
+
 static SHELL_NONNULL(1, 2, 3) shell_dep_error_t
     dep_complete_owner_setup(const shell_dep_graph_t *graph,
                              const dep_subgraph_streams_t *streams,
@@ -11217,11 +11802,21 @@ static SHELL_NONNULL(2) dep_fd_route_t
                 : (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
 }
 
+static SHELL_NONNULL(2) uint32_t
+    dep_presence_bindings(uint32_t root, const dep_route_journal_t *journal) {
+  const dep_route_change_t *holder =
+      dep_route_map_change(root, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                           DEP_FD_ACCESS_PRESENCE_MAP);
+  return holder ? journal->snapshots[holder->snapshot - 1].routes[0].value : 0;
+}
+
 static SHELL_NONNULL(2) const dep_route_change_t *dep_route_root_change(
     uint32_t root, const dep_route_journal_t *journal, dep_fd_ref_t fd,
     dep_fd_access_t access) {
   if (fd.value == SHELL_DEP_FD_NAMED && access == DEP_FD_ACCESS_BINDING)
     root = dep_named_bindings(root, journal).value;
+  else if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE)
+    root = dep_presence_bindings(root, journal);
   return dep_route_map_change(root, journal, fd, access);
 }
 
@@ -11741,6 +12336,8 @@ static SHELL_NONNULL(1) void dep_route_journal_reset(
   journal->read_observations.root = journal->read_observations.count = 0;
   journal->read_observations.active = false;
   journal->read_observations.identity = false;
+  journal->read_observations.presence = false;
+  journal->presence_writer_root = journal->presence_writer_count = 0;
   journal->scratch_observable = false;
   journal->named_closes = false;
   journal->ifs_seen = false;
@@ -11879,6 +12476,7 @@ static SHELL_NONNULL(1) void dep_process_domain_mark_tree(
       access == DEP_FD_ACCESS_PROCESS_BEFORE)
     dep_process_domain_mark(&journal->process_domains, fact->routes[0].value);
   else if (access == DEP_FD_ACCESS_NAMED_BINDINGS ||
+           access == DEP_FD_ACCESS_PRESENCE_MAP ||
            access == DEP_FD_ACCESS_ENTRY ||
            access == DEP_FD_ACCESS_SETUP_FRAME ||
            access == DEP_FD_ACCESS_UNDO_ENTRY ||
@@ -12557,6 +13155,19 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_append_map(
 static SHELL_NONNULL(1, 2) bool dep_route_state_append_one(
     dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t fd,
     dep_fd_access_t access, dep_route_set_t routes) {
+  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE) {
+    uint32_t root = dep_presence_bindings(state->root, journal);
+    dep_route_state_t names = dep_route_state_single(root);
+    if (!dep_route_state_append_map(&names, journal, fd, access, routes))
+      return false;
+    if (names.root == root)
+      return true;
+    dep_route_set_set(&routes,
+                      (dep_fd_route_t){DEP_ROUTE_INHERITED, names.root});
+    return dep_route_state_append_map(state, journal,
+                                      dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                      DEP_FD_ACCESS_PRESENCE_MAP, routes);
+  }
   if (fd.value != SHELL_DEP_FD_NAMED || access != DEP_FD_ACCESS_BINDING)
     return dep_route_state_append_map(state, journal, fd, access, routes);
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
@@ -12608,7 +13219,7 @@ static SHELL_NONNULL(1, 2) bool dep_read_note_assignment(
       result = one;
     first = false;
   }
-  result.correlated = state->correlated;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -13057,7 +13668,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_process_cleanup(
     } else if (!dep_route_state_add_root(&result, journal, one.root))
       return false;
   }
-  result.correlated = state->correlated;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -13090,6 +13701,7 @@ static SHELL_NONNULL(1, 2) bool dep_setup_begin(dep_route_state_t *state,
     }
   }
   result.correlated = true;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -13113,7 +13725,7 @@ static SHELL_NONNULL(1, 2, 3) uint8_t
  */
 typedef struct {
   dep_fd_route_t bindings;
-  uint32_t inherited, entry, variables;
+  uint32_t inherited, entry, variables, presence;
   bool assignment_only;
 } dep_scalar_import_key_t;
 
@@ -13132,6 +13744,8 @@ static SHELL_NONNULL(1, 3) int dep_scalar_import_compare(const void *context,
     return item->entry < key->entry ? -1 : 1;
   if (item->variables != key->variables)
     return item->variables < key->variables ? -1 : 1;
+  if (item->presence != key->presence)
+    return item->presence < key->presence ? -1 : 1;
   return item->assignment_only == key->assignment_only ? 0
          : item->assignment_only                       ? 1
                                                        : -1;
@@ -13172,13 +13786,16 @@ static SHELL_NONNULL(1, 2) bool dep_import_route_alternatives(
           .inherited = inherited ? inherited->snapshot : 0,
           .entry = entry ? entry->snapshot : 0,
           .variables = variables ? variables->snapshot : 0,
+          .presence = dep_presence_bindings(parent, imports->scalar_journal),
           .assignment_only = imports->path_assignment_only[path]};
       uint32_t match = 0;
       scalar_root = dep_index_insert(
           scalar_index, scalar_root, path + 1, SHELL_DEP_MAX_NODES,
           dep_scalar_import_compare, scalar_keys, &scalar_keys[path], &match);
-      /* Versions differing only in physical FDs share their scalar view, so
-       * this dependency must not obstruct descriptor-domain factoring. */
+      /* Presence includes epochs and writer identity: an unchanged inherited
+       * binding and a local same-value assignment are different scalar views.
+       * Versions differing only in physical FDs still share their scalar view.
+       */
       dep_route_set_t scalar_path = {0};
       dep_route_set_set(&scalar_path,
                         (dep_fd_route_t){DEP_ROUTE_INHERITED, match - 1});
@@ -13187,8 +13804,8 @@ static SHELL_NONNULL(1, 2) bool dep_import_route_alternatives(
               DEP_FD_ACCESS_READ_ARGUMENT, scalar_path))
         return false;
       /* Copy only executor-independent capability bits, never parent-local
-       * allocation IDs or orphan scopes. Two words cover the fixed registry;
-       * importing a child does not enumerate its parent's variable names. */
+       * allocation IDs or orphan scopes. Both positional registry masks are
+       * inherited without enumerating the parent's variable names. */
       if (variables &&
           !dep_route_state_store_access(
               &one, changes, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
@@ -13533,6 +14150,7 @@ static SHELL_NONNULL(1, 2, 3, 6) bool dep_read_observe_binding(
   uint32_t root;
   while (dep_route_next(&paths, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
+    dep_route_state_inherit(&one, state);
     dep_route_set_t binding = dep_fd_raw_fact(
         &one, journal, baseline, dep_fd_numeric(fd), DEP_FD_ACCESS_BINDING);
     unsigned wanted = free ? DEP_STATUS_MAY_FAIL : DEP_STATUS_MAY_SUCCEED;
@@ -13582,8 +14200,10 @@ static SHELL_NONNULL(1, 2, 3, 6) bool dep_read_observe_binding(
       return false;
     *possible = true;
   }
-  if (*possible)
+  if (*possible) {
+    dep_route_state_inherit(&result, state);
     *state = result;
+  }
   return true;
 }
 
@@ -13818,6 +14438,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_guard_prepare(
     }
   }
   result.correlated = true;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return true;
 }
@@ -13858,7 +14479,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_process_guard_select(
     } else if (!dep_route_state_add_root(selected, journal, root))
       return false;
   }
-  selected->correlated = state->correlated;
+  dep_route_state_inherit(selected, state);
   return true;
 }
 
@@ -15261,6 +15882,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_open(
     }
   }
   result.correlated = state->correlated || dep_route_state_count(&result) > 1;
+  dep_route_state_inherit(&result, state);
   *state = result;
   return !first;
 }
@@ -15357,7 +15979,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_close_owner(
           return false;
       }
     }
-    one.correlated = state->correlated;
+    dep_route_state_inherit(&one, state);
     if (first) {
       result = one;
       first = false;
@@ -15629,6 +16251,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo_one(
     }
   }
   result.correlated = before.correlated;
+  dep_route_state_inherit(&result, &before);
   *state = result;
   return have_result;
 }
@@ -15664,7 +16287,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo(
   uint32_t source_root;
   while (dep_route_next(&iterator, journal, &source_root)) {
     dep_route_state_t one = dep_route_state_single(source_root);
-    one.correlated = before.correlated;
+    dep_route_state_inherit(&one, &before);
     dep_domain_collection_t branch_pins = {
         .roots = {&result, &one},
         .remaining = &iterator,
@@ -15690,7 +16313,9 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo(
       }
     }
     result.correlated |= one.correlated;
+    result.truncated |= one.truncated;
   }
+  dep_route_state_inherit(&result, &before);
   *state = result;
   return have_result;
 }
@@ -15748,7 +16373,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     uint32_t source_root;
     while (dep_route_next(&iterator, changes, &source_root)) {
       dep_route_state_t one = dep_route_state_single(source_root);
-      one.correlated = before.correlated;
+      dep_route_state_inherit(&one, &before);
       dep_domain_collection_t branch_pins = {.roots = {&result, &one},
                                              .remaining = &iterator,
                                              .release_domains = {&one},
@@ -15772,7 +16397,9 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
         }
       }
       result.correlated |= one.correlated;
+      result.truncated |= one.truncated;
     }
+    dep_route_state_inherit(&result, &before);
     *route_state = result;
     return have_result;
   }
@@ -15849,9 +16476,17 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     /* A named reset reaches this leaf only after dep_route_state_apply has
      * selected its physical allocation. All other effective operations pass
      * no allocation and carry resets_descriptor == false. */
-    if (named && op->resets_descriptor && op->kind != DEP_FD_OP_CLOSE &&
-        !dep_read_note_assignment(&after, changes, target))
-      return false;
+    if (named && op->resets_descriptor && op->kind != DEP_FD_OP_CLOSE) {
+      if (!dep_read_note_assignment(&after, changes, target))
+        return false;
+      /* Allocation assigns the scalar during setup. A later redirect can
+       * fail while retaining this binding and its assigned presence. */
+      if ((dep_read_observation(&changes->read_observations, target) &
+           DEP_READ_OBSERVE_PRESENCE) &&
+          !dep_presence_store(&after, changes, target, SHELL_TEST_TRUE,
+                              op->fd_name))
+        return false;
+    }
     if (named && op->resets_descriptor) {
       dep_route_set_set(
           &slots, indirect
@@ -16198,7 +16833,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
       } else if (!dep_route_state_add_root(&framed, changes, one.root))
         return false;
     }
-    framed.correlated = current.correlated;
+    dep_route_state_inherit(&framed, &current);
     current = framed;
   }
   for (uint32_t op_index = 0; op_index < op_count; op_index++) {
@@ -16218,7 +16853,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
       if (collection)
         dep_route_domains_collect(changes, collection, &current, &next);
       dep_route_state_t one = dep_route_state_single(root);
-      one.correlated = current.correlated;
+      dep_route_state_inherit(&one, &current);
       dep_domain_collection_t allocation_pins = {.roots = {&next, &one},
                                                  .remaining = &iterator,
                                                  .release_domains = {&one},
@@ -16405,6 +17040,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
         }
       }
     }
+    dep_route_state_inherit(&next, &current);
     current = next;
   }
   *route_state = current;
@@ -16696,9 +17332,8 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish_one(
     uint32_t op_count, bool descriptor_exec,
     const dep_domain_collection_t *collection) {
   dep_route_state_t original = *route_state;
-  bool correlated = route_state->correlated;
   *route_state = *executed_state;
-  route_state->correlated |= correlated;
+  dep_route_state_inherit(route_state, &original);
   bool stopped = false;
   /* Bash prepends each newly registered undo. Source-close undo is registered
    * after a move's destination save, so it runs first during unwind. */
@@ -16814,6 +17449,8 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_merge_versions(
     if (!dep_route_state_add_root(&result, journal, roots[i]))
       return false;
   result.correlated = count > 1;
+  dep_route_state_inherit(&result, destination);
+  dep_route_state_inherit(&result, source);
   *destination = result;
   return true;
 }
@@ -16831,6 +17468,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish(
      * of the owner's original alternatives. Argument captures are private
      * journal facts; scalar mutations/restoration are published below. */
     *route_state = *executed_state;
+    dep_route_state_inherit(route_state, &entry);
     return !route_state->truncated;
   }
   dep_route_state_t published = {0};
@@ -16852,12 +17490,14 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish(
     if (entry_count == executed_count)
       entry_root = dep_route_take(&entry_iterator, changes);
     dep_route_state_t executed_branch = dep_route_state_single(root);
+    dep_route_state_inherit(&executed_branch, executed_state);
     dep_route_set_t saved =
         dep_fd_raw_fact(&executed_branch, changes, entry_baseline,
                         dep_fd_numeric(SHELL_DEP_FD_NONE), DEP_FD_ACCESS_ENTRY);
     uint32_t original = saved.count == 1 ? saved.routes[0].value : entry_root;
     dep_route_state_t branch = dep_route_state_single(original);
-    branch.correlated = entry.correlated || executed_state->correlated;
+    dep_route_state_inherit(&branch, &entry);
+    dep_route_state_inherit(&branch, executed_state);
     if (!dep_route_state_publish_one(
             &branch, changes, &executed_branch, entry_baseline, ops, op_count,
             descriptor_exec, collection ? &pins : NULL))
@@ -16874,6 +17514,8 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish(
       }
     }
   }
+  dep_route_state_inherit(&published, &entry);
+  dep_route_state_inherit(&published, executed_state);
   *route_state = published;
   return !route_state->truncated;
 }
@@ -16908,7 +17550,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_restore_slots(
   for (uint32_t path = 0; path < paths; path++) {
     uint32_t root = dep_route_take(&iterator, journal);
     dep_route_state_t one = dep_route_state_single(root);
-    one.correlated = state->correlated;
+    dep_route_state_inherit(&one, state);
     if (!dep_fd_restore_slots_one(&one, journal, baseline, scratch_keys,
                                   scratch_count))
       return false;
@@ -16917,6 +17559,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_restore_slots(
     else if (!dep_route_state_add_root(&restored, journal, one.root))
       return false;
   }
+  dep_route_state_inherit(&restored, state);
   *state = restored;
   return true;
 }
@@ -16944,12 +17587,297 @@ dep_time_report_for_fd2(const dep_route_state_t *state,
   return dep_route_state_get(state, changes, baseline, dep_fd_numeric(2));
 }
 
+/* Presence is a scalar fact. Epochs let opaque writes invalidate all names
+ * without traversing the observation inventory; subsequent writes override
+ * that epoch locally. Parent maps are borrowed lazily at recursive entry. */
+static SHELL_NONNULL(2, 3) unsigned dep_presence_root(
+    uint32_t root, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t name) {
+  const dep_route_change_t *epoch = dep_route_root_change(
+      root, journal, dep_fd_numeric(0), DEP_FD_ACCESS_VARIABLE_PRESENCE);
+  uint32_t generation =
+      epoch ? journal->snapshots[epoch->snapshot - 1].routes[0].value : 0;
+  const dep_route_change_t *entry = dep_route_root_change(
+      root, journal, name, DEP_FD_ACCESS_VARIABLE_PRESENCE);
+  if (entry) {
+    dep_fd_route_t fact = journal->snapshots[entry->snapshot - 1].routes[0];
+    if (fact.value == generation)
+      return fact.kind == DEP_ROUTE_INHERITED     ? SHELL_TEST_TRUE
+             : fact.kind == DEP_ROUTE_UNAVAILABLE ? SHELL_TEST_FALSE
+                                                  : 3u;
+  }
+  if (epoch)
+    return 3u;
+  const dep_fd_imports_t *imports = baseline->scalar_imports;
+  if (imports && imports->scalar_journal) {
+    const dep_route_change_t *paths =
+        dep_route_root_change(root, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                              DEP_FD_ACCESS_READ_ARGUMENT);
+    if (paths) {
+      const dep_route_set_t *versions =
+          &journal->snapshots[paths->snapshot - 1];
+      unsigned result = 0;
+      for (uint32_t i = 0; i < versions->count; ++i) {
+        uint32_t path = versions->routes[i].value;
+        if (imports->path_assignment_only[path] &&
+            dep_assignment_precedes(
+                imports->assignment_source, imports->assignment_command, name,
+                imports->assignment_position, imports->path_scalar_root[path],
+                imports->scalar_journal, imports->scalar_baseline))
+          result |= SHELL_TEST_TRUE;
+        else
+          result |= dep_presence_root(imports->path_scalar_root[path],
+                                      imports->scalar_journal,
+                                      imports->scalar_baseline, name);
+      }
+      return result ? result : 3u;
+    }
+  }
+  uint8_t variable = shell_builtin_name_index(name.name, name.name_len);
+  if (variable) {
+    const char *spelling = shell_builtin_variable_index_name(variable);
+    if (!strcmp(spelling, "LC_ALL") || !strcmp(spelling, "UID") ||
+        !strcmp(spelling, "EUID") || !strcmp(spelling, "PPID") ||
+        !strcmp(spelling, "SHELLOPTS") || !strcmp(spelling, "BASHOPTS"))
+      return SHELL_TEST_TRUE;
+    if (shell_builtin_variable_index_properties(variable) &
+        SHELL_VARIABLE_FROZEN)
+      return SHELL_TEST_FALSE;
+  }
+  return 3u;
+}
+
+static SHELL_NONNULL(1,
+                     3) int dep_presence_writer_compare(const void *context,
+                                                        uint32_t index,
+                                                        const void *pending) {
+  const dep_route_journal_t *journal = context;
+  const dep_presence_writer_t *a = &journal->presence_writers[index],
+                              *b = pending;
+  if (a->operation != b->operation)
+    return (uintptr_t)a->operation < (uintptr_t)b->operation ? -1 : 1;
+  return dep_fd_ref_compare(a->name, b->name);
+}
+
+static SHELL_NONNULL(1, 3) uint32_t
+    dep_presence_writer(dep_route_journal_t *journal, dep_fd_ref_t name,
+                        const char *operation) {
+  dep_presence_writer_t key = {.operation = operation, .name = name};
+  uint32_t candidate = journal->presence_writer_count + 1, match = 0;
+  journal->presence_writer_root = dep_index_insert(
+      journal->presence_writer_index, journal->presence_writer_root, candidate,
+      DEP_PRESENCE_WRITER_CAPACITY, dep_presence_writer_compare, journal, &key,
+      &match);
+  if (match == candidate)
+    journal->presence_writers[journal->presence_writer_count++] = key;
+  return match;
+}
+
+static SHELL_NONNULL(1, 2) bool dep_presence_store_kind(
+    dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t name,
+    unsigned presence, const char *operation) {
+  if (!journal->read_observations.presence)
+    return true;
+  /* Root-inventory names outlive recursive program scratch and its views. */
+  name = dep_read_observation_find(&journal->read_observations, name)->fd;
+  uint32_t stamp =
+      operation ? dep_presence_writer(journal, name, operation) : 0;
+  if (operation && !stamp)
+    return false;
+  dep_route_state_t result = {0};
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  bool ready = false;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    const dep_route_change_t *epoch = dep_route_root_change(
+        root, journal, dep_fd_numeric(0), DEP_FD_ACCESS_VARIABLE_PRESENCE);
+    uint32_t generation =
+        epoch ? journal->snapshots[epoch->snapshot - 1].routes[0].value : 0;
+    const dep_route_change_t *old = dep_route_root_change(
+        root, journal, name, DEP_FD_ACCESS_VARIABLE_PRESENCE);
+    const dep_route_set_t *previous =
+        old ? &journal->snapshots[old->snapshot - 1] : NULL;
+    uint32_t identity = stamp;
+    if (!operation && previous && previous->count > 1 &&
+        previous->routes[0].value == generation)
+      identity = previous->routes[1].value;
+    dep_route_set_t fact = {.count = 2};
+    fact.routes[0] =
+        (dep_fd_route_t){presence == SHELL_TEST_TRUE    ? DEP_ROUTE_INHERITED
+                         : presence == SHELL_TEST_FALSE ? DEP_ROUTE_UNAVAILABLE
+                                                        : DEP_ROUTE_DYNAMIC,
+                         generation};
+    fact.routes[1] = (dep_fd_route_t){DEP_ROUTE_INHERITED, identity};
+    if (!dep_route_state_append_one(&one, journal, name,
+                                    DEP_FD_ACCESS_VARIABLE_PRESENCE, fact))
+      return false;
+    if (!ready)
+      result = one;
+    else if (!dep_route_state_add_root(&result, journal, one.root))
+      return false;
+    ready = true;
+  }
+  result.correlated |= state->correlated;
+  result.truncated |= state->truncated;
+  *state = result;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 5) bool dep_presence_store(
+    dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t name,
+    unsigned presence, const char *operation) {
+  return dep_presence_store_kind(state, journal, name, presence, operation);
+}
+
+/* Observe only an unchanged inherited scalar. Equal-valued writes carry a
+ * distinct identity, so a child's assignment cannot constrain its parent. */
+static SHELL_NONNULL(1, 2, 3, 6) bool dep_presence_assume(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t name, unsigned presence,
+    bool *possible) {
+  name = dep_read_observation_find(&journal->read_observations, name)->fd;
+  *possible =
+      (dep_presence_root(state->root, journal, baseline, name) & presence) != 0;
+  if (!*possible)
+    return true;
+  dep_route_state_t before = *state;
+  if (!dep_presence_store_kind(state, journal, name, presence, NULL))
+    return false;
+  dep_route_set_t scope = dep_fd_raw_fact(&before, journal, baseline,
+                                          dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                          DEP_FD_ACCESS_PRIVATE_SCOPE);
+  if (!scope.count)
+    return true;
+  const dep_route_change_t *entry = dep_route_root_change(
+      before.root, journal, name, DEP_FD_ACCESS_VARIABLE_PRESENCE);
+  const dep_route_change_t *epoch = dep_route_root_change(
+      before.root, journal, dep_fd_numeric(0), DEP_FD_ACCESS_VARIABLE_PRESENCE);
+  if (scope.routes[0].value == UINT32_MAX) {
+    /* Earlier assignment RHS commits are visible in this expansion overlay,
+     * rather than in the parent's pre-command journal. They are not an
+     * observation of the unchanged inherited binding. */
+    const dep_fd_imports_t *imports = baseline->scalar_imports;
+    const dep_route_change_t *paths = dep_route_root_change(
+        before.root, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+        DEP_FD_ACCESS_READ_ARGUMENT);
+    if (imports && paths) {
+      const dep_route_set_t *versions =
+          &journal->snapshots[paths->snapshot - 1];
+      for (uint32_t i = 0; i < versions->count; ++i) {
+        uint32_t path = versions->routes[i].value;
+        if (imports->path_assignment_only[path] &&
+            dep_assignment_precedes(
+                imports->assignment_source, imports->assignment_command, name,
+                imports->assignment_position, imports->path_scalar_root[path],
+                imports->scalar_journal, imports->scalar_baseline))
+          return true;
+      }
+    }
+    const dep_route_set_t *fact =
+        entry ? &journal->snapshots[entry->snapshot - 1] : NULL;
+    if (!epoch && (!fact || fact->count < 2 || !fact->routes[1].value)) {
+      dep_route_set_t observation = {0};
+      dep_route_set_set(&observation,
+                        (dep_fd_route_t){DEP_ROUTE_INHERITED, presence});
+      return dep_observation_remember(state, journal, baseline, name,
+                                      DEP_FD_ACCESS_VARIABLE_PRESENCE,
+                                      observation);
+    }
+    return true;
+  }
+  dep_fd_ref_t event = dep_fd_numeric(scope.routes[0].value - 1);
+  dep_route_set_t origin = dep_fd_raw_fact(&before, journal, baseline, event,
+                                           DEP_FD_ACCESS_PRIVATE_ENTRY);
+  dep_route_state_t parent = dep_route_state_single(origin.routes[0].value);
+  const dep_route_change_t *parent_entry = dep_route_root_change(
+      parent.root, journal, name, DEP_FD_ACCESS_VARIABLE_PRESENCE);
+  const dep_route_change_t *parent_epoch = dep_route_root_change(
+      parent.root, journal, dep_fd_numeric(0), DEP_FD_ACCESS_VARIABLE_PRESENCE);
+  if ((entry ? entry->snapshot : 0) !=
+          (parent_entry ? parent_entry->snapshot : 0) ||
+      (epoch ? epoch->snapshot : 0) !=
+          (parent_epoch ? parent_epoch->snapshot : 0))
+    return true;
+  if (!dep_presence_assume(&parent, journal, baseline, name, presence,
+                           possible))
+    return false;
+  if (!*possible)
+    return true;
+  origin.routes[0].value = parent.root;
+  return dep_route_state_store_access(state, journal, event,
+                                      DEP_FD_ACCESS_PRIVATE_ENTRY, origin);
+}
+
+static SHELL_NONNULL(1, 2, 3, 5) bool dep_presence_clear(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline,
+    const dep_prefix_assignment_set_t *restored, const char *operation,
+    uint32_t entry) {
+  if (!journal->read_observations.presence)
+    return true;
+  uint32_t generation =
+      dep_presence_writer(journal, dep_fd_numeric(0), operation);
+  if (!generation)
+    return false;
+  dep_route_state_t result = {0};
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  bool ready = false;
+  dep_route_state_t installed = dep_route_state_single(entry);
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t epoch = {0};
+    dep_route_set_set(&epoch, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, generation});
+    if (!dep_route_state_append_one(&one, journal, dep_fd_numeric(0),
+                                    DEP_FD_ACCESS_VARIABLE_PRESENCE, epoch))
+      return false;
+    for (uint32_t i = 0; restored && i < restored->count; ++i) {
+      dep_token_t prefix = {restored->names[i].start, restored->names[i].len};
+      if (dep_prefix_assignment_visible(restored, &prefix, &installed, journal,
+                                        baseline) != SHELL_TEST_TRUE)
+        continue;
+      dep_fd_ref_t name = {.name = restored->names[i].start,
+                           .name_len = restored->names[i].len,
+                           .value = SHELL_DEP_FD_NAMED};
+      if (!(dep_read_observation(&journal->read_observations, name) &
+            DEP_READ_OBSERVE_PRESENCE))
+        continue;
+      if (!dep_presence_store_kind(
+              &one, journal, name,
+              dep_presence_root(root, journal, baseline, name), NULL))
+        return false;
+    }
+    if (!ready)
+      result = one;
+    else if (!dep_route_state_add_root(&result, journal, one.root))
+      return false;
+    ready = true;
+  }
+  result.correlated |= state->correlated;
+  result.truncated |= state->truncated;
+  *state = result;
+  return true;
+}
+
 /* Flow versions use an immutable baseline. Unlike command-local lookup,
  * binding visibility is an explicit journal fact, not a mutable-table test. */
 static SHELL_NONNULL(2, 3) dep_route_set_t
     dep_fd_raw_root_fact(uint32_t root, const dep_route_journal_t *journal,
                          const dep_owner_routes_t *baseline, dep_fd_ref_t fd,
                          dep_fd_access_t access) {
+  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE &&
+      fd.value == SHELL_DEP_FD_NAMED) {
+    unsigned presence = dep_presence_root(root, journal, baseline, fd);
+    dep_route_set_t result = {0};
+    dep_route_set_set(&result, (dep_fd_route_t){presence == SHELL_TEST_TRUE
+                                                    ? DEP_ROUTE_INHERITED
+                                                : presence == SHELL_TEST_FALSE
+                                                    ? DEP_ROUTE_UNAVAILABLE
+                                                    : DEP_ROUTE_DYNAMIC,
+                                                0});
+    return result;
+  }
   if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
     dep_route_set_t result = {0};
     dep_route_set_set(&result, dep_named_bindings(root, journal));
@@ -17008,9 +17936,10 @@ static SHELL_NONNULL(2, 3) dep_route_set_t
         uint32_t path = versions->routes[i].value;
         dep_fd_route_t value = {DEP_ROUTE_UNSEEN, UINT32_MAX};
         if (!(imports->path_assignment_only[path] &&
-              dep_assignment_precedes(imports->assignment_source,
-                                      imports->assignment_command, fd,
-                                      imports->assignment_position))) {
+              dep_assignment_precedes(
+                  imports->assignment_source, imports->assignment_command, fd,
+                  imports->assignment_position, imports->path_scalar_root[path],
+                  imports->scalar_journal, imports->scalar_baseline))) {
           dep_route_set_t parent = dep_fd_raw_root_fact(
               imports->path_scalar_root[path], imports->scalar_journal,
               imports->scalar_baseline, fd, access);
@@ -17032,7 +17961,9 @@ static SHELL_NONNULL(2, 3) dep_route_set_t
   }
   if (access == DEP_FD_ACCESS_AVAILABLE)
     return (dep_route_set_t){.ready = true};
-  if (access == DEP_FD_ACCESS_PROCESS_OWNED ||
+  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE ||
+      access == DEP_FD_ACCESS_PRESENCE_MAP ||
+      access == DEP_FD_ACCESS_PROCESS_OWNED ||
       access == DEP_FD_ACCESS_PRIVATE_SCOPE ||
       access == DEP_FD_ACCESS_READ_ARGUMENT ||
       access == DEP_FD_ACCESS_EFFECT_STATE ||
@@ -17106,17 +18037,20 @@ static SHELL_NONNULL(2, 3) bool dep_read_scalar_shadowed(
                             DEP_FD_ACCESS_READ_ARGUMENT);
   if (!paths)
     return false;
-  if (imports->assignment_source &&
-      dep_assignment_precedes(imports->assignment_source,
-                              imports->assignment_command, fd,
-                              imports->assignment_position))
-    return true;
   const dep_route_set_t *versions = &journal->snapshots[paths->snapshot - 1];
-  for (uint32_t i = 0; i < versions->count; i++)
-    if (dep_read_scalar_shadowed(
-            imports->path_scalar_root[versions->routes[i].value],
-            imports->scalar_journal, imports->scalar_baseline, fd))
+  for (uint32_t i = 0; i < versions->count; i++) {
+    uint32_t path = versions->routes[i].value;
+    if (imports->assignment_source &&
+        dep_assignment_precedes(
+            imports->assignment_source, imports->assignment_command, fd,
+            imports->assignment_position, imports->path_scalar_root[path],
+            imports->scalar_journal, imports->scalar_baseline))
       return true;
+    if (dep_read_scalar_shadowed(imports->path_scalar_root[path],
+                                 imports->scalar_journal,
+                                 imports->scalar_baseline, fd))
+      return true;
+  }
   return false;
 }
 
@@ -17359,7 +18293,9 @@ static SHELL_NONNULL(1, 2, 3, 10) bool dep_fd_merge_key(
     result->correlated = true;
     return true;
   }
-  if (access == DEP_FD_ACCESS_PROCESS_OWNED ||
+  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE ||
+      access == DEP_FD_ACCESS_PRESENCE_MAP ||
+      access == DEP_FD_ACCESS_PROCESS_OWNED ||
       access == DEP_FD_ACCESS_PRIVATE_SCOPE ||
       access == DEP_FD_ACCESS_EFFECT_STATE ||
       access == DEP_FD_ACCESS_SUBSTITUTION_STATUS ||
@@ -17833,7 +18769,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_private_begin(
     } else if (!dep_route_state_add_root(&tagged, journal, one.root))
       return false;
   }
-  tagged.correlated = state->correlated;
+  dep_route_state_inherit(&tagged, state);
   *state = tagged;
   return true;
 }
@@ -17856,12 +18792,14 @@ static SHELL_NONNULL(1, 2, 3, 5) bool dep_fd_private_project(
         dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(event),
                         DEP_FD_ACCESS_PRIVATE_ENTRY);
     dep_route_state_t parent = dep_route_state_single(origin.routes[0].value);
+    dep_route_state_inherit(&parent, state);
     if (first) {
       *projected = parent;
       first = false;
     } else if (!dep_fd_merge(projected, &parent, journal, baseline))
       return false;
   }
+  dep_route_state_inherit(projected, state);
   return true;
 }
 
@@ -18324,6 +19262,9 @@ static SHELL_NONNULL(1, 2, 3) dep_fd_ref_t
                                 const dep_route_journal_t *journal,
                                 uint32_t index) {
   const dep_named_effect_t *effect = &mutations->effects[index];
+  if (effect->kind == DEP_NAMED_EFFECT_OPAQUE_WRITE ||
+      effect->kind == DEP_NAMED_EFFECT_OPAQUE_UNSET)
+    return dep_fd_numeric(SHELL_DEP_FD_NONE);
   if (effect->variable)
     return dep_variable_ref(effect->variable);
   if (effect->observation)
@@ -18343,7 +19284,7 @@ static SHELL_NONNULL(1, 2, 3) dep_fd_ref_t
 static SHELL_NONNULL(1, 2, 3) bool dep_fd_note_unset_effects(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, dep_fd_ref_t fd, uint8_t variable,
-    uint8_t scope) {
+    uint8_t scope, bool conditional) {
   dep_route_state_t previous = *state;
   dep_route_state_t updated = {0};
   dep_route_iterator_t versions = dep_route_iterator(&previous);
@@ -18357,19 +19298,15 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_note_unset_effects(
         dep_fd_raw_fact(&one, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
     bool was_despecialized = false;
     if (variable) {
-      dep_route_set_t capabilities = dep_fd_raw_fact(
-          &one, journal, baseline, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
-          DEP_FD_ACCESS_EFFECT_STATE);
+      dep_route_set_t capabilities =
+          dep_variable_state(&one, journal, baseline);
       uint32_t word = (variable - 1u) / 32u;
       uint32_t bit = UINT32_C(1) << ((variable - 1u) % 32u);
-      if (!capabilities.count) {
-        capabilities.count = 2;
-        capabilities.routes[0] = capabilities.routes[1] =
-            (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
-      }
       was_despecialized = (capabilities.routes[word].value & bit) != 0;
       if (!was_despecialized) {
-        capabilities.routes[word].value |= bit;
+        if (!conditional)
+          capabilities.routes[word].value |= bit;
+        capabilities.routes[word + 2].value |= bit;
         if (!dep_route_state_append_one(
                 &one, journal, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
                 DEP_FD_ACCESS_EFFECT_STATE, capabilities)) {
@@ -18429,71 +19366,162 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_note_unset_effects(
   return true;
 }
 
-/* Update prepared mutation targets, including observed variables which have
- * never named an allocation. A stable explicit unset establishes emptiness;
- * ordinary writes invalidate that value just like an allocation association.
- * NULL after means null-command assignment commits. Other unobserved targets
- * retain the existing before/after route-removal contract. */
-static SHELL_NONNULL(1, 2, 3, 4, 6) bool dep_fd_mutation_bindings(
+/* An opaque event forgets values at this exact commit boundary. It may also
+ * remove resettable attributes, but never those of an installed temporary
+ * prefix. Later explicit effects still run and can reestablish precise facts.
+ */
+static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_fd_opaque_mutation(
     dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_owner_routes_t *baseline, const dep_owner_routes_t *before,
-    const dep_owner_routes_t *after, const dep_named_mutations_t *mutations) {
-  if (mutations->clear) {
-    dep_route_state_t result = {0};
-    dep_route_iterator_t versions = dep_route_iterator(state);
-    uint32_t root;
-    bool ready = false;
-    while (dep_route_next(&versions, journal, &root)) {
-      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
-      dep_route_state_t original = dep_route_state_single(root);
-      dep_route_state_t cleared = original;
-      dep_route_set_t holder = {0};
-      dep_route_set_set(&holder, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, 0});
-      if (!dep_route_state_append_one(&cleared, journal, dep_fd_numeric(0),
-                                      DEP_FD_ACCESS_NAMED_BINDINGS, holder))
-        return false;
-      const dep_prefix_assignment_set_t *prefixes =
-          mutations->restored_prefixes;
-      for (uint32_t p = 0; prefixes && p < prefixes->count; p++) {
-        DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
-        dep_fd_ref_t fd = {.name = prefixes->names[p].start,
-                           .name_len = prefixes->names[p].len,
-                           .value = SHELL_DEP_FD_NAMED};
-        if (!dep_route_state_append_one(
-                &cleared, journal, fd, DEP_FD_ACCESS_BINDING,
-                dep_fd_raw_fact(&original, journal, baseline, fd,
-                                DEP_FD_ACCESS_BINDING)))
-          return false;
-      }
-      if (!dep_read_state_add(&result, ready, &cleared, journal, baseline))
-        return false;
-      ready = true;
-    }
-    result.correlated |= state->correlated;
-    *state = result;
-    return true;
+    const dep_owner_routes_t *baseline, const dep_named_mutations_t *mutations,
+    const dep_named_effect_t *effect, uint32_t entry) {
+  if (!dep_presence_clear(state, journal, baseline,
+                          mutations->restored_prefixes, effect->token.start,
+                          entry))
+    return false;
+  dep_route_state_t before = *state;
+  dep_route_state_t installed = dep_route_state_single(entry);
+  dep_route_set_t holder = {0};
+  dep_route_set_set(&holder, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, 0});
+  if (!dep_route_state_append_one(state, journal, dep_fd_numeric(0),
+                                  DEP_FD_ACCESS_NAMED_BINDINGS, holder))
+    return false;
+  const dep_prefix_assignment_set_t *prefixes = mutations->restored_prefixes;
+  for (uint32_t p = 0; prefixes && p < prefixes->count; ++p) {
+    dep_token_t name = {prefixes->names[p].start, prefixes->names[p].len};
+    if (dep_prefix_assignment_visible(prefixes, &name, &installed, journal,
+                                      baseline) != SHELL_TEST_TRUE)
+      continue;
+    dep_fd_ref_t fd = {
+        .name = name.start, .name_len = name.len, .value = SHELL_DEP_FD_NAMED};
+    if (!dep_route_state_append_one(state, journal, fd, DEP_FD_ACCESS_BINDING,
+                                    dep_fd_raw_fact(&before, journal, baseline,
+                                                    fd, DEP_FD_ACCESS_BINDING)))
+      return false;
   }
-  uint32_t targets = mutations->count;
-  for (uint32_t i = 0; i < targets; i++) {
-    dep_fd_ref_t fd =
-        dep_mutation_binding_target(mutations, before, journal, i);
+  if (effect->kind == DEP_NAMED_EFFECT_OPAQUE_UNSET) {
+    dep_route_set_t marker = dep_variable_state(state, journal, baseline);
+    for (uint8_t variable = 1; variable <= SHELL_BUILTIN_VARIABLE_NAMES;
+         ++variable) {
+      if (!(shell_builtin_variable_index_properties(variable) &
+            SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
+        continue;
+      dep_token_t name = {
+          shell_builtin_variable_index_name(variable),
+          (uint32_t)shell_builtin_variable_index_length(variable)};
+      if (prefixes &&
+          dep_prefix_assignment_visible(prefixes, &name, &installed, journal,
+                                        baseline) == SHELL_TEST_TRUE)
+        continue;
+      marker.routes[2 + (variable - 1u) / 32u].value |=
+          UINT32_C(1) << ((variable - 1u) % 32u);
+    }
+    if (!dep_route_state_append_one(state, journal,
+                                    dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+                                    DEP_FD_ACCESS_EFFECT_STATE, marker))
+      return false;
+  }
+  return true;
+}
+
+/* Apply one complete explicit mutation bundle to a single execution version.
+ * Dependent writes read this version's immutable entry, while ordered effects
+ * update its current state. Merge only completed bundles: intermediate writes
+ * can erase distinctions needed by a later effect (PWD before OLDPWD). */
+static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_mutation_version(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_owner_routes_t *after,
+    const dep_named_mutations_t *mutations, const dep_fd_ref_t *targets,
+    uint32_t entry, uint32_t first) {
+  dep_route_state_t installed = dep_route_state_single(entry);
+  for (uint32_t i = first; i < mutations->count; i++) {
+    dep_fd_ref_t fd = targets[i];
     const dep_named_effect_t *effect = &mutations->effects[i];
+    if (effect->kind == DEP_NAMED_EFFECT_OPAQUE_WRITE ||
+        effect->kind == DEP_NAMED_EFFECT_OPAQUE_UNSET) {
+      if (!dep_fd_opaque_mutation(state, journal, baseline, mutations, effect,
+                                  entry))
+        return false;
+      continue;
+    }
+    if (mutations->restored_prefixes && fd.value == SHELL_DEP_FD_NAMED &&
+        dep_prefix_assignment_visible(
+            mutations->restored_prefixes, &(dep_token_t){fd.name, fd.name_len},
+            &installed, journal, baseline) == SHELL_TEST_TRUE)
+      continue;
+    if (!dep_variable_resolve(state, journal, baseline, effect->variable))
+      return false;
+    if (dep_route_state_count(state) > 1) {
+      dep_route_state_t result = {0};
+      dep_route_iterator_t alternatives = dep_route_iterator(state);
+      uint32_t root;
+      bool ready = false;
+      while (dep_route_next(&alternatives, journal, &root)) {
+        dep_route_state_t one = dep_route_state_single(root);
+        if (!dep_fd_mutation_version(&one, journal, baseline, after, mutations,
+                                     targets, entry, i))
+          return false;
+        if (!ready)
+          result = one;
+        else {
+          dep_route_iterator_t completed = dep_route_iterator(&one);
+          while (dep_route_next(&completed, journal, &root))
+            if (!dep_route_state_add_root(&result, journal, root))
+              return false;
+        }
+        ready = true;
+      }
+      dep_route_state_inherit(&result, state);
+      *state = result;
+      return true;
+    }
     bool unset = effect->kind == DEP_NAMED_EFFECT_UNSET;
+    /* Candidate effects include resettable special names. A rejected write
+     * changes neither presence nor binding/writer identity in this version.
+     * Unset has its own admission rules and can remove the restriction. */
+    if (!unset && effect->variable &&
+        (dep_variable_properties(effect->variable, state, journal, baseline) &
+         SHELL_VARIABLE_NOASSIGN))
+      continue;
+    if (fd.value == SHELL_DEP_FD_NAMED &&
+        (dep_read_observation(&journal->read_observations, fd) &
+         DEP_READ_OBSERVE_PRESENCE)) {
+      unsigned presence = effect->presence ? effect->presence
+                          : unset          ? SHELL_TEST_FALSE
+                                           : SHELL_TEST_TRUE;
+      if (effect->presence_from_pwd) {
+        dep_fd_ref_t pwd = {
+            .name = "PWD", .name_len = 3, .value = SHELL_DEP_FD_NAMED};
+        dep_token_t word = {"PWD", 3};
+        presence = mutations->presence_prefixes &&
+                           dep_prefix_assignment_contains(
+                               mutations->presence_prefixes, &word)
+                       ? SHELL_TEST_TRUE
+                       : dep_presence_root(entry, journal, baseline, pwd);
+      }
+      if (effect->presence_may_skip)
+        presence |= dep_presence_root(state->root, journal, baseline, fd);
+      if (!dep_presence_store(state, journal, fd, presence,
+                              mutations->operation))
+        return false;
+    }
     bool despecializes =
         unset && effect->variable &&
         (shell_builtin_variable_index_properties(effect->variable) &
          SHELL_VARIABLE_DESPECIALIZES_ON_UNSET);
-    if (!dep_named_mutation_affects(mutations, fd) ||
+    if (fd.value != SHELL_DEP_FD_NAMED ||
         (!unset && after && dep_route_find(after, fd) && !effect->observation))
       continue;
-    if (unset && !dep_fd_note_unset_effects(
-                     state, journal, baseline, fd,
-                     despecializes ? effect->variable : 0, mutations->scope))
+    if (unset &&
+        !dep_fd_note_unset_effects(state, journal, baseline, fd,
+                                   despecializes ? effect->variable : 0,
+                                   mutations->scope, effect->presence_may_skip))
       return false;
     dep_route_set_t bound = {0};
-    dep_route_set_set(&bound, (dep_fd_route_t){unset ? DEP_ROUTE_UNAVAILABLE
-                                                     : DEP_ROUTE_DYNAMIC,
-                                               UINT32_MAX});
+    dep_route_set_set(&bound,
+                      (dep_fd_route_t){unset && !effect->presence_may_skip
+                                           ? DEP_ROUTE_UNAVAILABLE
+                                           : DEP_ROUTE_DYNAMIC,
+                                       UINT32_MAX});
     if (despecializes) {
       /* The predefined name entered the descriptor inventory before it was
        * removed. Invalidate every access through that spelling; otherwise a
@@ -18512,6 +19540,53 @@ static SHELL_NONNULL(1, 2, 3, 4, 6) bool dep_fd_mutation_bindings(
     if (!dep_read_note_assignment(state, journal, fd))
       return false;
   }
+  return true;
+}
+
+/* Update prepared mutation targets, including observed variables which have
+ * never named an allocation. A stable explicit unset establishes emptiness;
+ * ordinary writes invalidate that value just like an allocation association.
+ * NULL after means null-command assignment commits. Other unobserved targets
+ * retain the existing before/after route-removal contract. */
+static SHELL_NONNULL(1, 2, 3, 4, 6) bool dep_fd_mutation_bindings(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_owner_routes_t *before,
+    const dep_owner_routes_t *after, const dep_named_mutations_t *mutations) {
+  if (!mutations->count)
+    return true;
+  dep_fd_ref_t targets[SHELL_DEP_MAX_TOKENS];
+  for (uint32_t i = 0; i < mutations->count; ++i)
+    targets[i] = dep_mutation_binding_target(mutations, before, journal, i);
+  dep_route_state_t entries = *state;
+  if (mutations->restored_prefixes &&
+      !dep_prefixes_resolve(&entries, mutations->restored_prefixes, journal,
+                            baseline))
+    return false;
+  dep_route_state_t result = {0};
+  dep_route_iterator_t versions = dep_route_iterator(&entries);
+  uint32_t root;
+  bool ready = false;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    if (!dep_fd_mutation_version(&one, journal, baseline, after, mutations,
+                                 targets, root, 0))
+      return false;
+    if (!ready)
+      result = one;
+    else {
+      dep_route_iterator_t completed = dep_route_iterator(&one);
+      uint32_t completed_root;
+      while (dep_route_next(&completed, journal, &completed_root))
+        if (!dep_route_state_add_root(&result, journal, completed_root))
+          return false;
+    }
+    ready = true;
+    dep_route_state_inherit(&result, &one);
+  }
+  result.truncated |= state->truncated;
+  result.correlated |= state->correlated;
+  result.correlated |= entries.correlated;
+  *state = result;
   return true;
 }
 
@@ -19014,6 +20089,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
   for (uint32_t path = 0; path < count; path++) {
     dep_route_state_t one =
         dep_route_state_single(dep_route_take(&iterator, journal));
+    dep_route_state_inherit(&one, setup_entry);
     dep_route_set_t frame = {0};
     dep_route_set_set(&frame, (dep_fd_route_t){DEP_ROUTE_INHERITED, one.root});
     if (!dep_route_state_store_access(&one, journal,
@@ -19031,6 +20107,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
       return false;
   }
   local.correlated = true;
+  dep_route_state_inherit(&local, setup_entry);
   if (op_count && !dep_setup_begin(&local, journal, ops[0].undo_mode))
     return false;
   dep_owner_routes_t undo_targets = {0};
@@ -19050,6 +20127,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
     uint32_t root;
     while (dep_route_next(&paths, journal, &root)) {
       dep_route_state_t one = dep_route_state_single(root);
+      dep_route_state_inherit(&one, &local);
       one.correlated = true;
       dep_domain_collection_t path_pins = {
           .workspace = collection.workspace,
@@ -19109,6 +20187,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
       uint32_t applied_root;
       while (dep_route_next(&branches, journal, &applied_root)) {
         dep_route_state_t applied = dep_route_state_single(applied_root);
+        dep_route_state_inherit(&applied, &one);
         applied.correlated = true;
         uint32_t branch_head = head;
         uint32_t branch_uses = uses;
@@ -19157,6 +20236,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
     }
     if (!have_next)
       break;
+    dep_route_state_inherit(&next, &local);
     local = next;
     begin = end;
   }
@@ -19182,8 +20262,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11, 12) bool dep_fd_setup_failures(
    * returns the entry version itself. Do not manufacture an equivalent map
    * by undoing the completed tree, which loses shared identity and makes
    * successive conditional failures merge ever-growing descriptor tables. */
-  bool numeric_only = !mutations->count && !mutations->clear, has_move = false,
-       has_named = false, high_target = false, fallible = false;
+  bool numeric_only = !mutations->count, has_move = false, has_named = false,
+       high_target = false, fallible = false;
   for (uint32_t op = 0; op < op_count; op++) {
     fallible |= ops[op].kind != DEP_FD_OP_PROCESS &&
                 ops[op].kind != DEP_FD_OP_IDENTITY &&
@@ -19253,7 +20333,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11, 12) bool dep_fd_setup_failures(
     }
     return true;
   }
-  bool single_allocation = op_count && !mutations->count && !mutations->clear &&
+  bool single_allocation = op_count && !mutations->count &&
                            ops[0].fd == SHELL_DEP_FD_NAMED &&
                            ops[0].resets_descriptor;
   for (uint32_t op = 1; op < op_count; op++)
@@ -19375,7 +20455,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7) void dep_read_mutations(
     const dep_prefix_assignment_set_t *prefixes, const dep_route_state_t *state,
     const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
     dep_named_mutations_t *mutations) {
-  *mutations = (dep_named_mutations_t){.restored_prefixes = prefixes};
+  *mutations = (dep_named_mutations_t){.restored_prefixes = prefixes,
+                                       .operation = plan->operation};
   for (uint32_t i = 0; i < plan->count; i++) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_READ_INPUT);
     if (!(read->targets & (UINT64_C(1) << i)))
@@ -19387,23 +20468,24 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7) void dep_read_mutations(
     shell_builtin_variable_t variable =
         dep_read_target(word, state, journal, baseline, empty, positive);
     if (variable == SHELL_BUILTIN_VARIABLE_DYNAMIC) {
-      mutations->clear = true;
+      mutations->effects[mutations->count++] = (dep_named_effect_t){
+          .token = word->effect.token, .kind = DEP_NAMED_EFFECT_OPAQUE_WRITE};
       if (!plan->ifs_restored)
         dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
-      return;
+      continue;
     }
     bool projected = empty && word->empty_known;
     dep_named_effect_t effect = projected ? word->empty_effect : word->effect;
-    if (!(projected ? word->empty_restored : word->restored) &&
-        effect.token.len) {
+    if (effect.token.len) {
       mutations->effects[mutations->count++] = effect;
-      if (projected ? word->empty_ifs
-                    : dep_effect_is_ifs(effect.token.start, effect.token.len,
-                                        effect.kind))
+      if (!(projected ? word->empty_restored : word->restored) &&
+          (projected ? word->empty_ifs
+                     : dep_effect_is_ifs(effect.token.start, effect.token.len,
+                                         effect.kind)))
         dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
     }
   }
-  if (read->default_target && !plan->default_restored)
+  if (read->default_target)
     mutations->effects[mutations->count++] = plan->default_effect;
 }
 
@@ -19565,6 +20647,22 @@ static SHELL_NONNULL(
   }
   if (source->read.active)
     body_status = read.status;
+  if (source->argv_presence == DEP_ARGV_EMPTY &&
+      dep_assignments_may_reject(&source->null_mutations))
+    body_status |= DEP_STATUS_MAY_FAIL;
+  if (source->test.active) {
+    dep_route_state_t body = *executed_state;
+    dep_test_context_t test = {.state = &body,
+                               .journal = journal,
+                               .baseline = baseline,
+                               .prefixes = &source->prefix_assignments};
+    unsigned result =
+        shell_test_evaluate(&source->test, dep_test_lookup, &test);
+    body_status = (result & SHELL_TEST_TRUE ? DEP_STATUS_MAY_SUCCEED : 0) |
+                  (result & (SHELL_TEST_FALSE | SHELL_TEST_ERROR_RESULT)
+                       ? DEP_STATUS_MAY_FAIL
+                       : 0);
+  }
   /* A nonmutating executable consumes its substitution values, not their
    * completion status. With no setup or persistent effects, all of those
    * private observation paths reconverge to the selected entry. Retaining
@@ -19574,7 +20672,7 @@ static SHELL_NONNULL(
    * I/O uses executed_state, not this continuation projection. */
   if (source->argv_presence == DEP_ARGV_PRESENT && !source->read.active &&
       !all_op_count && !descriptor_exec && !mutations->count &&
-      !mutations->clear && !mutations->ifs_write &&
+      !mutations->ifs_write &&
       !context->process_routes->first[context->range_node[range]] &&
       (source->observation_first[0] || source->observation_first[1] ||
        (source->observation_first[2] || source->observation_first[3])))
@@ -19638,6 +20736,23 @@ static SHELL_NONNULL(
                         : i < 2 ? continued
                                 : selected;
   outcomes.state[negated ? 0 : 1] = private ? *executed_state : failed_body;
+  if (source->test.active && setup_survived) {
+    for (unsigned i = 0; i < 2; ++i) {
+      if (!(outcomes.mask & (1u << i)))
+        continue;
+      dep_route_state_t refined;
+      bool ready, failed = false;
+      unsigned desired =
+          (i == 0) != negated ? SHELL_TEST_TRUE : SHELL_TEST_FALSE;
+      if (!dep_test_select(source, &outcomes.state[i], journal, baseline,
+                           &refined, &ready, desired, &failed))
+        return false;
+      if (ready)
+        outcomes.state[i] = refined;
+      else
+        outcomes.mask &= (uint8_t)~(1u << i);
+    }
+  }
   if (failures.mask && !dep_fd_add(&outcomes, negated ? 0 : 1,
                                    failures.state[1], journal, baseline))
     return false;
@@ -19710,7 +20825,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_setup_select(
     } else if (!dep_route_state_add_root(selected, journal, root))
       return false;
   }
-  selected->correlated = state->correlated;
+  dep_route_state_inherit(selected, state);
   return true;
 }
 
@@ -19742,6 +20857,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) shell_dep_error_t
     bool report_ready = false;
     while (dep_route_next(&iterator, journal, &root)) {
       dep_route_state_t one = dep_route_state_single(root);
+      dep_route_state_inherit(&one, executed_state);
       const dep_read_plan_t *plan = &prepared->read;
       dep_read_versions_t observations = {.outcomes = {one}, .mask = 1};
       dep_read_result_t read = {0};
@@ -19766,6 +20882,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) shell_dep_error_t
         uint32_t version;
         while (dep_route_next(&versions, journal, &version)) {
           dep_route_state_t terminal = dep_route_state_single(version);
+          dep_route_state_inherit(&terminal, &observations.outcomes[kind]);
           dep_read_result_t local_read = read;
           dep_route_set_t effects = dep_fd_raw_fact(
               &terminal, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
@@ -20140,7 +21257,12 @@ typedef struct {
   bool required[DEP_ROUTE_OPERATION_CAPACITY];
   dep_index_node_t index[DEP_ROUTE_OPERATION_CAPACITY];
   uint32_t root, count;
-  dep_read_observations_t read_observations;
+  /* Root-only collection borrows the final-route journal's inventory until
+   * construction copies it into the snapshot journal. Recursive inspections
+   * reuse that prepared inventory and leave this pointer NULL. This keeps the
+   * node/token-sized table out of every recursive parser stack frame. */
+  dep_read_observations_t *read_observations;
+  dep_test_programs_t *tests;
   /* Source positions of descriptor-sensitive operations, including nested
    * bodies. Sort once, then query command/group lifetimes by lower bound. */
   uint32_t positions[DEP_ROUTE_OPERATION_CAPACITY];
@@ -20305,8 +21427,8 @@ static SHELL_NONNULL(1, 7) void dep_observe_read_fd(
     dep_inventory_position(inventory, word);
   if (kind == 1)
     dep_inventory_low(inventory, word, fd);
-  if (parameter &&
-      !dep_read_observe(&inventory->read_observations,
+  if (parameter && inventory->read_observations &&
+      !dep_read_observe(inventory->read_observations,
                         (dep_fd_ref_t){.name = parameter,
                                        .value = SHELL_DEP_FD_NAMED,
                                        .name_len = (uint32_t)parameter_length},
@@ -20318,7 +21440,8 @@ static SHELL_NONNULL(1, 7) void dep_observe_read_fd(
     inventory->named_fds = true;
     inventory->scratch_observable = true;
   } else if (kind == 1 || kind == 3) {
-    if (!dep_read_observe(&inventory->read_observations, dep_fd_numeric(fd),
+    if (inventory->read_observations &&
+        !dep_read_observe(inventory->read_observations, dep_fd_numeric(fd),
                           kind == 3 ? DEP_READ_OBSERVE_ACCESS
                                     : DEP_READ_OBSERVE_IDENTITY |
                                           DEP_READ_OBSERVE_ACCESS))
@@ -20336,10 +21459,43 @@ static SHELL_NONNULL(1, 3) void dep_observe_process(const char *word,
   inventory->has_process |= !shell_source_empty_process_word(word, length);
 }
 
-/* The semantic boundary already visits root and expansion-body tokens.
- * Collect observable numeric identities there, before any operand snapshot
- * needs allocation decisions. This is metadata extraction, not another parse
- * or a later replay of the source for each named descriptor. */
+/* Names borrow decoded program values. Only grammar-selected queries enter
+ * this inventory, including the PWD dependency of an OLDPWD presence write. */
+static SHELL_NONNULL(1, 3) void dep_observe_presence(const char *word,
+                                                     size_t length,
+                                                     void *context) {
+  dep_observable_inventory_t *inventory = context;
+  if (length == 6 && !memcmp(word, "OLDPWD", 6) &&
+      !dep_read_observe(inventory->read_observations,
+                        (dep_fd_ref_t){.name = "PWD",
+                                       .name_len = 3,
+                                       .value = SHELL_DEP_FD_NAMED},
+                        DEP_READ_OBSERVE_PRESENCE))
+    inventory->overflow = true;
+  if (!dep_read_observe(inventory->read_observations,
+                        (dep_fd_ref_t){.name = word,
+                                       .name_len = (uint32_t)length,
+                                       .value = SHELL_DEP_FD_NAMED},
+                        DEP_READ_OBSERVE_PRESENCE))
+    inventory->overflow = true;
+}
+
+static SHELL_NONNULL(1, 2, 3) void dep_observe_test(
+    const char *command, const shell_test_program_t *program, void *context) {
+  dep_observable_inventory_t *inventory = context;
+  dep_test_programs_t *tests = inventory->tests;
+  uint32_t candidate = tests->count + 1, match = 0;
+  tests->root = dep_index_insert(tests->index, tests->root, candidate,
+                                 SHELL_DEP_MAX_NODES, dep_test_program_compare,
+                                 tests, command, &match);
+  if (!match)
+    inventory->overflow = true;
+  else if (match == candidate) {
+    tests->commands[tests->count] = command;
+    tests->programs[tests->count++] = *program;
+  }
+}
+
 static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
     const shell_token_t *token, void *context) {
   dep_observable_inventory_t *inventory = context;
@@ -20405,7 +21561,8 @@ static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
     size_t name_after;
     (void)shell_source_parse_named_fd_at_word_start(token->start, 0,
                                                     token->length, &name_after);
-    if (!dep_read_observe(&inventory->read_observations,
+    if (inventory->read_observations &&
+        !dep_read_observe(inventory->read_observations,
                           (dep_fd_ref_t){.name = token->start + 1,
                                          .value = SHELL_DEP_FD_NAMED,
                                          .name_len = (uint32_t)name_after - 2},
@@ -20472,7 +21629,8 @@ static SHELL_NONNULL(1) void dep_prepare_observable_fds(
       workspace->snapshot_journal.observable_fd_count;
   journal->scratch_observable = workspace->snapshot_journal.scratch_observable;
   journal->named_closes = workspace->snapshot_journal.named_closes;
-  journal->read_observations = workspace->snapshot_journal.read_observations;
+  dep_read_observations_copy(&journal->read_observations,
+                             &workspace->snapshot_journal.read_observations);
   memcpy(journal->observable_fds, workspace->snapshot_journal.observable_fds,
          journal->observable_fd_count * sizeof(journal->observable_fds[0]));
 }
@@ -21307,7 +22465,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       if (!dep_process_open(&local_route_state, &workspace->route_journal,
                             &flow_baseline, &op))
         return SHELL_DEP_ETRUNC;
-      if (route->standalone && (stdin_source->read.active || !route->byte_use))
+      if (route->standalone && (stdin_source->read.active ||
+                                stdin_source->test.active || !route->byte_use))
         dynamic_route_edges[route->edge] = true;
     }
     for (unsigned phase = DEP_SNAPSHOT_COMMAND_WORD;
@@ -21658,12 +22817,19 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
 
   bool external_eligible[SHELL_DEP_MAX_NODES] = {false};
   memset(workspace->generic_read, 0, sizeof(workspace->generic_read));
+  memset(workspace->test_body, 0, sizeof(workspace->test_body));
   for (uint32_t owner = 0; owner < graph->node_count; owner++)
     if (resolved_owner[owner]) {
       external_eligible[owner] = dep_owner_has_body_io(
           graph, context, owner,
           control_execution[owner] != DEP_EXECUTION_NEVER);
+      if (graph->nodes[owner].type == SHELL_NODE_CMD)
+        workspace->test_body[owner] =
+            workspace
+                ->snapshot_sources[context->snapshot->prepared_source[owner]]
+                .test.active;
       if (graph->nodes[owner].type == SHELL_NODE_CMD &&
+          !workspace->test_body[owner] &&
           !workspace
                ->snapshot_sources[context->snapshot->prepared_source[owner]]
                .read.active) {
@@ -21888,7 +23054,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       if (state->fd[i].fd.value > SHELL_DEP_FD_MAX)
         continue;
       for (uint32_t access = 0; access < 2; access++) {
-        if (access == 0 && !workspace->generic_read[owner])
+        if ((access == 0 && !workspace->generic_read[owner]) ||
+            (workspace->test_body[owner] && state->fd[i].fd.value != 2))
           continue;
         dep_route_state_t owner_state = workspace->owner_route_state[owner];
         dep_fd_access_t direction =
@@ -22043,6 +23210,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
            use++) {
         uint32_t fd = dep_owner_route_slot(workspace, owner, use);
         if (empty_timing_owner[owner] ||
+            (workspace->test_body[owner] && state->fd[fd].fd.value != 2) ||
             state->fd[fd].fd.value > SHELL_DEP_FD_MAX ||
             (state->fd[fd].fd.value > 2 &&
              (dep_owner_route_touched(workspace, owner, fd) & access) == 0))
@@ -24594,16 +25762,33 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
   }
   dep_observable_inventory_t observable = {.source = cmd,
                                            .source_length = cmd_len};
+  if (depth == 0 && limits->workspace) {
+    dep_route_workspace_t *workspace = limits->workspace;
+    workspace->tests.root = workspace->tests.count = 0;
+    observable.tests = &workspace->tests;
+    observable.read_observations = &workspace->route_journal.read_observations;
+    observable.read_observations->root = observable.read_observations->count =
+        0;
+    observable.read_observations->active = false;
+    observable.read_observations->identity = false;
+    observable.read_observations->presence = false;
+  }
   /* Inspect the complete immutable source, not only ranges retained by the
    * supplied fast result. A truncated structural prefix cannot hide a later
    * expansion whose semantics require unrepresentable translated source. */
-  if (shell_tokenizer_inspect_semantics(
-          cmd, cmd_len, dep_observe_descriptor_token, dep_observe_read_fd,
-          dep_observe_process, &observable)) {
+  shell_semantic_result_t inspected = shell_tokenizer_inspect_semantics(
+      cmd, cmd_len, dep_observe_descriptor_token, dep_observe_read_fd,
+      dep_observe_process, observable.tests ? dep_observe_presence : NULL,
+      observable.tests ? dep_observe_test : NULL, &observable);
+  if (inspected == SHELL_SEMANTIC_UNSUPPORTED) {
     out->status = SHELL_DEP_STATUS_ERROR;
     return SHELL_DEP_EPARSE;
   }
-  if (observable.overflow) {
+  if (inspected == SHELL_SEMANTIC_EWORKSPACE) {
+    out->status = SHELL_DEP_STATUS_ERROR;
+    return SHELL_DEP_EWORKSPACE;
+  }
+  if (inspected == SHELL_SEMANTIC_TRUNCATED || observable.overflow) {
     out->status = SHELL_DEP_STATUS_TRUNCATED;
     return SHELL_DEP_ETRUNC;
   }
@@ -24783,8 +25968,9 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     route_workspace->snapshot_journal.scratch_observable =
         observable.scratch_observable;
     route_workspace->snapshot_journal.named_closes = observable.named_closes;
-    route_workspace->snapshot_journal.read_observations =
-        observable.read_observations;
+    dep_read_observations_copy(
+        &route_workspace->snapshot_journal.read_observations,
+        observable.read_observations);
     memcpy(route_workspace->snapshot_journal.observable_fds, observable.fds,
            observable.count * sizeof(observable.fds[0]));
     route_workspace->snapshot_source_count = 0;
@@ -25584,6 +26770,25 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         &route_workspace->snapshot_sources[parse_context.snapshot
                                                ->prepared_source[cmd_node_idx]];
     assignment_source->exec = exec_analysis;
+    /* Attach the inventoried test before any snapshot or status query. A
+     * literal expression need not request a descriptor snapshot at all.
+     * Dispatch is already established here; reuse it without rescanning argv.
+     */
+    if (effective_builtin && !dynamic_command) {
+      shell_source_builtin_kind_t kind = shell_source_static_builtin_kind(
+          effective_builtin->start, effective_builtin->len);
+      if (kind == SHELL_SOURCE_BUILTIN_TEST ||
+          kind == SHELL_SOURCE_BUILTIN_BRACKET) {
+        assignment_source->test =
+            dep_test_program(&route_workspace->tests, effective_builtin->start);
+        size_t count = 0;
+        for (uint32_t i = effective_command + 1; i < tokens.count; ++i) {
+          if (dep_skip_nonargument(&tokens, &i))
+            continue;
+          assignment_source->test.words[count++].token = i;
+        }
+      }
+    }
     bool command_word_active = dep_owner_phase_active(
         &parse_context, cmd_node_idx, DEP_SNAPSHOT_COMMAND_WORD, range->start);
     if (tokens.count > max_tokens)
@@ -25972,10 +27177,13 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
             cmd + condition.operands[operand_index],
             (uint32_t)condition.operand_lengths[operand_index]};
         const shell_dep_word_value_t *value = NULL;
-        body_error = dep_resolve_word(
-            out, &parse_context, &operand,
-            out->cwd_buf.data + *range_cwd_offset, cmd_node_idx,
-            SHELL_EXPAND_WORD_CONDITIONAL, body_active, UINT32_MAX, &value);
+        body_error =
+            condition.predicate == SHELL_CONDITIONAL_VARIABLE_SET
+                ? SHELL_DEP_OK
+                : dep_resolve_word(out, &parse_context, &operand,
+                                   out->cwd_buf.data + *range_cwd_offset,
+                                   cmd_node_idx, SHELL_EXPAND_WORD_CONDITIONAL,
+                                   body_active, UINT32_MAX, &value);
         if (body_error != SHELL_DEP_OK)
           return dep_stop_graph_construction(out, body_error);
         if (value && value->resolved)
@@ -25995,6 +27203,31 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
             truth ? SHELL_CONDITIONAL_TRUE : SHELL_CONDITIONAL_FALSE;
       if (shell_source_scratch_exhausted())
         return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
+    }
+
+    dep_snapshot_source_t *test_source =
+        &route_workspace->snapshot_sources[parse_context.snapshot
+                                               ->prepared_source[cmd_node_idx]];
+    uint8_t test_status = DEP_STATUS_EITHER;
+    if (test_source->test.active && active) {
+      for (uint32_t i = 0; i < test_source->test.word_count; ++i) {
+        shell_test_value_t *word = &test_source->test.words[i];
+        if (conditional_command || word->known)
+          continue;
+        const shell_dep_word_value_t *value = argument_values[word->token];
+        if (value && value->resolved && value->count == 1) {
+          shell_test_set_value(word, value->first, value->first_length);
+        }
+      }
+      shell_dep_error_t error = dep_test_body_status(
+          out, streams, &parse_context, cmd_node_idx, &test_status);
+      if (error != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, error);
+      if (conditional_command)
+        node->cmd.conditional_truth =
+            test_status == DEP_STATUS_MAY_SUCCEED ? SHELL_CONDITIONAL_TRUE
+            : test_status == DEP_STATUS_MAY_FAIL  ? SHELL_CONDITIONAL_FALSE
+                                                  : SHELL_CONDITIONAL_UNKNOWN;
     }
 
     const dep_token_t *execution_target = effective_builtin;
@@ -26025,7 +27258,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
           event_static_status[source_event] & DEP_STATUS_STOP;
       uint8_t outcomes =
           argv_presence == DEP_ARGV_EMPTY
-              ? dep_null_command_status(&parse_context, source_event)
+              ? dep_null_command_status(&parse_context, source_event,
+                                        &test_source->null_mutations)
               : DEP_STATUS_EITHER;
       if (effective_builtin)
         outcomes = dep_static_command_status(effective_builtin);
@@ -26039,6 +27273,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                    : node->cmd.conditional_truth == SHELL_CONDITIONAL_TRUE
                        ? DEP_STATUS_MAY_SUCCEED
                        : DEP_STATUS_MAY_FAIL;
+      if (test_source->test.active)
+        outcomes = test_status;
       if (expansion_status[source_event].redirect_scopes &
           DEP_REDIRECT_BAD_BUILTIN)
         outcomes = DEP_STATUS_MAY_FAIL;
@@ -26247,7 +27483,8 @@ static SHELL_NONNULL(1, 2, 3) void dep_external_owner_collect(
     }
     for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_WRITE;
          access <<= 1) {
-      if (access == DEP_FD_ACCESS_READ && !workspace->generic_read[owner])
+      if ((access == DEP_FD_ACCESS_READ && !workspace->generic_read[owner]) ||
+          (workspace->test_body[owner] && fd != 2))
         continue;
       bool used =
           sparse ? fd <= 2 || (dep_owner_route_touched(workspace, owner, slot) &

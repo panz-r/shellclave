@@ -71,6 +71,10 @@ spelling rather than their final runtime values. Check
 decision. Full-input policy evaluation covers argument matching; execution
 authorization also depends on effects and application controls.
 
+Scalar-presence queries such as `[[ -v CONFIG ]]` can remain UNKNOWN with no
+unresolved-expansion flag. Applications requiring presence certainty inspect
+Shellsplit's `conditional_truth` and the possible continuations in its graph.
+
 ### What policy rules cover
 
 Each retained command with an argument sequence is an argv-policy subject.
@@ -88,6 +92,8 @@ their effects alongside the command.
 | `VALUE=example` | No subject; `UNDETERMINED` | Shell-state assignment |
 | `# comment` | No subject; `ALLOW` | Policy-neutral source |
 | `[[ -n word ]]` | No subject; `ALLOW` when conditionals are enabled | String truth and substitution dependencies |
+| `[[ -v CONFIG ]]` | No subject; `ALLOW` when conditionals are enabled | Scalar presence; an empty assigned value is set |
+| `test -v CONFIG` / `[ -v CONFIG ]` | Ordinary argv-policy subject | Presence and compound-test outcomes refine continuations |
 | `[[ "$mode" == "release" ]]` | No subject; `ALLOW` when conditionals are enabled | Exact comparison; unresolved values and substitutions |
 | `[[ "$mode" == release-"$arch" ]]` | No subject; `ALLOW` when conditionals are enabled | Literal composition; quoted expansion results remain literal |
 | `[[ "$file" == *.txt ]]` | No subject; `ALLOW` when conditionals and globs are enabled | Static star pattern; unresolved left value |
@@ -161,7 +167,7 @@ pre-push verification use that same reference.
 
 | Area | Current analysis support |
 |---|---|
-| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, unary string tests, literal comparisons and static `*` patterns in `[[ … ]]` |
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, unary string and scalar-presence tests, literal comparisons and static `*` patterns in `[[ … ]]`, compound `test`/`[` expressions |
 | Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
 | Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
 | Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, wider `[[ … ]]` predicates, dynamic or mutating arithmetic, and the builtin forms listed in the reference |

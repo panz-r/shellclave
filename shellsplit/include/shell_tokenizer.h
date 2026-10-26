@@ -54,7 +54,8 @@ typedef enum {
 
 /* Normalized conditional predicate. Bare words use STRING_NONEMPTY; = and ==
  * share STRING_EQUAL for literal RHSs. Active static stars use PATTERN_MATCH
- * or PATTERN_NOT_MATCH. Lexical ! parity is represented separately. */
+ * or PATTERN_NOT_MATCH. VARIABLE_SET queries a statically named scalar; an
+ * empty assigned value is set. Lexical ! parity is represented separately. */
 typedef enum {
   SHELL_CONDITIONAL_PREDICATE_NONE = 0,
   SHELL_CONDITIONAL_STRING_NONEMPTY,
@@ -63,6 +64,7 @@ typedef enum {
   SHELL_CONDITIONAL_STRING_NOT_EQUAL,
   SHELL_CONDITIONAL_PATTERN_MATCH,
   SHELL_CONDITIONAL_PATTERN_NOT_MATCH,
+  SHELL_CONDITIONAL_VARIABLE_SET, /* Static scalar-name presence lookup. */
 } shell_conditional_predicate_t;
 
 /**
@@ -173,9 +175,11 @@ typedef struct {
 
 /* Sufficient capacity for operation-local source-analysis scratch: delimiter
  * normalization (including literal command-fragment printing), non-evicting
- * subscript boundary facts, and conditional-pattern evaluation. Pattern
- * evaluation reserves projected units, a prefix table and decoded subject
- * bytes as needed. Public iterators retain subscript facts in the buffer
+ * subscript boundary facts, conditional-pattern evaluation, and compiled
+ * builtin-test arguments and expression nodes. Pattern evaluation reserves
+ * projected units, a prefix table and decoded subject bytes as needed.
+ * Builtin-test programs remain live through graph construction and recursive
+ * analysis. Public iterators retain subscript facts in the buffer
  * between next() calls.
  * No source is read and no storage is allocated.
  * Required output is cleared on arithmetic overflow (false). The buffer may

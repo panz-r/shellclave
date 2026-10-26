@@ -59,7 +59,8 @@ primary error. Failed or truncated evaluation leaves anomaly learning unchanged.
 
 ## Runtime values and substitution inspection
 
-`unresolved_expansion_flags` distinguishes unresolved argv and pathname values.
+`unresolved_expansion_flags` distinguishes unresolved argv, pathname and
+conditional-string values.
 These flags can accompany `ALLOW`: policy matching may have used processed
 source spelling. Applications needing final-value checks resolve eligible words
 through the documented callback or keep the decision pending. The callback
@@ -67,6 +68,11 @@ returns canonical netargv valid for every modeled execution state reaching that
 word; a value the caller cannot establish remains `SHELL_EXPAND_UNRESOLVED`.
 Command identity, assignments, and protected shell-state operands have separate
 modeling rules; the ordinary-word callback does not resolve those roles.
+
+Scalar-presence queries can remain UNKNOWN without setting these flags.
+Applications requiring that certainty inspect Shellsplit's conditional truth
+and conservative continuations. A clean set of expansion flags establishes
+only that those expansion categories contain no reported unresolved values.
 
 `requires_substitution_evaluation` identifies runtime-generated shell-word
 content requiring inspection and evaluation in its receiving role. Resolve that

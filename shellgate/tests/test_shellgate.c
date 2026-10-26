@@ -117,10 +117,7 @@ static int fail_count = 0;
  * dependency-graph workspace. Keep normal test evaluation on the public
  * size-hint path's safe side; small-prefix contracts below deliberately pass
  * a narrower view of this same storage. */
-/* Include the complete ~25 MiB graph workspace and a result-string prefix,
- * matching the parser test workspace allowance. Boundary tests below still
- * derive exact private-tail reservations from the public size hint. */
-static char eval_buf[26u * 1024u * 1024u];
+static char eval_buf[32u * 1024u * 1024u];
 static char **temp_files = NULL;
 static size_t temp_file_count = 0;
 static size_t temp_file_capacity = 0;
@@ -3740,6 +3737,36 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
   *value = context;
   *length = strlen(context);
   return SHELL_EXPAND_RESOLVED;
+}
+
+TEST(variable_presence_contract) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"test -v *", "\"[\" -v * -o ! -v * ]",
+                                       "test x -o -n *", "printf *"},
+                      4);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -v CONFIG ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -v CONFIG ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
+         !result.unresolved_expansion_flags &&
+         !result.requires_substitution_evaluation);
+  ASSERT_SG_OK(eval_cmd(gate, "test -v CONFIG", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "[ -v CONFIG -o ! -v OTHER ]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "test x -o -n \"$(printf marker)\"", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+         result.subcommand_count == 2 &&
+         result.requires_substitution_evaluation &&
+         result.has_dynamic_substitution_io);
+  ASSERT(eval_cmd(gate, "[[ -v \"$name\" ]]", &result) == SG_ERR_PARSE);
+  ASSERT(eval_cmd(gate, "[[ -v 'a[$(printf marker)]' ]]", &result) ==
+         SG_ERR_PARSE);
+  sg_gate_free(gate);
 }
 
 TEST(conditional_string_contract) {
@@ -15672,6 +15699,7 @@ int main(int argc, char **argv) {
   RUN(file_substitution_reject_mask_contract);
   RUN(nested_feature_rejection_contract);
   RUN(static_arithmetic_literal_contract);
+  RUN(variable_presence_contract);
   RUN(conditional_string_contract);
   RUN(continued_expansion_policy_contract);
   RUN(continued_punctuation_policy_contract);

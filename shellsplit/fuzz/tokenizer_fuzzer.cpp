@@ -251,10 +251,13 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
     shell_source_operation_begin(input, length);
     shell_source_workspace_scope_t previous = shell_source_workspace_begin(
         input, length, semantic_workspace.data(), source_workspace_size);
-    definitely_unsupported = shell_tokenizer_inspect_semantics(
+    shell_semantic_result_t inspected = shell_tokenizer_inspect_semantics(
         input, length, tokenizer_observe_semantic_token,
-        tokenizer_observe_read_fd, tokenizer_observe_process, &source_only);
-    semantic_scan_complete = !shell_source_scratch_exhausted();
+        tokenizer_observe_read_fd, tokenizer_observe_process, nullptr, nullptr,
+        &source_only);
+    definitely_unsupported = inspected == SHELL_SEMANTIC_UNSUPPORTED;
+    semantic_scan_complete = inspected == SHELL_SEMANTIC_OK ||
+                             inspected == SHELL_SEMANTIC_UNSUPPORTED;
     shell_source_workspace_end(previous);
     shell_source_operation_end();
   }

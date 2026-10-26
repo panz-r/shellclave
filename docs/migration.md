@@ -3,6 +3,70 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
+## Unreleased: scalar variable presence and builtin test composition
+
+Conditional commands now support `[[ -v name ]]` with static ASCII scalar
+names and lexical negation. The appended VARIABLE_SET predicate retains one
+original operand span. Its graph truth comes from variable presence, separately
+from string length and descriptor validity. Existing enum values and public
+layouts are unchanged.
+
+`test` and `[` share these presence facts. Their argument-count rules, `!`,
+`-a`, `-o` and parenthesized expressions can refine subsequent execution.
+`getopts` presence effects summarize its outcome-dependent write order. A
+definite OPTARG destination remains SET when every possible optstring has a
+provable leading `:`. Other OPTARG destination cases remain UNKNOWN because
+non-silent option errors can clear it after the destination assignment; this
+includes concrete invocations which happen to leave it set. Named-descriptor
+allocations establish presence during setup and retain it after a later
+redirect failure under the existing publication and scope rules.
+
+String predicates and literal comparisons contribute established values;
+other admitted predicates retain conservative results, including possible
+argument errors. These builtins remain SIMPLE commands with argv-policy
+subjects. Conditional-only metadata remains reserved for `[[ … ]]`.
+Small parenthesized tests preserve pinned Bash's invocation-wide first-argument
+reference in its one-argument dispatch, while the three-argument shortcut uses
+its local operand. Corrected status proofs retain previously omitted reachable
+continuations and their I/O dependencies. Literal tests without expansions or
+redirects also establish their status before successor construction, removing
+I/O effects from continuations that are provably unreachable.
+Terminal predicates follow Bash's `-t` operand rules, including implicit fd 1
+before Boolean connectors in qualifying expressions. Invalid decimal operands
+produce argument-error outcomes; terminal status remains conservative.
+Admission and evaluation share nested small-argument dispatch. A guaranteed
+parenthesized argument error can now precede an otherwise unsupported `-v`
+operand without rejecting the source; the builtin has a failure-only outcome.
+Lookups reached before an error still require supported operands, and ordinary
+argv substitutions retain their dependencies even when the builtin must fail.
+Presence/descriptor correlations and truncation are preserved across observation,
+read-effect and scope-cleanup transformations.
+
+Rejected writes to nonassignable predefined arrays preserve presence and
+binding facts. This covers assignments, temporary prefixes, declarations,
+`printf`, `read` and `getopts`. `read` retains earlier completed assignments
+and its input consumption; independent `printf` format writes and `getopts`
+updates still apply. Successful whole-variable `unset` makes `FUNCNAME` and
+`GROUPS` ordinary scalar destinations. The protected `BASH_ARGC`, `BASH_ARGV`,
+`BASH_SOURCE` and `BASH_LINENO` arrays remain nonassignable after rejected
+unsets. These restrictions are distinct from readonly assignment termination;
+ordinary failure continuations remain reachable.
+Opaque mutations now retain their position among known effects. Mixed
+static/dynamic `unset` operands preserve explicit unsets and track possible
+despecialization independently of scalar presence. Later assignment decisions
+retain both capability alternatives when needed. Prefix restoration applies
+only to bindings actually installed at command entry; an ignored special-name
+prefix no longer suppresses the builtin's persistent unset.
+
+A static name lookup makes no expansion callback. UNKNOWN presence is graph
+uncertainty, rather than an unresolved-expansion flag. Dynamic names, subscript
+re-evaluation and wider `[[ … ]]` expressions remain unsupported.
+
+Private graph storage and source scratch requirements have increased. Obtain
+capacities through the existing workspace sizing functions and size hints;
+rebuild consumers and update fixed scratch reservations. Evaluation continues
+to use caller workspace without a new heap allocation or environment API.
+
 ## Unreleased: mixed literal conditional operands
 
 Exact comparisons with `=`, `==` and `!=` now accept literal text surrounding
@@ -68,12 +132,13 @@ unary predicates have one operand; comparisons have two. Incomplete headers
 retain received operands. Nonconditional entries leave these fields zero.
 
 The shared `shell_conditional_predicate_t` describes normalized STRING_NONEMPTY,
-STRING_EMPTY, STRING_EQUAL, STRING_NOT_EQUAL, PATTERN_MATCH and PATTERN_NOT_MATCH
-predicates; `conditional_negated` records lexical `!` parity. Bare words
-normalize to STRING_NONEMPTY. Literal `=`/`==` comparisons use STRING_EQUAL;
-active stars select the pattern predicates. Rebuild consumers for changed public
-layouts. Existing CT anomaly records, callback purposes and feature-bit
-assignments are unchanged.
+STRING_EMPTY, STRING_EQUAL, STRING_NOT_EQUAL, PATTERN_MATCH, PATTERN_NOT_MATCH
+and VARIABLE_SET predicates; `conditional_negated` records lexical `!` parity.
+Bare words normalize to STRING_NONEMPTY. Literal `=`/`==` comparisons use STRING_EQUAL;
+active stars select the pattern predicates. VARIABLE_SET retains one static
+scalar-name operand and uses graph execution-state presence. Rebuild consumers
+for changed public layouts. Existing CT anomaly records, callback purposes
+and feature-bit assignments are unchanged.
 
 Each dynamic operand uses the existing CONDITIONAL callback purpose, requiring one
 NUL-free string record without pattern escaping. Left operand expansions finish

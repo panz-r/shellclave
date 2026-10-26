@@ -15,6 +15,10 @@
 
 static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics(
     const char *input, size_t length);
+static _Thread_local shell_semantic_variable_observer_t
+    semantic_variable_observer;
+static _Thread_local shell_semantic_test_observer_t semantic_test_observer;
+static _Thread_local bool semantic_inventory_truncated;
 static _Thread_local shell_semantic_token_observer_t semantic_token_observer;
 static _Thread_local shell_semantic_read_fd_observer_t
     semantic_read_fd_observer;
@@ -710,8 +714,52 @@ typedef struct {
   bool wait_options;
   bool test_builtin;
   shell_builtin_test_t test;
+  const char *test_command;
+  shell_source_span_t test_words[SHELL_DEP_MAX_TOKENS];
+  uint32_t test_word_count;
+  bool test_word_overflow;
   shell_source_wrapper_state_t wrapper;
 } semantic_builtin_state_t;
+
+/* Finalize only after Bash's argument-count dispatch is known. Admission uses
+ * the compact recognizer; graph observers retain one compiled program and its
+ * actual lookup targets for later snapshots. Source-only callers need neither.
+ */
+static SHELL_NONNULL(1, 2) bool semantic_finish_test(
+    semantic_builtin_state_t *state, const char *input) {
+  if (!state->test_builtin)
+    return false;
+  if (shell_builtin_test_unsupported(&state->test))
+    return true;
+  if (!semantic_test_observer && !semantic_variable_observer)
+    return false;
+  if (state->test_word_overflow) {
+    semantic_inventory_truncated = true;
+    return false;
+  }
+  shell_test_value_t *words = shell_source_scratch_take_array(
+      state->test_word_count, sizeof(*words), _Alignof(shell_test_value_t));
+  if (!words)
+    return false;
+  for (uint32_t i = 0; i < state->test_word_count; ++i)
+    if (!shell_test_prepare_value(input + state->test_words[i].start,
+                                  state->test_words[i].length, words + i))
+      return false;
+  shell_test_program_t program;
+  if (!shell_test_compile(words, state->test_word_count, state->test.bracket,
+                          &program))
+    return false;
+  if (state->test.count > 4 && state->test.phase == SHELL_TEST_ERROR &&
+      !state->test.alternatives.active)
+    shell_test_prove_error(&program);
+  if (semantic_test_observer)
+    semantic_test_observer(state->test_command, &program,
+                           semantic_token_context);
+  if (semantic_variable_observer)
+    shell_test_observe_presence(&program, semantic_variable_observer,
+                                semantic_token_context);
+  return false;
+}
 
 /* token borrows the required immutable input span; state is required writable
  * scanner-local storage, replaced by this command's builtin classification. */
@@ -749,6 +797,7 @@ static SHELL_NONNULL(1, 3, 4) bool semantic_set_builtin_target(
   state->test_builtin =
       kind == SHELL_SOURCE_BUILTIN_TEST || kind == SHELL_SOURCE_BUILTIN_BRACKET;
   state->test.bracket = kind == SHELL_SOURCE_BUILTIN_BRACKET;
+  state->test_command = input + token->position;
   return false;
 }
 
@@ -819,6 +868,14 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
           shell_conditional_parse(input, input_length, token.position);
       if (condition.frame != SHELL_CONDITIONAL_COMPLETE)
         return true;
+      if (condition.predicate == SHELL_CONDITIONAL_VARIABLE_SET &&
+          semantic_variable_observer) {
+        shell_test_value_t value;
+        if (shell_test_prepare_value(input + condition.operands[0],
+                                     condition.operand_lengths[0], &value))
+          semantic_variable_observer(value.value, value.value_length,
+                                     semantic_token_context);
+      }
       shell_token_regions_t regions =
           shell_conditional_regions(input, &condition);
       for (unsigned operand = 0; operand < regions.count; ++operand)
@@ -927,7 +984,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       continue;
     redirect_operand_end = 0;
     if (list_operator) {
-      if (builtin.test_builtin && shell_builtin_test_unsupported(&builtin.test))
+      if (semantic_finish_test(&builtin, input))
         return true;
       if (integer_assignment)
         return true;
@@ -961,7 +1018,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     }
     if (token.type == SHELL_TOKEN_GROUP_END ||
         token.type == SHELL_TOKEN_SUBSHELL_END) {
-      if (builtin.test_builtin && shell_builtin_test_unsupported(&builtin.test))
+      if (semantic_finish_test(&builtin, input))
         return true;
       if (integer_assignment)
         return true;
@@ -1089,6 +1146,14 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
        * until the command boundary supplies Bash's expression arity. */
       if (semantic_word_end <= token.position)
         return false;
+      if (semantic_test_observer || semantic_variable_observer) {
+        if (builtin.test_word_count == SHELL_DEP_MAX_TOKENS)
+          builtin.test_word_overflow = true;
+        else
+          builtin.test_words[builtin.test_word_count++] = (shell_source_span_t){
+              (uint32_t)token.position,
+              (uint32_t)(semantic_word_end - token.position)};
+      }
       shell_builtin_test_word(&builtin.test, input + token.position,
                               semantic_word_end - token.position);
       continue;
@@ -1256,9 +1321,8 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         return true;
     }
   }
-  return (builtin.test_builtin &&
-          shell_builtin_test_unsupported(&builtin.test)) ||
-         integer_assignment || terminal_empty_time ||
+  return semantic_finish_test(&builtin, input) || integer_assignment ||
+         terminal_empty_time ||
          (parenthesized_substitution && command_start &&
           pipeline_prefix.has_time && !pipeline_prefix.has_stage);
 }
@@ -1271,25 +1335,43 @@ bool shell_tokenizer_has_unsupported_semantics(const char *input,
   return unsupported;
 }
 
-bool shell_tokenizer_inspect_semantics(
-    const char *input, size_t input_length,
-    shell_semantic_token_observer_t observer,
-    shell_semantic_read_fd_observer_t read_fd,
-    shell_semantic_process_observer_t process, void *context) {
+shell_semantic_result_t
+shell_tokenizer_inspect_semantics(const char *input, size_t input_length,
+                                  shell_semantic_token_observer_t observer,
+                                  shell_semantic_read_fd_observer_t read_fd,
+                                  shell_semantic_process_observer_t process,
+                                  shell_semantic_variable_observer_t variable,
+                                  shell_semantic_test_observer_t test,
+                                  void *context) {
   shell_semantic_token_observer_t previous = semantic_token_observer;
   shell_semantic_read_fd_observer_t previous_read = semantic_read_fd_observer;
   shell_semantic_process_observer_t previous_process =
       semantic_process_observer;
+  shell_semantic_variable_observer_t previous_variable =
+      semantic_variable_observer;
+  shell_semantic_test_observer_t previous_test = semantic_test_observer;
+  bool previous_truncated = semantic_inventory_truncated;
   void *previous_context = semantic_token_context;
   semantic_token_observer = observer;
   semantic_read_fd_observer = read_fd;
   semantic_process_observer = process;
+  semantic_variable_observer = variable;
+  semantic_test_observer = test;
+  semantic_inventory_truncated = false;
   semantic_token_context = context;
   bool unsupported =
       shell_tokenizer_has_unsupported_semantics(input, input_length);
+  shell_semantic_result_t result =
+      unsupported                        ? SHELL_SEMANTIC_UNSUPPORTED
+      : shell_source_scratch_exhausted() ? SHELL_SEMANTIC_EWORKSPACE
+      : semantic_inventory_truncated     ? SHELL_SEMANTIC_TRUNCATED
+                                         : SHELL_SEMANTIC_OK;
   semantic_token_observer = previous;
   semantic_read_fd_observer = previous_read;
   semantic_process_observer = previous_process;
+  semantic_variable_observer = previous_variable;
+  semantic_test_observer = previous_test;
+  semantic_inventory_truncated = previous_truncated;
   semantic_token_context = previous_context;
-  return unsupported;
+  return result;
 }
