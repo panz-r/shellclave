@@ -1,6 +1,6 @@
 #include "shell_conditional_internal.h"
 #include "shell_source_internal.h"
-#include "shell_test_internal.h"
+#include "shell_word_internal.h"
 #include <string.h>
 
 /* Newlines/comments are grammar trivia before a primary, after lexical !,
@@ -275,7 +275,7 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
     if (!operand(s, n, p, 0, &r, &end))
       return r;
     if (variable) {
-      if (!shell_test_static_scalar(s + p, end - p)) {
+      if (!shell_word_static_scalar(s + p, end - p)) {
         r.frame = SHELL_CONDITIONAL_UNSUPPORTED;
         return r;
       }

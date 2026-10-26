@@ -1,3 +1,4 @@
+#include "shell_source_internal.h"
 #include "shell_source_runtime_internal.h"
 #include "shell_test_internal.h"
 #include "shell_word_internal.h"
@@ -24,34 +25,6 @@ _Static_assert(SHELL_DEP_MAX_TOKENS * 2u + 2u <= UINT16_MAX,
 _Static_assert(sizeof(shell_test_value_t) + 2 * sizeof(shell_test_node_t) + 8 <=
                    SHELL_SOURCE_VALUE_SCRATCH_FACTOR,
                "test values and aligned program nodes fit source scratch");
-
-bool shell_test_scalar_name(const char *name, size_t length) {
-  if (!length || !(shell_ascii_alpha((unsigned char)name[0]) || name[0] == '_'))
-    return false;
-  for (size_t i = 1; i < length; ++i)
-    if (!(shell_ascii_alnum((unsigned char)name[i]) || name[i] == '_'))
-      return false;
-  return true;
-}
-
-typedef struct {
-  bool valid;
-  size_t length;
-} scalar_name_t;
-static SHELL_NONNULL(2) bool scalar_byte(unsigned char byte, void *context) {
-  scalar_name_t *name = context;
-  name->valid &= name->length++ ? shell_ascii_alnum(byte) || byte == '_'
-                                : shell_ascii_alpha(byte) || byte == '_';
-  return true;
-}
-
-bool shell_test_static_scalar(const char *word, size_t length) {
-  scalar_name_t name = {.valid = true};
-  return !shell_source_word_has_dynamic_syntax_in_context(
-             word, length, SHELL_SOURCE_WORD_CONDITIONAL) &&
-         shell_source_visit_decoded_word(word, length, scalar_byte, &name) &&
-         name.valid && name.length != 0;
-}
 
 bool shell_test_prepare_value(const char *source, size_t length,
                               shell_test_value_t *value) {
@@ -397,7 +370,7 @@ static SHELL_NONNULL(1, 2, 3,
       break;
     }
     case TEST_PRESENT:
-      result = a->known && shell_test_scalar_name(a->value, a->value_length)
+      result = a->known && shell_word_scalar_name(a->value, a->value_length)
                    ? lookup(a->value, a->value_length, context)
                    : 3u;
       break;
@@ -455,7 +428,7 @@ void shell_test_observe_presence(const shell_test_program_t *program,
     shell_test_node_t n = program->nodes[pending[--count]];
     if (n.operation == TEST_PRESENT) {
       const shell_test_value_t *v = &program->words[n.left];
-      if (v->known && shell_test_scalar_name(v->value, v->value_length))
+      if (v->known && shell_word_scalar_name(v->value, v->value_length))
         observer(v->value, v->value_length, context);
     } else if (n.operation == TEST_NOT) {
       pending[count++] = n.left;
@@ -487,7 +460,7 @@ bool shell_test_require(const shell_test_program_t *program, unsigned desired,
     shell_test_node_t n = program->nodes[index];
     if (n.operation == TEST_PRESENT) {
       const shell_test_value_t *v = &program->words[n.left];
-      if (v->known && shell_test_scalar_name(v->value, v->value_length) &&
+      if (v->known && shell_word_scalar_name(v->value, v->value_length) &&
           !assume(v->value, v->value_length, wanted, context))
         return false;
     } else if (n.operation == TEST_NOT) {

@@ -1,4 +1,5 @@
 #include "../src/shell_semantics_internal.h"
+#include "../src/shell_source_runtime_internal.h"
 #include "../src/shell_test_internal.h"
 #include "shell_depgraph.h"
 #include "shell_source.h"

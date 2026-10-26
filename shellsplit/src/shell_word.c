@@ -5,7 +5,27 @@
 #include "alloc.h"
 #include "shell_source_internal.h"
 #include "shell_word_decode_internal.h"
+#include "shell_word_internal.h"
 #include <stdlib.h>
+
+typedef struct {
+  bool valid;
+  size_t length;
+} scalar_name_t;
+static SHELL_NONNULL(2) bool scalar_byte(unsigned char byte, void *context) {
+  scalar_name_t *name = context;
+  name->valid &= name->length++ ? shell_ascii_alnum(byte) || byte == '_'
+                                : shell_ascii_alpha(byte) || byte == '_';
+  return true;
+}
+
+bool shell_word_static_scalar(const char *word, size_t length) {
+  scalar_name_t name = {.valid = true};
+  return !shell_source_word_has_dynamic_syntax_in_context(
+             word, length, SHELL_SOURCE_WORD_CONDITIONAL) &&
+         shell_source_visit_decoded_word(word, length, scalar_byte, &name) &&
+         name.valid && name.length != 0;
+}
 
 static SHELL_NONNULL(1, 5) shell_process_status_t
     visit_word_mode(const char *text, size_t length,

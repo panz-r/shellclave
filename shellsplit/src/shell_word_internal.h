@@ -1,11 +1,25 @@
 #ifndef SHELL_WORD_INTERNAL_H
 #define SHELL_WORD_INTERNAL_H
 
+#include "shell_ascii.h"
 #include "shell_processor.h"
 
-/* Declaration-only interface for semantic word values. Decoding loops belong
- * to shell_word_decode_internal.h; direct canonical emitters include that
- * header, while callers of these operations need only this interface. */
+/* ASCII scalar identifiers and static conditional-word spellings. */
+static inline SHELL_NONNULL(1) bool shell_word_scalar_name(const char *name,
+                                                           size_t length) {
+  if (!length || !(shell_ascii_alpha((unsigned char)name[0]) || name[0] == '_'))
+    return false;
+  for (size_t i = 1; i < length; ++i)
+    if (!(shell_ascii_alnum((unsigned char)name[i]) || name[i] == '_'))
+      return false;
+  return true;
+}
+bool shell_word_static_scalar(const char *word, size_t length) SHELL_NONNULL(1);
+
+/* Semantic word-value operations are declared below; scalar-name validation
+ * above stays inline. Decoding loops belong to shell_word_decode_internal.h;
+ * direct canonical emitters include that header, while callers of these
+ * operations need only this interface. */
 
 /* Literal shell-word projection for semantic consumers: ANSI-C NUL truncates
  * only its fragment, and later fragments resume. Dynamic expansions remain

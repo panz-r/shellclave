@@ -3,7 +3,6 @@
 
 #include "shell_builtin_word_internal.h"
 #include "shell_source_internal.h"
-#include "shell_test_internal.h"
 #include <limits.h>
 
 /* Private operand roles shared by source validation and named-FD mutation

@@ -101,11 +101,11 @@ The implementation owners and private interfaces are:
 | Retained source/draft collection | `shell_source.c` |
 | Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
 | Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
-| Builtin test argument roles, argument-count grammar and eager expression evaluation | `shell_test.c`, `shell_test_internal.h` |
+| Builtin test argument-count grammar, admission and eager expression evaluation | `shell_test_grammar_internal.h`, `shell_test_admission_internal.h`, `shell_test.c`, `shell_test_internal.h` |
 | Shared builtin word projection and scalar cardinality | `shell_builtin_word_internal.h` |
 | Whole-word expansion requests, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
 | Supported-operation inspection, builtin roles and semantic observers | `shell_semantics.c`, `shell_semantics_internal.h` |
-| Word-value operations, public decoding adapters and diagnostic word rendering | `shell_word.c`, `shell_word_internal.h` |
+| Word-value operations, scalar identifier checks, public decoding adapters and diagnostic word rendering | `shell_word.c`, `shell_word_internal.h` |
 | Heredoc delimiter spelling and printer storage layout | `shell_heredoc.c`, `shell_heredoc_storage_internal.h` |
 
 Shared inline interfaces have narrower responsibilities:
@@ -160,6 +160,14 @@ bindings and empty scalar values. Prepare observed names and mutation targets
 once, then carry immutable presence facts through the existing outcome and
 scope machinery. Conditional parsing supplies static-name queries; builtin test
 programs use the same facts while preserving their separate argument grammar.
+Private graph implementation fragments group related execution-state operations:
+`shell_depgraph_variable_impl.h` owns predefined-variable capabilities and prefix
+visibility, `shell_depgraph_test_impl.h` owns test lookup and outcome selection,
+and `shell_depgraph_presence_impl.h` owns presence facts, epochs and assumptions.
+They are included at their dependency points in `shell_depgraph.c` and share its
+translation unit. They are not independent interfaces or installed headers.
+Route storage, mutation ordering, scope publication and recursive observation
+remain owned by the graph; the fragments borrow those existing types and lifetimes.
 Collect only grammar-selected lookup targets after each complete test expression
 has been compiled. The root semantic traversal prepares programs once; graph
 snapshots and nested bodies borrow their source-operation values and nodes.

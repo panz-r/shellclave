@@ -8,6 +8,8 @@
  */
 #include "shell_semantics_internal.h"
 #include "shell_source_internal.h"
+#include "shell_test_admission_internal.h"
+#include "shell_test_internal.h"
 #include "shell_token_context_internal.h"
 #include "shell_token_regions_internal.h"
 #include "shell_token_traits_internal.h"
