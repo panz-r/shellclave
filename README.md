@@ -74,6 +74,8 @@ authorization also depends on effects and application controls.
 Scalar-presence queries such as `[[ -v CONFIG ]]` can remain UNKNOWN with no
 unresolved-expansion flag. Applications requiring presence certainty inspect
 Shellsplit's `conditional_truth` and the possible continuations in its graph.
+Filesystem predicates can likewise remain UNKNOWN. Their FILE_TEST relations
+identify possible metadata checks for separate application authorization.
 
 ### What policy rules cover
 
@@ -93,6 +95,7 @@ their effects alongside the command.
 | `# comment` | No subject; `ALLOW` | Policy-neutral source |
 | `[[ -n word ]]` | No subject; `ALLOW` when conditionals are enabled | String truth and substitution dependencies |
 | `[[ -v CONFIG ]]` | No subject; `ALLOW` when conditionals are enabled | Scalar presence; an empty assigned value is set |
+| `[[ -f config.json ]]` | No subject; `ALLOW` when conditionals are enabled | Possible filesystem metadata check |
 | `test -v CONFIG` / `[ -v CONFIG ]` | Ordinary argv-policy subject | Presence and compound-test outcomes refine continuations |
 | `[[ "$mode" == "release" ]]` | No subject; `ALLOW` when conditionals are enabled | Exact comparison; unresolved values and substitutions |
 | `[[ "$mode" == release-"$arch" ]]` | No subject; `ALLOW` when conditionals are enabled | Literal composition; quoted expansion results remain literal |

@@ -23,6 +23,19 @@ class ConditionalCommands(unittest.TestCase):
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
+    def test_file_predicates(self):
+        for op in ("-e", "-f", "-d", "-L", "-h"):
+            for negation in ("", "! "):
+                source = f"[[ {negation}{op} '' ]]"
+                with self.subTest(source=source):
+                    self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+                    truth = self.probe_result(source)
+                    self.assertEqual(self.bash_result(source).returncode,
+                                     0 if truth == 2 else 1)
+            self.assertEqual(self.probe_result(f"[[ {op} some-path ]]"), 0)
+        self.assertEqual(self.bash_result("test -a ''").returncode, 1)
+        self.assertEqual(self.bash_result("[ -a '' ]").returncode, 1)
+
     def test_literal_truth(self):
         for operand in ("x", "''", '""', "'-n'", "'!'", "*", "{,}",
                         "日本", "$'a\\0tail'", "$'\\0tail'", "'a b'",
@@ -312,7 +325,7 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ("[[ -f file ]]", "[[ -\\\nf file ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
+        for source in ("[[ -b file ]]", "[[ -\\\nb file ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
                        "[[ 1 -eq 1 ]]", "[[ (x) ]]", "[[ x && y ]]",
                        "[[ x || y ]]"):
             with self.subTest(source=source):
@@ -396,9 +409,8 @@ class ConditionalCommands(unittest.TestCase):
                                  0 if truth == 2 else 1)
         source = "[[ -\\\nf ]]"
         self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
-        # The wider predicate grammar is outside this model, including its
-        # malformed instances; it must never be accepted as a bare string.
-        self.assertEqual(self.probe_result(source, "--status"), 4)
+        self.assertEqual(self.probe_result(source, "--status"), 2)
+        self.assertEqual(self.probe_result("[[ -\\\nf path ]]", "--status"), 0)
 
     def test_expansion_and_setup(self):
         for source in ("[[ -z $missing ]]", "[[ -n $(printf x) ]]",

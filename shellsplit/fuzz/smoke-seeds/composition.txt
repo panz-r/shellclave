@@ -1,1 +1,8 @@
 test -f input && cat input || echo missing
+[[ -e "$path" ]] && test -f config.json -a -d output
+[ -h current ] || [[ -L "$(printf '%s' current)" ]]
+test "$predicate" target
+test -a existing
+test -e "$operator" -e -a -f target && cat <effect
+[ "$operator" target ]
+CONFIG=; test "$operator" CONFIG

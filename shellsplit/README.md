@@ -191,15 +191,31 @@ The `test` and `[` builtins use the same presence facts and evaluate compound
 expressions with `!`, `-a`, `-o` and parentheses. They retain ordinary argv and
 policy subjects. See [variable presence](../docs/shell-model.md#scalar-variable-presence).
 
+Filesystem predicates `-e`, `-f`, `-d`, `-L` and `-h` are supported in
+conditional commands and the `test` and `[` builtins. A FILE_TEST edge
+connects the command to a FILE document and identifies the possible metadata
+checks. It does not claim a file-content read. Inspect the document's pathname
+and CWD when authorizing the check; unresolved arguments can leave its path
+or the predicate kind uncertain. See [filesystem predicates](../docs/shell-model.md#filesystem-predicates).
+Other filesystem operators accepted by the `test` and `[` builtins remain
+opaque and do not produce FILE_TEST edges. Unary `-a` in those builtins is an
+existence alias; their grammar distinguishes it from conjunction.
+
 ## Dependency-graph workspace
+
+The fixed per-command token capacity and default graph limit are 48. Graph
+preparation also counts assignment prefixes and redirection syntax, so this
+capacity is distinct from final expanded argc. Smaller graph limits remain
+configurable; capacity exhaustion reports truncation. Public retained arrays
+and workspace sizes depend on this capacity; rebuild consumers after updating.
 
 Graph construction uses one temporary workspace. Allocating processor/tokenizer,
 abstraction, transformation, and sequence APIs manage their own source scratch.
 Allocation-free APIs accept caller scratch for delimiter normalization,
 non-evicting indexed-subscript boundary records, conditional-pattern
-evaluation and compiled builtin-test expressions. Obtain the sufficient capacity
-from `shell_source_workspace_size()`
-rather than estimating bytes. A public tokenizer retains facts between calls
+evaluation, prepared builtin-test arguments, expression nodes and bounded
+grammar projection. Obtain sufficient capacity from
+`shell_source_workspace_size()` rather than estimating bytes. A public tokenizer retains facts between calls
 in its supplied buffer; independent live iterators require distinct buffers.
 
 Dependency-graph parsing uses caller-owned scratch for source analysis,
@@ -246,8 +262,8 @@ alignment; the example rounds up after adding source scratch. Applications
 with a different allocator can over-allocate and align manually. An absent,
 misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Use
 `shell_source_workspace_size()` to cover delimiter normalization, persistent
-subscript facts, conditional-pattern storage and compiled builtin-test arguments
-and expressions in the same tail.
+subscript facts, conditional-pattern storage, compiled builtin-test arguments
+and expressions, and bounded ambiguous-grammar projection in the same tail.
 Command bytes, configuration, workspace, and graph output must obey the
 non-overlap requirements documented by the API.
 

@@ -62,9 +62,10 @@ static inline SHELL_NONNULL(4) void shell_builtin_test_dynamic(const char *word,
  * queue selects nested small-argument dispatch before visiting its predicates.
  * Larger groups need a depth, not a tree or rescanning. Truth and short-circuit
  * values are not inferred: every syntactically reached lookup is checked.
- * Unresolved operator positions remain unsupported. Ordinary unary/binary
- * data has fixed consumption; -t separately retains the possibility that a
- * dynamic operand becomes a connector. */
+ * Dynamic operator positions retain alternatives when every possible lookup
+ * is safe. Unresolved or subscripted lookup targets remain unsupported.
+ * Ordinary unary/binary data has fixed consumption; -t separately retains the
+ * possibility that a dynamic operand becomes a connector. */
 typedef enum {
   SHELL_TEST_PRIMARY,
   SHELL_TEST_LOOKAHEAD,
@@ -148,12 +149,11 @@ static inline SHELL_NONNULL(1) bool shell_builtin_test_alternatives_word(
     } else if (phase == SHELL_TEST_ALT_AFTER) {
       shell_builtin_test_alternative_after(&next, word, depth);
     } else {
-      bool binary = !word.dynamic && (word.roles & SHELL_TEST_BINARY) &&
-                    !(word.roles & SHELL_TEST_JOIN);
-      if (word.dynamic || binary)
+      unsigned lookahead = shell_test_lookahead(word.roles, word.dynamic);
+      if (lookahead & SHELL_TEST_LOOKAHEAD_BINARY)
         shell_builtin_test_alternative_add(&next, SHELL_TEST_ALT_BINARY_VALUE,
                                            depth);
-      if (!binary) {
+      if (lookahead & SHELL_TEST_LOOKAHEAD_OPERAND) {
         if (phase == SHELL_TEST_ALT_STRING)
           shell_builtin_test_alternative_after(&next, word, depth);
         else if (phase == SHELL_TEST_ALT_TERMINAL) {
@@ -207,8 +207,8 @@ static inline SHELL_NONNULL(1) void shell_builtin_test_expression_word(
       state->phase = SHELL_TEST_LOOKAHEAD;
       return;
     case SHELL_TEST_LOOKAHEAD:
-      if (!word.dynamic && (word.roles & SHELL_TEST_BINARY) &&
-          !(word.roles & SHELL_TEST_JOIN)) {
+      if (shell_test_lookahead(word.roles, word.dynamic) ==
+          SHELL_TEST_LOOKAHEAD_BINARY) {
         /* The ordinary interpretation consumes the saved word as data.
          * A !/( value makes this operator the next primary's first word.
          * Both structural alternatives have a plain head; retain their
@@ -219,6 +219,9 @@ static inline SHELL_NONNULL(1) void shell_builtin_test_expression_word(
         state->phase = SHELL_TEST_BINARY_VALUE;
         return;
       }
+      if (word.dynamic)
+        shell_builtin_test_alternative_add(
+            &state->alternatives, SHELL_TEST_ALT_BINARY_VALUE, state->depth);
       if (state->head.dynamic) {
         state->unsupported = true;
         state->phase = SHELL_TEST_ERROR;

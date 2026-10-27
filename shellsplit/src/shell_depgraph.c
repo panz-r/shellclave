@@ -40,9 +40,9 @@
 /* --- NAME HELPERS --- */
 
 static const char *dep_edge_names[] = {
-    "READ",  "WRITE",   "APPEND",   "PIPE", "ARG", "ENV",
-    "SUBST", "SEQ",     "AND",      "OR",   "CWD", "BACKGROUND",
-    "GROUP", "FD_OPEN", "FD_CLOSE", "TIME",
+    "READ",  "WRITE",   "APPEND",   "PIPE", "ARG",       "ENV",
+    "SUBST", "SEQ",     "AND",      "OR",   "CWD",       "BACKGROUND",
+    "GROUP", "FD_OPEN", "FD_CLOSE", "TIME", "FILE_TEST",
 };
 
 static const char *dep_node_names[] = {
@@ -1194,7 +1194,7 @@ static SHELL_NONNULL(1, 3, 4) dep_cd_target_t
  * Keep the first readonly rejection independent of argv presence: all later
  * argument words participate in the proof that the prefix is temporary.
  */
-_Static_assert(SHELL_DEP_MAX_TOKENS <= 32,
+_Static_assert(SHELL_DEP_MAX_TOKENS <= 64,
                "prefix rejection bits cover every prepared token");
 
 enum { DEP_ARGV_EMPTY = 1u, DEP_ARGV_PRESENT = 2u };
@@ -1202,7 +1202,7 @@ enum { DEP_ARGV_EMPTY = 1u, DEP_ARGV_PRESENT = 2u };
 static SHELL_NONNULL(1, 2, 3, 4, 5) uint32_t
     dep_first_command_index(const dep_token_list_t *tokens,
                             uint32_t *assignment_stop, bool *isolated_setup,
-                            uint32_t *rejected_assignments,
+                            uint64_t *rejected_assignments,
                             uint8_t *argv_presence) {
   *assignment_stop = UINT32_MAX;
   *isolated_setup = false;
@@ -1248,7 +1248,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) uint32_t
         SHELL_VARIABLE_READONLY) {
       if (*assignment_stop == UINT32_MAX)
         *assignment_stop = i;
-      *rejected_assignments |= UINT32_C(1) << i;
+      *rejected_assignments |= UINT64_C(1) << i;
     }
   }
   return command;
@@ -1648,6 +1648,78 @@ static SHELL_NONNULL(1, 5, 8) bool dep_add_argument_document(
                 SHELL_EDGE_ARG, SHELL_DIR_UNDIR, SHELL_DEP_FD_NONE,
                 SHELL_DEP_FD_NONE);
   return true;
+}
+
+/* The operand and optional resolved value borrow source/resolver storage.
+ * Predicate checks use the command's CWD and never imply content reads.
+ * Record active path uncertainty even if output capacity omits the relation. */
+static SHELL_NONNULL(1, 5, 9) void dep_add_file_test(
+    shell_dep_graph_t *graph, uint32_t max_nodes, uint32_t max_edges,
+    uint32_t owner, const dep_token_t *source,
+    const shell_dep_word_value_t *value, bool dynamic, unsigned tests,
+    uint8_t *unresolved_paths) {
+  if (value && value->resolved && value->count == 1 && !value->first_length)
+    return;
+  bool resolved =
+      value && value->resolved && value->count == 1 && value->first_length;
+  if (resolved && value->first_length > UINT32_MAX) {
+    graph->status |= SHELL_DEP_STATUS_TRUNCATED;
+    return;
+  }
+  /* Argument callbacks may return embedded NUL bytes. Such a value is not a
+   * representable filesystem pathname; retain uncertainty rather than store
+   * it as a resolved FILE path. Conditional callbacks already reject NUL. */
+  if (resolved && memchr(value->first, '\0', value->first_length)) {
+    resolved = false;
+    dynamic = true;
+  }
+  if (dynamic && !resolved)
+    unresolved_paths[owner] = true;
+  if (graph->node_count >= max_nodes || graph->edge_count >= max_edges) {
+    graph->status |= SHELL_DEP_STATUS_TRUNCATED;
+    return;
+  }
+  uint32_t document = graph->node_count++;
+  graph->nodes[document].type = SHELL_NODE_DOC;
+  graph->nodes[document].doc =
+      (shell_dep_doc_t){.kind = SHELL_DOC_FILE,
+                        .path = source->start,
+                        .path_len = source->len,
+                        .flags = dynamic ? SHELL_DEP_DOC_FLAG_DYNAMIC_NAME : 0};
+  shell_dep_doc_t *doc = &graph->nodes[document].doc;
+  const shell_dep_cmd_t *command = &graph->nodes[owner].cmd;
+  doc->cwd_known = command->cwd_known;
+  doc->cwd_offset = command->cwd_known ? command->cwd_offset : 0;
+  doc->cwd_absolute = command->cwd_absolute;
+  if (resolved) {
+    doc->value = value->first;
+    doc->value_len = (uint32_t)value->first_length;
+    doc->flags = SHELL_DEP_DOC_FLAG_RESOLVED_PATH;
+  }
+  shell_dep_edge_t *edge = &graph->edges[graph->edge_count++];
+  dep_init_edge(edge, owner, document, SHELL_EDGE_FILE_TEST, SHELL_DIR_FORWARD,
+                SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
+  edge->flags = (uint8_t)tests;
+}
+
+typedef struct {
+  shell_dep_graph_t *graph;
+  uint32_t max_nodes, max_edges, owner;
+  const shell_dep_word_value_t *const *values;
+  uint8_t *unresolved_paths;
+} dep_test_file_context_t;
+
+static SHELL_NONNULL(1, 3) void dep_observe_test_file(
+    const shell_test_value_t *word, unsigned tests, void *context) {
+  dep_test_file_context_t *ctx = context;
+  if (word->known && !word->value_length)
+    return;
+  dep_token_t source = {word->source, (uint32_t)word->length};
+  const shell_dep_word_value_t *value = ctx->values[word->token];
+  bool dynamic =
+      shell_source_argument_has_dynamic_syntax(word->source, word->length);
+  dep_add_file_test(ctx->graph, ctx->max_nodes, ctx->max_edges, ctx->owner,
+                    &source, value, dynamic, tests, ctx->unresolved_paths);
 }
 
 static bool add_doc_file(shell_dep_graph_t *g, uint32_t max_nodes,
@@ -2489,9 +2561,9 @@ typedef struct dep_import_join {
 #define DEP_OBSERVATION_ROOT_EVENT DEP_EXECUTION_EVENT_CAPACITY
 #define DEP_SCALAR_IMPORT_EVENT (DEP_OBSERVATION_ROOT_EVENT + 2)
 #define DEP_VARIABLE_STATE_EVENT (DEP_OBSERVATION_ROOT_EVENT + 3)
-/* The root semantic traversal compiles each test once, including nested
- * bodies. Source-operation scratch owns values/nodes; this index borrows them
- * until all snapshots and recursive parses finish. */
+/* The root traversal prepares canonical test programs, including nested
+ * bodies. Values/nodes borrow source-operation scratch. After argv resolution
+ * grammar refreshes in place before body snapshots borrow the program. */
 typedef struct {
   const char *commands[SHELL_DEP_MAX_NODES];
   shell_test_program_t programs[SHELL_DEP_MAX_NODES];
@@ -2509,13 +2581,13 @@ static SHELL_NONNULL(1, 3) int dep_test_program_compare(const void *context,
 
 /* command is the effective builtin source start reported during the root
  * semantic traversal. Successful inventory preparation guarantees its entry. */
-static SHELL_NONNULL(1, 2) shell_test_program_t
-    dep_test_program(const dep_test_programs_t *tests, const char *command) {
+static SHELL_NONNULL(1, 2) shell_test_program_t *dep_test_program(
+    dep_test_programs_t *tests, const char *command) {
   uint32_t cursor = tests->root;
   for (;;) {
     int order = dep_test_program_compare(tests, cursor - 1, command);
     if (!order)
-      return tests->programs[cursor - 1];
+      return &tests->programs[cursor - 1];
     cursor = order > 0 ? tests->index[cursor - 1].left
                        : tests->index[cursor - 1].right;
   }
@@ -3562,7 +3634,9 @@ struct dep_snapshot_source {
   dep_prefix_assignment_set_t prefix_assignments;
   dep_exec_analysis_t exec;
   dep_read_plan_t read;
-  shell_test_program_t test;
+  /* NULL means this owner has no test expression. Otherwise borrow its
+   * canonical program through the source operation, including refreshes. */
+  shell_test_program_t *test;
   uint32_t observation_first[DEP_SNAPSHOT_SETUP],
       observation_last[DEP_SNAPSHOT_SETUP];
   dep_assignment_ifs_t assignment_ifs[SHELL_DEP_MAX_TOKENS];
@@ -5762,7 +5836,8 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_read_prepare(
     const dep_prefix_assignment_set_t *prefixes,
     const dep_read_observations_t *observations) {
   *plan = (dep_read_plan_t){0};
-  uint32_t stop, rejected;
+  uint32_t stop;
+  uint64_t rejected;
   uint8_t presence;
   bool isolated;
   uint32_t command =
@@ -6841,10 +6916,14 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
           graph->nodes[owner].cmd.conditional_predicate ==
               SHELL_CONDITIONAL_VARIABLE_SET) {
         const shell_dep_cmd_t *command = &graph->nodes[owner].cmd;
+        source->test = shell_source_scratch_take_array(
+            1, sizeof(*source->test), _Alignof(shell_test_program_t));
+        if (!source->test)
+          return false;
         if (!shell_test_compile_presence(
                 command->conditional_operands[0],
                 command->conditional_operand_lengths[0],
-                command->conditional_negated, &source->test))
+                command->conditional_negated, source->test))
           return false;
       }
     }
@@ -7021,6 +7100,10 @@ static SHELL_NONNULL(1, 2, 3) dep_route_set_t
                     const dep_route_journal_t *journal,
                     const dep_owner_routes_t *baseline, dep_fd_ref_t fd,
                     dep_fd_access_t access);
+static SHELL_NONNULL(2, 3) dep_route_set_t
+    dep_fd_raw_root_fact(uint32_t root, const dep_route_journal_t *journal,
+                         const dep_owner_routes_t *baseline, dep_fd_ref_t fd,
+                         dep_fd_access_t access);
 static SHELL_NONNULL(1, 2) const dep_route_change_t *dep_route_state_change(
     const dep_route_state_t *state, const dep_route_journal_t *changes,
     dep_fd_ref_t fd, dep_fd_access_t access);
@@ -8072,10 +8155,16 @@ static SHELL_NONNULL(1, 2) bool dep_observation_export(
 /* Keep the write signature on each immutable version: two paths with the
  * same status/selector can still assign different targets (polling writes
  * none, rejected targets keep only their earlier prefix). Unequal effect
- * facts prevent premature factoring. */
+ * facts prevent premature factoring. The two existing 32-bit route values
+ * hold low/high target bits; the high word's top bit records REPLY. These
+ * are positional words: retrieve the single-root snapshot directly, since
+ * route unions deduplicate equal values and would discard the high word. */
+#define DEP_READ_EFFECT_REPLY (UINT32_C(1) << 31)
+_Static_assert(SHELL_DEP_MAX_TOKENS < 64,
+               "read target bits leave bit 63 for the REPLY marker");
 static SHELL_NONNULL(1, 2, 3) bool dep_read_note_write(
     dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_owner_routes_t *baseline, uint32_t targets, bool reply) {
+    const dep_owner_routes_t *baseline, uint64_t targets, bool reply) {
   dep_route_state_t result = {0};
   dep_route_iterator_t paths = dep_route_iterator(state);
   uint32_t root;
@@ -8083,16 +8172,17 @@ static SHELL_NONNULL(1, 2, 3) bool dep_read_note_write(
   while (dep_route_next(&paths, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
     dep_route_state_inherit(&one, state);
-    dep_route_set_t effects = dep_fd_raw_fact(&one, journal, baseline,
-                                              dep_fd_numeric(SHELL_DEP_FD_NONE),
-                                              DEP_FD_ACCESS_EFFECT_STATE);
+    dep_route_set_t effects = dep_fd_raw_root_fact(
+        root, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
+        DEP_FD_ACCESS_EFFECT_STATE);
     if (!effects.count) {
       effects.count = 2;
       effects.routes[0] = effects.routes[1] =
           (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
     }
-    effects.routes[0].value |= targets;
-    effects.routes[1].value |= reply;
+    effects.routes[0].value |= (uint32_t)targets;
+    effects.routes[1].value |=
+        (uint32_t)(targets >> 32) | (reply ? DEP_READ_EFFECT_REPLY : 0);
     if (!dep_route_state_store_access(&one, journal,
                                       dep_fd_numeric(SHELL_DEP_FD_NONE),
                                       DEP_FD_ACCESS_EFFECT_STATE, effects) ||
@@ -8371,7 +8461,7 @@ static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate_version(
                 (choices & (mode & 1u ? UINT64_MAX : readable))) {
               result.targets |= UINT64_C(1) << i;
               if (observations && !dep_read_note_write(&one, journal, baseline,
-                                                       UINT32_C(1) << i, false))
+                                                       UINT64_C(1) << i, false))
                 goto exhausted;
             }
             if (writable || elided)
@@ -8433,7 +8523,7 @@ static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate_version(
                 result.targets |= UINT64_C(1) << i;
                 if (observations &&
                     !dep_read_note_write(&one, journal, baseline,
-                                         UINT32_C(1) << i, false))
+                                         UINT64_C(1) << i, false))
                   goto exhausted;
               }
               if (writable)
@@ -17278,7 +17368,9 @@ dep_time_report_for_fd2(const dep_route_state_t *state,
 #include "shell_depgraph_presence_impl.h"
 
 /* Flow versions use an immutable baseline. Unlike command-local lookup,
- * binding visibility is an explicit journal fact, not a mutable-table test. */
+ * binding visibility is an explicit journal fact, not a mutable-table test.
+ * A single-root lookup preserves every stored snapshot position, including
+ * equal words in private metadata records. */
 static SHELL_NONNULL(2, 3) dep_route_set_t
     dep_fd_raw_root_fact(uint32_t root, const dep_route_journal_t *journal,
                          const dep_owner_routes_t *baseline, dep_fd_ref_t fd,
@@ -17471,6 +17563,8 @@ static SHELL_NONNULL(2, 3) bool dep_read_scalar_shadowed(
   return false;
 }
 
+/* Union route alternatives across versions, deduplicating equal kind/value
+ * pairs even within one snapshot. Positional metadata requires root lookup. */
 static SHELL_NONNULL(1, 2, 3) dep_route_set_t
     dep_fd_raw_fact(const dep_route_state_t *state,
                     const dep_route_journal_t *journal,
@@ -20067,14 +20161,13 @@ static SHELL_NONNULL(
   if (source->argv_presence == DEP_ARGV_EMPTY &&
       dep_assignments_may_reject(&source->null_mutations))
     body_status |= DEP_STATUS_MAY_FAIL;
-  if (source->test.active) {
+  if (source->test) {
     dep_route_state_t body = *executed_state;
     dep_test_context_t test = {.state = &body,
                                .journal = journal,
                                .baseline = baseline,
                                .prefixes = &source->prefix_assignments};
-    unsigned result =
-        shell_test_evaluate(&source->test, dep_test_lookup, &test);
+    unsigned result = shell_test_evaluate(source->test, dep_test_lookup, &test);
     body_status = (result & SHELL_TEST_TRUE ? DEP_STATUS_MAY_SUCCEED : 0) |
                   (result & (SHELL_TEST_FALSE | SHELL_TEST_ERROR_RESULT)
                        ? DEP_STATUS_MAY_FAIL
@@ -20153,7 +20246,7 @@ static SHELL_NONNULL(
                         : i < 2 ? continued
                                 : selected;
   outcomes.state[negated ? 0 : 1] = private ? *executed_state : failed_body;
-  if (source->test.active && setup_survived) {
+  if (source->test && setup_survived) {
     for (unsigned i = 0; i < 2; ++i) {
       if (!(outcomes.mask & (1u << i)))
         continue;
@@ -20301,11 +20394,18 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) shell_dep_error_t
           dep_route_state_t terminal = dep_route_state_single(version);
           dep_route_state_inherit(&terminal, &observations.outcomes[kind]);
           dep_read_result_t local_read = read;
-          dep_route_set_t effects = dep_fd_raw_fact(
-              &terminal, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
+          dep_route_set_t effects = dep_fd_raw_root_fact(
+              version, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
               DEP_FD_ACCESS_EFFECT_STATE);
-          local_read.targets = effects.count ? effects.routes[0].value : 0;
-          local_read.default_target = effects.count && effects.routes[1].value;
+          local_read.targets = effects.count
+                                   ? (uint64_t)effects.routes[0].value |
+                                         ((uint64_t)(effects.routes[1].value &
+                                                     ~DEP_READ_EFFECT_REPLY)
+                                          << 32)
+                                   : 0;
+          local_read.default_target =
+              effects.count &&
+              (effects.routes[1].value & DEP_READ_EFFECT_REPLY) != 0;
           local_read.status = kind == DEP_READ_SUCCESS ? DEP_STATUS_MAY_SUCCEED
                                                        : DEP_STATUS_MAY_FAIL;
           local_read.assigned_failure = kind == DEP_READ_ASSIGNED_FAILURE;
@@ -21882,8 +21982,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       if (!dep_process_open(&local_route_state, &workspace->route_journal,
                             &flow_baseline, &op))
         return SHELL_DEP_ETRUNC;
-      if (route->standalone && (stdin_source->read.active ||
-                                stdin_source->test.active || !route->byte_use))
+      if (route->standalone &&
+          (stdin_source->read.active || stdin_source->test || !route->byte_use))
         dynamic_route_edges[route->edge] = true;
     }
     for (unsigned phase = DEP_SNAPSHOT_COMMAND_WORD;
@@ -22244,7 +22344,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         workspace->test_body[owner] =
             workspace
                 ->snapshot_sources[context->snapshot->prepared_source[owner]]
-                .test.active;
+                .test != NULL;
       if (graph->nodes[owner].type == SHELL_NODE_CMD &&
           !workspace->test_body[owner] &&
           !workspace
@@ -24535,9 +24635,10 @@ static SHELL_NONNULL(1, 2) int dep_group_event_compare(const void *left,
   return a->position < b->position ? -1 : a->position != b->position;
 }
 
-/* Mark only words whose expansion cannot alter shell dispatch or builtin
- * state. Redirect operands and assignment prefixes are handled by their own
- * phases. Wholly elided words never advance argv roles, just as in semantic
+/* Mark ordinary data and admitted test arguments. Test values can select a
+ * different grammar, refreshed before body snapshots. Other shell-state
+ * operands stay unresolved. Redirects/prefixes have their own phases.
+ * Wholly elided words never advance argv roles, just as in semantic
  * validation and mutation analysis. Unknown dispatch remains unresolved.
  * printf data is ordinary argv except state-controlling %b operands in %n
  * formats; those, its options, destination and format retain their semantic
@@ -24579,7 +24680,9 @@ static SHELL_NONNULL(1, 6, 7) void dep_prepare_expandable_arguments(
         ordinary_after = i;
         break;
       }
-  } else if (kind == SHELL_SOURCE_BUILTIN_NONE) {
+  } else if (kind == SHELL_SOURCE_BUILTIN_NONE ||
+             kind == SHELL_SOURCE_BUILTIN_TEST ||
+             kind == SHELL_SOURCE_BUILTIN_BRACKET) {
     ordinary_after = effective_command;
   }
 
@@ -25923,7 +26026,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         !shell_execution_document(&lexical_documents[si]))
       continue;
 
-    uint32_t readonly_stop, rejected_assignments;
+    uint32_t readonly_stop;
+    uint64_t rejected_assignments;
     uint8_t argv_presence;
     bool isolated_setup;
     uint32_t command =
@@ -26202,7 +26306,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         for (uint32_t i = effective_command + 1; i < tokens.count; ++i) {
           if (dep_skip_nonargument(&tokens, &i))
             continue;
-          assignment_source->test.words[count++].token = i;
+          assignment_source->test->words[count++].token = i;
         }
       }
     }
@@ -26256,6 +26360,22 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       }
     }
 
+    /* All argv queries are complete. Refine the canonical program before
+     * any redirect/body snapshot can evaluate its grammar or return status. */
+    if (assignment_source->test && !conditional_command) {
+      bool changed = false;
+      for (uint32_t i = 0; i < assignment_source->test->word_count; ++i) {
+        shell_test_value_t *word = &assignment_source->test->words[i];
+        const shell_dep_word_value_t *value = argument_values[word->token];
+        if (!word->known && value && value->resolved && value->count == 1) {
+          shell_test_set_value(word, value->first, value->first_length);
+          changed = true;
+        }
+      }
+      if (changed && !shell_test_refresh(assignment_source->test))
+        return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
+    }
+
     /* For a statically present command, temporary assignment RHSs follow
      * argv expansion but precede its redirects, including redirects written
      * before the assignments. Null/nullable dispatch keeps its existing
@@ -26271,7 +26391,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         continue;
       }
       prefix_expanded[word] = true;
-      if (rejected_assignments & (UINT32_C(1) << word))
+      if (rejected_assignments & (UINT64_C(1) << word))
         continue;
       shell_source_assignment_word_t assignment;
       (void)shell_source_parse_scalar_assignment_word(token->start, token->len,
@@ -26458,7 +26578,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                        assignment.name_end, tok->start + assignment.equals + 1,
                        tok->len - assignment.equals - 1, assignment.append,
                        active && ti < assignment_stop &&
-                           !(rejected_assignments & (UINT32_C(1) << ti)),
+                           !(rejected_assignments & (UINT64_C(1) << ti)),
                        cmd_node_idx, &out->status);
         /* Temporary readonly prefixes are rejected before expanding their
          * RHS. Assignment-only rejection instead follows RHS expansion and
@@ -26466,7 +26586,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         uint8_t dispatch = argv_presence;
         if (ti > readonly_stop)
           dispatch &= (uint8_t)~DEP_ARGV_EMPTY;
-        if (rejected_assignments & (UINT32_C(1) << ti))
+        if (rejected_assignments & (UINT64_C(1) << ti))
           dispatch &= (uint8_t)~DEP_ARGV_PRESENT;
         if (!dispatch || prefix_expanded[ti]) {
           ti++;
@@ -26613,6 +26733,23 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
             cmd_node_idx);
         if (body_error != SHELL_DEP_OK)
           return dep_stop_graph_construction(out, body_error);
+        if (operand_index == 0 &&
+            condition.predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
+            condition.predicate <= SHELL_CONDITIONAL_FILE_SYMLINK &&
+            dep_owner_phase_active(&parse_context, cmd_node_idx,
+                                   DEP_SNAPSHOT_BODY_WORD, UINT32_MAX)) {
+          bool empty = false;
+          bool static_empty = shell_conditional_static_empty(
+                                  operand.start, operand.len, &empty) &&
+                              empty;
+          if (!static_empty)
+            dep_add_file_test(
+                out, max_nodes, max_edges, cmd_node_idx, &operand, value,
+                shell_conditional_word_dynamic(operand.start, operand.len),
+                SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS
+                    << (condition.predicate - SHELL_CONDITIONAL_FILE_EXISTS),
+                parse_context.unresolved_paths);
+        }
       }
       bool truth;
       if (shell_conditional_evaluate(cmd, &condition, values, &truth))
@@ -26626,20 +26763,20 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         &route_workspace->snapshot_sources[parse_context.snapshot
                                                ->prepared_source[cmd_node_idx]];
     uint8_t test_status = DEP_STATUS_EITHER;
-    if (test_source->test.active && active) {
-      for (uint32_t i = 0; i < test_source->test.word_count; ++i) {
-        shell_test_value_t *word = &test_source->test.words[i];
-        if (conditional_command || word->known)
-          continue;
-        const shell_dep_word_value_t *value = argument_values[word->token];
-        if (value && value->resolved && value->count == 1) {
-          shell_test_set_value(word, value->first, value->first_length);
-        }
-      }
+    if (test_source->test && active) {
       shell_dep_error_t error = dep_test_body_status(
           out, streams, &parse_context, cmd_node_idx, &test_status);
       if (error != SHELL_DEP_OK)
         return dep_stop_graph_construction(out, error);
+      if (!conditional_command &&
+          dep_owner_phase_active(&parse_context, cmd_node_idx,
+                                 DEP_SNAPSHOT_BODY_WORD, UINT32_MAX)) {
+        dep_test_file_context_t context = {
+            out,          max_nodes,       max_edges,
+            cmd_node_idx, argument_values, parse_context.unresolved_paths};
+        shell_test_observe_files(test_source->test, dep_observe_test_file,
+                                 &context);
+      }
       if (conditional_command)
         node->cmd.conditional_truth =
             test_status == DEP_STATUS_MAY_SUCCEED ? SHELL_CONDITIONAL_TRUE
@@ -26690,7 +26827,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                    : node->cmd.conditional_truth == SHELL_CONDITIONAL_TRUE
                        ? DEP_STATUS_MAY_SUCCEED
                        : DEP_STATUS_MAY_FAIL;
-      if (test_source->test.active)
+      if (test_source->test)
         outcomes = test_status;
       if (expansion_status[source_event].redirect_scopes &
           DEP_REDIRECT_BAD_BUILTIN)
@@ -28279,7 +28416,7 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       continue;
     }
 
-    if (e->type > SHELL_EDGE_TIME || e->dir > SHELL_DIR_UNDIR) {
+    if (e->type > SHELL_EDGE_FILE_TEST || e->dir > SHELL_DIR_UNDIR) {
       r.valid = false;
       r.errors[r.error_count].edge_idx = i;
       snprintf(r.errors[r.error_count].msg, 96,
@@ -28320,21 +28457,27 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       continue;
     }
 
-    if ((e->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
-                      SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
-                      SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
-                      SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
-        ((e->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
-         (e->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
-        ((e->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
-                      SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 &&
-         e->type != SHELL_EDGE_SUBST) ||
-        ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
-         e->type != SHELL_EDGE_FD_OPEN) ||
-        ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
-         e->type != SHELL_EDGE_FD_OPEN) ||
-        ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
-         (e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0)) {
+    if (e->type == SHELL_EDGE_FILE_TEST
+            ? (e->flags == 0 ||
+               (e->flags & ~(SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK)) != 0)
+            : ((e->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                             SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
+                             SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
+                             SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
+               ((e->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
+                (e->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
+               ((e->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                             SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 &&
+                e->type != SHELL_EDGE_SUBST) ||
+               ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
+                e->type != SHELL_EDGE_FD_OPEN) ||
+               ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
+                e->type != SHELL_EDGE_FD_OPEN) ||
+               ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
+                (e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0))) {
       r.valid = false;
       r.errors[r.error_count].edge_idx = i;
       snprintf(r.errors[r.error_count].msg, 96, "invalid flags %#x for %s edge",
@@ -28456,6 +28599,12 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       break;
     case SHELL_EDGE_ARG:
       ok = dep_arg_edge_endpoints_valid(g, e, ft, tt);
+      break;
+    case SHELL_EDGE_FILE_TEST:
+      ok = ft == SHELL_NODE_CMD && tt == SHELL_NODE_DOC &&
+           g->nodes[e->to].doc.kind == SHELL_DOC_FILE &&
+           e->source_fd == SHELL_DEP_FD_NONE &&
+           e->target_fd == SHELL_DEP_FD_NONE;
       break;
     case SHELL_EDGE_CWD:
       ok = (ft == SHELL_NODE_CMD && tt == SHELL_NODE_CMD) &&

@@ -1375,6 +1375,18 @@ static int test_fixed_oracles(void) {
   if (test_tokenizer_state(iterator_attached_heredoc,
                            sizeof(iterator_attached_heredoc) - 1))
     return fixed_oracle_failure(__LINE__);
+  /* Deferred control-flow classification only checks framing. The allocating
+   * tokenizer can still reject a malformed local pipeline in such a body. */
+  static const char *const malformed_control_pipelines[] = {
+      "for item in one; do a | !",
+      "for item in one; do a | !; done",
+      "a | b | c | d |for item in one  e | two; do printf '%s\\n' \"$item\"; "
+      "donf | g | h | i | j | k | l | m | e\n"
+      "n | o | p | q | r | s | t | u | v | w | x | y | z | aa | ab | !",
+  };
+  for (const char *source : malformed_control_pipelines)
+    if (test_tokenizer_state(source, strlen(source)))
+      return fixed_oracle_failure(__LINE__);
   static const char *const iterator_document_lists[] = {
       " <<OLDPvcat <<OLDPvalue0EOF\n",
       "<<A <<B\nA\nB\n",
@@ -4097,11 +4109,11 @@ static int test_fixed_oracles(void) {
   static const char *const unmodeled_semantic_cases[] = {
       "readonly v<()=text",
       "export POSIX<()LY_CORRECT=x",
-      "[[ -f /tmp/x ]]",
+      "[[ -b /tmp/x ]]",
       "(( count += 1 ))",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -f /tmp/x ]]",
+      "time [[ -b /tmp/x ]]",
       "time (( count += 1 ))",
       "time shopt -s varredir_close",
       "time command declare -a values",
@@ -4123,7 +4135,7 @@ static int test_fixed_oracles(void) {
       "readonly \"map[key]+=value\"",
       "typeset map[key]",
       "command -- declare \"arr[$(printf 0)]\"",
-      "echo $( [[ -f /tmp/x ]] )",
+      "echo $( [[ -b /tmp/x ]] )",
       "{ (( count )); }",
       "cat <<EOF\n$(while true; do :; done)\nEOF\n",
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
@@ -5541,6 +5553,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
       input, length, workspace.data(), workspace_size);
   bool unsupported = shell_tokenizer_has_unsupported_semantics(input, length);
   bool syntax_valid = shell_tokenizer_list_syntax_valid(input, length);
+  bool control_framing = shell_tokenizer_control_syntax(input, length) !=
+                         SHELL_CONTROL_SYNTAX_NONE;
   bool exhausted = shell_source_scratch_exhausted();
   shell_source_workspace_end(previous);
   shell_source_operation_end();
@@ -5664,10 +5678,14 @@ static int test_tokenizer_state(const char *input, size_t length) {
      * source with visible tokens may only take this escape for the documented
      * output-capacity limit. Comment/continuation-only source has no command
      * to return and may be rejected with EParse. All other valid grammar,
-     * including unsupported semantics, must yield diagnostic records. */
+     * including unsupported semantics, must yield diagnostic records. Deferred
+     * control-flow classification checks framing rather than complete body
+     * grammar, so its true result cannot override a local tokenizer rejection.
+     */
     return outputs_cleared && (!syntax_valid ||
                                (full_status == SHELL_TOKENIZE_EPARSE &&
-                                (!lexical_complete || iterated.empty())) ||
+                                (!lexical_complete || iterated.empty() ||
+                                 control_framing)) ||
                                full_status == SHELL_TOKENIZE_EOVERFLOW)
                ? 0
                : 1;

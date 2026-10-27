@@ -7,7 +7,11 @@
 
 /* Private test evaluation. Words borrow immutable source and operation-owned
  * decoded or callback values. Prepare each complete logical argument once.
- * Programs and their nodes live in source-operation scratch; no heap is used.
+ * Values, reserved nodes and operand-role masks live in source-operation
+ * scratch; snapshots borrow the canonical program through that operation.
+ * Concrete parsing advances one cursor through counted shortcuts and general
+ * fallback. Definite grammar failures stop enclosing parsing; they do not
+ * rewind to a candidate group closer or replay an already consumed suffix.
  * FALSE/TRUE are Boolean possibilities; ERROR is a builtin argument failure,
  * which remains distinct while composing eagerly evaluated expressions. */
 enum {
@@ -42,8 +46,9 @@ typedef struct {
 typedef struct shell_test_program {
   shell_test_value_t *words;
   shell_test_node_t *nodes;
+  uint16_t *operand_roles;
   uint16_t count, root, word_count;
-  bool active, proven_error;
+  bool active, proven_error, uncertain, bracket;
 } shell_test_program_t;
 typedef unsigned (*shell_test_lookup_t)(const char *name, size_t length,
                                         void *context);
@@ -51,6 +56,8 @@ typedef bool (*shell_test_assume_t)(const char *name, size_t length,
                                     unsigned presence, void *context);
 typedef void (*shell_test_presence_observer_t)(const char *name, size_t length,
                                                void *context);
+typedef void (*shell_test_file_observer_t)(const shell_test_value_t *word,
+                                           unsigned tests, void *context);
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -63,6 +70,10 @@ bool shell_test_prepare_value(const char *source, size_t length,
  * final, statically established ] before applying Bash argument-count rules. */
 bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
                         shell_test_program_t *program) SHELL_NONNULL(4);
+/* Refresh a program produced by shell_test_compile in its reserved storage
+ * after prepared values change. Call before body snapshots read it; words
+ * retain their source-token map. Returns false only on scratch exhaustion. */
+bool shell_test_refresh(shell_test_program_t *program) SHELL_NONNULL(1);
 /* Admission has proved that every grammar path ends in an argument error. */
 void shell_test_prove_error(shell_test_program_t *program) SHELL_NONNULL(1);
 bool shell_test_compile_presence(const char *word, size_t length, bool negated,
@@ -77,6 +88,12 @@ unsigned shell_test_evaluate(const shell_test_program_t *program,
 void shell_test_observe_presence(const shell_test_program_t *program,
                                  shell_test_presence_observer_t observer,
                                  void *context) SHELL_NONNULL(1, 2, 3);
+/* Report possible filesystem predicates on grammar-selected operand words.
+ * Unresolved operator roles can contribute several kinds to an operand;
+ * structural/operator words and the bracket terminator are not operands. */
+void shell_test_observe_files(const shell_test_program_t *program,
+                              shell_test_file_observer_t observer,
+                              void *context) SHELL_NONNULL(1, 2, 3);
 /* Refine only facts implied by the desired Boolean result. Error alternatives
  * prevent false-result refinement. Callbacks own path-local fact storage. */
 bool shell_test_require(const shell_test_program_t *program, unsigned desired,

@@ -65,6 +65,12 @@ typedef enum {
   SHELL_CONDITIONAL_PATTERN_MATCH,
   SHELL_CONDITIONAL_PATTERN_NOT_MATCH,
   SHELL_CONDITIONAL_VARIABLE_SET, /* Static scalar-name presence lookup. */
+  /* Filesystem predicates depend on runtime filesystem state. Symlink is the
+   * common normalized predicate for Bash's -L and -h spellings. */
+  SHELL_CONDITIONAL_FILE_EXISTS,
+  SHELL_CONDITIONAL_FILE_REGULAR,
+  SHELL_CONDITIONAL_FILE_DIRECTORY,
+  SHELL_CONDITIONAL_FILE_SYMLINK,
 } shell_conditional_predicate_t;
 
 /**
@@ -176,8 +182,9 @@ typedef struct {
 /* Sufficient capacity for operation-local source-analysis scratch: delimiter
  * normalization (including literal command-fragment printing), non-evicting
  * subscript boundary facts, conditional-pattern evaluation, and compiled
- * builtin-test arguments and expression nodes. Pattern evaluation reserves
- * projected units, a prefix table and decoded subject bytes as needed.
+ * builtin-test arguments, expression nodes and bounded ambiguous-grammar
+ * projection. Pattern evaluation reserves projected units, a prefix table
+ * and decoded subject bytes as needed.
  * Builtin-test programs remain live through graph construction and recursive
  * analysis. Public iterators retain subscript facts in the buffer
  * between next() calls.

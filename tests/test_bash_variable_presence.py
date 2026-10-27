@@ -34,6 +34,83 @@ class VariablePresence(unittest.TestCase):
             if actual:
                 self.assertEqual(actual, expected)
 
+    def test_dynamic_binary_lookahead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "target")
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write("payload")
+            for bracket in (False, True):
+                command = ("[ " if bracket else "test ")
+                command += '-e "$op" -e -a -f ' + shlex.quote(target)
+                command += " ]" if bracket else ""
+                for value in ("=", "!=", "x", "-a", "-o"):
+                    source = "op=" + shlex.quote(value) + "; " + command
+                    self.qualify(source, builtin=True, known=False)
+                source = "op='='; " + command
+                self.assertEqual(self.bash_result(source).returncode, 0)
+                self.assertNotEqual(self.model(source, builtin=True), 1)
+
+    def test_projected_expression_boundaries(self):
+        expressions = (
+            '-e "$op" x -a -e =',
+            "-e \"$op\" x -a '(' x -a -e = ')'",
+            "-e \"$op\" -e -a '(' x -o ! -e ')'",
+            "-e \"$op\" x -a '(' x -a x -a -e = ')'",
+            "-e \"$op\" x -a '(' x -a x -o ! -e ')'",
+        )
+        for bracket in (False, True):
+            for expression in expressions:
+                for value in ("=", "!=", "x", "-a", "-o"):
+                    command = ("[ " if bracket else "test ") + expression
+                    command += " ]" if bracket else ""
+                    source = "op=" + shlex.quote(value) + "; " + command
+                    self.qualify(source, builtin=True, known=False)
+        self.assertEqual(self.model("test " + expressions[0], builtin=True), 0)
+        source = "op='='; test -e \"$op\" -e -o ! -e"
+        self.assertEqual(self.bash_result(source).returncode, 0)
+        self.qualify(source, builtin=True, known=False)
+        for expression in expressions[1:]:
+            source = "op='='; test " + expression
+            self.assertEqual(self.bash_result(source).returncode, 2)
+            self.assertEqual(self.model(source, builtin=True), 1)
+
+    def test_chained_group_progress(self):
+        for bracket in (False, True):
+            for groups in range(1, 7):
+                command = ("[ " if bracket else "test ")
+                command += "'(' x -a -e = ')' -a " * groups + "-e tail"
+                command += " ]" if bracket else ""
+                self.assertEqual(self.bash_result(command).returncode, 2)
+                self.assertEqual(self.model(command, builtin=True), 1)
+            for operator in ("=", "!="):
+                command = ("[ " if bracket else "test ")
+                command += "'(' x -a -e " + operator + " ')' ')'"
+                command += " ]" if bracket else ""
+                self.qualify(command, builtin=True)
+
+    def test_high_read_targets(self):
+        for position in (31, 32, 46):
+            source = "unset pad CONFIG REPLY; read -n0" + " pad" * (position - 1)
+            source += " CONFIG; [[ -v CONFIG ]] && [[ ! -v REPLY ]]"
+            self.qualify(source)
+        source = "unset pad CONFIG IFS REPLY; read -n0" + " pad" * 32
+        source += " CONFIG FUNCNAME IFS; [[ -v CONFIG ]] && [[ ! -v IFS ]] && [[ ! -v REPLY ]]"
+        self.qualify(source)
+
+    def test_sparse_read_targets(self):
+        cases = ((1, "", False, False), (14, "", False, False),
+                 (1, " tail", True, False), (1, " bad-name tail", False, True))
+        for first, suffix, tail_set, failed in cases:
+            source = "unset gap first last tail REPLY; { read -n0"
+            source += " -r" * (first - 1) + " first" + " $gap" * 31
+            source += " last" + suffix
+            source += " || " if failed else " && "
+            source += "[[ -v first ]] && [[ -v last ]] && "
+            source += "[[ -v tail ]]" if tail_set else "[[ ! -v tail ]]"
+            source += " && [[ ! -v REPLY ]]; } <<<payload"
+            self.assertEqual(self.bash_result(source).returncode, 0)
+            self.qualify(source)
+
     def test_presence_and_scope(self):
         locales = subprocess.run(["locale", "-a"], capture_output=True, text=True,
                                  check=True, timeout=10).stdout.splitlines()

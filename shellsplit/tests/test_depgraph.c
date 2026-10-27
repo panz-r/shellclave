@@ -4,6 +4,7 @@
 #include "depgraph_test_workspace.h"
 #include "shell_depgraph.h"
 #include "shell_processor.h"
+#include "shell_source.h"
 #include "shell_tokenizer.h"
 #include "substitution_capacity_cases.h"
 #include "word_expansion_cases.h"
@@ -406,10 +407,10 @@ TEST(supplied_fast_parser_contract) {
   /* Unsupported source semantics are still rejected, even if lexical parsing
    * succeeds. Source support is separate from the trusted parse/source pair. */
   static const char *const unsupported[] = {
-      "[[ -f /tmp/x ]]",
+      "[[ -b /tmp/x ]]",
       "(( count += 1 ))",
       "printf '%s' $\"localized\"",
-      "echo $( [[ -f /tmp/x ]] )",
+      "echo $( [[ -b /tmp/x ]] )",
       "{ (( count )); }",
   };
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -9550,7 +9551,7 @@ TEST(redirect_frame_membership_scaling) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   for (unsigned family = 0; family < 4; family++) {
     size_t previous = 0;
-    /* A command plus both tokens of each duplication fits the 32-token
+    /* A command plus both tokens of each duplication fits the fixed token
      * semantic bound. The scratch-observable family has more route states, so
      * use 2/4/8 to remain within the independent graph-edge capacity. */
     unsigned first = family == 3 ? 2 : 3;
@@ -12212,8 +12213,8 @@ TEST(dialect_boundary_matrix) {
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
-      "[\\\n[ -f value ]]",
-      "[[\\\n -f value ]]",
+      "[\\\n[ -b value ]]",
+      "[[\\\n -b value ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;
@@ -12287,11 +12288,11 @@ TEST(limit_matrix) {
        0},
       {"c 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 "
        "24 25 26 27 28 29 30 31 32 33",
-       {64, 64, SHELL_DEP_MAX_TOKENS, 0, NULL, 0},
+       {64, 64, 32, 0, NULL, 0},
        SHELL_DEP_ETRUNC,
        1,
        0,
-       SHELL_DEP_MAX_TOKENS},
+       32},
       {"echo hello",
        {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, NULL, 0},
        SHELL_DEP_OK,
@@ -12837,6 +12838,57 @@ TEST(validation_rejects_corrupt_command_token_counts) {
   pass_count++;
 }
 
+TEST(command_token_capacity) {
+  static const unsigned counts[] = {32, 33, 47, 48, 49};
+  shell_dep_graph_t *graph = malloc(sizeof(*graph));
+  shell_source_result_t *draft = malloc(sizeof(*draft));
+  ASSERT(graph && draft);
+  for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); ++c) {
+    char source[256] = "cmd";
+    size_t length = 3;
+    for (unsigned i = 1; i < counts[c]; ++i) {
+      memcpy(source + length, " a", 2);
+      length += 2;
+    }
+    source[length] = 0;
+    bool fits = counts[c] <= SHELL_DEP_MAX_TOKENS;
+    ASSERT(parse(source, graph) == (fits ? SHELL_DEP_OK : SHELL_DEP_ETRUNC));
+    ASSERT(shell_dep_graph_validate(graph).valid);
+    ASSERT(graph->nodes[0].cmd.token_count ==
+           (fits ? counts[c] : SHELL_DEP_MAX_TOKENS));
+    ASSERT(shell_parse_draft(source, length, NULL, draft) ==
+           (fits ? SHELL_SOURCE_COMPLETE : SHELL_SOURCE_TRUNCATED));
+    if (fits)
+      ASSERT(draft->headers[0].word_count == counts[c]);
+    shell_dep_limits_t smaller = SHELL_DEP_LIMITS_DEFAULT;
+    smaller.max_tokens_per_cmd = 32;
+    ASSERT(shell_dep_graph_parse(source, length, ".", &smaller, graph) ==
+           (counts[c] == 32 ? SHELL_DEP_OK : SHELL_DEP_ETRUNC));
+  }
+  free(draft);
+  free(graph);
+  pass_count++;
+}
+
+TEST(high_readonly_assignment_positions) {
+  static const unsigned positions[] = {31, 32, 46};
+  shell_dep_graph_t *graph = malloc(sizeof(*graph));
+  ASSERT(graph);
+  for (unsigned p = 0; p < sizeof(positions) / sizeof(*positions); ++p) {
+    char source[1024] = "MARK=$(printf low)";
+    size_t used = strlen(source);
+    for (unsigned i = 1; i < positions[p]; ++i)
+      used += (size_t)snprintf(source + used, sizeof(source) - used, " PAD=x");
+    snprintf(source + used, sizeof(source) - used, " UID=$(printf never) true");
+    ASSERT(parse(source, graph) == SHELL_DEP_OK);
+    ASSERT(count_type(graph, SHELL_NODE_CMD) == 2);
+    ASSERT(count_edge_type(graph, SHELL_EDGE_SUBST) == 1);
+    ASSERT(shell_dep_graph_validate(graph).valid);
+  }
+  free(graph);
+  pass_count++;
+}
+
 TEST(validation_rejects_malformed_group_metadata) {
   shell_dep_graph_t graph = {0};
   ASSERT(parse("{ { echo inner; }; }", &graph) == SHELL_DEP_OK);
@@ -13102,12 +13154,12 @@ TEST(graph_dump_contract) {
 }
 
 TEST(name_helpers) {
-  static const char *edge_names[] = {"READ",  "WRITE",   "APPEND",
-                                     "PIPE",  "ARG",     "ENV",
-                                     "SUBST", "SEQ",     "AND",
-                                     "OR",    "CWD",     "BACKGROUND",
-                                     "GROUP", "FD_OPEN", "FD_CLOSE",
-                                     "TIME"},
+  static const char *edge_names[] = {"READ",  "WRITE",    "APPEND",
+                                     "PIPE",  "ARG",      "ENV",
+                                     "SUBST", "SEQ",      "AND",
+                                     "OR",    "CWD",      "BACKGROUND",
+                                     "GROUP", "FD_OPEN",  "FD_CLOSE",
+                                     "TIME",  "FILE_TEST"},
                     *node_names[] = {"CMD", "DOC", "GROUP", "ENDPOINT", "TIME"},
                     *doc_names[] = {"FILE", "HEREDOC", "HERESTRING", "ENVVAR"},
                     *error_names[] = {
@@ -17680,7 +17732,7 @@ TEST(nested_unsupported_syntax_fails_atomically) {
       "cmd <<<\"$(while true; do :; done)\"",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -f /tmp/x ]]",
+      "time [[ -b /tmp/x ]]",
       "cmd \"$(time eval echo hidden)\"",
       "{ cmd; } <<<\"$(while true; do :; done)\"",
       "{ cmd; } > >(while true; do :; done)",
@@ -18687,6 +18739,8 @@ int main(int argc, char **argv) {
   RUN(validation_rejects_ambiguous_fd_open_forms);
   RUN(validation_rejects_corrupt_counts_documents_and_endpoint_shapes);
   RUN(validation_rejects_corrupt_command_token_counts);
+  RUN(command_token_capacity);
+  RUN(high_readonly_assignment_positions);
   RUN(validation_rejects_malformed_group_metadata);
   RUN(validation_rejects_oob_topology_and_control_cycles);
   RUN(validation_topology_scaling);

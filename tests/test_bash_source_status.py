@@ -44,7 +44,7 @@ class SourceStatusContract(unittest.TestCase):
             (b"1f() { :; }", 4),
             (b'"f"() { :; }', 4),
             (b"f\\ g() { :; }", 4),
-            (b"[[ -f input ]]", 4),
+            (b"[[ -b input ]]", 4),
             (b"((1 + 2))", 0),
             (b"echo ${x!}", 4),
             (b"echo ${x:}", 4),

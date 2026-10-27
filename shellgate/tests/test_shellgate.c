@@ -117,7 +117,7 @@ static int fail_count = 0;
  * dependency-graph workspace. Keep normal test evaluation on the public
  * size-hint path's safe side; small-prefix contracts below deliberately pass
  * a narrower view of this same storage. */
-static char eval_buf[32u * 1024u * 1024u];
+static char eval_buf[48u * 1024u * 1024u];
 static char **temp_files = NULL;
 static size_t temp_file_count = 0;
 static size_t temp_file_capacity = 0;
@@ -3787,6 +3787,14 @@ TEST(conditional_string_contract) {
     ASSERT(eval_cmd(gate, invalid_boundaries[i], &result) == SG_ERR_PARSE);
   ASSERT_SG_OK(eval_cmd(gate, "[[ -z '' ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -f config.json ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -e \"$path\" ]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_ALLOW &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH) &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION));
   ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"x\" ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count);
   ASSERT_SG_OK(eval_cmd(gate, "[[ file.txt == *.txt ]]", &result));
@@ -3939,6 +3947,61 @@ TEST(conditional_string_contract) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT(eval_cmd(gate, "[[ x == ? ]]", &result) == SG_ERR_PARSE);
   sg_gate_free(gate);
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
+    builtin_test_value(const shell_expand_word_request_t *request,
+                       const char **value, size_t *length, void *context) {
+  if (request->purpose != SHELL_EXPAND_WORD_ARGUMENT)
+    return SHELL_EXPAND_UNRESOLVED;
+  *value = context;
+  *length = strlen(*value);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+TEST(builtin_test_grammar_contract) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"test * *"}, 1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, "test \"$op\" target", &result));
+  ASSERT(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV);
+  ASSERT(!(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, builtin_test_value, "2:-n,"));
+  ASSERT_SG_OK(eval_cmd(gate, "test \"$op\" target", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, builtin_test_value, "2:-e,"));
+  ASSERT_SG_OK(eval_cmd(gate, "test \"$op\" target", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  sg_gate_free(gate);
+}
+
+TEST(command_token_capacity_contract) {
+  static const unsigned counts[] = {32, 33, 47, 48, 49};
+  for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); ++c) {
+    char source[256] = "echo";
+    size_t length = 4;
+    for (unsigned i = 1; i < counts[c]; ++i) {
+      memcpy(source + length, " a", 2);
+      length += 2;
+    }
+    source[length] = 0;
+    sg_gate_t *gate = gate_with_rules((const char *[]){source}, 1);
+    ASSERT(gate != NULL);
+    sg_result_t result;
+    sg_error_t error = eval_cmd(gate, source, &result);
+    if (counts[c] <= SHELL_DEP_MAX_TOKENS) {
+      ASSERT(error == SG_OK && result.verdict == SG_VERDICT_ALLOW);
+      ASSERT(!result.truncated && result.subcommand_count == 1);
+    } else
+      ASSERT(error == SG_ERR_TRUNC && result.truncated &&
+             result.verdict == SG_VERDICT_UNDETERMINED);
+    sg_gate_free(gate);
+  }
 }
 
 TEST(static_arithmetic_literal_contract) {
@@ -15701,6 +15764,8 @@ int main(int argc, char **argv) {
   RUN(static_arithmetic_literal_contract);
   RUN(variable_presence_contract);
   RUN(conditional_string_contract);
+  RUN(builtin_test_grammar_contract);
+  RUN(command_token_capacity_contract);
   RUN(continued_expansion_policy_contract);
   RUN(continued_punctuation_policy_contract);
   RUN(dynamic_substitution_flow_contract);

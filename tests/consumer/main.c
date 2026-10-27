@@ -324,6 +324,48 @@ static bool check_depgraph_workspace_api(void) {
                SHELL_CONDITIONAL_VARIABLE_SET &&
            graph.nodes[0].cmd.conditional_operand_count == 1 &&
            graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_TRUE;
+      const char file_test[] = "[[ -f config.json ]]";
+      ok = ok &&
+           shell_parse_draft(file_test, sizeof(file_test) - 1, NULL, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           draft->headers[0].conditional_predicate ==
+               SHELL_CONDITIONAL_FILE_REGULAR &&
+           shell_dep_graph_parse_with_fast(file_test, sizeof(file_test) - 1,
+                                           ".", &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.conditional_predicate ==
+               SHELL_CONDITIONAL_FILE_REGULAR &&
+           graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_UNKNOWN;
+      unsigned file_checks = 0;
+      for (uint32_t i = 0; ok && i < graph.edge_count; ++i) {
+        const shell_dep_edge_t *edge = &graph.edges[i];
+        if (edge->type != SHELL_EDGE_FILE_TEST)
+          continue;
+        const shell_dep_doc_t *doc = &graph.nodes[edge->to].doc;
+        ok = edge->from == 0 && edge->dir == SHELL_DIR_FORWARD &&
+             graph.nodes[edge->to].type == SHELL_NODE_DOC &&
+             doc->kind == SHELL_DOC_FILE &&
+             edge->flags == SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR &&
+             edge->source_fd == SHELL_DEP_FD_NONE &&
+             edge->target_fd == SHELL_DEP_FD_NONE && doc->path_len == 11 &&
+             !memcmp(doc->path, "config.json", 11);
+        ++file_checks;
+      }
+      ok = ok && file_checks == 1;
+      char many_words[SHELL_DEP_MAX_TOKENS * 2 + 4] = "cmd";
+      size_t many_length = 3;
+      for (unsigned i = 1; i < SHELL_DEP_MAX_TOKENS; ++i) {
+        memcpy(many_words + many_length, " a", 2);
+        many_length += 2;
+      }
+      many_words[many_length] = 0;
+      ok = ok &&
+           shell_dep_graph_parse(many_words, many_length, ".", &limits,
+                                 &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.token_count == SHELL_DEP_MAX_TOKENS &&
+           shell_parse_draft(many_words, many_length, NULL, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           draft->headers[0].word_count == SHELL_DEP_MAX_TOKENS;
     }
     free(draft);
   }

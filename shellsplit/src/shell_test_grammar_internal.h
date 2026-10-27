@@ -20,7 +20,30 @@ enum {
   SHELL_TEST_JOIN = 64u,
   SHELL_TEST_END = 128u,
   SHELL_TEST_TERMINAL = 256u,
+  SHELL_TEST_FILE_EXISTS = 512u,
+  SHELL_TEST_FILE_REGULAR = 1024u,
+  SHELL_TEST_FILE_DIRECTORY = 2048u,
+  SHELL_TEST_FILE_SYMLINK = 4096u,
+  SHELL_TEST_AND_JOIN = 8192u,
+  SHELL_TEST_OR_JOIN = 16384u,
 };
+
+enum {
+  SHELL_TEST_LOOKAHEAD_BINARY = 1u,
+  SHELL_TEST_LOOKAHEAD_OPERAND = 2u,
+  SHELL_TEST_FILE_ROLES = SHELL_TEST_FILE_EXISTS | SHELL_TEST_FILE_REGULAR |
+                          SHELL_TEST_FILE_DIRECTORY | SHELL_TEST_FILE_SYMLINK,
+};
+
+/* General-expression binary precedence applies even to a unary-looking
+ * head. Unknown lookahead bytes retain both interpretations. */
+static inline unsigned shell_test_lookahead(unsigned roles, bool dynamic) {
+  bool binary =
+      (roles & (SHELL_TEST_BINARY | SHELL_TEST_JOIN)) == SHELL_TEST_BINARY;
+  return dynamic  ? SHELL_TEST_LOOKAHEAD_BINARY | SHELL_TEST_LOOKAHEAD_OPERAND
+         : binary ? SHELL_TEST_LOOKAHEAD_BINARY
+                  : SHELL_TEST_LOOKAHEAD_OPERAND;
+}
 
 /* Bash valid_number accepts signed base-10 intmax_t values with surrounding
  * ASCII whitespace. Keep this projection with test's operand grammar; read's
@@ -96,10 +119,24 @@ static inline SHELL_NONNULL(1) unsigned shell_test_static_roles(
       roles |= SHELL_TEST_LOOKUP;
     if (spelling[0] == '-' && spelling[1] == 't')
       roles |= SHELL_TEST_TERMINAL;
+    if (spelling[0] == '-') {
+      if (spelling[1] == 'e' || spelling[1] == 'a')
+        roles |= SHELL_TEST_FILE_EXISTS;
+      else if (spelling[1] == 'f')
+        roles |= SHELL_TEST_FILE_REGULAR;
+      else if (spelling[1] == 'd')
+        roles |= SHELL_TEST_FILE_DIRECTORY;
+      else if (spelling[1] == 'L' || spelling[1] == 'h')
+        roles |= SHELL_TEST_FILE_SYMLINK;
+    }
     if ((spelling[0] == '=' || spelling[0] == '!') && spelling[1] == '=')
       roles |= SHELL_TEST_BINARY;
     if (spelling[0] == '-' && (spelling[1] == 'a' || spelling[1] == 'o'))
       roles |= SHELL_TEST_BINARY | SHELL_TEST_JOIN;
+    if (spelling[0] == '-' && spelling[1] == 'a')
+      roles |= SHELL_TEST_AND_JOIN;
+    if (spelling[0] == '-' && spelling[1] == 'o')
+      roles |= SHELL_TEST_OR_JOIN;
   } else if (length == 3 && spelling[0] == '-') {
     if ((!memcmp(spelling, "-eq", 3)) || (!memcmp(spelling, "-ne", 3)) ||
         (!memcmp(spelling, "-lt", 3)) || (!memcmp(spelling, "-le", 3)) ||

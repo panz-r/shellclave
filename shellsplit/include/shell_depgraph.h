@@ -39,7 +39,9 @@ extern "C" {
 
 #define SHELL_DEP_MAX_NODES 128
 #define SHELL_DEP_MAX_EDGES 256
-#define SHELL_DEP_MAX_TOKENS 32
+/* Fixed per-command token capacity, including preparation of assignment
+ * prefixes and redirection syntax. It is not a final expanded argc limit. */
+#define SHELL_DEP_MAX_TOKENS 48
 #define SHELL_DEP_MAX_HEREDOCS 8
 #define SHELL_DEP_CWD_BUF_SIZE 16384 /* 16KB buffer for unique CWD strings */
 /* An edge endpoint has no applicable file descriptor. */
@@ -110,9 +112,12 @@ typedef enum {
   /* `value` is a physical `<<-` source span. Use the content helpers to
    * obtain the tab-stripped logical bytes. */
   SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS = 1 << 0,
-  /* The file-path operand contains a command substitution, so `path` is
-   * source spelling rather than a resolved filesystem path. This covers both
-   * ordinary redirections and Bash `$(<word)` file-command substitutions. */
+  /* The FILE pathname is dynamic, for example through parameter or command
+   * expansion. `path` retains source spelling. Successful resolution clears
+   * DYNAMIC_NAME and sets RESOLVED_PATH, supplying the pathname in
+   * value/value_len. This applies to redirection targets,
+   * Bash `$(<word)` file-command substitutions,
+   * path-looking arguments and filesystem predicate operands. */
   SHELL_DEP_DOC_FLAG_DYNAMIC_NAME = 1 << 1,
   /* The heredoc delimiter was quoted and its body is literal. */
   SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL = 1 << 2,
@@ -182,6 +187,11 @@ typedef enum {
   /* TIME node to the command/group endpoint that roots the measured
    * pipeline. This is structural, not a byte-flow edge. */
   SHELL_EDGE_TIME = 15,
+  /* A possible filesystem metadata query, directed from CMD to FILE, with
+   * no descriptor. This is not a file-content read. Its flags identify one
+   * or more possible tests; uncertain builtin argument roles can produce
+   * conservative alternatives. The FILE retains pathname and CWD facts. */
+  SHELL_EDGE_FILE_TEST = 16,
 } shell_dep_edge_type_t;
 
 typedef enum {
@@ -211,6 +221,13 @@ typedef enum {
    * opening a document. Its source and target can be numeric or Bash named
    * descriptors. */
   SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP = 1 << 3,
+  /* FILE_TEST tests existence, regular-file type, directory type, or link
+   * type respectively. The first three follow links; the last inspects the
+   * link itself. These flags may be combined for uncertain operator roles. */
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS = 1 << 4,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR = 1 << 5,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY = 1 << 6,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK = 1 << 7,
 } shell_dep_edge_flags_t;
 
 /**
@@ -246,8 +263,8 @@ typedef enum {
 typedef struct {
   uint32_t max_nodes;
   uint32_t max_edges;
-  uint32_t max_tokens_per_cmd;
-  uint32_t cwd_buf_size; /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
+  uint32_t max_tokens_per_cmd; /* Graph token budget, capped at 48. */
+  uint32_t cwd_buf_size;       /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
   void *workspace;
   size_t workspace_size;
 } shell_dep_limits_t;
@@ -329,8 +346,10 @@ typedef enum {
  */
 typedef struct {
   shell_command_kind_t kind;
-  /* Borrowed CONDITIONAL spans in source/expansion order; never argv or
-   * pathname operands. Predicate truth includes lexical negation. EQUAL and
+  /* Borrowed CONDITIONAL spans in source/expansion order, separate from argv.
+   * Filesystem operands also have FILE documents linked by FILE_TEST when a
+   * metadata check is possible. Empty paths are false; other filesystem truth
+   * remains unknown. Predicate truth includes lexical negation. EQUAL and
    * NOT_EQUAL compare literal strings; PATTERN_MATCH and PATTERN_NOT_MATCH use
    * static RHS patterns with active stars. VARIABLE_SET queries scalar presence
    * from execution state, independently of string length or descriptor access;
@@ -592,7 +611,8 @@ typedef struct {
   shell_dep_edge_type_t type;
   shell_dep_edge_dir_t dir;
   uint8_t flags; /* shell_dep_edge_flags_t */
-  /* Descriptor pair for the directed byte relation. Use SHELL_DEP_FD_NONE on
+  /* Descriptor pair for byte routes and setup bindings. FILE_TEST and other
+   * descriptor-free relations use SHELL_DEP_FD_NONE on both sides. Use it on
    * the non-descriptor side: DOC→owner READ is none→fd, owner→DOC WRITE is
    * fd→none, and PIPE is fd→fd. Shell-word and dynamic-FILE-name SUBST edges
    * terminate at none; an unflagged process-substitution route can instead
@@ -799,26 +819,27 @@ typedef struct {
  * mutate bindings or evaluate value data as shell syntax without a modeled
  * runtime source. Ordinary expansion and prefix-name enumeration do not
  * perform that re-evaluation and remain supported. The same rejection applies
- * to `test`/`[` -v array-variable lookups and unresolved lookup operands or
- * expression roles. Quoting such a target does not disable its subscript
- * evaluation. Static scalar queries and non-evaluating string/file predicates
- * remain supported; expression argument cardinality must be known.
- * Declaration operands recognize assignments after quote removal and empty
- * process-fragment elision. Scalar writes invalidate the same named bindings
- * as plain spellings; integer/protected/readonly restrictions still apply.
- * ENVVAR names retain their raw spans and decode through the name accessors.
- * This does not change lexical command-prefix assignment recognition.
- * A successful whole-variable unset of a resettable predefined Bash getter,
- * integer, or array is retained in the path-local execution journal. Later
- * writes in that shell and its descendants are ordinary scalar writes.
- * Command, backtick, and process substitutions inherit the path's capability
- * mask, separately from physical descriptor imports. Child-local changes do
- * not publish into their parent. A
- * conditional unset, a child-shell unset observed from its parent, or a join
- * which can retain the original predefined binding does not establish that
- * proof. Automatically recreated, unset-rejected, readonly, and executor-
- * frozen variables never acquire it. This is shell-state semantics, not a
- * source-only tokenizer decision.
+ * to `test`/`[` -v array-variable lookups and unresolved lookup operands.
+ * Quoting such a target does not disable its subscript evaluation. Safe dynamic
+ * operator roles retain grammar alternatives and captured argument values
+ * refine them before body evaluation. Every possible lookup must satisfy the
+ * scalar-name restrictions, and expression argument cardinality must be known.
+ * Static scalar queries and non-evaluating string/file predicates are
+ * supported. Declaration operands recognize assignments after quote removal and
+ * empty process-fragment elision. Scalar writes invalidate the same named
+ * bindings as plain spellings; integer/protected/readonly restrictions still
+ * apply. ENVVAR names retain their raw spans and decode through the name
+ * accessors. This does not change lexical command-prefix assignment
+ * recognition. A successful whole-variable unset of a resettable predefined
+ * Bash getter, integer, or array is retained in the path-local execution
+ * journal. Later writes in that shell and its descendants are ordinary scalar
+ * writes. Command, backtick, and process substitutions inherit the path's
+ * capability mask, separately from physical descriptor imports. Child-local
+ * changes do not publish into their parent. A conditional unset, a child-shell
+ * unset observed from its parent, or a join which can retain the original
+ * predefined binding does not establish that proof. Automatically recreated,
+ * unset-rejected, readonly, and executor-frozen variables never acquire it.
+ * This is shell-state semantics, not a source-only tokenizer decision.
  * `getopts` likewise rejects integer/protected or runtime-expanded destinations
  * and unknown operand cardinality before its target. Quoted runtime optstrings
  * must leave every possible target position safe (including an expanded --).
@@ -1188,8 +1209,11 @@ bool shell_dep_resolved_workspace_size(size_t command_length,
  *
  * Optional unresolved_paths references SHELL_DEP_MAX_NODES writable bytes,
  * distinct from inputs, output and workspace. It receives one flag per retained
- * node for unresolved active pathname expansion, including removed byte-flow
- * edges. Unused bytes and all flags on errors are zero. */
+ * node for unresolved active pathname expansion, including filesystem-predicate
+ * operands and removed byte-flow edges. Predicate paths are marked only when
+ * a retained grammar alternative can select the check. Flags survive output
+ * truncation for retained owners. Unused bytes and all flags on errors other
+ * than truncation are zero. */
 shell_dep_error_t shell_dep_graph_parse_resolved(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
     const shell_dep_limits_t *limits, shell_dep_graph_t *out,
@@ -1272,9 +1296,10 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp)
  *   (PIPE/SEQ/AND/OR require CMD/GROUP endpoints; SUBST additionally permits
  *    ENDPOINT and DOC(FILE) sources and DOC(HEREDOC/HERESTRING) targets; READ
  * requires DOC→CMD/GROUP, WRITE/APPEND require an execution endpoint→DOC or
- * ENDPOINT, ENV requires DOC→CMD, ARG requires CMD↔DOC(FILE); FD_OPEN is a
- * forward setup binding: execution→DOC for output, DOC→execution for input,
- * execution→ENDPOINT for process-substitution output, or
+ * ENDPOINT, ENV requires DOC→CMD, ARG requires CMD↔DOC(FILE); FILE_TEST
+ * requires CMD→DOC(FILE), predicate flags, and no source or target descriptor.
+ * FD_OPEN is a forward setup binding: execution→DOC for output, DOC→execution
+ * for input, execution→ENDPOINT for process-substitution output, or
  * execution/ENDPOINT→execution for descriptor routing. An internal retained
  * process-substitution endpoint may have only FD_OPEN setup, or one-sided
  * numeric SUBST/WRITE uses, without a connected child stream. It also permits a

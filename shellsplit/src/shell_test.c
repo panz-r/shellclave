@@ -11,6 +11,10 @@ enum {
   TEST_EQUAL,
   TEST_NOT_EQUAL,
   TEST_PRESENT,
+  TEST_FILE_EXISTS,
+  TEST_FILE_REGULAR,
+  TEST_FILE_DIRECTORY,
+  TEST_FILE_SYMLINK,
   TEST_TERMINAL,
   TEST_OPAQUE,
   TEST_OPAQUE_ERROR,
@@ -22,9 +26,15 @@ enum {
 
 _Static_assert(SHELL_DEP_MAX_TOKENS * 2u + 2u <= UINT16_MAX,
                "test expression ordinals fit retained private nodes");
-_Static_assert(sizeof(shell_test_value_t) + 2 * sizeof(shell_test_node_t) + 8 <=
+_Static_assert(sizeof(shell_test_value_t) + 2 * sizeof(shell_test_node_t) +
+                       sizeof(uint16_t) + 8 +
+                       2 * (SHELL_DEP_MAX_TOKENS + 1) *
+                           (SHELL_DEP_MAX_TOKENS + 1) / SHELL_DEP_MAX_TOKENS +
+                       2 <=
                    SHELL_SOURCE_VALUE_SCRATCH_FACTOR,
-               "test values and aligned program nodes fit source scratch");
+               "test values, nodes and bounded projection fit source scratch");
+_Static_assert(SHELL_DEP_MAX_TOKENS < 63,
+               "projected parenthesis depths fit the bounded bitset");
 
 bool shell_test_prepare_value(const char *source, size_t length,
                               shell_test_value_t *value) {
@@ -72,7 +82,7 @@ static SHELL_NONNULL(1) bool binary(const shell_test_program_t *p, size_t i) {
   const shell_test_value_t *v = &p->words[i];
   unsigned roles =
       v->known ? shell_test_static_roles(v->value, v->value_length) : 0;
-  return (roles & (SHELL_TEST_BINARY | SHELL_TEST_JOIN)) == SHELL_TEST_BINARY;
+  return shell_test_lookahead(roles, !v->known) == SHELL_TEST_LOOKAHEAD_BINARY;
 }
 
 static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
@@ -91,6 +101,14 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
       kind = TEST_OPAQUE_ERROR;
   } else if (is_word(p, op, "-v"))
     kind = TEST_PRESENT;
+  else if (is_word(p, op, "-e") || is_word(p, op, "-a"))
+    kind = TEST_FILE_EXISTS;
+  else if (is_word(p, op, "-f"))
+    kind = TEST_FILE_REGULAR;
+  else if (is_word(p, op, "-d"))
+    kind = TEST_FILE_DIRECTORY;
+  else if (is_word(p, op, "-L") || is_word(p, op, "-h"))
+    kind = TEST_FILE_SYMLINK;
   else if (is_word(p, op, "-t"))
     kind = TEST_TERMINAL;
   else if (is_word(p, op, "-n"))
@@ -105,11 +123,18 @@ typedef struct {
   uint16_t close[SHELL_DEP_MAX_TOKENS];
   uint16_t unknown[SHELL_DEP_MAX_TOKENS + 1];
   size_t total_count;
-  bool uncertain;
+  bool uncertain, failed;
 } parser_t;
 
-static uint16_t expression(parser_t *parser, size_t *position, size_t end);
-static uint16_t counted(parser_t *parser, size_t begin, size_t end);
+static SHELL_NONNULL(1, 2) uint16_t
+    expression(parser_t *parser, size_t *position, size_t end);
+static SHELL_NONNULL(1, 2) uint16_t counted(parser_t *parser, size_t *position,
+                                            size_t end, size_t expression_end);
+
+static SHELL_NONNULL(1) uint16_t parse_error(parser_t *parser) {
+  parser->failed = true;
+  return node(parser->program, TEST_ERROR, 0, 0);
+}
 
 static SHELL_NONNULL(1, 2) uint16_t
     term(parser_t *parser, size_t *position, size_t end) {
@@ -117,7 +142,7 @@ static SHELL_NONNULL(1, 2) uint16_t
   size_t i = (*position)++;
   if (i == end) {
     *position = end;
-    return node(p, TEST_ERROR, 0, 0);
+    return parse_error(parser);
   }
   if (!p->words[i].known) {
     parser->uncertain = true;
@@ -126,6 +151,8 @@ static SHELL_NONNULL(1, 2) uint16_t
   }
   if (is_word(p, i, "!")) {
     uint16_t child = term(parser, position, end);
+    if (parser->failed)
+      return child;
     return node(p, TEST_NOT, child, 0);
   }
   if (is_word(p, i, "(")) {
@@ -136,15 +163,14 @@ static SHELL_NONNULL(1, 2) uint16_t
       parser->uncertain = true;
     uint16_t child;
     if (close < end && close - i - 1 <= 4) {
-      child = counted(parser, i + 1, close);
-      *position = close;
+      child = counted(parser, position, close, end);
     } else {
       child = expression(parser, position, end);
     }
-    if (*position == end || !is_word(p, *position, ")")) {
-      *position = end;
-      return node(p, TEST_ERROR, 0, 0);
-    }
+    if (parser->failed)
+      return child;
+    if (*position == end || !is_word(p, *position, ")"))
+      return parse_error(parser);
     ++*position;
     return child;
   }
@@ -152,6 +178,8 @@ static SHELL_NONNULL(1, 2) uint16_t
     *position = i + 3;
     return primary(p, i + 1, i, i + 2, true);
   }
+  if (i + 2 < end && !p->words[i + 1].known)
+    parser->uncertain = true;
   if (i + 1 < end && unary(p, i)) {
     if (is_word(p, i, "-t")) {
       const shell_test_value_t *argument = &p->words[i + 1];
@@ -182,27 +210,41 @@ static SHELL_NONNULL(1, 2) uint16_t
     conjunction(parser_t *parser, size_t *position, size_t end) {
   shell_test_program_t *p = parser->program;
   uint16_t result = term(parser, position, end);
+  if (parser->failed)
+    return result;
   while (*position < end && is_word(p, *position, "-a")) {
     ++*position;
     uint16_t right = term(parser, position, end);
+    if (parser->failed)
+      return right;
     result = node(p, TEST_AND, result, right);
   }
   return result;
 }
 
-static uint16_t expression(parser_t *parser, size_t *position, size_t end) {
+static SHELL_NONNULL(1, 2) uint16_t
+    expression(parser_t *parser, size_t *position, size_t end) {
   shell_test_program_t *p = parser->program;
   uint16_t result = conjunction(parser, position, end);
+  if (parser->failed)
+    return result;
   while (*position < end && is_word(p, *position, "-o")) {
     ++*position;
     uint16_t right = conjunction(parser, position, end);
+    if (parser->failed)
+      return right;
     result = node(p, TEST_OR, result, right);
   }
   return result;
 }
 
-static uint16_t counted(parser_t *parser, size_t begin, size_t end) {
+/* Shortcuts consume their counted span. General fallback keeps the enclosing
+ * expression end and returns its actual cursor, which may pass the candidate
+ * ')' used to choose dispatch. The enclosing group validates that cursor. */
+static SHELL_NONNULL(1, 2) uint16_t counted(parser_t *parser, size_t *position,
+                                            size_t end, size_t expression_end) {
   shell_test_program_t *p = parser->program;
+  size_t begin = *position;
   size_t count = end - begin;
   shell_builtin_test_word_t words[4];
   for (size_t i = 0; i < count && i < 4; ++i) {
@@ -242,37 +284,30 @@ static uint16_t counted(parser_t *parser, size_t begin, size_t end) {
     break;
   }
   case SHELL_TEST_DISPATCH_UNKNOWN:
+    parser->uncertain = true;
     result = node(p, TEST_OPAQUE_ERROR, 0, 0);
     break;
   case SHELL_TEST_DISPATCH_ERROR:
-    result = node(p, TEST_ERROR, 0, 0);
-    break;
+    return parse_error(parser);
   case SHELL_TEST_DISPATCH_GENERAL:
-    goto general;
+    return expression(parser, position, expression_end);
   }
+  *position = end;
   return dispatch.negated ? node(p, TEST_NOT, result, 0) : result;
-general:;
-  size_t position = begin;
-  result = expression(parser, &position, end);
-  if (position != end) {
-    for (size_t i = position; i < end; ++i)
-      if (!p->words[i].known)
-        parser->uncertain = true;
-    return node(p, parser->uncertain ? TEST_OPAQUE_ERROR : TEST_ERROR, 0, 0);
-  }
-  return result;
 }
 
-bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
-                        shell_test_program_t *program) {
-  *program = (shell_test_program_t){
-      .words = words, .word_count = (uint16_t)count, .active = true};
-  program->nodes = shell_source_scratch_take_array(
-      count * 2 + 1, sizeof(*program->nodes), _Alignof(shell_test_node_t));
-  if (!program->nodes)
-    return false;
-  if (bracket) {
+#include "shell_test_projection_impl.h"
+
+bool shell_test_refresh(shell_test_program_t *program) {
+  shell_test_value_t *words = program->words;
+  size_t count = program->word_count;
+  program->count = 0;
+  program->uncertain = false;
+  if (count)
+    memset(program->operand_roles, 0, count * sizeof(uint16_t));
+  if (program->bracket) {
     if (!count || !is_word(program, count - 1, "]")) {
+      program->uncertain = count && !words[count - 1].known;
       program->root = node(program,
                            count && !words[count - 1].known ? TEST_OPAQUE_ERROR
                                                             : TEST_ERROR,
@@ -309,10 +344,36 @@ bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
     parser.close[i] = i + 2 <= count ? next[i + 2] : UINT16_MAX;
     parser.unknown[i + 1] = parser.unknown[i] + !words[i].known;
   }
-  program->root = counted(&parser, 0, count);
+  size_t position = 0;
+  program->root = counted(&parser, &position, count, count);
+  if (!parser.failed && position != count) {
+    for (size_t i = position; i < count; ++i)
+      if (!words[i].known)
+        parser.uncertain = true;
+    program->root = parse_error(&parser);
+  }
   if (parser.uncertain)
     program->root = node(program, TEST_OPAQUE_ERROR, 0, 0);
-  return true;
+  program->uncertain = parser.uncertain;
+  return !program->uncertain || project_program(program, count);
+}
+
+bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
+                        shell_test_program_t *program) {
+  *program = (shell_test_program_t){.words = words,
+                                    .word_count = (uint16_t)count,
+                                    .active = true,
+                                    .bracket = bracket};
+  /* Each term consumes source words once; successful operators add at most
+   * one combining node per word. Definite errors propagate without wrapping
+   * or replay. Two extra nodes cover terminal and uncertain-result roots. */
+  program->nodes = shell_source_scratch_take_array(
+      count * 2 + 2, sizeof(*program->nodes), _Alignof(shell_test_node_t));
+  program->operand_roles = shell_source_scratch_take_array(
+      count, sizeof(*program->operand_roles), _Alignof(uint16_t));
+  if (!program->nodes || (!program->operand_roles && count))
+    return false;
+  return shell_test_refresh(program);
 }
 
 void shell_test_prove_error(shell_test_program_t *program) {
@@ -374,6 +435,12 @@ static SHELL_NONNULL(1, 2, 3,
                    ? lookup(a->value, a->value_length, context)
                    : 3u;
       break;
+    case TEST_FILE_EXISTS:
+    case TEST_FILE_REGULAR:
+    case TEST_FILE_DIRECTORY:
+    case TEST_FILE_SYMLINK:
+      result = a->known && !a->value_length ? SHELL_TEST_FALSE : 3u;
+      break;
     case TEST_TERMINAL:
       result = !a->known ? 7u : a->number ? 3u : SHELL_TEST_ERROR_RESULT;
       break;
@@ -418,9 +485,53 @@ unsigned shell_test_evaluate(const shell_test_program_t *program,
   return evaluate(program, lookup, context, results);
 }
 
+void shell_test_observe_files(const shell_test_program_t *program,
+                              shell_test_file_observer_t observer,
+                              void *context) {
+  if (program->proven_error)
+    return;
+  if (program->uncertain) {
+    for (size_t i = 0; i < program->word_count; ++i) {
+      unsigned roles = program->operand_roles[i] & SHELL_TEST_FILE_ROLES;
+      if (roles)
+        observer(&program->words[i],
+                 (roles / SHELL_TEST_FILE_EXISTS) *
+                     SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS,
+                 context);
+    }
+    return;
+  }
+  uint16_t stack[SHELL_DEP_MAX_TOKENS * 2 + 2];
+  size_t count = 0;
+  stack[count++] = program->root;
+  while (count) {
+    shell_test_node_t n = program->nodes[stack[--count]];
+    if (n.operation >= TEST_FILE_EXISTS && n.operation <= TEST_FILE_SYMLINK)
+      observer(&program->words[n.left],
+               SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS
+                   << (n.operation - TEST_FILE_EXISTS),
+               context);
+    else if (n.operation == TEST_NOT)
+      stack[count++] = n.left;
+    else if (n.operation == TEST_AND || n.operation == TEST_OR) {
+      stack[count++] = n.right;
+      stack[count++] = n.left;
+    }
+  }
+}
+
 void shell_test_observe_presence(const shell_test_program_t *program,
                                  shell_test_presence_observer_t observer,
                                  void *context) {
+  if (program->uncertain) {
+    for (size_t i = 0; i < program->word_count; ++i) {
+      const shell_test_value_t *word = &program->words[i];
+      if ((program->operand_roles[i] & SHELL_TEST_LOOKUP) && word->known &&
+          shell_word_scalar_name(word->value, word->value_length))
+        observer(word->value, word->value_length, context);
+    }
+    return;
+  }
   uint16_t pending[SHELL_DEP_MAX_TOKENS * 2 + 2];
   unsigned count = 1;
   pending[0] = program->root;

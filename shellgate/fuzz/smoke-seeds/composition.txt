@@ -1,1 +1,3 @@
 test -f input && cat input || echo missing
+test -e "$operator" -e -a -f target && cat <effect
+[ "$operator" target ]

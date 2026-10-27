@@ -2176,14 +2176,14 @@ void run_semantic_reference_oracles() {
    * cannot construct the command's execution semantics. These fixed cases
    * intentionally live in the harness rather than the smoke corpus. */
   static const char *const unmodeled_semantic_cases[] = {
-      "[[ -f /tmp/x ]]",
+      "[[ -b /tmp/x ]]",
       "(( count += 1 ))",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -f /tmp/x ]]",
+      "time [[ -b /tmp/x ]]",
       "echo \"$(time eval echo hidden)\"",
       "printf '%s' $\"localized\"",
-      "echo $( [[ -f /tmp/x ]] )",
+      "echo $( [[ -b /tmp/x ]] )",
       "{ (( count )); }",
       "cat <<EOF\n$(while true; do :; done)\nEOF\n",
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",

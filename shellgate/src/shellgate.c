@@ -1517,9 +1517,9 @@ static SHELL_NONNULL(1, 2, 3) uint32_t
                       (doc->flags & (SHELL_DEP_DOC_FLAG_RESOLVED_PATH |
                                      SHELL_DEP_DOC_FLAG_EXPANSION_FAILED)) == 0;
     bool owns_path =
-        edge->type == SHELL_EDGE_ARG || edge->type == SHELL_EDGE_READ ||
-        edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND ||
-        edge->type == SHELL_EDGE_FD_OPEN ||
+        edge->type == SHELL_EDGE_ARG || edge->type == SHELL_EDGE_FILE_TEST ||
+        edge->type == SHELL_EDGE_READ || edge->type == SHELL_EDGE_WRITE ||
+        edge->type == SHELL_EDGE_APPEND || edge->type == SHELL_EDGE_FD_OPEN ||
         (edge->type == SHELL_EDGE_SUBST && edge->from == document);
     if (unresolved && owns_path) {
       flags[owner] |= SG_EXPANSION_UNRESOLVED_PATH;
@@ -1988,7 +1988,7 @@ static SHELL_NONNULL(1, 2) sg_file_path_t
   size_t decoded_capacity = capacity / 2;
   char *identity = scratch + decoded_capacity;
   sg_file_path_t path = {.decoded = scratch, .identity = identity};
-  /* The graph has already classified this redirect operand in its shell
+  /* The graph has already classified this pathname operand in its shell
    * context. Decode once for spelling heuristics; unresolved dynamic paths
    * must never acquire a concrete identity from generic word classification. */
   bool is_static = !(doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME);
@@ -3025,6 +3025,8 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
            graph->nodes[edge->from].type == SHELL_NODE_GROUP) ||
           edge->type == SHELL_EDGE_SEQ || edge->type == SHELL_EDGE_AND ||
           edge->type == SHELL_EDGE_OR || edge->type == SHELL_EDGE_BACKGROUND ||
+          (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+           edge->type == SHELL_EDGE_FILE_TEST && edge->from == endpoint) ||
           (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
            edge->type == SHELL_EDGE_SUBST && edge->to == endpoint);
       if (!allowed)

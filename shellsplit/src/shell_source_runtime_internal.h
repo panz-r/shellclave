@@ -46,8 +46,9 @@ typedef struct shell_source_array_boundary {
   struct shell_source_array_boundary *parent;
 } shell_source_array_boundary_t;
 #define SHELL_SOURCE_INLINE_ARRAYS 8u
-/* Temporary value storage per source byte within the aggregate arena bound. */
-enum { SHELL_SOURCE_VALUE_SCRATCH_FACTOR = 64 };
+/* Temporary value storage per source byte, including one bounded ambiguous
+ * test grammar chart in addition to retained decoded arguments and nodes. */
+enum { SHELL_SOURCE_VALUE_SCRATCH_FACTOR = 192 };
 typedef struct {
   shell_source_array_boundary_t *entries;
   size_t count;

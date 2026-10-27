@@ -75,13 +75,12 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 8) bool dep_test_select(
                                .journal = journal,
                                .baseline = baseline,
                                .prefixes = &source->prefix_assignments};
-    unsigned result =
-        shell_test_evaluate(&source->test, dep_test_lookup, &test);
+    unsigned result = shell_test_evaluate(source->test, dep_test_lookup, &test);
     if (!(result & (desired == SHELL_TEST_FALSE
                         ? SHELL_TEST_FALSE | SHELL_TEST_ERROR_RESULT
                         : desired)))
       continue;
-    if (!shell_test_require(&source->test, desired, dep_test_lookup,
+    if (!shell_test_require(source->test, desired, dep_test_lookup,
                             dep_test_assume, &test)) {
       *failed = true;
       return false;

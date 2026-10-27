@@ -229,7 +229,7 @@ int main(int argc, char **argv) {
       {"1f() { :; }", SHELL_SOURCE_UNSUPPORTED},
       {"\"f\"() { :; }", SHELL_SOURCE_UNSUPPORTED},
       {"f\\ g() { :; }", SHELL_SOURCE_UNSUPPORTED},
-      {"[[ -f input ]]", SHELL_SOURCE_UNSUPPORTED},
+      {"[[ -b input ]]", SHELL_SOURCE_UNSUPPORTED},
       {"((1 + 2))", SHELL_SOURCE_COMPLETE},
       {"(( $(printf 1; : 日本) ))", SHELL_SOURCE_COMPLETE},
       {"(( $(printf 日本 &&) ))", SHELL_SOURCE_INVALID},

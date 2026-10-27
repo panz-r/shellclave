@@ -254,12 +254,25 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
   if (p == n)
     return r;
   bool variable = plain(s, n, p, end, "-v");
-  bool unary =
-      variable || plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z");
+  bool file_exists = plain(s, n, p, end, "-e");
+  bool file_regular = plain(s, n, p, end, "-f");
+  bool file_directory = plain(s, n, p, end, "-d");
+  bool file_symlink = plain(s, n, p, end, "-L") || plain(s, n, p, end, "-h");
+  bool unary = variable || file_exists || file_regular || file_directory ||
+               file_symlink || plain(s, n, p, end, "-n") ||
+               plain(s, n, p, end, "-z");
   r.predicate = SHELL_CONDITIONAL_STRING_NONEMPTY;
   if (unary) {
     if (variable)
       r.predicate = SHELL_CONDITIONAL_VARIABLE_SET;
+    else if (file_exists)
+      r.predicate = SHELL_CONDITIONAL_FILE_EXISTS;
+    else if (file_regular)
+      r.predicate = SHELL_CONDITIONAL_FILE_REGULAR;
+    else if (file_directory)
+      r.predicate = SHELL_CONDITIONAL_FILE_DIRECTORY;
+    else if (file_symlink)
+      r.predicate = SHELL_CONDITIONAL_FILE_SYMLINK;
     else if (plain(s, n, p, end, "-z"))
       r.predicate = SHELL_CONDITIONAL_STRING_EMPTY;
     r.operand_count = 0;
@@ -502,6 +515,20 @@ bool shell_conditional_evaluate(const char *source,
                                 bool *truth) {
   if (condition->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
     return false; /* Presence is a path-local graph fact, not a string value. */
+  if (condition->predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
+      condition->predicate <= SHELL_CONDITIONAL_FILE_SYMLINK) {
+    bool empty;
+    if (values[0].known)
+      empty = values[0].length == 0;
+    else if (!shell_conditional_static_empty(source + condition->operands[0],
+                                             condition->operand_lengths[0],
+                                             &empty))
+      return false;
+    if (!empty)
+      return false;
+    *truth = condition->negated;
+    return true;
+  }
   bool unary = condition->operand_count == 1;
   if (unary) {
     bool empty;

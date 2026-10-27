@@ -23,6 +23,8 @@ extern "C" {
  * Static-name [[ -v name ]] lookups use graph state and make no callback.
  * CONDITIONAL requests instead require one final NUL-free string record,
  * including 0:, for empty; suppress splitting, pathname and brace expansion.
+ * Filesystem predicates in [[ ... ]] use this purpose too: an empty value
+ * makes the predicate false. The test/[ builtins use ARGUMENT requests.
  * Join positional expansion results according to Bash conditional semantics.
  * Literal comparisons query each dynamic operand separately in source order;
  * return ordinary final string bytes for both sides, without pattern escaping.
@@ -41,12 +43,17 @@ extern "C" {
  * state reaching this expansion point, accounting for earlier/scoped effects;
  * otherwise return UNRESOLVED. This library never executes an expansion.
  * Bash assignment-shaped tilde expansion (name=~, name+=~, name=a:~) also
- * applies to FILE operands, including $(<name=~), but not here-string data.
+ * applies to redirection and file-command-substitution pathname operands,
+ * including $(<name=~), but not here-string data.
  * Source syntax is validated before callbacks. Command identity, wrappers,
  * assignments, cd and shell-state/descriptor operands are not resolved here.
  * This includes printf %b operands in formats containing %n: an expanded
  * '\c' can suppress later variable writes, including on format reuse.
  * Ordinary printf data, including %b without %n, remains eligible.
+ * Admitted test/[ arguments are eligible too. Captured values refine their
+ * operator/operand roles before body evaluation; unresolved values retain
+ * possible grammar alternatives. Admission still rejects potentially unsafe
+ * scalar/subscript lookups before any callback.
  * Eligibility follows surviving argv positions: wholly elided process words
  * consume no builtin argument slot, while quoted empty arguments do. Requests
  * still identify the original source spelling and offsets.
@@ -54,9 +61,10 @@ extern "C" {
  * short-circuiting. Each eligible dynamic source word is queried at most once.
  * Resolution does not discharge executable-substitution inspection obligations.
  * Unresolved words retain source spelling; consumers report uncertainty in
- * their results. A pathname must resolve to one nonempty NUL-free record.
- * Zero/multiple records or an empty pathname model redirection failure; NUL is
- * a resolution error.
+ * their results. REDIRECT_PATH and FILE_SUBSTITUTION_PATH require one nonempty
+ * NUL-free record. Zero/multiple records or an empty pathname model redirection
+ * failure; NUL is a resolution error. An empty filesystem-predicate operand
+ * instead yields false without a FILE_TEST relation.
  */
 typedef enum {
   SHELL_EXPAND_UNRESOLVED = 0,
@@ -68,7 +76,7 @@ typedef enum {
   SHELL_EXPAND_WORD_ARGUMENT = 0,
   SHELL_EXPAND_WORD_REDIRECT_PATH,
   SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH,
-  /* One conditional string, without word splitting, globbing or brace
+  /* One conditional operand value, without word splitting, globbing or brace
    * expansion. RESOLVED requires one NUL-free record, including 0:, for an
    * empty string. */
   SHELL_EXPAND_WORD_CONDITIONAL,

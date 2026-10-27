@@ -31,6 +31,9 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
   case SHELL_EDGE_ARG:
     return (from == SHELL_NODE_DOC && to == SHELL_NODE_CMD) ||
            (from == SHELL_NODE_CMD && to == SHELL_NODE_DOC);
+  case SHELL_EDGE_FILE_TEST:
+    return from == SHELL_NODE_CMD && to == SHELL_NODE_DOC &&
+           graph->nodes[edge->to].doc.kind == SHELL_DOC_FILE;
   case SHELL_EDGE_WRITE:
   case SHELL_EDGE_APPEND:
     return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
@@ -176,20 +179,27 @@ static bool shellsplit_test_depgraph_invariants(
   for (uint32_t i = 0; i < graph->edge_count; i++) {
     const shell_dep_edge_t *edge = &graph->edges[i];
     if (edge->from >= graph->node_count || edge->to >= graph->node_count ||
-        edge->type > SHELL_EDGE_TIME || edge->dir > SHELL_DIR_UNDIR ||
-        (edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
-                         SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
-                         SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
-                         SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
-        ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
-         (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
-        ((edge->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
-                         SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 &&
-         edge->type != SHELL_EDGE_SUBST) ||
-        ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
-         edge->type != SHELL_EDGE_FD_OPEN) ||
-        ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
-         edge->type != SHELL_EDGE_FD_OPEN) ||
+        edge->type > SHELL_EDGE_FILE_TEST || edge->dir > SHELL_DIR_UNDIR ||
+        (edge->type == SHELL_EDGE_FILE_TEST
+             ? (edge->flags == 0 ||
+                (edge->flags & ~(SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK)) != 0)
+             : ((edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                                 SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
+                                 SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
+                                 SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
+                ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
+                 (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
+                ((edge->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                                 SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) !=
+                     0 &&
+                 edge->type != SHELL_EDGE_SUBST) ||
+                ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
+                 edge->type != SHELL_EDGE_FD_OPEN) ||
+                ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
+                 edge->type != SHELL_EDGE_FD_OPEN))) ||
         !shellsplit_test_span_in_input(input, length, edge->source_fd_name,
                                        edge->source_fd_name_len) ||
         !shellsplit_test_span_in_input(input, length, edge->target_fd_name,

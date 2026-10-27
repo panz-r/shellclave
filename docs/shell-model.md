@@ -185,12 +185,12 @@ Quoted or escaped `?`, brackets and parentheses remain literal bytes. Unquoted
 unmatched `[` that Bash would treat literally.
 
 Internal boolean combinations, parenthesized conditions, wider patterns, regex,
-ordering/numeric comparisons and filesystem/variable-attribute predicates
+ordering/numeric comparisons and other filesystem/variable-attribute predicates
 remain UNSUPPORTED.
 Lists and existing outer `&&`/`||` connectors compose supported conditions.
 
 Newlines and comments are permitted before a primary, after lexical `!`, and
-after the operand of an explicit `-n`/`-z` predicate or the right operand of a
+after the operand of an explicit unary predicate or the right operand of a
 comparison. They are not permitted between a left operand and its comparison
 operator or between that operator and its right operand. A bare operand requires
 the following token without an intervening newline or comment: `[[ x` followed
@@ -284,6 +284,52 @@ Nested executables still require argv-policy matches. Unresolved condition
 values in either operand set `SG_EXPANSION_UNRESOLVED_CONDITION`, independently of unresolved
 argv/paths and substitution-inspection requirements. Anomaly sequences retain
 one empty executable with the `CT` marker per conditional stage.
+
+### Filesystem predicates
+
+Conditional commands, `test`, and `[` support the filesystem predicates `-e`
+(existence), `-f` (regular file), `-d` (directory), and `-L` or `-h` (symbolic
+link). The first three follow symbolic links; `-L` and `-h` inspect the link
+itself. Shellsplit does not query the host filesystem: nonempty paths have
+unknown truth, while an empty path is false. Lexical negation reverses truth.
+For `test` and `[`, the unary `-a` alias also tests existence; argument-count
+and expression grammar distinguish it from the binary `-a` conjunction.
+Other filesystem operators accepted by those builtins remain opaque and do not
+produce FILE_TEST edges. Applications requiring complete metadata-check
+coverage must handle those operators conservatively.
+
+A `SHELL_EDGE_FILE_TEST` edge points from the command to a FILE document. Its
+flags identify possible predicate kinds; multiple flags can occur where a
+dynamic builtin argument may occupy an operator position. Only words selected
+as operands by a retained grammar alternative receive these relations; the
+bracket terminator and words with fixed operator roles are excluded. The document
+retains the source spelling and CWD, and a resolved pathname when supplied through the
+expansion callback. Captured builtin argument values refresh the prepared
+expression before body snapshots use it: resolving an operator to `-n` removes
+filesystem alternatives, while resolving it to `-e` selects an existence check.
+An unresolved lookahead can be a binary operator even after a unary-looking
+word, so it cannot by itself establish a definite argument failure. Projection
+preserves the expression boundary used by Bash's argument-count dispatch:
+at that boundary, `-e =` tests the pathname `=`, and a lone `-e` tests a nonempty
+string. Argument-count shortcuts inside parentheses consume their selected
+operands directly. A fallback to general expression parsing still sees the
+closing parenthesis as lookahead, including a four-argument fallback. If it
+consumes that candidate closer as data, the group checks the next unconsumed
+token for its actual closing parenthesis. A definite grammar failure stops
+enclosing parsing; the cursor never rewinds to replay a consumed suffix. This
+edge records a possible metadata check, not a content READ. Applications must
+authorize such checks separately from argv-policy matching. A dynamic unresolved
+path contributes `SG_EXPANSION_UNRESOLVED_PATH`. An argument callback can return
+embedded NUL bytes, but such a value cannot name a filesystem path; its FILE
+document retains an unresolved pathname instead of a resolved value.
+Direct Shellsplit consumers receive the same pathname uncertainty through the
+optional `unresolved_paths` output of `shell_dep_graph_parse_resolved()`, indexed
+by the owning command. Reached predicates retain this flag if output capacity
+prevents their FILE_TEST relation from being stored.
+The flags `SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY`, and
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK` identify the individual checks.
 
 ### Scalar variable presence
 
@@ -990,7 +1036,10 @@ target assignment. Dynamic splitting/cardinality and unsupported runtime
 descriptor operands are rejected where their semantics cannot be established.
 
 Target writes, implicit REPLY, IFS changes, and descriptor-value invalidation
-stay attached to their individual outcomes. Children can refine facts about
+stay attached to their individual outcomes. Known-empty unquoted words can
+disappear without losing later target writes anywhere within the supported
+command-token capacity. A later target failure retains the earlier assignments
+and prevents assignment to subsequent targets. Children can refine facts about
 unchanged inherited descriptors through status, while child mutations remain
 isolated. Process-substitution descriptors close according to scope; explicit
 duplicates can survive the original end's cleanup.
@@ -1036,12 +1085,21 @@ and race-free access require application filesystem checks.
 
 ## Workspace, lifetimes, and errors
 
+The fixed command-token capacity and default graph limit are 48. Graph
+preparation counts assignment prefixes, redirection operators and operands
+alongside command words. Retained source headers likewise have space for 48
+source words, with redirects stored separately. These are analysis resource
+bounds, independent of final argv cardinality after expansion. Smaller graph
+limits remain configurable; exceeding a capacity reports truncation rather
+than a Bash syntax error.
+
 Bounded parsing and graph construction use caller-provided or documented small
 private scratch. `shell_source_workspace_size()` supplies a checked capacity
 bound for source analysis: delimiter normalization, persistent subscript
 boundaries and conditional-pattern evaluation. Graph construction adds that
-scratch, including decoded builtin-test arguments and compiled expressions,
-to the fixed aligned `shell_dep_workspace_size()` prefix. Patterns and builtin
+scratch, including decoded builtin-test arguments, compiled expressions and
+bounded ambiguous-grammar projection, to the fixed aligned
+`shell_dep_workspace_size()` prefix. Patterns and builtin
 tests can require this tail even without heredocs. Use
 `shell_dep_resolved_workspace_size()` when resolving words. Allocating
 higher-level APIs reserve their own temporary workspace and retain their

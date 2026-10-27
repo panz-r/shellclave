@@ -51,7 +51,7 @@ typedef enum {
  * A compound record spans the compound and its trailing redirects, has no
  * ordinary words, and keeps its enclosed headers separate. Arithmetic headers
  * have kind ARITHMETIC, compound true and an expression span with no argv
- * words. String conditions have kind CONDITIONAL with an expression span,
+ * words. Conditional commands have kind CONDITIONAL with an expression span,
  * ordered operands, normalized predicate and lexical negation, and no argv.
  * Supported literal arithmetic has no nested headers; executable substitutions
  * in semantically unsupported arithmetic retain their lexical headers.

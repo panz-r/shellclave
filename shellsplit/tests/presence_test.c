@@ -97,7 +97,7 @@ static void check_observation_roles(void) {
       {"test -n \"$(test -v CONFIG)\"", 1, 2},
       {"test '' -o '(' CONFIG ')'", 0, 1},
       {"[ x -a '(' -v ')' ]", 0, 1},
-      {"command builtin test '(' -t -o ')' -o -v CONFIG", 1, 1},
+      {"command builtin test '(' -t -o ')' -o -v CONFIG", 0, 1},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
     current = cases[i].source;
@@ -127,7 +127,7 @@ static void check_observation_roles(void) {
 
 static void check_inspection_outcomes(void) {
   char source[1024] = "test x";
-  for (unsigned i = 0; i < 20; ++i)
+  for (unsigned i = 0; i < SHELL_DEP_MAX_TOKENS / 2; ++i)
     strcat(source, " -o x");
   strcat(source, "; test -v CONFIG");
   for (unsigned unsupported = 0; unsupported < 2; ++unsupported) {
@@ -465,17 +465,179 @@ static void check_prepared_test_values(void) {
                                        &words[word]));
       shell_test_program_t program;
       CHECK(shell_test_compile(words, count, bracket, &program));
-      /* Refine data without recompiling or rebasing the nested dispatch. */
-      if (values[value])
+      /* Captured values can change operator roles as well as string truth.
+       * Refresh in reserved storage, preserving global counted dispatch. */
+      if (values[value]) {
         shell_test_set_value(&words[1], values[value], strlen(values[value]));
+        CHECK(shell_test_refresh(&program));
+      }
       CHECK(shell_test_evaluate(&program, unexpected_test_lookup, &program) ==
-            (value == 0   ? SHELL_TEST_FALSE | SHELL_TEST_TRUE
+            (value == 0
+                 ? SHELL_TEST_FALSE | SHELL_TEST_TRUE | SHELL_TEST_ERROR_RESULT
              : value == 1 ? SHELL_TEST_FALSE
                           : SHELL_TEST_TRUE));
       shell_source_workspace_end(previous);
       shell_source_operation_end();
     }
   }
+}
+
+typedef struct {
+  const shell_test_value_t *words;
+  unsigned masks[SHELL_DEP_MAX_TOKENS];
+} projected_files_t;
+
+static SHELL_NONNULL(1, 3) void capture_projected_file(
+    const shell_test_value_t *word, unsigned mask, void *context) {
+  projected_files_t *files = context;
+  files->masks[word - files->words] |= mask;
+}
+
+static SHELL_NONNULL(1, 3) unsigned unknown_test_lookup(const char *name,
+                                                        size_t length,
+                                                        void *context) {
+  (void)name;
+  (void)length;
+  (void)context;
+  return SHELL_TEST_FALSE | SHELL_TEST_TRUE;
+}
+
+static void check_projected_test_alternatives(void) {
+  static const struct {
+    unsigned count;
+    const char *words[12]; /* NULL selects the one unresolved operator. */
+  } cases[] = {
+      {2, {NULL, "target"}},
+      {3, {"!", NULL, "target"}},
+      {4, {"(", NULL, "target", ")"}},
+      {4, {"x", NULL, "-e", "target"}},
+      {5, {"-t", NULL, "-o", "-f", "target"}},
+      {6, {"-e", NULL, "-e", "-a", "-f", "target"}},
+      {6, {"-n", NULL, "-a", "(", "''", ")"}},
+      {7, {"(", NULL, "target", ")", "-a", "-e", "other"}},
+      {8, {"(", "-e", NULL, "-e", "-a", "-f", "target", ")"}},
+      {6, {"-e", NULL, "x", "-a", "-e", "="}},
+      {6, {"-e", NULL, "-e", "-o", "!", "-e"}},
+      {10, {"-e", NULL, "x", "-a", "(", "x", "-a", "-e", "=", ")"}},
+      {10, {"-e", NULL, "x", "-a", "(", "x", "-o", "!", "-e", ")"}},
+      {12, {"-e", NULL, "x", "-a", "(", "x", "-a", "x", "-a", "-e", "=", ")"}},
+      {12, {"-e", NULL, "x", "-a", "(", "x", "-a", "x", "-o", "!", "-e", ")"}},
+  };
+  static const char *const values[] = {"",   "x",  "0",  "1",  "!",  "(",  ")",
+                                       "=",  "!=", "-a", "-o", "-n", "-z", "-e",
+                                       "-f", "-d", "-h", "-L", "-v", "-t"};
+  static const char *const vocabulary[] = {
+      "x", "-e", "-f", "-n", "-t", "(", ")", "!", "-a", "-o", "=", "target"};
+  uint32_t generator = UINT32_C(0x94138427);
+  unsigned named_cases = sizeof(cases) / sizeof(*cases);
+  /* Exercise interactions of grouping/precedence with one unknown slot.
+   * Concrete prepared programs are the differential oracle for the projected
+   * grammar's status and operand coverage, independently of runtime strings. */
+  for (unsigned c = 0; c < named_cases + 128; ++c) {
+    const char *generated[8];
+    unsigned word_count = c < named_cases ? cases[c].count : 5 + c % 4;
+    const char *const *words_source =
+        c < named_cases ? cases[c].words : generated;
+    if (c >= named_cases) {
+      for (unsigned i = 0; i < word_count; ++i) {
+        generator ^= generator << 13;
+        generator ^= generator >> 17;
+        generator ^= generator << 5;
+        generated[i] =
+            vocabulary[generator % (sizeof(vocabulary) / sizeof(*vocabulary))];
+      }
+      generated[c % word_count] = NULL;
+    }
+    for (unsigned bracket = 0; bracket < 2; ++bracket)
+      for (unsigned v = 0; v < sizeof(values) / sizeof(*values); ++v) {
+        current = "projected test grammar alternatives";
+        shell_source_operation_begin(current, strlen(current));
+        unsigned char scratch[32768];
+        shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+            current, strlen(current), scratch, sizeof(scratch));
+        shell_test_value_t abstract_words[13], concrete_words[13];
+        unsigned count = word_count + bracket;
+        for (unsigned i = 0; i < count; ++i) {
+          const char *source = i == word_count ? "]" : words_source[i];
+          bool dynamic = source == NULL;
+          if (dynamic)
+            source = "\"$op\"";
+          CHECK(shell_test_prepare_value(source, strlen(source),
+                                         &abstract_words[i]));
+          concrete_words[i] = abstract_words[i];
+          if (dynamic)
+            shell_test_set_value(&concrete_words[i], values[v],
+                                 strlen(values[v]));
+        }
+        shell_test_program_t abstract, concrete;
+        CHECK(shell_test_compile(abstract_words, count, bracket, &abstract));
+        CHECK(shell_test_compile(concrete_words, count, bracket, &concrete));
+        unsigned result =
+            shell_test_evaluate(&concrete, unknown_test_lookup, &concrete);
+        if (result & (SHELL_TEST_FALSE | SHELL_TEST_TRUE)) {
+          unsigned projected =
+              shell_test_evaluate(&abstract, unknown_test_lookup, &abstract);
+          if ((result & projected) != result)
+            fprintf(stderr,
+                    "case %u bracket %u value '%s': actual %#x projected %#x\n",
+                    c, bracket, values[v], result, projected);
+          CHECK((result & projected) == result);
+          projected_files_t a = {.words = abstract_words},
+                            b = {.words = concrete_words};
+          shell_test_observe_files(&abstract, capture_projected_file, &a);
+          shell_test_observe_files(&concrete, capture_projected_file, &b);
+          for (unsigned i = 0; i < count; ++i) {
+            if ((a.masks[i] & b.masks[i]) != b.masks[i])
+              fprintf(stderr,
+                      "case %u bracket %u value '%s' word %u: actual %#x "
+                      "projected %#x\n",
+                      c, bracket, values[v], i, b.masks[i], a.masks[i]);
+            CHECK((a.masks[i] & b.masks[i]) == b.masks[i]);
+          }
+        }
+        /* Refresh the same canonical program after capturing the unknown
+         * value. A prior projection must not leave a false error proof. */
+        for (unsigned i = 0; i < count; ++i)
+          if (!abstract_words[i].known)
+            shell_test_set_value(&abstract_words[i], values[v],
+                                 strlen(values[v]));
+        CHECK(shell_test_refresh(&abstract));
+        CHECK(shell_test_evaluate(&abstract, unknown_test_lookup, &abstract) ==
+              result);
+        projected_files_t refreshed = {.words = abstract_words},
+                          exact = {.words = concrete_words};
+        shell_test_observe_files(&abstract, capture_projected_file, &refreshed);
+        shell_test_observe_files(&concrete, capture_projected_file, &exact);
+        for (unsigned i = 0; i < count; ++i) {
+          if ((result & (SHELL_TEST_FALSE | SHELL_TEST_TRUE)) &&
+              refreshed.masks[i] != exact.masks[i])
+            fprintf(
+                stderr,
+                "refresh case %u bracket %u value '%s' word %u: %#x vs %#x\n",
+                c, bracket, values[v], i, refreshed.masks[i], exact.masks[i]);
+          if (result & (SHELL_TEST_FALSE | SHELL_TEST_TRUE))
+            CHECK(refreshed.masks[i] == exact.masks[i]);
+        }
+        shell_source_workspace_end(previous);
+        shell_source_operation_end();
+      }
+  }
+  current = "bounded test projection scratch exhaustion";
+  shell_source_operation_begin(current, strlen(current));
+  unsigned char scratch[512];
+  shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+      current, strlen(current), scratch, sizeof(scratch));
+  CHECK(shell_source_scratch_take(384) != NULL);
+  static const char *const source[] = {"-e", "\"$op\"", "-e",
+                                       "-a", "-f",      "target"};
+  shell_test_value_t words[6];
+  for (unsigned i = 0; i < 6; ++i)
+    CHECK(shell_test_prepare_value(source[i], strlen(source[i]), &words[i]));
+  shell_test_program_t program;
+  CHECK(!shell_test_compile(words, 6, false, &program));
+  CHECK(shell_source_scratch_exhausted());
+  shell_source_workspace_end(previous);
+  shell_source_operation_end();
 }
 
 static void check_parenthesized_tests(void) {
@@ -522,6 +684,125 @@ static void check_parenthesized_tests(void) {
   CHECK(truth(source) == SHELL_CONDITIONAL_TRUE);
   CHECK(has_file_read("important.txt"));
   check_prepared_test_values();
+  check_projected_test_alternatives();
+}
+
+static void check_chained_group_progress(void) {
+  static const char *const group[] = {"(", "x", "-a", "-e", "=", ")", "-a"};
+  for (unsigned groups = 1; groups <= 6; ++groups)
+    for (unsigned bracket = 0; bracket < 2; ++bracket) {
+      char source[1024];
+      size_t used = (size_t)snprintf(source, sizeof(source), "%s ",
+                                     bracket ? "[" : "test");
+      for (unsigned i = 0; i < groups; ++i)
+        used += (size_t)snprintf(source + used, sizeof(source) - used,
+                                 "'(' x -a -e = ')' -a ");
+      snprintf(source + used, sizeof(source) - used, "-e tail%s",
+               bracket ? " ]" : "");
+      CHECK(test_truth(source) == SHELL_CONDITIONAL_FALSE);
+
+      current = "chained group compilation and refresh";
+      shell_source_operation_begin(current, strlen(current));
+      unsigned char scratch[32768];
+      shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+          current, strlen(current), scratch, sizeof(scratch));
+      shell_test_value_t words[SHELL_DEP_MAX_TOKENS];
+      unsigned count = groups * 7 + 2 + bracket;
+      unsigned dynamic = (groups - 1) * 7 + 4;
+      for (unsigned i = 0; i < count; ++i) {
+        const char *word = i < groups * 7        ? group[i % 7]
+                           : i == groups * 7     ? "-e"
+                           : i == groups * 7 + 1 ? "tail"
+                                                 : "]";
+        CHECK(shell_test_prepare_value(word, strlen(word), &words[i]));
+      }
+      shell_test_program_t exact;
+      CHECK(shell_test_compile(words, count, bracket, &exact));
+      CHECK(exact.count <= count * 2 + 2);
+      CHECK(shell_test_evaluate(&exact, unknown_test_lookup, &exact) ==
+            SHELL_TEST_ERROR_RESULT);
+      CHECK(shell_test_prepare_value("\"$op\"", 5, &words[dynamic]));
+      shell_test_program_t captured;
+      CHECK(shell_test_compile(words, count, bracket, &captured));
+      CHECK(captured.count <= count * 2 + 2);
+      shell_test_set_value(&words[dynamic], "=", 1);
+      CHECK(shell_test_refresh(&captured));
+      CHECK(captured.count <= count * 2 + 2);
+      CHECK(shell_test_evaluate(&captured, unknown_test_lookup, &captured) ==
+            SHELL_TEST_ERROR_RESULT);
+      shell_source_workspace_end(previous);
+      shell_source_operation_end();
+    }
+  /* A consumed candidate ')' can be data; the actual later ')' still closes
+   * the group. Preserving the real cursor must accept these valid neighbors. */
+  CHECK(test_truth("test '(' x -a -e = ')' ')'") == SHELL_CONDITIONAL_FALSE);
+  CHECK(test_truth("test '(' x -a -e != ')' ')'") == SHELL_CONDITIONAL_TRUE);
+}
+
+static void check_high_read_targets(void) {
+  static const unsigned target_positions[] = {31, 32, 46};
+  for (unsigned t = 0; t < sizeof(target_positions) / sizeof(*target_positions);
+       ++t) {
+    char source[1024] = "unset pad CONFIG REPLY; read -n0";
+    size_t used = strlen(source);
+    for (unsigned i = 1; i < target_positions[t]; ++i)
+      used += (size_t)snprintf(source + used, sizeof(source) - used, " pad");
+    snprintf(source + used, sizeof(source) - used,
+             " CONFIG; [[ -v CONFIG ]] && [[ ! -v REPLY ]]");
+    CHECK(truth(source) == SHELL_CONDITIONAL_TRUE);
+  }
+  char source[1024] = "unset pad CONFIG IFS REPLY; read -n0";
+  size_t used = strlen(source);
+  for (unsigned i = 0; i < 32; ++i)
+    used += (size_t)snprintf(source + used, sizeof(source) - used, " pad");
+  snprintf(source + used, sizeof(source) - used,
+           " CONFIG FUNCNAME IFS; [[ -v CONFIG ]] && [[ ! -v IFS ]] && [[ ! -v "
+           "REPLY ]]");
+  CHECK(truth(source) == SHELL_CONDITIONAL_TRUE);
+  CHECK(truth("unset REPLY; read -n0; [[ -v REPLY ]]") ==
+        SHELL_CONDITIONAL_TRUE);
+}
+
+static void check_sparse_read_targets(void) {
+  static const struct {
+    unsigned first;
+    const char *suffix;
+    bool tail_set, failed;
+  } cases[] = {{1, "", false, false},
+               {14, "", false, false},
+               {1, " tail", true, false},
+               {1, " bad-name tail", false, true}};
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+    char source[2048] = "unset gap first last tail REPLY; { read -n0";
+    size_t used = strlen(source);
+    for (unsigned i = 1; i < cases[c].first; ++i)
+      used += (size_t)snprintf(source + used, sizeof(source) - used, " -r");
+    used += (size_t)snprintf(source + used, sizeof(source) - used, " first");
+    /* Elided words still occupy prepared argument slots. Targets separated
+     * by 32 slots produce equal low/high mask words, including at capacity. */
+    for (unsigned i = 0; i < 31; ++i)
+      used += (size_t)snprintf(source + used, sizeof(source) - used, " $gap");
+    used += (size_t)snprintf(source + used, sizeof(source) - used, " last%s",
+                             cases[c].suffix);
+    for (unsigned on_failure = 0; on_failure < 2; ++on_failure) {
+      int n = snprintf(source + used, sizeof(source) - used,
+                       " %s cat <continued.txt; [[ -v first ]] && "
+                       "[[ -v last ]] && [[ %s-v tail ]] && [[ ! -v REPLY ]] "
+                       "&& cat <present.txt; [[ -v last ]]; } <<<payload",
+                       on_failure ? "||" : "&&", cases[c].tail_set ? "" : "! ");
+      CHECK(n >= 0 && (size_t)n < sizeof(source) - used);
+      CHECK(truth(source) == SHELL_CONDITIONAL_TRUE);
+      CHECK(has_file_read("continued.txt") == (on_failure == cases[c].failed));
+      CHECK(has_file_read("present.txt"));
+      for (uint32_t i = 0; i < graph->edge_count; ++i) {
+        const shell_dep_edge_t *edge = &graph->edges[i];
+        const shell_dep_node_t *to = &graph->nodes[edge->to];
+        CHECK(!(edge->type == SHELL_EDGE_READ && to->type == SHELL_NODE_CMD &&
+                to->cmd.token_count && to->cmd.token_lens[0] == 4 &&
+                !memcmp(to->cmd.tokens[0], "read", 4)));
+      }
+    }
+  }
 }
 
 static void check_parenthesized_admission(void) {
@@ -536,8 +817,8 @@ static void check_parenthesized_admission(void) {
       "'(' -t invalid ')' -o -v 'a[$(printf marker >&2)]'",
       "'(' -t -o ')' -o -v \"a[$(printf expansion-marker >&2)]\"",
       "-t \"$FD\" '(' -v 'a[$(printf marker >&2)]' extra ')'",
-      "-t \"$FD\" '(' -v 'a[$(printf marker >&2)]' extra ')' -o "
-      "\"$(printf expansion-marker >&2)\"",
+      ("-t \"$FD\" '(' -v 'a[$(printf marker >&2)]' extra ')' -o "
+       "\"$(printf expansion-marker >&2)\""),
   };
   for (size_t i = 0; i < sizeof(failures) / sizeof(*failures); ++i) {
     for (unsigned bracket = 0; bracket < 2; ++bracket) {
@@ -601,6 +882,9 @@ int main(int argc, char **argv) {
   check_observation_capacity();
   check_recursive_routes();
   check_parenthesized_tests();
+  check_chained_group_progress();
+  check_high_read_targets();
+  check_sparse_read_targets();
   check_parenthesized_admission();
   check_nonassignable_variables();
   check_opaque_unsets();

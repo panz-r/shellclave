@@ -101,7 +101,7 @@ The implementation owners and private interfaces are:
 | Retained source/draft collection | `shell_source.c` |
 | Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
 | Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
-| Builtin test argument-count grammar, admission and eager expression evaluation | `shell_test_grammar_internal.h`, `shell_test_admission_internal.h`, `shell_test.c`, `shell_test_internal.h` |
+| Builtin test argument-count grammar, admission, bounded grammar-role projection and eager expression evaluation | `shell_test_grammar_internal.h`, `shell_test_admission_internal.h`, `shell_test.c`, `shell_test_projection_impl.h`, `shell_test_internal.h` |
 | Shared builtin word projection and scalar cardinality | `shell_builtin_word_internal.h` |
 | Whole-word expansion requests, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
 | Supported-operation inspection, builtin roles and semantic observers | `shell_semantics.c`, `shell_semantics_internal.h` |
@@ -196,8 +196,10 @@ independent implicit effects according to that builtin's commit rules.
 Opaque mutations are ordered effects, not a bundle-wide early return. Classify
 them as value writes or possible unsets, and preserve surrounding known effects.
 The capability marker stores separate definite and possible despecialization
-masks as four positional words. Read that snapshot directly; route unions
-deduplicate equal words and cannot represent its layout. Resolve uncertain
+masks as four positional words. Each `read` write signature stores its low and
+high target masks, including the REPLY marker, as two positional words.
+Read these snapshots through single-root lookup; route unions deduplicate
+equal words and cannot represent their layouts. Resolve uncertain
 assignment restrictions into bounded execution versions when needed, retaining
 their correlation through read outcomes, prefix visibility and scalar imports.
 Determine prefix installation from the immutable command-entry version. Later

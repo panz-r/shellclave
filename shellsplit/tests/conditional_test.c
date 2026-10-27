@@ -98,6 +98,129 @@ static unsigned file_node(const char *name) {
   return 0;
 }
 
+static void check_file_predicates(void) {
+  static const struct {
+    const char *source, *path;
+    unsigned flag;
+  } cases[] = {
+      {"[[ -e config.json ]]", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"[[ -f config.json ]]", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR},
+      {"[[ -d output ]]", "output", SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY},
+      {"[[ -L current ]]", "current", SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK},
+      {"[[ -h current ]]", "current", SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK},
+      {"test -e config.json", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"test -a config.json", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"command test -e config.json", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"[ -f config.json ]", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR},
+      {"test -d output", "output", SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY},
+      {"test '-f' config.json", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR},
+      {"[ -h current ]", "current", SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK},
+      {"{ [[ -f config.json ]]; }", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR},
+      {"printf '%s' \"$( [[ -f config.json ]] && printf yes )\"", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR},
+      {"printf '%s' \"$( test -e config.json && printf yes )\"", "config.json",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    parse(cases[i].source);
+    unsigned found = 0;
+    for (unsigned j = 0; j < graph->edge_count; ++j) {
+      const shell_dep_edge_t *edge = &graph->edges[j];
+      if (edge->type != SHELL_EDGE_FILE_TEST)
+        continue;
+      const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+      CHECK(edge->flags == cases[i].flag);
+      CHECK(doc->path_len == strlen(cases[i].path));
+      CHECK(!memcmp(doc->path, cases[i].path, doc->path_len));
+      CHECK(doc->cwd_known && doc->cwd_absolute);
+      for (unsigned k = 0; k < graph->edge_count; ++k)
+        CHECK(graph->edges[k].type != SHELL_EDGE_READ ||
+              graph->edges[k].from != edge->to);
+      ++found;
+    }
+    CHECK(found == 1);
+    for (unsigned j = 0; j < graph->edge_count; ++j) {
+      shell_dep_edge_t *edge = &graph->edges[j];
+      if (edge->type == SHELL_EDGE_FILE_TEST) {
+        unsigned saved = edge->flags;
+        edge->flags = 0;
+        CHECK(!shell_dep_graph_validate(graph).valid);
+        edge->flags = saved;
+      }
+    }
+  }
+  parse("[[ -e '' ]]");
+  CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+        SHELL_CONDITIONAL_FALSE);
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  parse("exec 99<&-; [[ -e config.json ]] <&99");
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  parse("exec 99<&-; test -e config.json <&99");
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  parse("test \"$operator\" target");
+  bool possible_target = false;
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    if (edge->type != SHELL_EDGE_FILE_TEST)
+      continue;
+    const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+    if (doc->path_len == 6 && !memcmp(doc->path, "target", 6)) {
+      CHECK(edge->flags == (SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK));
+      possible_target = true;
+    }
+  }
+  CHECK(possible_target);
+  parse("[[ -f * ]]");
+  unsigned literal_star = file_node("*");
+  CHECK(!(graph->nodes[literal_star].doc.flags &
+          SHELL_DEP_DOC_FLAG_DYNAMIC_NAME));
+  parse("test -e = x"); /* Three-argument binary comparison, not -e x. */
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  parse("test 1 -eq 1");
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  parse("test x -a y");
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  parse("test -e a -a -d b");
+  unsigned combined = 0, count = 0;
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    if (graph->edges[i].type == SHELL_EDGE_FILE_TEST) {
+      combined |= graph->edges[i].flags;
+      ++count;
+    }
+  CHECK(combined == (SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
+                     SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY));
+  CHECK(count == 2);
+  parse("test -f '' && cat /unreachable");
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_READ ||
+          graph->nodes[graph->edges[i].from].type != SHELL_NODE_DOC);
+  parse("cd sub && [[ -e config.json ]]");
+  unsigned file = file_node("config.json");
+  CHECK(!graph->nodes[file].doc.cwd_known);
+  parse("cd /src && [[ -e config.json ]]");
+  file = file_node("config.json");
+  CHECK(graph->nodes[file].doc.cwd_known);
+  CHECK(
+      !strcmp(graph->cwd_buf.data + graph->nodes[file].doc.cwd_offset, "/src"));
+}
+
 static void check_body_setup(void) {
   parse("[[ -n $(printf side >&2; printf value) ]] 2>report");
   unsigned owner = condition_node(), report = file_node("report");
@@ -157,6 +280,283 @@ static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
   *value = resolved_value;
   *length = resolved_length ? resolved_length : strlen(resolved_value);
   return SHELL_EXPAND_RESOLVED;
+}
+
+static void check_file_predicate_resolution(void) {
+  current = "[[ -e \"$path\" ]]";
+  resolved_value = "4:path,";
+  resolved_length = 0;
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve, NULL,
+                                       NULL) == SHELL_DEP_OK);
+  CHECK(shell_dep_graph_validate(graph).valid);
+  bool found = false;
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    if (edge->type != SHELL_EDGE_FILE_TEST)
+      continue;
+    const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+    CHECK(doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH);
+    CHECK(doc->value_len == 4 && !memcmp(doc->value, "path", 4));
+    found = true;
+  }
+  CHECK(found);
+  resolved_value = "0:,";
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve, NULL,
+                                       NULL) == SHELL_DEP_OK);
+  CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+        SHELL_CONDITIONAL_FALSE);
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+}
+
+static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
+    resolve_nul_argument(const shell_expand_word_request_t *request,
+                         const char **value, size_t *length, void *context) {
+  (void)context;
+  if (request->purpose != SHELL_EXPAND_WORD_ARGUMENT)
+    return SHELL_EXPAND_UNRESOLVED;
+  static const char encoded[] = {'3', ':', 'a', 0, 'b', ','};
+  *value = encoded;
+  *length = sizeof(encoded);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+static void check_file_predicate_nul_argument(void) {
+  current = "test -e \"$path\"";
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve_nul_argument,
+                                       NULL, NULL) == SHELL_DEP_OK);
+  CHECK(shell_dep_graph_validate(graph).valid);
+  bool found = false;
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    if (edge->type == SHELL_EDGE_FILE_TEST) {
+      CHECK(graph->nodes[edge->to].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME);
+      found = true;
+    }
+  }
+  CHECK(found);
+}
+
+static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
+    resolve_predicate_path(const shell_expand_word_request_t *request,
+                           const char **value, size_t *length, void *context) {
+  (void)request;
+  if (!context)
+    return SHELL_EXPAND_UNRESOLVED;
+  *value = context;
+  *length = strlen(*value);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+static void check_file_predicate_unresolved_paths(void) {
+  static const struct {
+    const char *source, *value;
+    unsigned flagged;
+  } cases[] = {
+      {"[[ -e \"$path\" ]]", NULL, 1},
+      {"test -e \"$path\"", NULL, 1},
+      {"[ -e \"$path\" ]", NULL, 1},
+      {"printf '%s' \"$( [[ -e \"$path\" ]] )\"", NULL, 1},
+      {"printf '%s' \"$( test -e \"$path\" )\"", NULL, 1},
+      {"{ [[ -e \"$path\" ]]; }", NULL, 1},
+      {"[[ -e \"$path\" ]]", "4:path,", 0},
+      {"test -e \"$path\"", "4:path,", 0},
+      {"[[ -e \"$path\" ]]", "0:,", 0},
+      {"test -e \"$path\"", "0:,", 0},
+      {"[[ -e '' ]]", NULL, 0},
+      {"test -e config.json", NULL, 0},
+      {"false && [[ -e \"$path\" ]]", NULL, 0},
+      {"false && test -e \"$path\"", NULL, 0},
+      {"exec 99<&-; [[ -e \"$path\" ]] <&99", NULL, 0},
+      {"exec 99<&-; test -e \"$path\" <&99", NULL, 0},
+      {"test -n \"$path\"", NULL, 0},
+  };
+  uint8_t unresolved[SHELL_DEP_MAX_NODES];
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+    current = cases[c].source;
+    memset(unresolved, 0xff, sizeof(unresolved));
+    CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                         &limits, graph, resolve_predicate_path,
+                                         (void *)cases[c].value,
+                                         unresolved) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(graph).valid);
+    unsigned flagged = 0;
+    for (unsigned i = 0; i < SHELL_DEP_MAX_NODES; ++i) {
+      if (!unresolved[i])
+        continue;
+      CHECK(i < graph->node_count);
+      CHECK(graph->nodes[i].type == SHELL_NODE_CMD);
+      bool owns_predicate = false;
+      for (unsigned e = 0; e < graph->edge_count; ++e)
+        owns_predicate |= graph->edges[e].type == SHELL_EDGE_FILE_TEST &&
+                          graph->edges[e].from == i;
+      CHECK(owns_predicate);
+      ++flagged;
+    }
+    CHECK(flagged == cases[c].flagged);
+  }
+  current = "test -e \"$path\"";
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve_nul_argument,
+                                       NULL, unresolved) == SHELL_DEP_OK);
+  unsigned flagged = 0;
+  for (unsigned i = 0; i < graph->node_count; ++i)
+    flagged += unresolved[i] != 0;
+  CHECK(flagged == 1);
+
+  /* Keep the command owner while denying capacity for its FILE document.
+   * The public uncertainty result must survive that output truncation. */
+  current = "[[ -e \"$path\" ]]";
+  shell_dep_limits_t truncated = limits;
+  truncated.max_nodes = 1;
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &truncated, graph, NULL, NULL,
+                                       unresolved) == SHELL_DEP_ETRUNC);
+  CHECK(graph->node_count == 1 && unresolved[0] == 1);
+  for (unsigned i = graph->node_count; i < SHELL_DEP_MAX_NODES; ++i)
+    CHECK(unresolved[i] == 0);
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
+    resolve_test_operator(const shell_expand_word_request_t *request,
+                          const char **value, size_t *length, void *context) {
+  if (request->purpose != SHELL_EXPAND_WORD_ARGUMENT)
+    return SHELL_EXPAND_UNRESOLVED;
+  *value = context;
+  *length = strlen(*value);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+static void parse_test_operator(const char *source, const char *encoded) {
+  current = source;
+  CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/workspace",
+                                       &limits, graph, resolve_test_operator,
+                                       (void *)encoded, NULL) == SHELL_DEP_OK);
+  CHECK(shell_dep_graph_validate(graph).valid);
+}
+
+static unsigned predicate_edges(const char *path, unsigned mask) {
+  unsigned found = 0;
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    if (edge->type != SHELL_EDGE_FILE_TEST)
+      continue;
+    const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+    CHECK(doc->path_len == strlen(path));
+    CHECK(!memcmp(doc->path, path, doc->path_len));
+    if (edge->flags != mask)
+      fprintf(stderr, "predicate flags %#x, expected %#x\n", edge->flags, mask);
+    CHECK(edge->flags == mask);
+    ++found;
+  }
+  return found;
+}
+
+static bool has_document_read(void) {
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    if (graph->edges[i].type == SHELL_EDGE_READ &&
+        graph->nodes[graph->edges[i].from].type == SHELL_NODE_DOC)
+      return true;
+  return false;
+}
+
+static void check_test_grammar_refinement(void) {
+  const unsigned all = SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK;
+  parse("test -e \"$op\" -e -a -f target && cat <effect");
+  CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR) == 1);
+  CHECK(has_document_read());
+  static const struct {
+    const char *expression;
+    unsigned files;
+    bool succeeds;
+  } boundaries[] = {
+      {"-e \"$op\" x -a -e =", 1, false},
+      {"-e \"$op\" -e -o ! -e", 0, true},
+      {"-e \"$op\" x -a '(' x -a -e = ')'", 0, false},
+      {"-e \"$op\" -e -a '(' x -o ! -e ')'", 0, false},
+      {"-e \"$op\" x -a '(' x -a x -a -e = ')'", 0, false},
+      {"-e \"$op\" x -a '(' x -a x -o ! -e ')'", 0, false},
+  };
+  for (unsigned i = 0; i < sizeof(boundaries) / sizeof(*boundaries); ++i)
+    for (unsigned bracket = 0; bracket < 2; ++bracket) {
+      char source[256];
+      snprintf(source, sizeof(source), "%s %s%s %s cat <effect",
+               bracket ? "[" : "test", boundaries[i].expression,
+               bracket ? " ]" : "", boundaries[i].succeeds ? "&&" : "||");
+      parse(source);
+      CHECK(predicate_edges("=", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) ==
+            boundaries[i].files);
+      CHECK(has_document_read());
+      parse_test_operator(source, "1:=,");
+      CHECK(predicate_edges("=", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) ==
+            boundaries[i].files);
+      CHECK(has_document_read());
+    }
+  for (unsigned bracket = 0; bracket < 2; ++bracket) {
+    char source[128];
+    snprintf(source, sizeof(source), "%s -e \"$op\" x -a -e =%s && cat <effect",
+             bracket ? "[" : "test", bracket ? " ]" : "");
+    parse(source);
+    CHECK(has_document_read());
+    CHECK(predicate_edges("=", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) == 1);
+    parse_test_operator(source, "2:!=,");
+    CHECK(has_document_read());
+    CHECK(predicate_edges("=", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) == 1);
+  }
+  parse_test_operator("test -e \"$op\" -e -a -f target && cat <effect", "1:=,");
+  CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR) == 1);
+  CHECK(has_document_read());
+  for (unsigned bracket = 0; bracket < 2; ++bracket) {
+    const char *source = bracket ? "[ \"$op\" target ]" : "test \"$op\" target";
+    parse(source);
+    CHECK(predicate_edges("target", all) == 1);
+    parse_test_operator(source, "2:-n,");
+    CHECK(predicate_edges("target", 0) == 0);
+    parse_test_operator(source, "2:-e,");
+    CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) == 1);
+  }
+  parse_test_operator("test \"$op\" target || cat <unreachable", "2:-n,");
+  CHECK(!has_document_read());
+  parse_test_operator("test \"$op\" target && cat <input", "2:-n,");
+  CHECK(has_document_read());
+  parse_test_operator("test \"$op\" target && cat <unreachable", "2:-z,");
+  CHECK(!has_document_read());
+  parse_test_operator("unset CONFIG; test \"$op\" CONFIG && cat <unreachable",
+                      "2:-v,");
+  CHECK(!has_document_read());
+  CHECK(predicate_edges("CONFIG", 0) == 0);
+  parse_test_operator("CONFIG=; test \"$op\" CONFIG && cat <input", "2:-v,");
+  CHECK(has_document_read());
+  CHECK(predicate_edges("CONFIG", 0) == 0);
+  parse_test_operator(
+      "unset CONFIG; test -e \"$op\" -e -a -v CONFIG && cat <unreachable",
+      "1:=,");
+  CHECK(!has_document_read());
+  parse_test_operator("CONFIG=; test -e \"$op\" -e -a -v CONFIG && cat <input",
+                      "1:=,");
+  CHECK(has_document_read());
+  current = "test -e \"$op\" -e -a -v 'a[$(printf marker)]'";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EPARSE);
+  CHECK(!graph->node_count && !graph->edge_count);
+  char source[512] = "test -e \"$op\" -e -a -f target";
+  unsigned tokens = 7;
+  for (; tokens + 3 <= SHELL_DEP_MAX_TOKENS; tokens += 3)
+    strcat(source, " -a -f target");
+  if (tokens + 2 == SHELL_DEP_MAX_TOKENS)
+    strcat(source, " -o x");
+  size_t fixed, tail, previous = limits.workspace_size;
+  CHECK(shell_dep_workspace_size(NULL, &fixed));
+  CHECK(shell_source_workspace_size(strlen(source), &tail));
+  limits.workspace_size = fixed + tail;
+  parse(source);
+  limits.workspace_size = previous;
 }
 
 typedef struct {
@@ -520,6 +920,11 @@ static void check_patterns(void) {
       {"[[ x != x* ]]", SHELL_CONDITIONAL_PATTERN_NOT_MATCH},
       {"[[ x == \"\"* ]]", SHELL_CONDITIONAL_PATTERN_MATCH},
       {"[[ -v UID ]]", SHELL_CONDITIONAL_VARIABLE_SET},
+      {"[[ -e config.json ]]", SHELL_CONDITIONAL_FILE_EXISTS},
+      {"[[ -f config.json ]]", SHELL_CONDITIONAL_FILE_REGULAR},
+      {"[[ -d output ]]", SHELL_CONDITIONAL_FILE_DIRECTORY},
+      {"[[ -L current ]]", SHELL_CONDITIONAL_FILE_SYMLINK},
+      {"[[ -h current ]]", SHELL_CONDITIONAL_FILE_SYMLINK},
   };
   for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); ++i) {
     parse(forms[i].source);
@@ -714,6 +1119,11 @@ int main(int argc, char **argv) {
     goto done;
   }
   check_body_setup();
+  check_file_predicates();
+  check_file_predicate_resolution();
+  check_file_predicate_nul_argument();
+  check_file_predicate_unresolved_paths();
+  check_test_grammar_refinement();
   check_expansion_regions();
   check_comparisons();
   check_mixed_literal_comparisons();

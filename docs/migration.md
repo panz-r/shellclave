@@ -3,13 +3,27 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
-## Unreleased: scalar variable presence and builtin test composition
+## Unreleased: conditional predicates and builtin test composition
+
+The fixed per-command token capacity and default graph limit increase from 32
+to 48. Rebuild consumers against the new headers: public graph and source
+structures have larger arrays. Workspace reservations also grow; use the sizing
+APIs for the updated capacities. Graph preparation counts assignment prefixes,
+redirection operators and their operands as tokens, so this is not a promise
+of 48 final argv entries. Smaller configured limits remain supported, and
+capacity exhaustion retains its explicit truncation outcome.
 
 Conditional commands now support `[[ -v name ]]` with static ASCII scalar
 names and lexical negation. The appended VARIABLE_SET predicate retains one
 original operand span. Its graph truth comes from variable presence, separately
-from string length and descriptor validity. Existing enum values and public
-layouts are unchanged.
+from string length and descriptor validity. Existing enum values retain their
+numeric values; presence uses the retained operand fields.
+
+Filesystem predicates append FILE_EXISTS, FILE_REGULAR, FILE_DIRECTORY and
+FILE_SYMLINK conditional kinds and the FILE_TEST graph relation. Metadata
+checks are separate from content READ edges. See the
+[filesystem predicate reference](shell-model.md#filesystem-predicates) for
+supported spellings and remaining opaque builtin operators.
 
 `test` and `[` share these presence facts. Their argument-count rules, `!`,
 `-a`, `-o` and parenthesized expressions can refine subsequent execution.
@@ -25,6 +39,21 @@ String predicates and literal comparisons contribute established values;
 other admitted predicates retain conservative results, including possible
 argument errors. These builtins remain SIMPLE commands with argv-policy
 subjects. Conditional-only metadata remains reserved for `[[ … ]]`.
+Admitted dynamic `test`/`[` arguments now reach the expansion callback. Their
+captured values refine operator roles and status before body evaluation.
+Unresolved operator roles retain grammar alternatives rather than proving an
+argument failure or treating every word as a pathname. Callback payloads remain
+data. Workspace queries reserve the extra bounded grammar-projection storage;
+obtain current capacities through the sizing APIs rather than cached constants.
+Grammar projection preserves invocation ends, including terminal unary operands
+whose bytes resemble binary operators. A small group's general-grammar fallback
+keeps its closing parenthesis visible as lookahead, matching pinned Bash.
+Counted parsing now returns its actual consumed cursor. General fallback can
+consume a candidate closer as data and finish at a later closing parenthesis;
+the group validates that actual position. Definite grammar failures stop
+enclosing parsing without replaying suffixes, preserving bounded node storage.
+The resolved graph API's `unresolved_paths` output includes dynamic filesystem
+predicate operands, including recursively imported checks and truncated output.
 Small parenthesized tests preserve pinned Bash's invocation-wide first-argument
 reference in its one-argument dispatch, while the three-argument shortcut uses
 its local operand. Corrected status proofs retain previously omitted reachable

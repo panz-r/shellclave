@@ -14,7 +14,7 @@
  * a route-workspace growth turns the dedicated size-contract test into the
  * place that needs adjustment, rather than silently restoring heap use. */
 static _Alignas(
-    max_align_t) unsigned char shellsplit_test_dep_workspace[26u * 1024u *
+    max_align_t) unsigned char shellsplit_test_dep_workspace[40u * 1024u *
                                                              1024u];
 
 static SHELL_NONNULL(2) bool shellsplit_test_dep_limits(
