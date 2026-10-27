@@ -6,3 +6,5 @@ test -a existing
 test -e "$operator" -e -a -f target && cat <effect
 [ "$operator" target ]
 CONFIG=; test "$operator" CONFIG
+[[ -S "$path" ]] || [ -p pipe ]
+test "$operator" target -a -s data

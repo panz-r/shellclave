@@ -221,13 +221,18 @@ typedef enum {
    * opening a document. Its source and target can be numeric or Bash named
    * descriptors. */
   SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP = 1 << 3,
-  /* FILE_TEST tests existence, regular-file type, directory type, or link
-   * type respectively. The first three follow links; the last inspects the
-   * link itself. These flags may be combined for uncertain operator roles. */
+  /* FILE_TEST flags identify metadata predicates. SYMLINK inspects the link;
+   * all other predicates follow it. Flags may be combined for uncertain
+   * operator roles. NONEMPTY tests whether the size is greater than zero. */
   SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS = 1 << 4,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR = 1 << 5,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY = 1 << 6,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK = 1 << 7,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY = 1 << 8,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK = 1 << 9,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER = 1 << 10,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO = 1 << 11,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET = 1 << 12,
 } shell_dep_edge_flags_t;
 
 /**
@@ -610,7 +615,7 @@ typedef struct {
   uint32_t to;
   shell_dep_edge_type_t type;
   shell_dep_edge_dir_t dir;
-  uint8_t flags; /* shell_dep_edge_flags_t */
+  uint16_t flags; /* shell_dep_edge_flags_t */
   /* Descriptor pair for byte routes and setup bindings. FILE_TEST and other
    * descriptor-free relations use SHELL_DEP_FD_NONE on both sides. Use it on
    * the non-descriptor side: DOC→owner READ is none→fd, owner→DOC WRITE is

@@ -8169,7 +8169,7 @@ static void test_heredoc_expansion_semantic_contract(void) {
 static void test_continued_bash_compound_syntax_contract(void) {
   static const char *const unsupported[] = {
       "(\\\n( count += 1 ))", "(\\\n( count += 1 ))", "(\\\n( count += 1 ))",
-      "[\\\n[ -b value ]]",   "[\\\n[ -b value ]]",   "[[\\\n -b value ]]",
+      "[\\\n[ -r value ]]",   "[\\\n[ -r value ]]",   "[[\\\n -r value ]]",
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {

@@ -58,7 +58,7 @@ static SHELL_NONNULL(1) void project_rule(test_projection_t *p,
     return;
   }
   if (roles)
-    p->program->operand_roles[operand] |= (uint16_t)roles;
+    p->program->operand_roles[operand] |= roles;
   if (a.kind)
     project_visit(p, a, true);
   if (b.kind)
@@ -238,7 +238,8 @@ static SHELL_NONNULL(1) bool project_program(shell_test_program_t *program,
   if (!chart)
     return false;
   memset(chart, 0, cells * 2);
-  memset(program->operand_roles, 0, program->word_count * sizeof(uint16_t));
+  memset(program->operand_roles, 0,
+         program->word_count * sizeof(*program->operand_roles));
   test_projection_t projection = {.program = program,
                                   .chart = chart,
                                   .visited = chart + cells,

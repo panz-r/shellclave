@@ -50,7 +50,11 @@ heap in fixed sweeps; sanitizer instrumentation can reserve separate stack
 slots for sequential fixture scopes.
 
 Set `TMPDIR` to a writable directory with enough space and inodes for test
-fixtures and compiler artifacts. Shellgate policy fixtures honor this setting.
+fixtures and compiler artifacts. Shellgate policy fixtures and the Shelltype
+full-capacity policy test honor this setting. The latter writes a large NFA
+export in a private directory under `TMPDIR` (default `/tmp`) and removes that
+directory on success or failure. Filesystem quotas can prevent these writes
+even when the filesystem reports free space.
 
 Host-locale regressions require `localedef` and the `en_US` and `ISO-8859-1`
 locale sources (`locales` on Debian/Ubuntu). Tests generate private locale data

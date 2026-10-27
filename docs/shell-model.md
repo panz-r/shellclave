@@ -287,13 +287,15 @@ one empty executable with the `CT` marker per conditional stage.
 
 ### Filesystem predicates
 
-Conditional commands, `test`, and `[` support the filesystem predicates `-e`
-(existence), `-f` (regular file), `-d` (directory), and `-L` or `-h` (symbolic
-link). The first three follow symbolic links; `-L` and `-h` inspect the link
-itself. Shellsplit does not query the host filesystem: nonempty paths have
-unknown truth, while an empty path is false. Lexical negation reverses truth.
-For `test` and `[`, the unary `-a` alias also tests existence; argument-count
-and expression grammar distinguish it from the binary `-a` conjunction.
+Conditional commands, `test`, and `[` support `-e` and `-a` (existence),
+`-f` (regular file), `-d` (directory), `-s` (size greater than zero),
+`-b` (block device), `-c` (character device), `-p` (FIFO), `-S` (socket),
+and `-L` or `-h` (symbolic link). All follow symbolic links except `-L` and
+`-h`, which inspect the link itself. Shellsplit does not query the host
+filesystem: nonempty paths have unknown truth, while an empty path is false.
+Lexical negation reverses truth.
+In `test` and `[`, argument-count and expression grammar distinguish unary
+`-a` from the binary `-a` conjunction.
 Other filesystem operators accepted by those builtins remain opaque and do not
 produce FILE_TEST edges. Applications requiring complete metadata-check
 coverage must handle those operators conservatively.
@@ -328,8 +330,11 @@ by the owning command. Reached predicates retain this flag if output capacity
 prevents their FILE_TEST relation from being stored.
 The flags `SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS`,
 `SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR`,
-`SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY`, and
-`SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK` identify the individual checks.
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO`, and `SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET`
+identify the individual checks.
 
 ### Scalar variable presence
 

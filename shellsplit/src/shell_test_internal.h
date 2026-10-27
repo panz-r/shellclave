@@ -46,7 +46,7 @@ typedef struct {
 typedef struct shell_test_program {
   shell_test_value_t *words;
   shell_test_node_t *nodes;
-  uint16_t *operand_roles;
+  uint32_t *operand_roles;
   uint16_t count, root, word_count;
   bool active, proven_error, uncertain, bracket;
 } shell_test_program_t;

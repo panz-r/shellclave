@@ -185,7 +185,12 @@ static bool shellsplit_test_depgraph_invariants(
                 (edge->flags & ~(SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
                                  SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
                                  SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK)) != 0)
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
+                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET)) != 0)
              : ((edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                                  SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                                  SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |

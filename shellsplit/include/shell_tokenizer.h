@@ -66,11 +66,17 @@ typedef enum {
   SHELL_CONDITIONAL_PATTERN_NOT_MATCH,
   SHELL_CONDITIONAL_VARIABLE_SET, /* Static scalar-name presence lookup. */
   /* Filesystem predicates depend on runtime filesystem state. Symlink is the
-   * common normalized predicate for Bash's -L and -h spellings. */
+   * common normalized predicate for Bash's -L and -h spellings; -e and
+   * -a both use FILE_EXISTS. NONEMPTY tests size greater than zero. */
   SHELL_CONDITIONAL_FILE_EXISTS,
   SHELL_CONDITIONAL_FILE_REGULAR,
   SHELL_CONDITIONAL_FILE_DIRECTORY,
   SHELL_CONDITIONAL_FILE_SYMLINK,
+  SHELL_CONDITIONAL_FILE_NONEMPTY,
+  SHELL_CONDITIONAL_FILE_BLOCK,
+  SHELL_CONDITIONAL_FILE_CHARACTER,
+  SHELL_CONDITIONAL_FILE_FIFO,
+  SHELL_CONDITIONAL_FILE_SOCKET,
 } shell_conditional_predicate_t;
 
 /**

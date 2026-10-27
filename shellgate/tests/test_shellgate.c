@@ -3790,7 +3790,7 @@ TEST(conditional_string_contract) {
   ASSERT_SG_OK(eval_cmd(gate, "[[ -f config.json ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
          !result.unresolved_expansion_flags);
-  ASSERT_SG_OK(eval_cmd(gate, "[[ -e \"$path\" ]]", &result));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -S \"$path\" ]]", &result));
   ASSERT(
       result.verdict == SG_VERDICT_ALLOW &&
       (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH) &&

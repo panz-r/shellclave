@@ -191,11 +191,12 @@ The `test` and `[` builtins use the same presence facts and evaluate compound
 expressions with `!`, `-a`, `-o` and parentheses. They retain ordinary argv and
 policy subjects. See [variable presence](../docs/shell-model.md#scalar-variable-presence).
 
-Filesystem predicates `-e`, `-f`, `-d`, `-L` and `-h` are supported in
-conditional commands and the `test` and `[` builtins. A FILE_TEST edge
-connects the command to a FILE document and identifies the possible metadata
-checks. It does not claim a file-content read. Inspect the document's pathname
-and CWD when authorizing the check; unresolved arguments can leave its path
+Filesystem predicates `-e`, `-a`, `-f`, `-d`, `-L`, `-h`, `-s`, `-b`, `-c`,
+`-p` and `-S` are supported in conditional commands and the `test` and `[`
+builtins. A FILE_TEST edge connects the command to a FILE document and
+identifies the possible metadata checks. It does not claim a file-content
+read. Inspect the document's pathname and CWD when authorizing the check;
+unresolved arguments can leave its path
 or the predicate kind uncertain. See [filesystem predicates](../docs/shell-model.md#filesystem-predicates).
 Other filesystem operators accepted by the `test` and `[` builtins remain
 opaque and do not produce FILE_TEST edges. Unary `-a` in those builtins is an

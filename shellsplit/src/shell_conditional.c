@@ -254,12 +254,18 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
   if (p == n)
     return r;
   bool variable = plain(s, n, p, end, "-v");
-  bool file_exists = plain(s, n, p, end, "-e");
+  bool file_exists = plain(s, n, p, end, "-e") || plain(s, n, p, end, "-a");
   bool file_regular = plain(s, n, p, end, "-f");
   bool file_directory = plain(s, n, p, end, "-d");
   bool file_symlink = plain(s, n, p, end, "-L") || plain(s, n, p, end, "-h");
+  bool file_nonempty = plain(s, n, p, end, "-s");
+  bool file_block = plain(s, n, p, end, "-b");
+  bool file_character = plain(s, n, p, end, "-c");
+  bool file_fifo = plain(s, n, p, end, "-p");
+  bool file_socket = plain(s, n, p, end, "-S");
   bool unary = variable || file_exists || file_regular || file_directory ||
-               file_symlink || plain(s, n, p, end, "-n") ||
+               file_symlink || file_nonempty || file_block || file_character ||
+               file_fifo || file_socket || plain(s, n, p, end, "-n") ||
                plain(s, n, p, end, "-z");
   r.predicate = SHELL_CONDITIONAL_STRING_NONEMPTY;
   if (unary) {
@@ -273,6 +279,16 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
       r.predicate = SHELL_CONDITIONAL_FILE_DIRECTORY;
     else if (file_symlink)
       r.predicate = SHELL_CONDITIONAL_FILE_SYMLINK;
+    else if (file_nonempty)
+      r.predicate = SHELL_CONDITIONAL_FILE_NONEMPTY;
+    else if (file_block)
+      r.predicate = SHELL_CONDITIONAL_FILE_BLOCK;
+    else if (file_character)
+      r.predicate = SHELL_CONDITIONAL_FILE_CHARACTER;
+    else if (file_fifo)
+      r.predicate = SHELL_CONDITIONAL_FILE_FIFO;
+    else if (file_socket)
+      r.predicate = SHELL_CONDITIONAL_FILE_SOCKET;
     else if (plain(s, n, p, end, "-z"))
       r.predicate = SHELL_CONDITIONAL_STRING_EMPTY;
     r.operand_count = 0;
@@ -516,7 +532,7 @@ bool shell_conditional_evaluate(const char *source,
   if (condition->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
     return false; /* Presence is a path-local graph fact, not a string value. */
   if (condition->predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
-      condition->predicate <= SHELL_CONDITIONAL_FILE_SYMLINK) {
+      condition->predicate <= SHELL_CONDITIONAL_FILE_SOCKET) {
     bool empty;
     if (values[0].known)
       empty = values[0].length == 0;

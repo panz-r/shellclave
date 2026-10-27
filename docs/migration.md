@@ -3,7 +3,14 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
-## Unreleased: conditional predicates and builtin test composition
+## Unreleased: extended filesystem predicates
+
+`[[ ... ]]`, `test` and `[` now model `-s`, `-b`, `-c`, `-p` and `-S`;
+`[[ -a ... ]]` also tests existence. FILE_TEST edges use a widened 16-bit
+flag field for the new predicates. Rebuild consumers against the current public
+headers and recalculate workspace sizes using the sizing APIs.
+
+### Conditional predicates and builtin test composition
 
 The fixed per-command token capacity and default graph limit increase from 32
 to 48. Rebuild consumers against the new headers: public graph and source

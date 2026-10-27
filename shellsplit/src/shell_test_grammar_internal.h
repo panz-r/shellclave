@@ -24,15 +24,23 @@ enum {
   SHELL_TEST_FILE_REGULAR = 1024u,
   SHELL_TEST_FILE_DIRECTORY = 2048u,
   SHELL_TEST_FILE_SYMLINK = 4096u,
-  SHELL_TEST_AND_JOIN = 8192u,
-  SHELL_TEST_OR_JOIN = 16384u,
+  SHELL_TEST_FILE_NONEMPTY = 8192u,
+  SHELL_TEST_FILE_BLOCK = 16384u,
+  SHELL_TEST_FILE_CHARACTER = 32768u,
+  SHELL_TEST_FILE_FIFO = 65536u,
+  SHELL_TEST_FILE_SOCKET = 131072u,
+  SHELL_TEST_AND_JOIN = 262144u,
+  SHELL_TEST_OR_JOIN = 524288u,
 };
 
 enum {
   SHELL_TEST_LOOKAHEAD_BINARY = 1u,
   SHELL_TEST_LOOKAHEAD_OPERAND = 2u,
   SHELL_TEST_FILE_ROLES = SHELL_TEST_FILE_EXISTS | SHELL_TEST_FILE_REGULAR |
-                          SHELL_TEST_FILE_DIRECTORY | SHELL_TEST_FILE_SYMLINK,
+                          SHELL_TEST_FILE_DIRECTORY | SHELL_TEST_FILE_SYMLINK |
+                          SHELL_TEST_FILE_NONEMPTY | SHELL_TEST_FILE_BLOCK |
+                          SHELL_TEST_FILE_CHARACTER | SHELL_TEST_FILE_FIFO |
+                          SHELL_TEST_FILE_SOCKET,
 };
 
 /* General-expression binary precedence applies even to a unary-looking
@@ -128,6 +136,16 @@ static inline SHELL_NONNULL(1) unsigned shell_test_static_roles(
         roles |= SHELL_TEST_FILE_DIRECTORY;
       else if (spelling[1] == 'L' || spelling[1] == 'h')
         roles |= SHELL_TEST_FILE_SYMLINK;
+      else if (spelling[1] == 's')
+        roles |= SHELL_TEST_FILE_NONEMPTY;
+      else if (spelling[1] == 'b')
+        roles |= SHELL_TEST_FILE_BLOCK;
+      else if (spelling[1] == 'c')
+        roles |= SHELL_TEST_FILE_CHARACTER;
+      else if (spelling[1] == 'p')
+        roles |= SHELL_TEST_FILE_FIFO;
+      else if (spelling[1] == 'S')
+        roles |= SHELL_TEST_FILE_SOCKET;
     }
     if ((spelling[0] == '=' || spelling[0] == '!') && spelling[1] == '=')
       roles |= SHELL_TEST_BINARY;

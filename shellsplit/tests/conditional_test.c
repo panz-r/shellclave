@@ -110,6 +110,24 @@ static void check_file_predicates(void) {
       {"[[ -d output ]]", "output", SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY},
       {"[[ -L current ]]", "current", SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK},
       {"[[ -h current ]]", "current", SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK},
+      {"[[ -a target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"test -a target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"[ -a target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
+      {"[[ -s target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY},
+      {"test -s target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY},
+      {"[ -s target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY},
+      {"[[ -b target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK},
+      {"test -b target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK},
+      {"[ -b target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK},
+      {"[[ -c target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER},
+      {"test -c target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER},
+      {"[ -c target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER},
+      {"[[ -p target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO},
+      {"test -p target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO},
+      {"[ -p target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO},
+      {"[[ -S target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET},
+      {"test -S target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET},
+      {"[ -S target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET},
       {"test -e config.json", "config.json",
        SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
       {"test -a config.json", "config.json",
@@ -153,9 +171,28 @@ static void check_file_predicates(void) {
         unsigned saved = edge->flags;
         edge->flags = 0;
         CHECK(!shell_dep_graph_validate(graph).valid);
+        edge->flags = UINT16_C(1) << 15;
+        CHECK(!shell_dep_graph_validate(graph).valid);
         edge->flags = saved;
       }
     }
+  }
+  static const char *const operators[] = {"-a", "-s", "-b", "-c", "-p", "-S"};
+  for (unsigned i = 0; i < sizeof(operators) / sizeof(*operators); ++i) {
+    char source[96];
+    snprintf(source, sizeof(source), "[[ %s '' ]]", operators[i]);
+    parse(source);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          SHELL_CONDITIONAL_FALSE);
+    for (unsigned edge = 0; edge < graph->edge_count; ++edge)
+      CHECK(graph->edges[edge].type != SHELL_EDGE_FILE_TEST);
+    snprintf(source, sizeof(source), "test %s '' && cat <unreachable",
+             operators[i]);
+    parse(source);
+    for (unsigned edge = 0; edge < graph->edge_count; ++edge)
+      CHECK(graph->edges[edge].type != SHELL_EDGE_FILE_TEST &&
+            (graph->edges[edge].type != SHELL_EDGE_READ ||
+             graph->nodes[graph->edges[edge].from].type != SHELL_NODE_DOC));
   }
   parse("[[ -e '' ]]");
   CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
@@ -179,7 +216,12 @@ static void check_file_predicates(void) {
       CHECK(edge->flags == (SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
                             SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
                             SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
-                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK));
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET));
       possible_target = true;
     }
   }
@@ -467,7 +509,12 @@ static void check_test_grammar_refinement(void) {
   const unsigned all = SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
                        SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
                        SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
-                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK;
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET;
   parse("test -e \"$op\" -e -a -f target && cat <effect");
   CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR) == 1);
   CHECK(has_document_read());
@@ -520,6 +567,8 @@ static void check_test_grammar_refinement(void) {
     CHECK(predicate_edges("target", 0) == 0);
     parse_test_operator(source, "2:-e,");
     CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) == 1);
+    parse_test_operator(source, "2:-S,");
+    CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET) == 1);
   }
   parse_test_operator("test \"$op\" target || cat <unreachable", "2:-n,");
   CHECK(!has_document_read());
@@ -925,6 +974,12 @@ static void check_patterns(void) {
       {"[[ -d output ]]", SHELL_CONDITIONAL_FILE_DIRECTORY},
       {"[[ -L current ]]", SHELL_CONDITIONAL_FILE_SYMLINK},
       {"[[ -h current ]]", SHELL_CONDITIONAL_FILE_SYMLINK},
+      {"[[ -a current ]]", SHELL_CONDITIONAL_FILE_EXISTS},
+      {"[[ -s current ]]", SHELL_CONDITIONAL_FILE_NONEMPTY},
+      {"[[ -b current ]]", SHELL_CONDITIONAL_FILE_BLOCK},
+      {"[[ -c current ]]", SHELL_CONDITIONAL_FILE_CHARACTER},
+      {"[[ -p current ]]", SHELL_CONDITIONAL_FILE_FIFO},
+      {"[[ -S current ]]", SHELL_CONDITIONAL_FILE_SOCKET},
   };
   for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); ++i) {
     parse(forms[i].source);

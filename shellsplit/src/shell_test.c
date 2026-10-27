@@ -15,6 +15,11 @@ enum {
   TEST_FILE_REGULAR,
   TEST_FILE_DIRECTORY,
   TEST_FILE_SYMLINK,
+  TEST_FILE_NONEMPTY,
+  TEST_FILE_BLOCK,
+  TEST_FILE_CHARACTER,
+  TEST_FILE_FIFO,
+  TEST_FILE_SOCKET,
   TEST_TERMINAL,
   TEST_OPAQUE,
   TEST_OPAQUE_ERROR,
@@ -27,7 +32,7 @@ enum {
 _Static_assert(SHELL_DEP_MAX_TOKENS * 2u + 2u <= UINT16_MAX,
                "test expression ordinals fit retained private nodes");
 _Static_assert(sizeof(shell_test_value_t) + 2 * sizeof(shell_test_node_t) +
-                       sizeof(uint16_t) + 8 +
+                       sizeof(uint32_t) + 8 +
                        2 * (SHELL_DEP_MAX_TOKENS + 1) *
                            (SHELL_DEP_MAX_TOKENS + 1) / SHELL_DEP_MAX_TOKENS +
                        2 <=
@@ -109,6 +114,16 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
     kind = TEST_FILE_DIRECTORY;
   else if (is_word(p, op, "-L") || is_word(p, op, "-h"))
     kind = TEST_FILE_SYMLINK;
+  else if (is_word(p, op, "-s"))
+    kind = TEST_FILE_NONEMPTY;
+  else if (is_word(p, op, "-b"))
+    kind = TEST_FILE_BLOCK;
+  else if (is_word(p, op, "-c"))
+    kind = TEST_FILE_CHARACTER;
+  else if (is_word(p, op, "-p"))
+    kind = TEST_FILE_FIFO;
+  else if (is_word(p, op, "-S"))
+    kind = TEST_FILE_SOCKET;
   else if (is_word(p, op, "-t"))
     kind = TEST_TERMINAL;
   else if (is_word(p, op, "-n"))
@@ -304,7 +319,7 @@ bool shell_test_refresh(shell_test_program_t *program) {
   program->count = 0;
   program->uncertain = false;
   if (count)
-    memset(program->operand_roles, 0, count * sizeof(uint16_t));
+    memset(program->operand_roles, 0, count * sizeof(*program->operand_roles));
   if (program->bracket) {
     if (!count || !is_word(program, count - 1, "]")) {
       program->uncertain = count && !words[count - 1].known;
@@ -370,7 +385,7 @@ bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
   program->nodes = shell_source_scratch_take_array(
       count * 2 + 2, sizeof(*program->nodes), _Alignof(shell_test_node_t));
   program->operand_roles = shell_source_scratch_take_array(
-      count, sizeof(*program->operand_roles), _Alignof(uint16_t));
+      count, sizeof(*program->operand_roles), _Alignof(uint32_t));
   if (!program->nodes || (!program->operand_roles && count))
     return false;
   return shell_test_refresh(program);
@@ -439,6 +454,11 @@ static SHELL_NONNULL(1, 2, 3,
     case TEST_FILE_REGULAR:
     case TEST_FILE_DIRECTORY:
     case TEST_FILE_SYMLINK:
+    case TEST_FILE_NONEMPTY:
+    case TEST_FILE_BLOCK:
+    case TEST_FILE_CHARACTER:
+    case TEST_FILE_FIFO:
+    case TEST_FILE_SOCKET:
       result = a->known && !a->value_length ? SHELL_TEST_FALSE : 3u;
       break;
     case TEST_TERMINAL:
@@ -506,7 +526,7 @@ void shell_test_observe_files(const shell_test_program_t *program,
   stack[count++] = program->root;
   while (count) {
     shell_test_node_t n = program->nodes[stack[--count]];
-    if (n.operation >= TEST_FILE_EXISTS && n.operation <= TEST_FILE_SYMLINK)
+    if (n.operation >= TEST_FILE_EXISTS && n.operation <= TEST_FILE_SOCKET)
       observer(&program->words[n.left],
                SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS
                    << (n.operation - TEST_FILE_EXISTS),

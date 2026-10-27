@@ -3,7 +3,9 @@
 import argparse
 import os
 import shlex
+import socket
 import subprocess
+import tempfile
 import unittest
 
 
@@ -24,7 +26,7 @@ class ConditionalCommands(unittest.TestCase):
         return int(result.stdout)
 
     def test_file_predicates(self):
-        for op in ("-e", "-f", "-d", "-L", "-h"):
+        for op in ("-e", "-a", "-f", "-d", "-L", "-h", "-s", "-b", "-c", "-p", "-S"):
             for negation in ("", "! "):
                 source = f"[[ {negation}{op} '' ]]"
                 with self.subTest(source=source):
@@ -35,6 +37,48 @@ class ConditionalCommands(unittest.TestCase):
             self.assertEqual(self.probe_result(f"[[ {op} some-path ]]"), 0)
         self.assertEqual(self.bash_result("test -a ''").returncode, 1)
         self.assertEqual(self.bash_result("[ -a '' ]").returncode, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            regular = os.path.join(directory, "data")
+            empty = os.path.join(directory, "empty")
+            fifo = os.path.join(directory, "fifo")
+            link = os.path.join(directory, "link")
+            # Exercise a pathname longer than Linux's Unix socket bind limit.
+            socket_directory = os.path.join(directory, "s" * 100)
+            os.mkdir(socket_directory)
+            sockpath = os.path.join(socket_directory, "socket")
+            with open(regular, "w", encoding="ascii") as stream:
+                stream.write("x")
+            with open(empty, "w", encoding="ascii"):
+                pass
+            os.mkfifo(fifo)
+            os.symlink(regular, link)
+            fixtures = [("-s", regular, True), ("-s", empty, False),
+                        ("-s", link, True), ("-p", fifo, True),
+                        ("-b", regular, False), ("-c", regular, False),
+                        ("-c", "/dev/null", True)]
+            with socket.socket(socket.AF_UNIX) as sock:
+                # Unix socket pathname limits apply to the bind argument,
+                # so avoid including a potentially long TMPDIR prefix.
+                previous_cwd = os.getcwd()
+                os.chdir(socket_directory)
+                try:
+                    try:
+                        sock.bind("socket")
+                    except PermissionError:
+                        pass  # Some sandboxes prohibit Unix socket endpoints.
+                    else:
+                        fixtures.append(("-S", sockpath, True))
+                finally:
+                    os.chdir(previous_cwd)
+                for op, path, expected in fixtures:
+                    for form in (f"[[ {op} {shlex.quote(path)} ]]",
+                                 f"test {op} {shlex.quote(path)}",
+                                 f"[ {op} {shlex.quote(path)} ]"):
+                        with self.subTest(source=form):
+                            self.assertEqual(self.bash_result(form).returncode,
+                                             0 if expected else 1)
+                    self.assertEqual(self.probe_result(
+                        f"[[ {op} {shlex.quote(path)} ]]"), 0)
 
     def test_literal_truth(self):
         for operand in ("x", "''", '""', "'-n'", "'!'", "*", "{,}",
@@ -325,7 +369,7 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ("[[ -b file ]]", "[[ -\\\nb file ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
+        for source in ("[[ -r file ]]", "[[ -\\\nr file ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
                        "[[ 1 -eq 1 ]]", "[[ (x) ]]", "[[ x && y ]]",
                        "[[ x || y ]]"):
             with self.subTest(source=source):

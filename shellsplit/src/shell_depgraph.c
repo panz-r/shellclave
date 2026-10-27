@@ -1699,7 +1699,7 @@ static SHELL_NONNULL(1, 5, 9) void dep_add_file_test(
   shell_dep_edge_t *edge = &graph->edges[graph->edge_count++];
   dep_init_edge(edge, owner, document, SHELL_EDGE_FILE_TEST, SHELL_DIR_FORWARD,
                 SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
-  edge->flags = (uint8_t)tests;
+  edge->flags = (uint16_t)tests;
 }
 
 typedef struct {
@@ -26735,7 +26735,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
           return dep_stop_graph_construction(out, body_error);
         if (operand_index == 0 &&
             condition.predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
-            condition.predicate <= SHELL_CONDITIONAL_FILE_SYMLINK &&
+            condition.predicate <= SHELL_CONDITIONAL_FILE_SOCKET &&
             dep_owner_phase_active(&parse_context, cmd_node_idx,
                                    DEP_SNAPSHOT_BODY_WORD, UINT32_MAX)) {
           bool empty = false;
@@ -28462,7 +28462,12 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
                (e->flags & ~(SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
                              SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
                              SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
-                             SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK)) != 0)
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
+                             SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET)) != 0)
             : ((e->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                              SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                              SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |

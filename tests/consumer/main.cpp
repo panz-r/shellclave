@@ -209,17 +209,17 @@ static bool check_depgraph_workspace_api() {
                SHELL_CONDITIONAL_VARIABLE_SET &&
            graph.nodes[0].cmd.conditional_operand_count == 1 &&
            graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_TRUE;
-      const char file_test[] = "[[ -f config.json ]]";
+      const char file_test[] = "[[ -S config.json ]]";
       ok = ok &&
            shell_parse_draft(file_test, sizeof(file_test) - 1, nullptr,
                              draft) == SHELL_SOURCE_COMPLETE &&
            draft->headers[0].conditional_predicate ==
-               SHELL_CONDITIONAL_FILE_REGULAR &&
+               SHELL_CONDITIONAL_FILE_SOCKET &&
            shell_dep_graph_parse_with_fast(file_test, sizeof(file_test) - 1,
                                            ".", &limits, &draft->prefix,
                                            &graph) == SHELL_DEP_OK &&
            graph.nodes[0].cmd.conditional_predicate ==
-               SHELL_CONDITIONAL_FILE_REGULAR &&
+               SHELL_CONDITIONAL_FILE_SOCKET &&
            graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_UNKNOWN;
       unsigned file_checks = 0;
       for (std::uint32_t i = 0; ok && i < graph.edge_count; ++i) {
@@ -230,7 +230,7 @@ static bool check_depgraph_workspace_api() {
         ok = edge->from == 0 && edge->dir == SHELL_DIR_FORWARD &&
              graph.nodes[edge->to].type == SHELL_NODE_DOC &&
              doc->kind == SHELL_DOC_FILE &&
-             edge->flags == SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR &&
+             edge->flags == SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET &&
              edge->source_fd == SHELL_DEP_FD_NONE &&
              edge->target_fd == SHELL_DEP_FD_NONE && doc->path_len == 11 &&
              !std::memcmp(doc->path, "config.json", 11);

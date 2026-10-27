@@ -1,3 +1,5 @@
 test -f input && cat input || echo missing
 test -e "$operator" -e -a -f target && cat <effect
 [ "$operator" target ]
+[[ -S "$path" ]] || [ -p pipe ]
+test "$operator" target -a -s data

@@ -407,10 +407,10 @@ TEST(supplied_fast_parser_contract) {
   /* Unsupported source semantics are still rejected, even if lexical parsing
    * succeeds. Source support is separate from the trusted parse/source pair. */
   static const char *const unsupported[] = {
-      "[[ -b /tmp/x ]]",
+      "[[ -r /tmp/x ]]",
       "(( count += 1 ))",
       "printf '%s' $\"localized\"",
-      "echo $( [[ -b /tmp/x ]] )",
+      "echo $( [[ -r /tmp/x ]] )",
       "{ (( count )); }",
   };
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -12213,8 +12213,8 @@ TEST(dialect_boundary_matrix) {
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
-      "[\\\n[ -b value ]]",
-      "[[\\\n -b value ]]",
+      "[\\\n[ -r value ]]",
+      "[[\\\n -r value ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;
@@ -17732,7 +17732,7 @@ TEST(nested_unsupported_syntax_fails_atomically) {
       "cmd <<<\"$(while true; do :; done)\"",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -b /tmp/x ]]",
+      "time [[ -r /tmp/x ]]",
       "cmd \"$(time eval echo hidden)\"",
       "{ cmd; } <<<\"$(while true; do :; done)\"",
       "{ cmd; } > >(while true; do :; done)",
