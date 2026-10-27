@@ -13,6 +13,12 @@
  * source-word scanning and cardinality checks belong to admission. */
 typedef uint32_t shell_test_roles_t;
 
+/* Leave the sign bit clear so role constants remain representable as C enum
+ * values as well as uint32_t masks. Extending beyond this bound needs a new
+ * role layout, rather than overlapping or truncating predicate roles. */
+_Static_assert(SHELL_FILE_PREDICATE_COUNT <= 20,
+               "filesystem and Boolean roles fit the grammar mask");
+
 enum {
   SHELL_TEST_NOT = 1u,
   SHELL_TEST_OPEN = 2u,
@@ -23,8 +29,9 @@ enum {
   SHELL_TEST_JOIN = 64u,
   SHELL_TEST_END = 128u,
   SHELL_TEST_TERMINAL = 256u,
-  SHELL_TEST_AND_JOIN = 262144u,
-  SHELL_TEST_OR_JOIN = 524288u,
+  /* Keep Boolean connector roles above the contiguous filesystem range. */
+  SHELL_TEST_AND_JOIN = UINT32_C(512) << SHELL_FILE_PREDICATE_COUNT,
+  SHELL_TEST_OR_JOIN = UINT32_C(1024) << SHELL_FILE_PREDICATE_COUNT,
 #define FILE_ROLE(kind, name, ordinal, spelling, alias)                        \
   SHELL_TEST_FILE_##kind = 512u << ordinal,
   SHELL_FILE_PREDICATES(FILE_ROLE)

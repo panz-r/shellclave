@@ -8,7 +8,7 @@
   | SHELL_DEP_EDGE_FLAG_FILE_TEST_##kind
 enum { DEP_FILE_TEST_FLAGS = 0 SHELL_FILE_PREDICATES(FILE_FLAG) };
 #undef FILE_FLAG
-_Static_assert((DEP_FILE_TEST_FLAGS & ~UINT16_MAX) == 0,
+_Static_assert((uintmax_t)DEP_FILE_TEST_FLAGS <= UINT32_MAX,
                "filesystem predicates fit graph edge flags");
 
 /* The operand and optional resolved value borrow source/resolver storage.
@@ -60,7 +60,7 @@ static SHELL_NONNULL(1, 5, 9) void dep_add_file_test(
   shell_dep_edge_t *edge = &graph->edges[graph->edge_count++];
   dep_init_edge(edge, owner, document, SHELL_EDGE_FILE_TEST, SHELL_DIR_FORWARD,
                 SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
-  edge->flags = (uint16_t)tests;
+  edge->flags = tests;
 }
 
 typedef struct {

@@ -9,3 +9,9 @@ test -t invalid -o -v CONFIG || printf invalid
 test '' -o '(' x ')' || printf failure
 test x -a '(' '' ')' && printf success
 test '(' -t -o ')' -o -v 'a[$(printf marker >&2)]' || cat <important.txt
+
+[[ -r "$path" ]] && test -w target
+[ -x target -a -u other ]
+test -g target -o -k other
+[[ -O target ]] && [ -G target ]
+printf "%s" "$( [[ -N target ]] && printf newer )"

@@ -185,8 +185,8 @@ Quoted or escaped `?`, brackets and parentheses remain literal bytes. Unquoted
 unmatched `[` that Bash would treat literally.
 
 Internal boolean combinations, parenthesized conditions, wider patterns, regex,
-ordering/numeric comparisons and other filesystem/variable-attribute predicates
-remain UNSUPPORTED.
+ordering/numeric comparisons, binary pathname comparisons and variable-attribute
+predicates remain UNSUPPORTED.
 Lists and existing outer `&&`/`||` connectors compose supported conditions.
 
 Newlines and comments are permitted before a primary, after lexical `!`, and
@@ -287,18 +287,38 @@ one empty executable with the `CT` marker per conditional stage.
 
 ### Filesystem predicates
 
-Conditional commands, `test`, and `[` support `-e` and `-a` (existence),
-`-f` (regular file), `-d` (directory), `-s` (size greater than zero),
-`-b` (block device), `-c` (character device), `-p` (FIFO), `-S` (socket),
-and `-L` or `-h` (symbolic link). All follow symbolic links except `-L` and
-`-h`, which inspect the link itself. Shellsplit does not query the host
-filesystem: nonempty paths have unknown truth, while an empty path is false.
-Lexical negation reverses truth.
+Conditional commands, `test`, and `[` support the complete unary pathname
+predicate family:
+
+| Operators | Query |
+|---|---|
+| `-e`, `-a` | Existence |
+| `-f`, `-d` | Regular file or directory |
+| `-L`, `-h` | Symbolic link |
+| `-s` | Size greater than zero |
+| `-b`, `-c`, `-p`, `-S` | Block device, character device, FIFO or socket |
+| `-r`, `-w`, `-x` | Effective read, write or execute/search access |
+| `-u`, `-g`, `-k` | Setuid, setgid or sticky mode bit |
+| `-O`, `-G` | Owner matches effective UID or group matches effective GID |
+| `-N` | Modification time is greater than access time |
+
+All follow symbolic links except `-L` and `-h`, which inspect the link itself.
+Shellsplit represents these queries symbolically: nonempty paths have UNKNOWN
+truth, while an empty path is false. Lexical negation reverses truth.
+Access checks depend on the executor's effective identity, supplementary groups
+and filesystem access rules. `-x` includes directory search permission. `-G`
+compares the effective GID specifically, rather than supplementary membership.
+`-N` compares stored filesystem timestamps at the filesystem's supported
+precision, including available subsecond fields. Its result is independent of
+the graph's record of command reads.
+
 In `test` and `[`, argument-count and expression grammar distinguish unary
-`-a` from the binary `-a` conjunction.
-Other filesystem operators accepted by those builtins remain opaque and do not
-produce FILE_TEST edges. Applications requiring complete metadata-check
-coverage must handle those operators conservatively.
+`-a` from the binary `-a` conjunction. Binary pathname comparisons (`-nt`,
+`-ot`, `-ef`) remain opaque in those builtins and produce no FILE_TEST edges;
+they remain unsupported in conditional commands. Descriptor tests (`-t`), shell
+option tests (`-o`) and variable-attribute tests (`-R`) are separate predicate
+families. Applications requiring complete metadata-check coverage must handle
+opaque operators conservatively.
 
 A `SHELL_EDGE_FILE_TEST` edge points from the command to a FILE document. Its
 flags identify possible predicate kinds; multiple flags can occur where a
@@ -333,8 +353,15 @@ The flags `SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS`,
 `SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY`,
 `SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY`,
 `SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER`,
-`SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO`, and `SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET`
-identify the individual checks.
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID`, `SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER`,
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP`, and
+`SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ` identify the individual checks.
+The access and mode checks describe metadata queries, separately from byte
+READ/WRITE edges and command execution.
 
 ### Scalar variable presence
 

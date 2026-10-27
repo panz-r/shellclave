@@ -8172,9 +8172,9 @@ static void test_continued_bash_compound_syntax_contract(void) {
       "(\\\n( count += 1 ))",
       "(\\\n( count += 1 ))",
       "(\\\n( count += 1 ))",
-      "[\\\n[ " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
-      "[\\\n[ " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
-      "[[\\\n " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
+      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
+      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
+      "[[\\\n file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {

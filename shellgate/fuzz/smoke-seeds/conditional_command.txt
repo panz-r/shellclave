@@ -2,3 +2,9 @@
 [[ "$(printf value)" == "value" ]] && printf ok
 
 [[ "report.txt" == "report"*.txt ]] && printf matched
+
+[[ -r "$path" ]] && test -w target
+[ -x target -a -u other ]
+test -g target -o -k other
+[[ -O target ]] && [ -G target ]
+printf "%s" "$( [[ -N target ]] && printf newer )"

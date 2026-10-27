@@ -223,7 +223,11 @@ typedef enum {
   SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP = 1 << 3,
   /* FILE_TEST flags identify metadata predicates. SYMLINK inspects the link;
    * all other predicates follow it. Flags may be combined for uncertain
-   * operator roles. NONEMPTY tests whether the size is greater than zero. */
+   * operator roles. NONEMPTY tests whether the size is greater than zero.
+   * READABLE/WRITABLE/EXECUTABLE query effective access; EXECUTABLE includes
+   * directory search. OWNED_BY_USER/GROUP compare effective UID/GID.
+   * MODIFIED_SINCE_READ compares modification time > access time, including
+   * subsecond fields. These checks do not imply byte transfer or execution. */
   SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS = 1 << 4,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR = 1 << 5,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY = 1 << 6,
@@ -233,6 +237,15 @@ typedef enum {
   SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER = 1 << 10,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO = 1 << 11,
   SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET = 1 << 12,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE = UINT32_C(1) << 13,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE = UINT32_C(1) << 14,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE = UINT32_C(1) << 15,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID = UINT32_C(1) << 16,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID = UINT32_C(1) << 17,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY = UINT32_C(1) << 18,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER = UINT32_C(1) << 19,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP = UINT32_C(1) << 20,
+  SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ = UINT32_C(1) << 21,
 } shell_dep_edge_flags_t;
 
 /**
@@ -615,7 +628,7 @@ typedef struct {
   uint32_t to;
   shell_dep_edge_type_t type;
   shell_dep_edge_dir_t dir;
-  uint16_t flags; /* shell_dep_edge_flags_t */
+  uint32_t flags; /* shell_dep_edge_flags_t */
   /* Descriptor pair for byte routes and setup bindings. FILE_TEST and other
    * descriptor-free relations use SHELL_DEP_FD_NONE on both sides. Use it on
    * the non-descriptor side: DOC→owner READ is none→fd, owner→DOC WRITE is

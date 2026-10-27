@@ -55,6 +55,9 @@ full-capacity policy test honor this setting. The latter writes a large NFA
 export in a private directory under `TMPDIR` (default `/tmp`) and removes that
 directory on success or failure. Filesystem quotas can prevent these writes
 even when the filesystem reports free space.
+Timestamp conformance uses the values stored by the filesystem behind `TMPDIR`;
+nanosecond storage precision is not required. The fixtures also exercise
+whole-second rounding on filesystems that preserve subsecond timestamps.
 
 Host-locale regressions require `localedef` and the `en_US` and `ISO-8859-1`
 locale sources (`locales` on Debian/Ubuntu). Tests generate private locale data
@@ -218,7 +221,10 @@ lexical recognition and builtin effective-argument recognition expand it through
 their own comparisons; quote handling and argument grammar remain separate.
 The list also supplies classification cases and masks. Compile-time assertions
 keep public conditional ordinals, builtin operations, role bits and graph flags
-aligned with the existing shift-based mappings. Predicate graph attachment
+aligned with the existing shift-based mappings. Boolean connector roles are
+placed above the filesystem role range using the predicate count; compile-time
+bounds prevent overlap or overflow. Public edge flags use 32-bit storage.
+Predicate graph attachment
 consumes existing operand-resolution results after ordered substitutions and
 preserves unresolved pathname facts.
 `shell_test_roles_t` owns the 32-bit grammar-role representation; retained masks,
@@ -228,7 +234,9 @@ To extend this predicate family, append the public kind and flag, add its privat
 definition row, and update independent tests and the shell-model reference.
 
 Shared C/C++ rejection fixtures in `shellsplit/tests/syntax_boundary_cases.h`
-own the unsupported filesystem-operator sentinel and continuation spelling.
+own the unsupported binary pathname-comparison sentinel, both operand spans
+and the continued operator spelling. Keep these fixtures valid Bash as unary
+predicate coverage grows.
 Each harness retains its own API assertions and contextual wrappers. Python
 Bash qualification cases and explicit predicate expectations stay independent
 of the implementation list.

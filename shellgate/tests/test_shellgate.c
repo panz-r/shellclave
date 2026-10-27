@@ -3769,6 +3769,32 @@ TEST(variable_presence_contract) {
   sg_gate_free(gate);
 }
 
+TEST(filesystem_predicate_contract) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"test -N *", "\"[\" -G * ]"}, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  static const char *const operators[] = {"-r", "-w", "-x", "-u", "-g",
+                                          "-k", "-O", "-G", "-N"};
+  sg_result_t result;
+  for (unsigned i = 0; i < sizeof(operators) / sizeof(*operators); ++i) {
+    char source[64];
+    snprintf(source, sizeof(source), "[[ %s target ]]", operators[i]);
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
+           !result.unresolved_expansion_flags);
+  }
+  ASSERT_SG_OK(eval_cmd(gate, "test -N target", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "[ -G target ]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "test -r target", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 1);
+  sg_gate_free(gate);
+}
+
 TEST(conditional_string_contract) {
   sg_gate_t *gate = gate_with_rules((const char *[]){"printf *"}, 1);
   ASSERT(gate != NULL);
@@ -3790,7 +3816,7 @@ TEST(conditional_string_contract) {
   ASSERT_SG_OK(eval_cmd(gate, "[[ -f config.json ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
          !result.unresolved_expansion_flags);
-  ASSERT_SG_OK(eval_cmd(gate, "[[ -S \"$path\" ]]", &result));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -N \"$path\" ]]", &result));
   ASSERT(
       result.verdict == SG_VERDICT_ALLOW &&
       (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH) &&
@@ -15763,6 +15789,7 @@ int main(int argc, char **argv) {
   RUN(nested_feature_rejection_contract);
   RUN(static_arithmetic_literal_contract);
   RUN(variable_presence_contract);
+  RUN(filesystem_predicate_contract);
   RUN(conditional_string_contract);
   RUN(builtin_test_grammar_contract);
   RUN(command_token_capacity_contract);

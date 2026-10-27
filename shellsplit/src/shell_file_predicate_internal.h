@@ -17,7 +17,16 @@
   X(BLOCK, block, 5, "-b", "-b")                                               \
   X(CHARACTER, character, 6, "-c", "-c")                                       \
   X(FIFO, fifo, 7, "-p", "-p")                                                 \
-  X(SOCKET, socket, 8, "-S", "-S")
+  X(SOCKET, socket, 8, "-S", "-S")                                             \
+  X(READABLE, readable, 9, "-r", "-r")                                         \
+  X(WRITABLE, writable, 10, "-w", "-w")                                        \
+  X(EXECUTABLE, executable, 11, "-x", "-x")                                    \
+  X(SETUID, setuid, 12, "-u", "-u")                                            \
+  X(SETGID, setgid, 13, "-g", "-g")                                            \
+  X(STICKY, sticky, 14, "-k", "-k")                                            \
+  X(OWNED_BY_USER, owned_by_user, 15, "-O", "-O")                              \
+  X(OWNED_BY_GROUP, owned_by_group, 16, "-G", "-G")                            \
+  X(MODIFIED_SINCE_READ, modified_since_read, 17, "-N", "-N")
 
 #define SHELL_FILE_COUNT(kind, name, ordinal, spelling, alias) +1
 enum { SHELL_FILE_PREDICATE_COUNT = 0 SHELL_FILE_PREDICATES(SHELL_FILE_COUNT) };

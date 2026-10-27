@@ -67,7 +67,12 @@ typedef enum {
   SHELL_CONDITIONAL_VARIABLE_SET, /* Static scalar-name presence lookup. */
   /* Filesystem predicates depend on runtime filesystem state. Symlink is the
    * common normalized predicate for Bash's -L and -h spellings; -e and
-   * -a both use FILE_EXISTS. NONEMPTY tests size greater than zero. */
+   * -a both use FILE_EXISTS. NONEMPTY tests size greater than zero. Access
+   * predicates use effective identity; EXECUTABLE includes directory search.
+   * OWNED_BY_USER/GROUP compare effective UID/GID. MODIFIED_SINCE_READ tests
+   * modification time greater than access time, including subsecond fields.
+   * All predicates except SYMLINK follow symbolic links. Nonempty paths have
+   * unknown truth; the library does not query the host filesystem. */
   SHELL_CONDITIONAL_FILE_EXISTS,
   SHELL_CONDITIONAL_FILE_REGULAR,
   SHELL_CONDITIONAL_FILE_DIRECTORY,
@@ -77,6 +82,15 @@ typedef enum {
   SHELL_CONDITIONAL_FILE_CHARACTER,
   SHELL_CONDITIONAL_FILE_FIFO,
   SHELL_CONDITIONAL_FILE_SOCKET,
+  SHELL_CONDITIONAL_FILE_READABLE,
+  SHELL_CONDITIONAL_FILE_WRITABLE,
+  SHELL_CONDITIONAL_FILE_EXECUTABLE,
+  SHELL_CONDITIONAL_FILE_SETUID,
+  SHELL_CONDITIONAL_FILE_SETGID,
+  SHELL_CONDITIONAL_FILE_STICKY,
+  SHELL_CONDITIONAL_FILE_OWNED_BY_USER,
+  SHELL_CONDITIONAL_FILE_OWNED_BY_GROUP,
+  SHELL_CONDITIONAL_FILE_MODIFIED_SINCE_READ,
 } shell_conditional_predicate_t;
 
 /**

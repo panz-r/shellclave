@@ -191,16 +191,20 @@ The `test` and `[` builtins use the same presence facts and evaluate compound
 expressions with `!`, `-a`, `-o` and parentheses. They retain ordinary argv and
 policy subjects. See [variable presence](../docs/shell-model.md#scalar-variable-presence).
 
-Filesystem predicates `-e`, `-a`, `-f`, `-d`, `-L`, `-h`, `-s`, `-b`, `-c`,
-`-p` and `-S` are supported in conditional commands and the `test` and `[`
-builtins. A FILE_TEST edge connects the command to a FILE document and
-identifies the possible metadata checks. It does not claim a file-content
-read. Inspect the document's pathname and CWD when authorizing the check;
-unresolved arguments can leave its path
-or the predicate kind uncertain. See [filesystem predicates](../docs/shell-model.md#filesystem-predicates).
-Other filesystem operators accepted by the `test` and `[` builtins remain
-opaque and do not produce FILE_TEST edges. Unary `-a` in those builtins is an
-existence alias; their grammar distinguishes it from conjunction.
+The complete unary pathname predicate family is supported in conditional
+commands and the `test` and `[` builtins: existence and file type (`-e`, `-a`,
+`-f`, `-d`, `-L`, `-h`, `-b`, `-c`, `-p`, `-S`), nonempty size (`-s`), effective
+access (`-r`, `-w`, `-x`), mode bits (`-u`, `-g`, `-k`), effective ownership
+(`-O`, `-G`) and modification time greater than access time (`-N`). A FILE_TEST
+edge connects the command to a FILE document and identifies the possible
+metadata checks. Inspect its pathname and CWD when authorizing the check;
+unresolved arguments can leave its path or predicate kind uncertain. Nonempty
+paths have UNKNOWN truth. Access checks and filesystem timestamps remain runtime
+facts, separate from file-content reads, writes and command execution.
+See [filesystem predicates](../docs/shell-model.md#filesystem-predicates).
+Binary pathname comparisons (`-nt`, `-ot`, `-ef`) remain opaque in `test` and `[`
+and do not produce FILE_TEST edges. Unary `-a` is an existence alias; builtin
+argument grammar distinguishes it from conjunction.
 
 ## Dependency-graph workspace
 

@@ -5,10 +5,17 @@ define the current API; rebuild consumers after updating the library.
 
 ## Unreleased: extended filesystem predicates
 
-`[[ ... ]]`, `test` and `[` now model `-s`, `-b`, `-c`, `-p` and `-S`;
-`[[ -a ... ]]` also tests existence. FILE_TEST edges use a widened 16-bit
-flag field for the new predicates. Rebuild consumers against the current public
-headers and recalculate workspace sizes using the sizing APIs.
+`[[ ... ]]`, `test` and `[` now model the complete unary pathname predicate
+family, adding access (`-r`, `-w`, `-x`), mode bits (`-u`, `-g`, `-k`), effective
+ownership (`-O`, `-G`) and timestamp comparison (`-N`) to existence, type and size
+checks. `[[ -a ... ]]` also tests existence.
+
+`shell_dep_edge_t.flags` is now `uint32_t`, widened from the previous 16-bit
+field. New FILE_TEST flags occupy bits 13 through 21; existing flag and
+conditional-kind numeric values remain unchanged. Consumers must preserve all
+32 flag bits in their own storage and conversions. Rebuild against the current
+public headers and recalculate workspace sizes using the sizing APIs; structure
+layout compatibility across builds is not promised.
 
 ### Conditional predicates and builtin test composition
 

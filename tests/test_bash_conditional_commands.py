@@ -1,4 +1,4 @@
-"""Qualify string conditional grammar and truth against the pinned Bash."""
+"""Qualify conditional grammar and predicate truth against the pinned Bash."""
 
 import argparse
 import os
@@ -26,7 +26,8 @@ class ConditionalCommands(unittest.TestCase):
         return int(result.stdout)
 
     def test_file_predicates(self):
-        for op in ("-e", "-a", "-f", "-d", "-L", "-h", "-s", "-b", "-c", "-p", "-S"):
+        for op in ("-e", "-a", "-f", "-d", "-L", "-h", "-s", "-b", "-c", "-p", "-S",
+                   "-r", "-w", "-x", "-u", "-g", "-k", "-O", "-G", "-N"):
             for negation in ("", "! "):
                 source = f"[[ {negation}{op} '' ]]"
                 with self.subTest(source=source):
@@ -34,6 +35,12 @@ class ConditionalCommands(unittest.TestCase):
                     truth = self.probe_result(source)
                     self.assertEqual(self.bash_result(source).returncode,
                                      0 if truth == 2 else 1)
+                    for form in (f"test {negation}{op} ''",
+                                 f"[ {negation}{op} '' ]"):
+                        # Three-argument ! -a '' selects binary conjunction.
+                        expected = bool(negation) and op != "-a"
+                        self.assertEqual(self.bash_result(form).returncode,
+                                         0 if expected else 1)
             self.assertEqual(self.probe_result(f"[[ {op} some-path ]]"), 0)
         self.assertEqual(self.bash_result("test -a ''").returncode, 1)
         self.assertEqual(self.bash_result("[ -a '' ]").returncode, 1)
@@ -79,6 +86,72 @@ class ConditionalCommands(unittest.TestCase):
                                              0 if expected else 1)
                     self.assertEqual(self.probe_result(
                         f"[[ {op} {shlex.quote(path)} ]]"), 0)
+
+    def test_access_mode_ownership_and_timestamps(self):
+        def check(op, path, expected):
+            quoted = shlex.quote(path)
+            for form in (f"[[ {op} {quoted} ]]", f"test {op} {quoted}",
+                         f"[ {op} {quoted} ]"):
+                with self.subTest(source=form):
+                    self.assertEqual(self.bash_result(form).returncode,
+                                     0 if expected else 1)
+            # Metadata and access remain runtime facts, even for a concrete
+            # pathname whose fixture state is known to this test process.
+            self.assertEqual(self.probe_result(f"[[ {op} {quoted} ]]"), 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            regular = os.path.join(directory, "data")
+            link = os.path.join(directory, "link")
+            missing = os.path.join(directory, "missing")
+            with open(regular, "w", encoding="ascii") as stream:
+                stream.write("x")
+            os.symlink(regular, link)
+            for op in ("-r", "-w", "-x", "-u", "-g", "-k", "-O", "-G", "-N"):
+                check(op, missing, False)
+            for mode in (0o000, 0o600, 0o700, 0o100, 0o7600):
+                os.chmod(regular, mode)
+                for path in (regular, link):
+                    for op, access in (("-r", os.R_OK), ("-w", os.W_OK),
+                                       ("-x", os.X_OK)):
+                        # Effective access accounts for root privileges and
+                        # supplementary groups; chmod(000) alone is insufficient.
+                        check(op, path, os.access(path, access, effective_ids=True))
+                    for op, bit in (("-u", 0o4000), ("-g", 0o2000), ("-k", 0o1000)):
+                        check(op, path, bool(os.stat(path).st_mode & bit))
+                    metadata = os.stat(path)
+                    check("-O", path, metadata.st_uid == os.geteuid())
+                    check("-G", path, metadata.st_gid == os.getegid())
+            # Restore ordinary permissions before exercising timestamp changes.
+            os.chmod(regular, 0o600)
+            check("-x", directory, os.access(directory, os.X_OK, effective_ids=True))
+            os.chmod(directory, 0o1700)
+            check("-k", directory, True)
+            base = 1_700_000_000_000_000_000
+            second = 1_000_000_000
+
+            def check_timestamps(set_times):
+                cases = ((base, base + 2 * second), (base, base),
+                         (base + 2 * second, base),
+                         (base, base + 1), (base + 1, base))
+                for atime, mtime in cases:
+                    with self.subTest(atime=atime, mtime=mtime):
+                        set_times(regular, ns=(atime, mtime))
+                        metadata = os.stat(regular)
+                        # Integer nanosecond fields report stored timestamps;
+                        # filesystem precision can round the requested values.
+                        # Stat and predicate queries leave file contents unread.
+                        expected = metadata.st_mtime_ns > metadata.st_atime_ns
+                        for path in (regular, link):
+                            check("-N", path, expected)
+
+            def set_whole_seconds(path, *, ns):
+                # Exercise rounding even when TMPDIR preserves nanoseconds.
+                os.utime(path, ns=tuple(value // second * second for value in ns))
+
+            for name, setter in (("native", os.utime),
+                                 ("whole-second", set_whole_seconds)):
+                with self.subTest(timestamp_setter=name):
+                    check_timestamps(setter)
 
     def test_literal_truth(self):
         for operand in ("x", "''", '""', "'-n'", "'!'", "*", "{,}",
@@ -369,7 +442,7 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ("[[ -r file ]]", "[[ -\\\nr file ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
+        for source in ("[[ file -nt other ]]", "[[ file -\\\nnt other ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
                        "[[ 1 -eq 1 ]]", "[[ (x) ]]", "[[ x && y ]]",
                        "[[ x || y ]]"):
             with self.subTest(source=source):

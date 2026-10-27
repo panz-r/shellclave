@@ -12214,8 +12214,8 @@ TEST(dialect_boundary_matrix) {
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
-      "[\\\n[ " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
-      "[[\\\n " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
+      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
+      "[[\\\n file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;

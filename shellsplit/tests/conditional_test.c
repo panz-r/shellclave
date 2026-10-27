@@ -128,6 +128,43 @@ static void check_file_predicates(void) {
       {"[[ -S target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET},
       {"test -S target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET},
       {"[ -S target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET},
+      {"[[ -r target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE},
+      {"test -r target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE},
+      {"[ -r target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE},
+      {"[[ -w target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE},
+      {"test -w target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE},
+      {"[ -w target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE},
+      {"[[ -x target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE},
+      {"test -x target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE},
+      {"[ -x target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE},
+      {"[[ -u target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID},
+      {"test -u target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID},
+      {"[ -u target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID},
+      {"[[ -g target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID},
+      {"test -g target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID},
+      {"[ -g target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID},
+      {"[[ -k target ]]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY},
+      {"test -k target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY},
+      {"[ -k target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY},
+      {"[[ -O target ]]", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER},
+      {"test -O target", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER},
+      {"[ -O target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER},
+      {"[[ -G target ]]", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP},
+      {"test -G target", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP},
+      {"[ -G target ]", "target", SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP},
+      {"[[ -N target ]]", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ},
+      {"test -N target", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ},
+      {"[ -N target ]", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ},
+      {"{ [[ -N target ]]; }", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ},
+      {"printf '%s' \"$( [[ -N target ]] && printf yes )\"", "target",
+       SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ},
       {"test -e config.json", "config.json",
        SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS},
       {"test -a config.json", "config.json",
@@ -171,28 +208,39 @@ static void check_file_predicates(void) {
         unsigned saved = edge->flags;
         edge->flags = 0;
         CHECK(!shell_dep_graph_validate(graph).valid);
-        edge->flags = UINT16_C(1) << 15;
+        edge->flags = UINT32_C(1) << 31;
         CHECK(!shell_dep_graph_validate(graph).valid);
         edge->flags = saved;
       }
     }
   }
-  static const char *const operators[] = {"-a", "-s", "-b", "-c", "-p", "-S"};
+  static const char *const operators[] = {
+      "-e", "-a", "-f", "-d", "-L", "-h", "-s", "-b", "-c", "-p",
+      "-S", "-r", "-w", "-x", "-u", "-g", "-k", "-O", "-G", "-N"};
   for (unsigned i = 0; i < sizeof(operators) / sizeof(*operators); ++i) {
     char source[96];
-    snprintf(source, sizeof(source), "[[ %s '' ]]", operators[i]);
-    parse(source);
-    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
-          SHELL_CONDITIONAL_FALSE);
-    for (unsigned edge = 0; edge < graph->edge_count; ++edge)
-      CHECK(graph->edges[edge].type != SHELL_EDGE_FILE_TEST);
-    snprintf(source, sizeof(source), "test %s '' && cat <unreachable",
-             operators[i]);
-    parse(source);
-    for (unsigned edge = 0; edge < graph->edge_count; ++edge)
-      CHECK(graph->edges[edge].type != SHELL_EDGE_FILE_TEST &&
-            (graph->edges[edge].type != SHELL_EDGE_READ ||
-             graph->nodes[graph->edges[edge].from].type != SHELL_NODE_DOC));
+    for (unsigned negate = 0; negate < 2; ++negate) {
+      snprintf(source, sizeof(source), "[[ %s%s '' ]]", negate ? "! " : "",
+               operators[i]);
+      parse(source);
+      CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+            (negate ? SHELL_CONDITIONAL_TRUE : SHELL_CONDITIONAL_FALSE));
+      for (unsigned edge = 0; edge < graph->edge_count; ++edge)
+        CHECK(graph->edges[edge].type != SHELL_EDGE_FILE_TEST);
+      /* Three-argument ! -a '' selects binary conjunction before unary
+       * negation; the explicit conditional grammar instead selects -a. */
+      for (unsigned bracket = 0; bracket < 2; ++bracket) {
+        snprintf(source, sizeof(source), "%s %s%s ''%s %s cat <unreachable",
+                 bracket ? "[" : "test", negate ? "! " : "", operators[i],
+                 bracket ? " ]" : "",
+                 negate && strcmp(operators[i], "-a") ? "||" : "&&");
+        parse(source);
+        for (unsigned edge = 0; edge < graph->edge_count; ++edge)
+          CHECK(graph->edges[edge].type != SHELL_EDGE_FILE_TEST &&
+                (graph->edges[edge].type != SHELL_EDGE_READ ||
+                 graph->nodes[graph->edges[edge].from].type != SHELL_NODE_DOC));
+      }
+    }
   }
   parse("[[ -e '' ]]");
   CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
@@ -221,7 +269,16 @@ static void check_file_predicates(void) {
                             SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
                             SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
                             SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
-                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET));
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP |
+                            SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ));
       possible_target = true;
     }
   }
@@ -249,14 +306,27 @@ static void check_file_predicates(void) {
   CHECK(combined == (SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
                      SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY));
   CHECK(count == 2);
+  /* Connector roles must remain separate from the expanded predicate mask;
+   * builtin evaluation records both queries even when a true operand decides
+   * the enclosing Boolean expression. */
+  parse("test x -o -N first -a -G second");
+  combined = count = 0;
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    if (graph->edges[i].type == SHELL_EDGE_FILE_TEST) {
+      combined |= graph->edges[i].flags;
+      ++count;
+    }
+  CHECK(combined == (SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ |
+                     SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP));
+  CHECK(count == 2);
   parse("test -f '' && cat /unreachable");
   for (unsigned i = 0; i < graph->edge_count; ++i)
     CHECK(graph->edges[i].type != SHELL_EDGE_READ ||
           graph->nodes[graph->edges[i].from].type != SHELL_NODE_DOC);
-  parse("cd sub && [[ -e config.json ]]");
+  parse("cd sub && [[ -N config.json ]]");
   unsigned file = file_node("config.json");
   CHECK(!graph->nodes[file].doc.cwd_known);
-  parse("cd /src && [[ -e config.json ]]");
+  parse("cd /src && [[ -N config.json ]]");
   file = file_node("config.json");
   CHECK(graph->nodes[file].doc.cwd_known);
   CHECK(
@@ -325,7 +395,7 @@ static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
 }
 
 static void check_file_predicate_resolution(void) {
-  current = "[[ -e \"$path\" ]]";
+  current = "[[ -N \"$path\" ]]";
   resolved_value = "4:path,";
   resolved_length = 0;
   CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
@@ -366,7 +436,7 @@ static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
 }
 
 static void check_file_predicate_nul_argument(void) {
-  current = "test -e \"$path\"";
+  current = "test -N \"$path\"";
   CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
                                        &limits, graph, resolve_nul_argument,
                                        NULL, NULL) == SHELL_DEP_OK);
@@ -398,22 +468,22 @@ static void check_file_predicate_unresolved_paths(void) {
     const char *source, *value;
     unsigned flagged;
   } cases[] = {
-      {"[[ -e \"$path\" ]]", NULL, 1},
-      {"test -e \"$path\"", NULL, 1},
-      {"[ -e \"$path\" ]", NULL, 1},
-      {"printf '%s' \"$( [[ -e \"$path\" ]] )\"", NULL, 1},
-      {"printf '%s' \"$( test -e \"$path\" )\"", NULL, 1},
-      {"{ [[ -e \"$path\" ]]; }", NULL, 1},
-      {"[[ -e \"$path\" ]]", "4:path,", 0},
-      {"test -e \"$path\"", "4:path,", 0},
-      {"[[ -e \"$path\" ]]", "0:,", 0},
-      {"test -e \"$path\"", "0:,", 0},
-      {"[[ -e '' ]]", NULL, 0},
-      {"test -e config.json", NULL, 0},
-      {"false && [[ -e \"$path\" ]]", NULL, 0},
-      {"false && test -e \"$path\"", NULL, 0},
-      {"exec 99<&-; [[ -e \"$path\" ]] <&99", NULL, 0},
-      {"exec 99<&-; test -e \"$path\" <&99", NULL, 0},
+      {"[[ -N \"$path\" ]]", NULL, 1},
+      {"test -N \"$path\"", NULL, 1},
+      {"[ -N \"$path\" ]", NULL, 1},
+      {"printf '%s' \"$( [[ -N \"$path\" ]] )\"", NULL, 1},
+      {"printf '%s' \"$( test -N \"$path\" )\"", NULL, 1},
+      {"{ [[ -N \"$path\" ]]; }", NULL, 1},
+      {"[[ -N \"$path\" ]]", "4:path,", 0},
+      {"test -N \"$path\"", "4:path,", 0},
+      {"[[ -N \"$path\" ]]", "0:,", 0},
+      {"test -N \"$path\"", "0:,", 0},
+      {"[[ -N '' ]]", NULL, 0},
+      {"test -N config.json", NULL, 0},
+      {"false && [[ -N \"$path\" ]]", NULL, 0},
+      {"false && test -N \"$path\"", NULL, 0},
+      {"exec 99<&-; [[ -N \"$path\" ]] <&99", NULL, 0},
+      {"exec 99<&-; test -N \"$path\" <&99", NULL, 0},
       {"test -n \"$path\"", NULL, 0},
   };
   uint8_t unresolved[SHELL_DEP_MAX_NODES];
@@ -440,7 +510,7 @@ static void check_file_predicate_unresolved_paths(void) {
     }
     CHECK(flagged == cases[c].flagged);
   }
-  current = "test -e \"$path\"";
+  current = "test -N \"$path\"";
   CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
                                        &limits, graph, resolve_nul_argument,
                                        NULL, unresolved) == SHELL_DEP_OK);
@@ -451,7 +521,7 @@ static void check_file_predicate_unresolved_paths(void) {
 
   /* Keep the command owner while denying capacity for its FILE document.
    * The public uncertainty result must survive that output truncation. */
-  current = "[[ -e \"$path\" ]]";
+  current = "[[ -N \"$path\" ]]";
   shell_dep_limits_t truncated = limits;
   truncated.max_nodes = 1;
   CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
@@ -514,7 +584,16 @@ static void check_test_grammar_refinement(void) {
                        SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
                        SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
                        SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
-                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET;
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP |
+                       SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ;
   parse("test -e \"$op\" -e -a -f target && cat <effect");
   CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR) == 1);
   CHECK(has_document_read());
@@ -569,6 +648,10 @@ static void check_test_grammar_refinement(void) {
     CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS) == 1);
     parse_test_operator(source, "2:-S,");
     CHECK(predicate_edges("target", SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET) == 1);
+    parse_test_operator(source, "2:-N,");
+    CHECK(predicate_edges("target",
+                          SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ) ==
+          1);
   }
   parse_test_operator("test \"$op\" target || cat <unreachable", "2:-n,");
   CHECK(!has_document_read());
@@ -980,6 +1063,15 @@ static void check_patterns(void) {
       {"[[ -c current ]]", SHELL_CONDITIONAL_FILE_CHARACTER},
       {"[[ -p current ]]", SHELL_CONDITIONAL_FILE_FIFO},
       {"[[ -S current ]]", SHELL_CONDITIONAL_FILE_SOCKET},
+      {"[[ -r current ]]", SHELL_CONDITIONAL_FILE_READABLE},
+      {"[[ -w current ]]", SHELL_CONDITIONAL_FILE_WRITABLE},
+      {"[[ -x current ]]", SHELL_CONDITIONAL_FILE_EXECUTABLE},
+      {"[[ -u current ]]", SHELL_CONDITIONAL_FILE_SETUID},
+      {"[[ -g current ]]", SHELL_CONDITIONAL_FILE_SETGID},
+      {"[[ -k current ]]", SHELL_CONDITIONAL_FILE_STICKY},
+      {"[[ -O current ]]", SHELL_CONDITIONAL_FILE_OWNED_BY_USER},
+      {"[[ -G current ]]", SHELL_CONDITIONAL_FILE_OWNED_BY_GROUP},
+      {"[[ -N current ]]", SHELL_CONDITIONAL_FILE_MODIFIED_SINCE_READ},
   };
   for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); ++i) {
     parse(forms[i].source);

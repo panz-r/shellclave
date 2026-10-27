@@ -182,15 +182,25 @@ static bool shellsplit_test_depgraph_invariants(
         edge->type > SHELL_EDGE_FILE_TEST || edge->dir > SHELL_DIR_UNDIR ||
         (edge->type == SHELL_EDGE_FILE_TEST
              ? (edge->flags == 0 ||
-                (edge->flags & ~(SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
-                                 SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET)) != 0)
+                (edge->flags &
+                 ~(SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_REGULAR |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_DIRECTORY |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_SYMLINK |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_NONEMPTY |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_BLOCK |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_CHARACTER |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_FIFO |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_SOCKET |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_READABLE |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_WRITABLE |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_EXECUTABLE |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_SETUID |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_SETGID |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_STICKY |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_USER |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_OWNED_BY_GROUP |
+                   SHELL_DEP_EDGE_FLAG_FILE_TEST_MODIFIED_SINCE_READ)) != 0)
              : ((edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                                  SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                                  SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
