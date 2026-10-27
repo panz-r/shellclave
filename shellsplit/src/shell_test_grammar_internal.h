@@ -2,6 +2,7 @@
 #define SHELL_TEST_GRAMMAR_INTERNAL_H
 
 #include "shell_contract.h"
+#include "shell_file_predicate_internal.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -10,6 +11,8 @@
 /* Shared effective-argument roles, numeric facts and argument-count dispatch
  * for test/[ admission and evaluation. Consumers supply projected word facts;
  * source-word scanning and cardinality checks belong to admission. */
+typedef uint32_t shell_test_roles_t;
+
 enum {
   SHELL_TEST_NOT = 1u,
   SHELL_TEST_OPEN = 2u,
@@ -20,32 +23,27 @@ enum {
   SHELL_TEST_JOIN = 64u,
   SHELL_TEST_END = 128u,
   SHELL_TEST_TERMINAL = 256u,
-  SHELL_TEST_FILE_EXISTS = 512u,
-  SHELL_TEST_FILE_REGULAR = 1024u,
-  SHELL_TEST_FILE_DIRECTORY = 2048u,
-  SHELL_TEST_FILE_SYMLINK = 4096u,
-  SHELL_TEST_FILE_NONEMPTY = 8192u,
-  SHELL_TEST_FILE_BLOCK = 16384u,
-  SHELL_TEST_FILE_CHARACTER = 32768u,
-  SHELL_TEST_FILE_FIFO = 65536u,
-  SHELL_TEST_FILE_SOCKET = 131072u,
   SHELL_TEST_AND_JOIN = 262144u,
   SHELL_TEST_OR_JOIN = 524288u,
+#define FILE_ROLE(kind, name, ordinal, spelling, alias)                        \
+  SHELL_TEST_FILE_##kind = 512u << ordinal,
+  SHELL_FILE_PREDICATES(FILE_ROLE)
+#undef FILE_ROLE
 };
 
 enum {
   SHELL_TEST_LOOKAHEAD_BINARY = 1u,
   SHELL_TEST_LOOKAHEAD_OPERAND = 2u,
-  SHELL_TEST_FILE_ROLES = SHELL_TEST_FILE_EXISTS | SHELL_TEST_FILE_REGULAR |
-                          SHELL_TEST_FILE_DIRECTORY | SHELL_TEST_FILE_SYMLINK |
-                          SHELL_TEST_FILE_NONEMPTY | SHELL_TEST_FILE_BLOCK |
-                          SHELL_TEST_FILE_CHARACTER | SHELL_TEST_FILE_FIFO |
-                          SHELL_TEST_FILE_SOCKET,
+#define FILE_ROLES(kind, name, ordinal, spelling, alias)                       \
+  | SHELL_TEST_FILE_##kind
+  SHELL_TEST_FILE_ROLES = 0 SHELL_FILE_PREDICATES(FILE_ROLES),
+#undef FILE_ROLES
 };
 
 /* General-expression binary precedence applies even to a unary-looking
  * head. Unknown lookahead bytes retain both interpretations. */
-static inline unsigned shell_test_lookahead(unsigned roles, bool dynamic) {
+static inline unsigned shell_test_lookahead(shell_test_roles_t roles,
+                                            bool dynamic) {
   bool binary =
       (roles & (SHELL_TEST_BINARY | SHELL_TEST_JOIN)) == SHELL_TEST_BINARY;
   return dynamic  ? SHELL_TEST_LOOKAHEAD_BINARY | SHELL_TEST_LOOKAHEAD_OPERAND
@@ -98,7 +96,7 @@ typedef enum {
 /* Called only after binary precedence selected unary -t. Global expression
  * arity, rather than a parenthesized subexpression's length, enables fd 1. */
 static inline shell_test_terminal_operand_t
-shell_test_terminal_operand(unsigned roles, bool known, bool number,
+shell_test_terminal_operand(shell_test_roles_t roles, bool known, bool number,
                             bool implicit_allowed) {
   return !known   ? SHELL_TEST_TERMINAL_UNKNOWN
          : number ? SHELL_TEST_TERMINAL_CONSUME
@@ -110,9 +108,9 @@ shell_test_terminal_operand(unsigned roles, bool known, bool number,
 /* Shared operator vocabulary. test/[ recognize effective argument bytes,
  * independently of their original quote protection. -a/-o have both binary
  * and join roles; argument-count rules choose the actual operation. */
-static inline SHELL_NONNULL(1) unsigned shell_test_static_roles(
-    const char *spelling, size_t length) {
-  unsigned roles = 0;
+static inline SHELL_NONNULL(1) shell_test_roles_t
+    shell_test_static_roles(const char *spelling, size_t length) {
+  shell_test_roles_t roles = 0;
   if (length == 1)
     return spelling[0] == '!'           ? SHELL_TEST_NOT
            : spelling[0] == '('         ? SHELL_TEST_OPEN
@@ -128,24 +126,13 @@ static inline SHELL_NONNULL(1) unsigned shell_test_static_roles(
     if (spelling[0] == '-' && spelling[1] == 't')
       roles |= SHELL_TEST_TERMINAL;
     if (spelling[0] == '-') {
-      if (spelling[1] == 'e' || spelling[1] == 'a')
-        roles |= SHELL_TEST_FILE_EXISTS;
-      else if (spelling[1] == 'f')
-        roles |= SHELL_TEST_FILE_REGULAR;
-      else if (spelling[1] == 'd')
-        roles |= SHELL_TEST_FILE_DIRECTORY;
-      else if (spelling[1] == 'L' || spelling[1] == 'h')
-        roles |= SHELL_TEST_FILE_SYMLINK;
-      else if (spelling[1] == 's')
-        roles |= SHELL_TEST_FILE_NONEMPTY;
-      else if (spelling[1] == 'b')
-        roles |= SHELL_TEST_FILE_BLOCK;
-      else if (spelling[1] == 'c')
-        roles |= SHELL_TEST_FILE_CHARACTER;
-      else if (spelling[1] == 'p')
-        roles |= SHELL_TEST_FILE_FIFO;
-      else if (spelling[1] == 'S')
-        roles |= SHELL_TEST_FILE_SOCKET;
+#define FILE_SPELLING(kind, name, ordinal, primary, alias)                     \
+  if (spelling[1] == primary[1] ||                                             \
+      (primary[1] != alias[1] && spelling[1] == alias[1]))                     \
+    roles |= SHELL_TEST_FILE_##kind;                                           \
+  else
+      SHELL_FILE_PREDICATES(FILE_SPELLING) {}
+#undef FILE_SPELLING
     }
     if ((spelling[0] == '=' || spelling[0] == '!') && spelling[1] == '=')
       roles |= SHELL_TEST_BINARY;
@@ -167,7 +154,7 @@ static inline SHELL_NONNULL(1) unsigned shell_test_static_roles(
 }
 
 typedef struct {
-  unsigned roles;
+  shell_test_roles_t roles;
   bool dynamic, unsafe_lookup, number;
 } shell_builtin_test_word_t;
 

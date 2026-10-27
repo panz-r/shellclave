@@ -35,7 +35,8 @@ static SHELL_NONNULL(1) void project_visit(test_projection_t *p,
                                            bool collect);
 
 static SHELL_NONNULL(1) bool project_role(const test_projection_t *p,
-                                          size_t word, unsigned role) {
+                                          size_t word,
+                                          shell_test_roles_t role) {
   return p->words[word].dynamic || (p->words[word].roles & role) != 0;
 }
 
@@ -44,12 +45,10 @@ static SHELL_NONNULL(1) bool project_has(const test_projection_t *p,
   return !ref.kind || (p->chart[ref.first * p->stride + ref.last] & ref.kind);
 }
 
-static SHELL_NONNULL(1) void project_rule(test_projection_t *p,
-                                          test_projection_ref_t ref,
-                                          bool collect, bool valid,
-                                          test_projection_ref_t a,
-                                          test_projection_ref_t b,
-                                          size_t operand, unsigned roles) {
+static SHELL_NONNULL(1) void project_rule(
+    test_projection_t *p, test_projection_ref_t ref, bool collect, bool valid,
+    test_projection_ref_t a, test_projection_ref_t b, size_t operand,
+    shell_test_roles_t roles) {
   SHELL_SOURCE_WORD_SCAN(1);
   if (!valid || !project_has(p, a) || !project_has(p, b))
     return;
@@ -84,8 +83,8 @@ static SHELL_NONNULL(1) bool project_group_close(const test_projection_t *p,
   return project_role(p, last, SHELL_TEST_CLOSE) && (depths & 2u);
 }
 
-static SHELL_NONNULL(1) unsigned project_unary_roles(
-    const shell_builtin_test_word_t *word) {
+static SHELL_NONNULL(1) shell_test_roles_t
+    project_unary_roles(const shell_builtin_test_word_t *word) {
   return word->dynamic
              ? SHELL_TEST_FILE_ROLES | SHELL_TEST_LOOKUP
              : word->roles & (SHELL_TEST_FILE_ROLES | SHELL_TEST_LOOKUP);
@@ -169,7 +168,7 @@ static SHELL_NONNULL(1) void project_visit(test_projection_t *p,
   if (kind == PROJECT_AND || kind == PROJECT_OR) {
     unsigned child = kind == PROJECT_AND ? PROJECT_TERM : PROJECT_AND;
     unsigned final_child = hard_end ? child << 4 : child;
-    unsigned connector =
+    shell_test_roles_t connector =
         kind == PROJECT_AND ? SHELL_TEST_AND_JOIN : SHELL_TEST_OR_JOIN;
     project_rule(p, ref, collect, true,
                  (test_projection_ref_t){final_child, first, last}, none, 0, 0);

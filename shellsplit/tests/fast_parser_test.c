@@ -11,6 +11,7 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "syntax_boundary_cases.h"
 #include "word_expansion_cases.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -3649,20 +3650,21 @@ static void test_semantic_classifier_boundaries(void) {
       {"typeset map[key]", true},
       {"command -- declare \"arr[$(printf 0)]\"", true},
       {"declare scalar='[literal]'", false},
-      {"[[ -r /tmp/x ]]", true},
+      {SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"), true},
       {"VALUE=x [[ $VALUE == x ]]", false},
       {">out [[ x ]]", false},
       {"VALUE=x then", false},
       {">out then", false},
       {"{ [[ -n value ]]; }", false},
-      {"echo $( [[ -r /tmp/x ]] )", true},
+      {"echo $( " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x") " )",
+       true},
       {"(( count += 1 ))", true},
       {"! (( 1 ))", false},
       {"{ (( 1 )); }", false},
       {"time echo x", false},
       {"time eval echo hidden", true},
       {"time coproc echo hidden", true},
-      {"time [[ -r /tmp/x ]]", true},
+      {"time " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"), true},
       {"time (( count += 1 ))", true},
       {"time shopt -s varredir_close", true},
       {"time command declare -a values", true},

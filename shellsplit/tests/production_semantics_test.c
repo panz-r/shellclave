@@ -14,6 +14,7 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "syntax_boundary_cases.h"
 #include "word_byte_cases.h"
 #include "word_expansion_cases.h"
 
@@ -2929,15 +2930,15 @@ static void test_modern_shell_syntax_boundaries(void) {
       "coproc worker { echo ok; }",
       "case value in x) : ;& esac",
       "case value in x) : ;;& esac",
-      "[[ -r /tmp/x ]]",
-      "{ [[ -r value ]]; }",
-      "echo $( [[ -r /tmp/x ]] )",
+      SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
+      "{ " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("value") "; }",
+      "echo $( " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x") " )",
       "(( count += 1 ))",
       "! (( count ))",
       "{ (( count )); }",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -r /tmp/x ]]",
+      "time " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "time (( count += 1 ))",
       "time shopt -s varredir_close",
       "time command declare -a values",
@@ -3070,7 +3071,7 @@ static void test_full_tokenizer_structural_matrix(void) {
       "cmd <(producer) >(consumer)",
       "cmd $'line\\n' @(left|right)",
       "items=(one two) map[key]=value",
-      "[[ -r /tmp/x ]]",
+      SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "(( 1 + 1 ))",
       "time -p echo x",
       "echo $\"localized\"",

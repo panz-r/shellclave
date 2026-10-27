@@ -1,6 +1,8 @@
 #ifndef SHELLSPLIT_CONDITIONAL_CASES_H
 #define SHELLSPLIT_CONDITIONAL_CASES_H
 
+#include "syntax_boundary_cases.h"
+
 static const struct {
   const char *source;
   int truth; /* 0 unknown, 1 false, 2 true. */
@@ -263,9 +265,9 @@ static const char *const conditional_unsupported[] = {
     "[[ x == name=~/\"$value\" ]]",
     "[[ x == name=~:\"$value\" ]]",
     "[[ x == <(printf x) ]]",
-    "[[ -r file ]]",
-    "[[ -\\\nr file ]]",
-    "[[ -\\\nr ]]",
+    SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("file"),
+    "[[ " SHELLSPLIT_TEST_UNMODELED_FILE_CONTINUED_WORD " file ]]",
+    "[[ " SHELLSPLIT_TEST_UNMODELED_FILE_CONTINUED_WORD " ]]",
     "[[ x =~ y ]]",
     "[[ 1 -eq 1 ]]",
     "[[ (x) ]]",

@@ -105,6 +105,7 @@ The implementation owners and private interfaces are:
 | Retained source/draft collection | `shell_source.c` |
 | Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
 | Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Filesystem predicate spellings, aliases and semantic ordinals | `shell_file_predicate_internal.h` |
 | Builtin test argument-count grammar, admission, bounded grammar-role projection and eager expression evaluation | `shell_test_grammar_internal.h`, `shell_test_admission_internal.h`, `shell_test.c`, `shell_test_projection_impl.h`, `shell_test_internal.h` |
 | Shared builtin word projection and scalar cardinality | `shell_builtin_word_internal.h` |
 | Whole-word expansion requests, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
@@ -166,8 +167,9 @@ scope machinery. Conditional parsing supplies static-name queries; builtin test
 programs use the same facts while preserving their separate argument grammar.
 Private graph implementation fragments group related execution-state operations:
 `shell_depgraph_variable_impl.h` owns predefined-variable capabilities and prefix
-visibility, `shell_depgraph_test_impl.h` owns test lookup and outcome selection,
-and `shell_depgraph_presence_impl.h` owns presence facts, epochs and assumptions.
+visibility, `shell_depgraph_test_impl.h` owns predicate observations, filesystem
+graph attachment, test lookup and outcome selection, and
+`shell_depgraph_presence_impl.h` owns presence facts, epochs and assumptions.
 They are included at their dependency points in `shell_depgraph.c` and share its
 translation unit. They are not independent interfaces or installed headers.
 Route storage, mutation ordering, scope publication and recursive observation
@@ -210,6 +212,27 @@ Determine prefix installation from the immutable command-entry version. Later
 effects cannot retroactively create or remove its restoration obligation.
 Keep predicate errors distinct during eager Boolean composition. Unresolved
 presence is not an unresolved word-expansion result.
+
+Filesystem predicates have one private compile-time definition list. Conditional
+lexical recognition and builtin effective-argument recognition expand it through
+their own comparisons; quote handling and argument grammar remain separate.
+The list also supplies classification cases and masks. Compile-time assertions
+keep public conditional ordinals, builtin operations, role bits and graph flags
+aligned with the existing shift-based mappings. Predicate graph attachment
+consumes existing operand-resolution results after ordered substitutions and
+preserves unresolved pathname facts.
+`shell_test_roles_t` owns the 32-bit grammar-role representation; retained masks,
+allocation alignment and scratch calculations use that type. The definition
+list and graph implementation fragments add no runtime registry or traversal.
+To extend this predicate family, append the public kind and flag, add its private
+definition row, and update independent tests and the shell-model reference.
+
+Shared C/C++ rejection fixtures in `shellsplit/tests/syntax_boundary_cases.h`
+own the unsupported filesystem-operator sentinel and continuation spelling.
+Each harness retains its own API assertions and contextual wrappers. Python
+Bash qualification cases and explicit predicate expectations stay independent
+of the implementation list.
+
 Test admission and compilation share the distinct terminal-predicate role and
 its numeric/implicit-operand rules. `shell_test_dispatch` owns the 0..4-argument
 precedence and recursive negation/parenthesis shortcuts for both consumers.

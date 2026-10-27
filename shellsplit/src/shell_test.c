@@ -11,15 +11,10 @@ enum {
   TEST_EQUAL,
   TEST_NOT_EQUAL,
   TEST_PRESENT,
-  TEST_FILE_EXISTS,
-  TEST_FILE_REGULAR,
-  TEST_FILE_DIRECTORY,
-  TEST_FILE_SYMLINK,
-  TEST_FILE_NONEMPTY,
-  TEST_FILE_BLOCK,
-  TEST_FILE_CHARACTER,
-  TEST_FILE_FIFO,
-  TEST_FILE_SOCKET,
+// clang-format off
+#define FILE_OPERATION(kind, name, ordinal, spelling, alias) TEST_FILE_##kind,
+  SHELL_FILE_PREDICATES(FILE_OPERATION)
+#undef FILE_OPERATION
   TEST_TERMINAL,
   TEST_OPAQUE,
   TEST_OPAQUE_ERROR,
@@ -28,11 +23,29 @@ enum {
   TEST_AND,
   TEST_OR
 };
+// clang-format on
+
+/* Retain the shift-based conversion without coupling independently edited
+ * enum sequences. New predicates must fit the existing role and edge fields. */
+#define FILE_MAPPING(kind, name, ordinal, spelling, alias)                     \
+  _Static_assert(TEST_FILE_##kind == TEST_FILE_EXISTS + ordinal,               \
+                 "builtin filesystem predicate ordinal");                      \
+  _Static_assert(SHELL_DEP_EDGE_FLAG_FILE_TEST_##kind ==                       \
+                     (SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS << ordinal),        \
+                 "filesystem edge flag mapping");                              \
+  _Static_assert(SHELL_TEST_FILE_##kind ==                                     \
+                     (SHELL_TEST_FILE_EXISTS << ordinal),                      \
+                 "filesystem role mapping");
+SHELL_FILE_PREDICATES(FILE_MAPPING)
+#undef FILE_MAPPING
+_Static_assert((SHELL_TEST_FILE_ROLES &
+                (SHELL_TEST_AND_JOIN | SHELL_TEST_OR_JOIN)) == 0,
+               "filesystem roles do not overlap Boolean connectors");
 
 _Static_assert(SHELL_DEP_MAX_TOKENS * 2u + 2u <= UINT16_MAX,
                "test expression ordinals fit retained private nodes");
 _Static_assert(sizeof(shell_test_value_t) + 2 * sizeof(shell_test_node_t) +
-                       sizeof(uint32_t) + 8 +
+                       sizeof(shell_test_roles_t) + 8 +
                        2 * (SHELL_DEP_MAX_TOKENS + 1) *
                            (SHELL_DEP_MAX_TOKENS + 1) / SHELL_DEP_MAX_TOKENS +
                        2 <=
@@ -85,7 +98,7 @@ static SHELL_NONNULL(1) bool unary(const shell_test_program_t *p, size_t i) {
 
 static SHELL_NONNULL(1) bool binary(const shell_test_program_t *p, size_t i) {
   const shell_test_value_t *v = &p->words[i];
-  unsigned roles =
+  shell_test_roles_t roles =
       v->known ? shell_test_static_roles(v->value, v->value_length) : 0;
   return shell_test_lookahead(roles, !v->known) == SHELL_TEST_LOOKAHEAD_BINARY;
 }
@@ -104,32 +117,25 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
     /* -eq/-ne also validate integers; -ef/-nt/-ot inspect files. */
     if (is_word(p, op, "-eq") || is_word(p, op, "-ne"))
       kind = TEST_OPAQUE_ERROR;
-  } else if (is_word(p, op, "-v"))
+  } else if (is_word(p, op, "-v")) {
     kind = TEST_PRESENT;
-  else if (is_word(p, op, "-e") || is_word(p, op, "-a"))
-    kind = TEST_FILE_EXISTS;
-  else if (is_word(p, op, "-f"))
-    kind = TEST_FILE_REGULAR;
-  else if (is_word(p, op, "-d"))
-    kind = TEST_FILE_DIRECTORY;
-  else if (is_word(p, op, "-L") || is_word(p, op, "-h"))
-    kind = TEST_FILE_SYMLINK;
-  else if (is_word(p, op, "-s"))
-    kind = TEST_FILE_NONEMPTY;
-  else if (is_word(p, op, "-b"))
-    kind = TEST_FILE_BLOCK;
-  else if (is_word(p, op, "-c"))
-    kind = TEST_FILE_CHARACTER;
-  else if (is_word(p, op, "-p"))
-    kind = TEST_FILE_FIFO;
-  else if (is_word(p, op, "-S"))
-    kind = TEST_FILE_SOCKET;
-  else if (is_word(p, op, "-t"))
+  }
+#define FILE_PRIMARY(kind_name, name, ordinal, spelling, alias)                \
+  else if (is_word(p, op, spelling) ||                                         \
+           (spelling[1] != alias[1] && is_word(p, op, alias))) {               \
+    kind = TEST_FILE_##kind_name;                                              \
+  }
+  SHELL_FILE_PREDICATES(FILE_PRIMARY)
+#undef FILE_PRIMARY
+  else if (is_word(p, op, "-t")) {
     kind = TEST_TERMINAL;
-  else if (is_word(p, op, "-n"))
+  }
+  else if (is_word(p, op, "-n")) {
     kind = TEST_NONEMPTY;
-  else if (is_word(p, op, "-z"))
+  }
+  else if (is_word(p, op, "-z")) {
     kind = TEST_EMPTY;
+  }
   return node(p, kind, left, right);
 }
 
@@ -198,7 +204,7 @@ static SHELL_NONNULL(1, 2) uint16_t
   if (i + 1 < end && unary(p, i)) {
     if (is_word(p, i, "-t")) {
       const shell_test_value_t *argument = &p->words[i + 1];
-      unsigned roles =
+      shell_test_roles_t roles =
           argument->known
               ? shell_test_static_roles(argument->value, argument->value_length)
               : 0;
@@ -385,7 +391,7 @@ bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
   program->nodes = shell_source_scratch_take_array(
       count * 2 + 2, sizeof(*program->nodes), _Alignof(shell_test_node_t));
   program->operand_roles = shell_source_scratch_take_array(
-      count, sizeof(*program->operand_roles), _Alignof(uint32_t));
+      count, sizeof(*program->operand_roles), _Alignof(shell_test_roles_t));
   if (!program->nodes || (!program->operand_roles && count))
     return false;
   return shell_test_refresh(program);
@@ -450,15 +456,10 @@ static SHELL_NONNULL(1, 2, 3,
                    ? lookup(a->value, a->value_length, context)
                    : 3u;
       break;
-    case TEST_FILE_EXISTS:
-    case TEST_FILE_REGULAR:
-    case TEST_FILE_DIRECTORY:
-    case TEST_FILE_SYMLINK:
-    case TEST_FILE_NONEMPTY:
-    case TEST_FILE_BLOCK:
-    case TEST_FILE_CHARACTER:
-    case TEST_FILE_FIFO:
-    case TEST_FILE_SOCKET:
+#define FILE_EVALUATE(kind, name, ordinal, spelling, alias)                    \
+  case TEST_FILE_##kind:
+      SHELL_FILE_PREDICATES(FILE_EVALUATE)
+#undef FILE_EVALUATE
       result = a->known && !a->value_length ? SHELL_TEST_FALSE : 3u;
       break;
     case TEST_TERMINAL:
@@ -512,7 +513,8 @@ void shell_test_observe_files(const shell_test_program_t *program,
     return;
   if (program->uncertain) {
     for (size_t i = 0; i < program->word_count; ++i) {
-      unsigned roles = program->operand_roles[i] & SHELL_TEST_FILE_ROLES;
+      shell_test_roles_t roles =
+          program->operand_roles[i] & SHELL_TEST_FILE_ROLES;
       if (roles)
         observer(&program->words[i],
                  (roles / SHELL_TEST_FILE_EXISTS) *
@@ -526,7 +528,8 @@ void shell_test_observe_files(const shell_test_program_t *program,
   stack[count++] = program->root;
   while (count) {
     shell_test_node_t n = program->nodes[stack[--count]];
-    if (n.operation >= TEST_FILE_EXISTS && n.operation <= TEST_FILE_SOCKET)
+    if (n.operation >= TEST_FILE_EXISTS &&
+        n.operation < TEST_FILE_EXISTS + SHELL_FILE_PREDICATE_COUNT)
       observer(&program->words[n.left],
                SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS
                    << (n.operation - TEST_FILE_EXISTS),

@@ -1,5 +1,6 @@
 #include "shell_sequence.h"
 #include "shell_source.h"
+#include "syntax_boundary_cases.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -229,7 +230,8 @@ int main(int argc, char **argv) {
       {"1f() { :; }", SHELL_SOURCE_UNSUPPORTED},
       {"\"f\"() { :; }", SHELL_SOURCE_UNSUPPORTED},
       {"f\\ g() { :; }", SHELL_SOURCE_UNSUPPORTED},
-      {"[[ -r input ]]", SHELL_SOURCE_UNSUPPORTED},
+      {SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("input"),
+       SHELL_SOURCE_UNSUPPORTED},
       {"((1 + 2))", SHELL_SOURCE_COMPLETE},
       {"(( $(printf 1; : 日本) ))", SHELL_SOURCE_COMPLETE},
       {"(( $(printf 日本 &&) ))", SHELL_SOURCE_INVALID},

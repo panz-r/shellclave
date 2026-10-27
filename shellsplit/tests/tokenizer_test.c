@@ -11,6 +11,7 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "syntax_boundary_cases.h"
 #include "test_allocator.h"
 #include "test_source_scans.h"
 #include <stdint.h>
@@ -8168,8 +8169,12 @@ static void test_heredoc_expansion_semantic_contract(void) {
  * adapter must reject that source atomically. */
 static void test_continued_bash_compound_syntax_contract(void) {
   static const char *const unsupported[] = {
-      "(\\\n( count += 1 ))", "(\\\n( count += 1 ))", "(\\\n( count += 1 ))",
-      "[\\\n[ -r value ]]",   "[\\\n[ -r value ]]",   "[[\\\n -r value ]]",
+      "(\\\n( count += 1 ))",
+      "(\\\n( count += 1 ))",
+      "(\\\n( count += 1 ))",
+      "[\\\n[ " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
+      "[\\\n[ " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
+      "[[\\\n " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {

@@ -7,6 +7,7 @@
 #include "shell_source.h"
 #include "shell_tokenizer.h"
 #include "substitution_capacity_cases.h"
+#include "syntax_boundary_cases.h"
 #include "word_expansion_cases.h"
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 #include "test_source_scans.h"
@@ -407,10 +408,10 @@ TEST(supplied_fast_parser_contract) {
   /* Unsupported source semantics are still rejected, even if lexical parsing
    * succeeds. Source support is separate from the trusted parse/source pair. */
   static const char *const unsupported[] = {
-      "[[ -r /tmp/x ]]",
+      SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "(( count += 1 ))",
       "printf '%s' $\"localized\"",
-      "echo $( [[ -r /tmp/x ]] )",
+      "echo $( " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x") " )",
       "{ (( count )); }",
   };
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -12213,8 +12214,8 @@ TEST(dialect_boundary_matrix) {
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
-      "[\\\n[ -r value ]]",
-      "[[\\\n -r value ]]",
+      "[\\\n[ " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
+      "[[\\\n " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " value ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;
@@ -17732,7 +17733,7 @@ TEST(nested_unsupported_syntax_fails_atomically) {
       "cmd <<<\"$(while true; do :; done)\"",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -r /tmp/x ]]",
+      "time " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "cmd \"$(time eval echo hidden)\"",
       "{ cmd; } <<<\"$(while true; do :; done)\"",
       "{ cmd; } > >(while true; do :; done)",

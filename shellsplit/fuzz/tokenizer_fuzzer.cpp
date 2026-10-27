@@ -1,6 +1,7 @@
 // LibFuzzer harness for shellsplit - fuzzes all parsers
 // Fuzzes: fast parser, full parser, transformer, processor
 
+#include "../tests/syntax_boundary_cases.h"
 #include "brace_fuzz_case.h"
 
 #include <ctype.h>
@@ -4109,11 +4110,11 @@ static int test_fixed_oracles(void) {
   static const char *const unmodeled_semantic_cases[] = {
       "readonly v<()=text",
       "export POSIX<()LY_CORRECT=x",
-      "[[ -r /tmp/x ]]",
+      SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "(( count += 1 ))",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -r /tmp/x ]]",
+      "time " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "time (( count += 1 ))",
       "time shopt -s varredir_close",
       "time command declare -a values",
@@ -4135,7 +4136,7 @@ static int test_fixed_oracles(void) {
       "readonly \"map[key]+=value\"",
       "typeset map[key]",
       "command -- declare \"arr[$(printf 0)]\"",
-      "echo $( [[ -r /tmp/x ]] )",
+      "echo $( " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x") " )",
       "{ (( count )); }",
       "cat <<EOF\n$(while true; do :; done)\nEOF\n",
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",

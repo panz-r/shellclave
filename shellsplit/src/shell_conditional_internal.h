@@ -2,6 +2,7 @@
 #define SHELL_CONDITIONAL_INTERNAL_H
 
 #include "shell_contract.h"
+#include "shell_file_predicate_internal.h"
 #include "shell_tokenizer.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -44,15 +45,10 @@ shell_conditional_arity(shell_conditional_predicate_t predicate) {
   case SHELL_CONDITIONAL_STRING_NONEMPTY:
   case SHELL_CONDITIONAL_STRING_EMPTY:
   case SHELL_CONDITIONAL_VARIABLE_SET:
-  case SHELL_CONDITIONAL_FILE_EXISTS:
-  case SHELL_CONDITIONAL_FILE_REGULAR:
-  case SHELL_CONDITIONAL_FILE_DIRECTORY:
-  case SHELL_CONDITIONAL_FILE_SYMLINK:
-  case SHELL_CONDITIONAL_FILE_NONEMPTY:
-  case SHELL_CONDITIONAL_FILE_BLOCK:
-  case SHELL_CONDITIONAL_FILE_CHARACTER:
-  case SHELL_CONDITIONAL_FILE_FIFO:
-  case SHELL_CONDITIONAL_FILE_SOCKET:
+#define FILE_ARITY(kind, name, ordinal, spelling, alias)                       \
+  case SHELL_CONDITIONAL_FILE_##kind:
+    SHELL_FILE_PREDICATES(FILE_ARITY)
+#undef FILE_ARITY
     return 1;
   case SHELL_CONDITIONAL_STRING_EQUAL:
   case SHELL_CONDITIONAL_STRING_NOT_EQUAL:
@@ -62,6 +58,17 @@ shell_conditional_arity(shell_conditional_predicate_t predicate) {
   default:
     return 0;
   }
+}
+
+/* The definition list and compile-time ordinal checks own this range. Keep
+ * these existing comparisons inline in unoptimized builds as well. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline bool
+shell_conditional_file(shell_conditional_predicate_t predicate) {
+  return predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
+         predicate < SHELL_CONDITIONAL_FILE_EXISTS + SHELL_FILE_PREDICATE_COUNT;
 }
 
 static inline uint32_t

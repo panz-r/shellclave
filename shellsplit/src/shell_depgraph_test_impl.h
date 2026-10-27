@@ -1,5 +1,115 @@
 /* Private shell_depgraph.c implementation; included at its dependency point. */
 
+/* Predicate observations and graph attachment share this translation unit
+ * with execution-state lookup and outcome selection. Consume existing word
+ * resolution results after ordered substitutions; paths can remain unresolved.
+ */
+#define FILE_FLAG(kind, name, ordinal, spelling, alias)                        \
+  | SHELL_DEP_EDGE_FLAG_FILE_TEST_##kind
+enum { DEP_FILE_TEST_FLAGS = 0 SHELL_FILE_PREDICATES(FILE_FLAG) };
+#undef FILE_FLAG
+_Static_assert((DEP_FILE_TEST_FLAGS & ~UINT16_MAX) == 0,
+               "filesystem predicates fit graph edge flags");
+
+/* The operand and optional resolved value borrow source/resolver storage.
+ * Predicate checks use the command's CWD and never imply content reads.
+ * Record active path uncertainty even if output capacity omits the relation. */
+static SHELL_NONNULL(1, 5, 9) void dep_add_file_test(
+    shell_dep_graph_t *graph, uint32_t max_nodes, uint32_t max_edges,
+    uint32_t owner, const dep_token_t *source,
+    const shell_dep_word_value_t *value, bool dynamic, unsigned tests,
+    uint8_t *unresolved_paths) {
+  if (value && value->resolved && value->count == 1 && !value->first_length)
+    return;
+  bool resolved =
+      value && value->resolved && value->count == 1 && value->first_length;
+  if (resolved && value->first_length > UINT32_MAX) {
+    graph->status |= SHELL_DEP_STATUS_TRUNCATED;
+    return;
+  }
+  /* Argument callbacks may return embedded NUL bytes. Such a value is not a
+   * representable filesystem pathname; retain uncertainty rather than store
+   * it as a resolved FILE path. Conditional callbacks already reject NUL. */
+  if (resolved && memchr(value->first, '\0', value->first_length)) {
+    resolved = false;
+    dynamic = true;
+  }
+  if (dynamic && !resolved)
+    unresolved_paths[owner] = true;
+  if (graph->node_count >= max_nodes || graph->edge_count >= max_edges) {
+    graph->status |= SHELL_DEP_STATUS_TRUNCATED;
+    return;
+  }
+  uint32_t document = graph->node_count++;
+  graph->nodes[document].type = SHELL_NODE_DOC;
+  graph->nodes[document].doc =
+      (shell_dep_doc_t){.kind = SHELL_DOC_FILE,
+                        .path = source->start,
+                        .path_len = source->len,
+                        .flags = dynamic ? SHELL_DEP_DOC_FLAG_DYNAMIC_NAME : 0};
+  shell_dep_doc_t *doc = &graph->nodes[document].doc;
+  const shell_dep_cmd_t *command = &graph->nodes[owner].cmd;
+  doc->cwd_known = command->cwd_known;
+  doc->cwd_offset = command->cwd_known ? command->cwd_offset : 0;
+  doc->cwd_absolute = command->cwd_absolute;
+  if (resolved) {
+    doc->value = value->first;
+    doc->value_len = (uint32_t)value->first_length;
+    doc->flags = SHELL_DEP_DOC_FLAG_RESOLVED_PATH;
+  }
+  shell_dep_edge_t *edge = &graph->edges[graph->edge_count++];
+  dep_init_edge(edge, owner, document, SHELL_EDGE_FILE_TEST, SHELL_DIR_FORWARD,
+                SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
+  edge->flags = (uint16_t)tests;
+}
+
+typedef struct {
+  shell_dep_graph_t *graph;
+  uint32_t max_nodes, max_edges, owner;
+  const shell_dep_word_value_t *const *values;
+  uint8_t *unresolved_paths;
+} dep_test_file_context_t;
+
+static SHELL_NONNULL(1, 3) void dep_observe_test_file(
+    const shell_test_value_t *word, unsigned tests, void *context) {
+  dep_test_file_context_t *ctx = context;
+  if (word->known && !word->value_length)
+    return;
+  dep_token_t source = {word->source, (uint32_t)word->length};
+  const shell_dep_word_value_t *value = ctx->values[word->token];
+  bool dynamic =
+      shell_source_argument_has_dynamic_syntax(word->source, word->length);
+  dep_add_file_test(ctx->graph, ctx->max_nodes, ctx->max_edges, ctx->owner,
+                    &source, value, dynamic, tests, ctx->unresolved_paths);
+}
+
+/* Keep this attachment in the construction loop even in large graph builds;
+ * extraction must not introduce an out-of-line call on each first operand. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline SHELL_NONNULL(1, 2, 6) void dep_observe_conditional_file(
+    shell_dep_graph_t *graph, const dep_parse_context_t *context,
+    uint32_t max_nodes, uint32_t max_edges, uint32_t owner,
+    const dep_token_t *operand, const shell_dep_word_value_t *value,
+    shell_conditional_predicate_t predicate) {
+  if (!shell_conditional_file(predicate) ||
+      !dep_owner_phase_active(context, owner, DEP_SNAPSHOT_BODY_WORD,
+                              UINT32_MAX))
+    return;
+  bool empty = false;
+  bool static_empty =
+      shell_conditional_static_empty(operand->start, operand->len, &empty) &&
+      empty;
+  if (!static_empty)
+    dep_add_file_test(
+        graph, max_nodes, max_edges, owner, operand, value,
+        shell_conditional_word_dynamic(operand->start, operand->len),
+        SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS
+            << (predicate - SHELL_CONDITIONAL_FILE_EXISTS),
+        context->unresolved_paths);
+}
+
 typedef struct {
   dep_route_state_t *state;
   dep_route_journal_t *journal;

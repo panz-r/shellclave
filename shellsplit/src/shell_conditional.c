@@ -3,6 +3,13 @@
 #include "shell_word_internal.h"
 #include <string.h>
 
+#define FILE_ORDINAL(kind, name, ordinal, spelling, alias)                     \
+  _Static_assert(SHELL_CONDITIONAL_FILE_##kind ==                              \
+                     SHELL_CONDITIONAL_FILE_EXISTS + ordinal,                  \
+                 "conditional filesystem predicate ordinal");
+SHELL_FILE_PREDICATES(FILE_ORDINAL)
+#undef FILE_ORDINAL
+
 /* Newlines/comments are grammar trivia before a primary, after lexical !,
  * and after an explicit unary or binary predicate. An operator needs its
  * operand immediately; a bare operand needs the following token without a
@@ -254,43 +261,29 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
   if (p == n)
     return r;
   bool variable = plain(s, n, p, end, "-v");
-  bool file_exists = plain(s, n, p, end, "-e") || plain(s, n, p, end, "-a");
-  bool file_regular = plain(s, n, p, end, "-f");
-  bool file_directory = plain(s, n, p, end, "-d");
-  bool file_symlink = plain(s, n, p, end, "-L") || plain(s, n, p, end, "-h");
-  bool file_nonempty = plain(s, n, p, end, "-s");
-  bool file_block = plain(s, n, p, end, "-b");
-  bool file_character = plain(s, n, p, end, "-c");
-  bool file_fifo = plain(s, n, p, end, "-p");
-  bool file_socket = plain(s, n, p, end, "-S");
-  bool unary = variable || file_exists || file_regular || file_directory ||
-               file_symlink || file_nonempty || file_block || file_character ||
-               file_fifo || file_socket || plain(s, n, p, end, "-n") ||
-               plain(s, n, p, end, "-z");
+#define FILE_WORD(kind, name, ordinal, spelling, alias)                        \
+  bool file_##name = plain(s, n, p, end, spelling) ||                          \
+                     (spelling[1] != alias[1] && plain(s, n, p, end, alias));
+  SHELL_FILE_PREDICATES(FILE_WORD)
+#undef FILE_WORD
+#define FILE_UNARY(kind, name, ordinal, spelling, alias) || file_##name
+  bool unary = variable SHELL_FILE_PREDICATES(FILE_UNARY) ||
+               plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z");
+#undef FILE_UNARY
   r.predicate = SHELL_CONDITIONAL_STRING_NONEMPTY;
   if (unary) {
-    if (variable)
+    if (variable) {
       r.predicate = SHELL_CONDITIONAL_VARIABLE_SET;
-    else if (file_exists)
-      r.predicate = SHELL_CONDITIONAL_FILE_EXISTS;
-    else if (file_regular)
-      r.predicate = SHELL_CONDITIONAL_FILE_REGULAR;
-    else if (file_directory)
-      r.predicate = SHELL_CONDITIONAL_FILE_DIRECTORY;
-    else if (file_symlink)
-      r.predicate = SHELL_CONDITIONAL_FILE_SYMLINK;
-    else if (file_nonempty)
-      r.predicate = SHELL_CONDITIONAL_FILE_NONEMPTY;
-    else if (file_block)
-      r.predicate = SHELL_CONDITIONAL_FILE_BLOCK;
-    else if (file_character)
-      r.predicate = SHELL_CONDITIONAL_FILE_CHARACTER;
-    else if (file_fifo)
-      r.predicate = SHELL_CONDITIONAL_FILE_FIFO;
-    else if (file_socket)
-      r.predicate = SHELL_CONDITIONAL_FILE_SOCKET;
-    else if (plain(s, n, p, end, "-z"))
+    }
+#define FILE_KIND(kind, name, ordinal, spelling, alias)                        \
+  else if (file_##name) {                                                      \
+    r.predicate = SHELL_CONDITIONAL_FILE_##kind;                               \
+  }
+    SHELL_FILE_PREDICATES(FILE_KIND)
+#undef FILE_KIND
+    else if (plain(s, n, p, end, "-z")) {
       r.predicate = SHELL_CONDITIONAL_STRING_EMPTY;
+    }
     r.operand_count = 0;
     r.operands[0] = r.operand_lengths[0] = 0;
     p = trivia(s, n, end, false);
@@ -531,8 +524,7 @@ bool shell_conditional_evaluate(const char *source,
                                 bool *truth) {
   if (condition->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
     return false; /* Presence is a path-local graph fact, not a string value. */
-  if (condition->predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
-      condition->predicate <= SHELL_CONDITIONAL_FILE_SOCKET) {
+  if (shell_conditional_file(condition->predicate)) {
     bool empty;
     if (values[0].known)
       empty = values[0].length == 0;

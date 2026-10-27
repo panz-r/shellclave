@@ -14,6 +14,7 @@
  *   ./shellgate/fuzz/run_fuzzing_4h.sh 1 300
  */
 
+#include "../../shellsplit/tests/syntax_boundary_cases.h"
 #include "../../shellsplit/tests/word_expansion_cases.h"
 #include "brace_fuzz_case.h"
 
@@ -2176,14 +2177,14 @@ void run_semantic_reference_oracles() {
    * cannot construct the command's execution semantics. These fixed cases
    * intentionally live in the harness rather than the smoke corpus. */
   static const char *const unmodeled_semantic_cases[] = {
-      "[[ -r /tmp/x ]]",
+      SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "(( count += 1 ))",
       "time eval echo hidden",
       "time coproc echo hidden",
-      "time [[ -r /tmp/x ]]",
+      "time " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"),
       "echo \"$(time eval echo hidden)\"",
       "printf '%s' $\"localized\"",
-      "echo $( [[ -r /tmp/x ]] )",
+      "echo $( " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x") " )",
       "{ (( count )); }",
       "cat <<EOF\n$(while true; do :; done)\nEOF\n",
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
