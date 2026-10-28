@@ -1,6 +1,11 @@
 #include "shell_conditional_internal.h"
 #include "shell_source_internal.h"
+#include "shell_test_grammar_internal.h"
+#include "shell_word_decode_internal.h"
 #include "shell_word_internal.h"
+#include <inttypes.h>
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 #define FILE_ORDINAL(kind, name, ordinal, spelling, alias)                     \
@@ -16,6 +21,14 @@ SHELL_FILE_PREDICATES(FILE_ORDINAL)
                  "binary filesystem predicate ordinal");
 SHELL_FILE_COMPARISONS(COMPARISON_ORDINAL)
 #undef COMPARISON_ORDINAL
+
+#define NUMERIC_ORDINAL(kind, spelling)                                        \
+  _Static_assert(SHELL_CONDITIONAL_NUMERIC_##kind ==                           \
+                     SHELL_CONDITIONAL_NUMERIC_EQUAL + SHELL_NUMERIC_##kind -  \
+                         SHELL_NUMERIC_EQUAL,                                  \
+                 "conditional numeric comparison mapping");
+SHELL_NUMERIC_COMPARISONS(NUMERIC_ORDINAL)
+#undef NUMERIC_ORDINAL
 
 /* Newlines/comments are grammar trivia before a primary, after lexical !,
  * and after an explicit unary or binary predicate. An operator needs its
@@ -85,7 +98,12 @@ static SHELL_NONNULL(1, 4, 5) conditional_token_t
 
 #define COMPARISON_SPELLING(kind, name, ordinal, spelling) , spelling
 static const char *const binary_operators[] = {
-    "=", "==", "!=" SHELL_FILE_COMPARISONS(COMPARISON_SPELLING)};
+    "=", "==",
+    "!=" SHELL_FILE_COMPARISONS(COMPARISON_SPELLING)
+#define NUMERIC_SPELLING(kind, spelling) , spelling
+        SHELL_NUMERIC_COMPARISONS(NUMERIC_SPELLING)
+#undef NUMERIC_SPELLING
+};
 #undef COMPARISON_SPELLING
 
 /* This error boundary follows a primary with no legal supported operator here.
@@ -110,7 +128,8 @@ static SHELL_NONNULL(1) bool misplaced_supported_operator(const char *s,
   SHELL_FILE_PREDICATES(FILE_OPERATOR)
 #undef FILE_OPERATOR
   return plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z") ||
-         plain(s, n, p, end, "-v") || plain(s, n, p, end, "!");
+         plain(s, n, p, end, "-v") || plain(s, n, p, end, "-t") ||
+         plain(s, n, p, end, "!");
 }
 
 /* Keep fully quoted RHSs on their existing admission path. Mixed dynamic
@@ -222,6 +241,183 @@ static SHELL_NONNULL(1) bool literal_dynamic_rhs(const char *word,
   return true;
 }
 
+typedef struct {
+  shell_arithmetic_reference_fn visitor;
+  void *context;
+  bool exhausted;
+} condition_parameter_visitor_t;
+
+/* name is a borrowed readable span of length bytes. context points to a live
+ * collector; its forwarded visitor context retains the visitor's contract. */
+static SHELL_NONNULL(1, 3) void condition_parameter(const char *name,
+                                                    size_t length,
+                                                    void *context) {
+  condition_parameter_visitor_t *state = context;
+  size_t bytes = 0;
+  for (size_t p = 0; p < length;) {
+    p = shell_source_skip_escaped_line_endings(name, length, p);
+    if (p < length) {
+      ++bytes;
+      ++p;
+    }
+  }
+  if (bytes != length) {
+    char *decoded = shell_source_scratch_take(bytes);
+    if (!decoded) {
+      state->exhausted = true;
+      return;
+    }
+    size_t written = 0;
+    for (size_t p = 0; p < length;) {
+      p = shell_source_skip_escaped_line_endings(name, length, p);
+      if (p < length)
+        decoded[written++] = name[p++];
+    }
+    name = decoded;
+  }
+  state->visitor(name, bytes, state->context);
+}
+
+bool shell_conditional_visit_parameters(const char *word, size_t length,
+                                        shell_arithmetic_reference_fn visitor,
+                                        void *context) {
+  condition_parameter_visitor_t state = {visitor, context, false};
+  shell_source_substitution_scan_t scan = {
+      .parameter_visitor = condition_parameter, .parameter_context = &state};
+  size_t start, after;
+  shell_source_substitution_kind_t kind;
+  shell_source_scan_status_t status;
+  do {
+    status = shell_source_next_word_expansion(word, length, &scan, &start,
+                                              &after, &kind);
+  } while (status == SHELL_SOURCE_SCAN_FOUND && !state.exhausted);
+  return status == SHELL_SOURCE_SCAN_DONE && !state.exhausted;
+}
+
+/* Project active literal arithmetic expansions before interpreting the final
+ * value. The original fragment cursor owns quote protection; decoded dollars
+ * are data and never re-enter expansion recognition. word is a readable span
+ * of length bytes; sink is initialized and unknown is writable. A NULL sink
+ * destination selects measurement; the sink itself remains required. */
+static SHELL_NONNULL(1, 3, 4) bool arithmetic_word(const char *word,
+                                                   size_t length,
+                                                   decoded_word_sink_t *sink,
+                                                   bool *unknown) {
+  char quote = 0;
+  for (size_t i = 0; i < length;) {
+    size_t open, after;
+    if (!quote && word[i] == '$' &&
+        shell_source_logical_next_is(word, length, i, '\'', NULL)) {
+      if (ansi_decode_quote(word, length, &i, sink, SHELL_SOURCE_ANSI_WORD) !=
+          SHELL_PROCESS_OK)
+        return false;
+      continue;
+    }
+    if (quote != '\'' && word[i] == '$' &&
+        shell_source_dollar_arithmetic_open(word, length, i, &open)) {
+      if (!shell_source_skip_arithmetic_expansion(word, length, i, &after))
+        return false;
+      size_t close = after - 2;
+      while (close > open + 1 && word[close] != ')')
+        --close;
+      shell_arithmetic_result_t value =
+          shell_arithmetic_analyze(word + open + 1, close - open - 1);
+      if (!value.supported)
+        return false;
+      if (!value.known) {
+        *unknown = true;
+        return true;
+      }
+      char number[32];
+      int count = snprintf(number, sizeof(number), "%" PRId64, value.value);
+      for (int j = 0; j < count; ++j)
+        if (decoded_word_emit(sink, (unsigned char)number[j]) !=
+            SHELL_PROCESS_OK)
+          return false;
+      i = after;
+      continue;
+    }
+    if (quote != '\'' &&
+        ((word[i] == '$' &&
+          (shell_source_skip_variable_expansion(word, length, i, &after) ||
+           shell_source_dollar_parentheses_open(word, length, i, &open))) ||
+         word[i] == '`')) {
+      *unknown = true;
+      return true;
+    }
+    unsigned char byte;
+    bool protected_byte;
+    if (shell_word_literal_step(word, length, &i, &quote, &byte,
+                                &protected_byte) &&
+        decoded_word_emit(sink, byte) != SHELL_PROCESS_OK)
+      return false;
+  }
+  return true;
+}
+
+shell_arithmetic_scalar_result_t shell_conditional_arithmetic_operand(
+    const char *word, size_t length, const char *value, size_t value_length,
+    bool resolved, shell_arithmetic_reference_fn visitor, void *context) {
+  if (resolved)
+    return shell_arithmetic_analyze_scalar(value ? value : "", value_length,
+                                           visitor, context);
+  /* Tilde expansion precedes arithmetic interpretation. Its raw spelling
+   * cannot prove complement or publish guessed scalar reads. */
+  if (shell_source_conditional_has_tilde_expansion(word, length))
+    return (shell_arithmetic_scalar_result_t){.result = {.supported = true},
+                                              .unresolved = true};
+  bool dynamic = shell_conditional_word_dynamic(word, length);
+  size_t mark = shell_source_scratch_mark();
+  decoded_word_sink_t measure = {0};
+  bool unknown = false;
+  if (!arithmetic_word(word, length, &measure, &unknown))
+    return (shell_arithmetic_scalar_result_t){0};
+  if (unknown) {
+    /* A standalone pure expansion still has only numerical uncertainty.
+     * Composed unknown text needs whole-operand resolution. */
+    size_t open, after;
+    const char *body = word;
+    size_t size = length;
+    if (size >= 2 && body[0] == '"' && body[size - 1] == '"') {
+      ++body;
+      size -= 2;
+    }
+    if (shell_source_dollar_arithmetic_open(body, size, 0, &open) &&
+        shell_source_skip_arithmetic_expansion(body, size, 0, &after) &&
+        after == size)
+      return (shell_arithmetic_scalar_result_t){.result = {.supported = true}};
+    return (shell_arithmetic_scalar_result_t){.result = {.supported = true},
+                                              .unresolved = true};
+  }
+  size_t bytes = measure.output_length;
+  char *decoded = shell_source_scratch_take(bytes + 1);
+  if (!decoded)
+    return (shell_arithmetic_scalar_result_t){0};
+  decoded_word_sink_t output = {.destination = decoded,
+                                .destination_size = bytes};
+  if (!arithmetic_word(word, length, &output, &unknown)) {
+    shell_source_scratch_release(mark);
+    return (shell_arithmetic_scalar_result_t){0};
+  }
+  decoded[bytes] = 0;
+  /* Publish only identifiers from the composed value: co$((1)) reads co1,
+   * while unresolved source fragments above publish no guessed names. */
+  shell_arithmetic_scalar_result_t result = shell_arithmetic_analyze_scalar(
+      decoded, bytes, dynamic ? NULL : visitor, context);
+  /* Known expansion pieces can compose a mutation token. Preserve that
+   * rejection instead of weakening it to an opaque runtime interpretation. */
+  if (dynamic && !result.result.supported && !result.mutation &&
+      !memchr(decoded, '$', bytes) && !memchr(decoded, '\\', bytes))
+    result = (shell_arithmetic_scalar_result_t){.result = {.supported = true},
+                                                .unresolved = true};
+  else if (dynamic && visitor && result.references)
+    result = shell_arithmetic_analyze_scalar(decoded, bytes, visitor, context);
+  /* Only published reference names borrow the decoded operand storage. */
+  if (!visitor || !result.references)
+    shell_source_scratch_release(mark);
+  return result;
+}
+
 static SHELL_NONNULL(1, 5) bool comparison_rhs(
     const char *s, size_t n, size_t p, size_t end,
     shell_conditional_predicate_t *predicate) {
@@ -309,19 +505,22 @@ static SHELL_NONNULL(1) shell_conditional_primary_t
   if (p == n)
     return r;
   bool variable = plain(s, n, p, end, "-v");
+  bool terminal = plain(s, n, p, end, "-t");
 #define FILE_WORD(kind, name, ordinal, spelling, alias)                        \
   bool file_##name = plain(s, n, p, end, spelling) ||                          \
                      (spelling[1] != alias[1] && plain(s, n, p, end, alias));
   SHELL_FILE_PREDICATES(FILE_WORD)
 #undef FILE_WORD
 #define FILE_UNARY(kind, name, ordinal, spelling, alias) || file_##name
-  bool unary = variable SHELL_FILE_PREDICATES(FILE_UNARY) ||
+  bool unary = variable || terminal SHELL_FILE_PREDICATES(FILE_UNARY) ||
                plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z");
 #undef FILE_UNARY
   r.predicate = SHELL_CONDITIONAL_STRING_NONEMPTY;
   if (unary) {
     if (variable) {
       r.predicate = SHELL_CONDITIONAL_VARIABLE_SET;
+    } else if (terminal) {
+      r.predicate = SHELL_CONDITIONAL_TERMINAL;
     }
 #define FILE_KIND(kind, name, ordinal, spelling, alias)                        \
   else if (file_##name) {                                                      \
@@ -393,9 +592,14 @@ static SHELL_NONNULL(1) shell_conditional_primary_t
         r.frame = SHELL_CONDITIONAL_INVALID;
         return r;
       }
-      r.predicate = op >= 3   ? SHELL_CONDITIONAL_FILE_NEWER + op - 3
-                    : op == 2 ? SHELL_CONDITIONAL_STRING_NOT_EQUAL
-                              : SHELL_CONDITIONAL_STRING_EQUAL;
+      shell_numeric_comparison_t numeric = shell_numeric_comparison(
+          binary_operators[op], strlen(binary_operators[op]));
+      r.predicate =
+          numeric != SHELL_NUMERIC_NONE
+              ? SHELL_CONDITIONAL_NUMERIC_EQUAL + numeric - SHELL_NUMERIC_EQUAL
+          : op >= 3 ? SHELL_CONDITIONAL_FILE_NEWER + op - 3
+          : op == 2 ? SHELL_CONDITIONAL_STRING_NOT_EQUAL
+                    : SHELL_CONDITIONAL_STRING_EQUAL;
       p = trivia(s, n, operator_end, false);
       if (p == n)
         return r;
@@ -782,6 +986,58 @@ bool shell_conditional_evaluate(const char *source,
                                 const shell_conditional_primary_t *condition,
                                 const shell_conditional_value_t values[2],
                                 bool *truth) {
+  if (shell_conditional_numeric(condition->predicate)) {
+    shell_arithmetic_scalar_result_t operands[2];
+    for (unsigned i = 0; i < 2; ++i) {
+      operands[i] = shell_conditional_arithmetic_operand(
+          source + condition->operands[i], condition->operand_lengths[i],
+          values[i].data, values[i].length, values[i].known, NULL, NULL);
+      if (!operands[i].result.known)
+        return false;
+    }
+    shell_numeric_comparison_t comparison =
+        (shell_numeric_comparison_t)(SHELL_NUMERIC_EQUAL +
+                                     condition->predicate -
+                                     SHELL_CONDITIONAL_NUMERIC_EQUAL);
+    *truth =
+        shell_numeric_compare(comparison, operands[0].result.value,
+                              operands[1].result.value) != condition->negated;
+    return true;
+  }
+  if (condition->predicate == SHELL_CONDITIONAL_TERMINAL) {
+    size_t mark = shell_source_scratch_mark();
+    const char *value = values[0].data;
+    size_t length = values[0].length;
+    if (!values[0].known) {
+      const char *word = source + condition->operands[0];
+      size_t size = condition->operand_lengths[0];
+      if (shell_conditional_word_dynamic(word, size))
+        return false;
+      if (shell_process_measure_word_value(word, size, &length) !=
+          SHELL_PROCESS_OK)
+        return false;
+      char *decoded = shell_source_scratch_take(length + 1);
+      if (!decoded)
+        return false;
+      size_t written;
+      if (shell_process_write_word_value(word, size, decoded, length,
+                                         &written) != SHELL_PROCESS_OK) {
+        shell_source_scratch_release(mark);
+        return false;
+      }
+      value = decoded;
+    }
+    shell_test_number_t number = {0};
+    for (size_t i = 0; i < length; ++i)
+      shell_test_number_byte(&number, (unsigned char)value[i]);
+    shell_source_scratch_release(mark);
+    if (number.digits && !number.invalid &&
+        (!number.negative || number.magnitude == 0) &&
+        number.magnitude <= INT_MAX)
+      return false; /* The executor's terminal state is a runtime fact. */
+    *truth = condition->negated;
+    return true;
+  }
   if (condition->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
     return false; /* Presence is a path-local graph fact, not a string value. */
   if (condition->predicate >= SHELL_CONDITIONAL_FILE_NEWER &&

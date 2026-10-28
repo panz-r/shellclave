@@ -78,6 +78,15 @@ Filesystem predicates can likewise remain UNKNOWN. FILE_TEST edges and
 FILE_COMPARISON nodes identify possible metadata checks for separate application
 authorization.
 
+Numeric conditions retain direct shell-variable reads as ENV dependencies.
+Unknown variable contents can introduce further arithmetic interpretation;
+`SG_EXPANSION_UNRESOLVED_ARITHMETIC` then blocks ALLOW and reports UNDETERMINED.
+Applications may supply dependency-resolved pure values through the arithmetic
+resolver purpose or apply an explicit exact-source approval rule. Shellsplit's
+matching graph-status flag qualifies incomplete semantic coverage: later lexical
+commands remain visible, but downstream state and effect proofs are unavailable.
+See [numeric predicates](docs/shell-model.md#numeric-predicates-and-terminal-tests).
+
 ### What policy rules cover
 
 Each retained command with an argument sequence is an argv-policy subject.
@@ -295,6 +304,8 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
     fputs("; unresolved pathname", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION)
     fputs("; unresolved condition", output);
+  if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC)
+    fputs("; unresolved arithmetic", output);
   if (result->has_dynamic_substitution_io)
     fputs("; dynamic substitution I/O present", output);
   fputc('\n', output);

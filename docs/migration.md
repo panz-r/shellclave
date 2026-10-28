@@ -3,6 +3,78 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
+## Unreleased: numeric predicates and ENV read dependencies
+
+Active tilde prefixes in numeric conditional operands now require whole-operand
+arithmetic resolution. Without it, graph coverage is qualified and Shellgate
+reports unresolved arithmetic instead of deriving truth from raw tilde text.
+Quoted, escaped and quote-cancelled tildes retain literal complement semantics.
+The existing callback purpose and status flags cover this behavior.
+
+Conditional predicate enums append six numeric comparisons and TERMINAL. The
+`test`/`[` builtins now prove integer comparison results instead of retaining
+opaque outcomes; argument errors remain distinct from false results.
+
+Conditional scalar arithmetic rejects statically established prefix and postfix
+mutations, including skipped branches and operators composed by known word
+expansions. Repeated signs on literals and separated unary operators remain
+supported. Unknown runtime arithmetic contents retain their coverage blocker;
+mutations returned as resolved arithmetic expressions fail EEXPAND. Framing-only
+COMPLETE results remain separate from semantic admission.
+
+ENV edges flagged `SHELL_DEP_EDGE_FLAG_ENV_READ` describe direct scalar reads.
+Nested parameter patterns and defaults use the shared source expansion rules,
+including ANSI-C re-expansion. These dependencies survive qualified resolver
+capture. Unresolved arithmetic coverage also propagates through redirect
+process substitutions and process-backed optimized file reads.
+This includes scalar reads nested in operator operands of positional and
+special parameters, such as `fallback` in `${1:-$fallback}`. The selectors
+themselves are not synthetic ENV names. These conservative source dependencies
+survive resolver capture and do not imply unconditional execution.
+
+Their ENVVAR documents have a logical name and NULL/zero value. Unflagged ENV
+edges retain assignment semantics. Update graph walkers, flag masks and ENV
+name consumers; read dependencies must not count as environment assignments.
+Decoded read names borrow retained graph workspace, which must stay valid and
+unchanged for the graph lifetime.
+
+`conditional_arithmetic_unresolved` and graph status
+`SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC` qualify incomplete semantic coverage.
+Later lexical commands remain retained, without qualified downstream state
+proofs. Later primaries in the same conditional also withhold filesystem
+observations and truth/presence proofs, including after unresolved arithmetic
+in a nested substitution. A successful graph return does not imply complete
+arithmetic coverage.
+Check this status before using the graph for complete effect authorization.
+
+Expansion callbacks can receive `SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC`.
+It requests one NUL-free, pure, dependency-resolved arithmetic expression,
+including a decimal result or empty zero. It is distinct from an ordinary
+conditional string expansion. Unsupported resolved expressions fail EEXPAND.
+
+Shellgate reports `SG_EXPANSION_UNRESOLVED_ARITHMETIC` and withholds ALLOW while
+that interpretation remains unresolved. Existing DENY and REJECT precedence is
+preserved. Rebuild consumers and recompute workspace sizes after updating.
+
+Conditional arithmetic first projects the original shell word, reducing active
+constant arithmetic expansions before interpreting the resulting expression.
+Quote-protected expansion spellings remain literal data and are unsupported
+arithmetic values. Resolver records likewise contain expanded expression bytes;
+shell expansion syntax and backslash-newline processing do not apply to them.
+Pure expansions outside the numerical proof domain remain unknown; composed
+unresolved expansion text requires whole-operand resolution.
+
+Retained ENV-read names always borrow immutable source or caller-owned graph
+workspace. Graph construction binds even small source arenas without falling
+back to temporary thread-local storage. Insufficient capacity returns
+`EWORKSPACE`; add the capacity from `shell_source_workspace_size()` and retry.
+
+Shellgate reserves the retained source arena separately from its reusable
+graph/index workspace. Path checks and anomaly analysis have their own sized
+scratch capacity while ENV-read names remain live. Recompute evaluation
+buffers with `sg_gate_evaluate_size_hint()`; callback-produced paths and
+diagnostic output can still require additional caller storage.
+
 ## Unreleased: filesystem comparisons and compound conditions
 
 Binary pathname comparisons (`-nt`, `-ot`, `-ef`) now have retained

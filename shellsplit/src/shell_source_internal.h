@@ -3260,6 +3260,10 @@ typedef struct {
                        void *context);
   void *code_context;
   size_t code_start;
+  /* Optional direct scalar observer. Names are raw logical-source spans;
+   * executable children and arithmetic scopes retain separate ownership. */
+  void (*parameter_visitor)(const char *name, size_t length, void *context);
+  void *parameter_context;
   /* Valid only at INCOMPLETE: body_start != 0 identifies an unfinished
    * executable child and its entire received body, without a closing byte.
    * Arithmetic/quote-only EOF has body_start == 0. No rescan is required to
@@ -3377,10 +3381,20 @@ shell_source_accept_expansion_byte(shell_source_expansion_scope_t *scope,
 static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
     const char *input, size_t length, size_t selector,
     shell_source_substitution_scan_t *scan) {
+  bool indirect = input[selector] == '!';
   if (input[selector] == '#' || input[selector] == '!') {
     size_t next = shell_source_logical_following(input, length, selector);
     if (next < length && input[next] != '}')
       selector = next;
+  }
+  if (scan->parameter_visitor && !indirect && !scan->arithmetic_depth &&
+      !scan->scope.arithmetic_scope &&
+      (shell_ascii_alpha((unsigned char)input[selector]) ||
+       input[selector] == '_')) {
+    size_t end = selector;
+    (void)shell_source_skip_parameter_base(input, length, &end);
+    scan->parameter_visitor(input + selector, end - selector,
+                            scan->parameter_context);
   }
   scan->has_variables = true;
   scan->has_positional |=
@@ -5077,9 +5091,9 @@ typedef struct {
  * CONDITIONAL context; ordinary value classification keeps all runtime
  * expansions dynamic. Both modes share tilde cancellation rules. */
 static inline shell_source_word_expansion_t
-shell_source_word_expansion_impl(const char *input, size_t length,
+shell_source_word_expansion_scan(const char *input, size_t length,
                                  shell_source_word_context_t context,
-                                 bool literal_quoted) {
+                                 bool literal_quoted, bool tilde_only) {
   shell_source_word_expansion_t expansion = {0};
   if (!input || length == 0)
     return (shell_source_word_expansion_t){.dynamic = true};
@@ -5158,8 +5172,29 @@ shell_source_word_expansion_impl(const char *input, size_t length,
       continue;
     }
     if (c == '`' ||
-        shell_source_dollar_has_dynamic_syntax(input, length, position))
-      return (shell_source_word_expansion_t){.dynamic = true};
+        shell_source_dollar_has_dynamic_syntax(input, length, position)) {
+      if (!tilde_only)
+        return (shell_source_word_expansion_t){.dynamic = true};
+      /* Opaque expansions cannot hide a completed tilde prefix. Their own
+       * quoting belongs to their nested scope, not this word's prefix. */
+      size_t after = position, open;
+      bool complete =
+          c == '`' ? shell_source_skip_complete_backtick(input, length,
+                                                         position, &after)
+          : shell_source_dollar_arithmetic_open(input, length, position, &open)
+              ? shell_source_skip_arithmetic_expansion(input, length, position,
+                                                       &after)
+          : shell_source_dollar_parentheses_open(input, length, position, &open)
+              ? shell_source_find_balanced_parentheses(input, length, open,
+                                                       &after)
+              : shell_source_skip_variable_expansion(input, length, position,
+                                                     &after);
+      if (!complete)
+        return expansion;
+      position = after;
+      tilde_start = false;
+      continue;
+    }
     if (!in_double_quote) {
       /* Bash marks the whole word as assignment-shaped, then recognizes the
        * first unquoted = and every unquoted colon, including in a subscript.
@@ -5168,6 +5203,8 @@ shell_source_word_expansion_impl(const char *input, size_t length,
       bool value_start = assignment && c == '=' && !seen_equals;
       seen_equals |= c == '=';
       if (tilde_prefix && (c == '/' || (assignment && c == ':'))) {
+        if (tilde_only)
+          return (shell_source_word_expansion_t){.leading_tilde = true};
         if (!leading_prefix)
           return (shell_source_word_expansion_t){.dynamic = true};
         expansion.leading_tilde = true;
@@ -5176,6 +5213,17 @@ shell_source_word_expansion_impl(const char *input, size_t length,
       if ((c == '<' || c == '>') && shell_source_process_substitution_open(
                                         input, length, position, NULL)) {
         size_t after;
+        if (tilde_only) {
+          size_t open;
+          (void)shell_source_process_substitution_open(input, length, position,
+                                                       &open);
+          if (!shell_source_find_balanced_parentheses(input, length, open,
+                                                      &after))
+            return expansion;
+          position = after;
+          tilde_start = false;
+          continue;
+        }
         if (!shell_source_empty_process_fragment(input, length, position,
                                                  &after))
           return (shell_source_word_expansion_t){.dynamic = true};
@@ -5206,8 +5254,27 @@ shell_source_word_expansion_impl(const char *input, size_t length,
   }
   expansion.dynamic =
       in_single_quote || in_double_quote || (tilde_prefix && !leading_prefix);
-  expansion.leading_tilde |= tilde_prefix && leading_prefix;
+  expansion.leading_tilde |= tilde_prefix && (leading_prefix || tilde_only);
   return expansion;
+}
+
+/* Ordinary classification retains its early exits. The tilde-only view
+ * walks opaque expansions to finish prefix cancellation in an admitted word.
+ * Its leading_tilde result denotes any active prefix, including assignments. */
+static inline shell_source_word_expansion_t
+shell_source_word_expansion_impl(const char *input, size_t length,
+                                 shell_source_word_context_t context,
+                                 bool literal_quoted) {
+  return shell_source_word_expansion_scan(input, length, context,
+                                          literal_quoted, false);
+}
+
+static inline SHELL_NONNULL(
+    1) bool shell_source_conditional_has_tilde_expansion(const char *input,
+                                                         size_t length) {
+  return shell_source_word_expansion_scan(
+             input, length, SHELL_SOURCE_WORD_CONDITIONAL, false, true)
+      .leading_tilde;
 }
 
 /* Value consumers classify all runtime expansions, including quoted ones.

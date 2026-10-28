@@ -2,6 +2,7 @@
 #include "shell_source_runtime_internal.h"
 #include "shell_test_internal.h"
 #include "shell_word_internal.h"
+#include <limits.h>
 #include <string.h>
 
 // clang-format off
@@ -16,6 +17,9 @@ enum {
   TEST_FILE_##kind,
   SHELL_FILE_COMPARISONS(FILE_COMPARISON_OPERATION)
 #undef FILE_COMPARISON_OPERATION
+#define NUMERIC_OPERATION(kind, spelling) TEST_NUMERIC_##kind,
+  SHELL_NUMERIC_COMPARISONS(NUMERIC_OPERATION)
+#undef NUMERIC_OPERATION
   TEST_PRESENT,
 #define FILE_OPERATION(kind, name, ordinal, spelling, alias) TEST_FILE_##kind,
   SHELL_FILE_PREDICATES(FILE_OPERATION)
@@ -51,6 +55,13 @@ SHELL_FILE_PREDICATES(FILE_MAPPING)
                  "binary comparison graph kind mapping");
 SHELL_FILE_COMPARISONS(COMPARISON_MAPPING)
 #undef COMPARISON_MAPPING
+#define NUMERIC_MAPPING(kind, spelling)                                        \
+  _Static_assert(TEST_NUMERIC_##kind == TEST_NUMERIC_EQUAL +                   \
+                                            SHELL_NUMERIC_##kind -             \
+                                            SHELL_NUMERIC_EQUAL,               \
+                 "builtin numeric comparison mapping");
+SHELL_NUMERIC_COMPARISONS(NUMERIC_MAPPING)
+#undef NUMERIC_MAPPING
 _Static_assert((SHELL_TEST_FILE_ROLES &
                 (SHELL_TEST_AND_JOIN | SHELL_TEST_OR_JOIN)) == 0,
                "filesystem roles do not overlap Boolean connectors");
@@ -136,9 +147,11 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
              p->words[op].value[1] != 'o' && p->words[op].value[1] != 'e') {
       kind = TEST_OPAQUE_ERROR;
     }
-    /* -eq/-ne also validate integers; -ef/-nt/-ot inspect files. */
-    if (is_word(p, op, "-eq") || is_word(p, op, "-ne"))
-      kind = TEST_OPAQUE_ERROR;
+#define NUMERIC_PRIMARY(suffix, spelling)                                      \
+  if (is_word(p, op, spelling))                                                \
+    kind = TEST_NUMERIC_##suffix;
+    SHELL_NUMERIC_COMPARISONS(NUMERIC_PRIMARY)
+#undef NUMERIC_PRIMARY
   } else if (is_word(p, op, "-v")) {
     kind = TEST_PRESENT;
   }
@@ -525,7 +538,10 @@ static SHELL_NONNULL(1, 2, 3,
       result = a->known && !a->value_length ? SHELL_TEST_FALSE : 3u;
       break;
     case TEST_TERMINAL:
-      result = !a->known ? 7u : a->number ? 3u : SHELL_TEST_ERROR_RESULT;
+      result = !a->known    ? 7u
+               : !a->number ? SHELL_TEST_ERROR_RESULT
+               : a->integer < 0 || a->integer > INT_MAX ? SHELL_TEST_FALSE
+                                                        : 3u;
       break;
     case TEST_OPAQUE:
       result = 3u;
@@ -543,6 +559,25 @@ static SHELL_NONNULL(1, 2, 3,
       result = known_false ? SHELL_TEST_FALSE : 3u;
       break;
     }
+#define NUMERIC_EVALUATE(kind, spelling) case TEST_NUMERIC_##kind:
+      SHELL_NUMERIC_COMPARISONS(NUMERIC_EVALUATE)
+#undef NUMERIC_EVALUATE
+      {
+        const shell_test_value_t *b = &p->words[n.right];
+        if ((a->known && !a->number) || (b->known && !b->number))
+          result = SHELL_TEST_ERROR_RESULT;
+        else if (!a->known || !b->known)
+          result = SHELL_TEST_FALSE | SHELL_TEST_TRUE | SHELL_TEST_ERROR_RESULT;
+        else {
+          shell_numeric_comparison_t comparison =
+              (shell_numeric_comparison_t)(SHELL_NUMERIC_EQUAL + n.operation -
+                                           TEST_NUMERIC_EQUAL);
+          result = shell_numeric_compare(comparison, a->integer, b->integer)
+                       ? SHELL_TEST_TRUE
+                       : SHELL_TEST_FALSE;
+        }
+        break;
+      }
     case TEST_OPAQUE_ERROR:
       result = 7u;
       break;
@@ -573,6 +608,12 @@ static SHELL_NONNULL(1, 2, 3,
     results[i] = result;
   }
   return p->proven_error ? SHELL_TEST_ERROR_RESULT : results[p->root];
+}
+
+void shell_test_forget_condition_presence(shell_test_program_t *program) {
+  for (unsigned i = 0; i < program->count; ++i)
+    if (program->nodes[i].operation == TEST_PRESENT)
+      program->nodes[i].operation = TEST_OPAQUE;
 }
 
 unsigned shell_test_evaluate(const shell_test_program_t *program,

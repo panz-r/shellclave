@@ -18,3 +18,6 @@ printf "%s" "$( [[ -N target ]] && printf newer )"
 [[ source -nt target && ( -r source || -d target ) ]]
 test left "$operator" right
 [[ x || -n $(cat <skipped) ]]
+
+[[ 2#10 -eq 2 && -t 0 ]]
+[[ count -gt 0 ]]; printf after

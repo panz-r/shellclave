@@ -1479,6 +1479,9 @@ static SHELL_NONNULL(1, 2, 3) uint32_t
     if (node->cmd.kind == SHELL_COMMAND_CONDITIONAL &&
         node->cmd.conditional_unresolved)
       flags[ni] |= SG_EXPANSION_UNRESOLVED_CONDITION;
+    if (node->cmd.conditional_arithmetic_unresolved ||
+        (graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC))
+      flags[ni] |= SG_EXPANSION_UNRESOLVED_ARITHMETIC;
     for (uint32_t token = 0; token < node->cmd.token_count; token++) {
       SG_EXPANSION_WORK();
       const shell_dep_word_value_t *value =
@@ -2462,7 +2465,7 @@ typedef struct {
 } sg_file_identity_node_t;
 
 /* Valid constructed graph, immutable throughout evaluation. These indexes
- * live in the resolver workspace after parsing has released its scratch. */
+ * reuse fixed graph storage while its separate source arena remains live. */
 typedef struct {
   uint32_t out_head[SHELL_DEP_MAX_NODES], in_head[SHELL_DEP_MAX_NODES];
   uint32_t out_next[SHELL_DEP_MAX_EDGES], in_next[SHELL_DEP_MAX_EDGES];
@@ -2497,34 +2500,67 @@ typedef struct {
   uint64_t control_reachable[SHELL_DEP_MAX_NODES][SG_NODE_WORDS];
 } sg_graph_index_t;
 
-/* Reuse the resolver workspace for one decoded FILE view and a persistent,
- * prefix-compressed canonical-identity pool. The pool shares CWD and path
- * prefixes across documents, so the source/CWD bound reserves all material
- * without multiplying it by the node count. */
-static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
-                                                    size_t *required) {
-  if (!shell_dep_workspace_size(NULL, required))
+typedef struct {
+  size_t graph, source, reusable, total;
+} sg_eval_workspace_layout_t;
+
+/* The fixed graph state ends at reusable; source analysis follows it and may
+ * retain ENV names. After construction the reusable prefix holds the graph
+ * index and either path storage or anomaly source scratch. Both lifetimes
+ * therefore fit without inspecting or relocating borrowed graph names. */
+static SHELL_NONNULL(2) bool sg_eval_workspace_plan(
+    size_t command_length, sg_eval_workspace_layout_t *layout) {
+  if (!shell_dep_workspace_size(NULL, &layout->graph) ||
+      !shell_source_workspace_size(command_length, &layout->source))
     return false;
-  size_t source_scratch_size;
-  if (!shell_source_workspace_size(command_length, &source_scratch_size) ||
-      source_scratch_size > SIZE_MAX - *required)
-    return false;
-  *required += source_scratch_size; /* Source analysis in the graph tail. */
   size_t overhead = sizeof(sg_graph_index_t);
   size_t cwd_space = SHELL_DEP_CWD_BUF_SIZE + 1u;
   if (command_length > (SIZE_MAX - overhead) / 4 - cwd_space)
     return false;
-  size_t path_space = overhead + 4 * (command_length + cwd_space);
-  if (path_space > *required)
-    *required = path_space;
+  size_t scratch = 4 * (command_length + cwd_space);
+  if (layout->source > scratch)
+    scratch = layout->source;
+  if (scratch > SIZE_MAX - overhead)
+    return false;
+  layout->reusable = overhead + scratch;
+  if (layout->graph > layout->reusable)
+    layout->reusable = layout->graph;
+  size_t alignment = shell_dep_workspace_alignment();
+  size_t padding = (alignment - layout->reusable % alignment) % alignment;
+  if (padding > SIZE_MAX - layout->reusable)
+    return false;
+  layout->reusable += padding;
+  if (layout->source > SIZE_MAX - layout->reusable)
+    return false;
+  layout->total = layout->reusable + layout->source;
+  return true;
+}
+
+static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
+                                                    size_t *required) {
+  sg_eval_workspace_layout_t layout;
+  if (!sg_eval_workspace_plan(command_length, &layout))
+    return false;
   size_t cache_size;
   size_t alignment = shell_dep_workspace_alignment();
   if (!shell_expand_cache_size(command_length, &cache_size) ||
-      *required > SIZE_MAX - cache_size - alignment)
+      cache_size > SIZE_MAX - alignment ||
+      layout.total > SIZE_MAX - cache_size - alignment)
     return false;
-  *required += cache_size + alignment;
+  *required = layout.total + cache_size + alignment;
   return true;
 }
+
+#ifdef SHELLGATE_TEST_ALLOCATOR
+bool sg_test_eval_workspace_layout(size_t length, sg_test_eval_layout_t *out) {
+  sg_eval_workspace_layout_t layout;
+  if (!sg_eval_workspace_plan(length, &layout))
+    return false;
+  *out = (sg_test_eval_layout_t){layout.graph, layout.source, layout.reusable,
+                                 layout.total, sizeof(sg_graph_index_t)};
+  return true;
+}
+#endif
 
 /* This boundary sizes path storage from graph metadata, not callback source
  * spellings. Resolver storage is retired; cache storage remains live. bw has
@@ -3023,6 +3059,10 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
            (edge->type == SHELL_EDGE_FILE_TEST ||
             edge->type == SHELL_EDGE_FILE_COMPARE) &&
            edge->from == endpoint) ||
+          (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+           edge->type == SHELL_EDGE_ENV &&
+           edge->flags == SHELL_DEP_EDGE_FLAG_ENV_READ &&
+           edge->to == endpoint) ||
           (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
            edge->type == SHELL_EDGE_SUBST && edge->to == endpoint);
       if (!allowed)
@@ -3535,7 +3575,8 @@ static SHELL_NONNULL(
           !(from_node->type == SHELL_NODE_DOC &&
             (from_node->doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)))
         cmd_read_count[e->to]++;
-      if (e->type == SHELL_EDGE_ENV)
+      if (e->type == SHELL_EDGE_ENV &&
+          !(e->flags & SHELL_DEP_EDGE_FLAG_ENV_READ))
         cmd_env_count[e->to]++;
     }
 
@@ -3565,7 +3606,9 @@ static SHELL_NONNULL(
     }
 
     /* --- SG_VIOL_ENV_PRIVILEGED --- */
-    if (e->type == SHELL_EDGE_ENV && from_node->type == SHELL_NODE_DOC &&
+    if (e->type == SHELL_EDGE_ENV &&
+        !(e->flags & SHELL_DEP_EDGE_FLAG_ENV_READ) &&
+        from_node->type == SHELL_NODE_DOC &&
         from_node->doc.kind == SHELL_DOC_ENVVAR &&
         to_node->type == SHELL_NODE_CMD && to_node->cmd.token_count > 0) {
 
@@ -4151,8 +4194,13 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       .context = &expansion_cache,
   };
   shell_dep_limits_t dep_limits = SHELL_DEP_LIMITS_DEFAULT;
-  dep_limits.workspace = dep_workspace;
-  dep_limits.workspace_size = dep_workspace_size;
+  /* Partitioning already established this source length's sizing bound.
+   * Shift fixed graph state to end immediately before the retained arena. */
+  sg_eval_workspace_layout_t workspace_layout;
+  (void)sg_eval_workspace_plan(cmd_len, &workspace_layout);
+  dep_limits.workspace = (char *)dep_workspace + workspace_layout.reusable -
+                         workspace_layout.graph;
+  dep_limits.workspace_size = workspace_layout.graph + workspace_layout.source;
   shell_dep_graph_t graph;
   memset(&graph, 0, sizeof(graph));
   shell_dep_error_t derr = shell_dep_graph_parse_with_fast_resolver(
@@ -4202,8 +4250,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         out->requires_substitution_evaluation = true;
     }
 
-  /* The bounded resolver workspace is no longer live. Reuse its aligned
-   * prefix for graph indexes and its remainder for path decoding scratch. */
+  dep_workspace_size = workspace_layout.reusable;
+  /* Graph state is retired; its source arena and expansion cache remain live.
+   * Only the separately sized prefix is reused by subsequent analysis. */
   sg_graph_index_t *graph_index = dep_workspace;
   sg_graph_index_build(&graph, graph_index);
 
@@ -4289,7 +4338,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   size_t cmd_seq_length = 0;
   size_t type_seq_length = 0;
 
-  /* Only a complete graph establishes contextual semantic support. A bounded
+  /* Only a complete retained lexical sequence is scored. Unresolved
+   * arithmetic remains a separate semantic blocker and prevents learning
+   * and history updates below. A bounded
    * prefix still gets policy diagnostics below, but must not be scored or
    * cached as a complete anomaly sequence. */
   bool anomaly_ready = !parse_truncated && !depgraph_truncated &&
@@ -4314,8 +4365,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
      * lexical analysis stages without repeating a context-free support check.
      * The stage order is not the dependency graph's node order. */
     shell_anomaly_stages_t stages = {0};
-    /* Graph/path preparation is finished. Its temporary tail now supplies
-     * source scratch; the graph index and expansion cache stay live. */
+    /* Path preparation is finished. Scratch after the index now supplies
+     * source analysis; the retained graph arena and expansion cache stay live.
+     */
     shell_limits_t stage_limits = SHELL_LIMITS_DEFAULT;
     stage_limits.workspace = (char *)dep_workspace + sizeof(*graph_index);
     stage_limits.workspace_size = dep_workspace_size - sizeof(*graph_index);
@@ -4689,7 +4741,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       out->verdict = SG_VERDICT_UNDETERMINED;
       return SG_ERR_TRUNC;
     }
-    out->verdict = SG_VERDICT_ALLOW;
+    out->verdict =
+        (out->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC)
+            ? SG_VERDICT_UNDETERMINED
+            : SG_VERDICT_ALLOW;
     return SG_OK;
   }
 
@@ -4721,7 +4776,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       out->deny_reason = bw_copy(
           &bw, "redirect-only shell operation is not argv-policy-evaluable",
           58);
-  } else if (all_allow)
+  } else if (out->unresolved_expansion_flags &
+             SG_EXPANSION_UNRESOLVED_ARITHMETIC)
+    out->verdict = SG_VERDICT_UNDETERMINED;
+  else if (all_allow)
     out->verdict = (out->requires_substitution_evaluation || any_conditional)
                        ? SG_VERDICT_ALLOW_CONDITIONAL
                        : SG_VERDICT_ALLOW;
@@ -4740,7 +4798,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   }
 
   /* Deferred anomaly model update — after a complete verdict is known. */
-  if (gate->anomaly_enabled && gate->anomaly_model && anomaly_count > 0) {
+  if (gate->anomaly_enabled && gate->anomaly_model && anomaly_count > 0 &&
+      !(out->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC)) {
     bool should_update = false;
     if (!gate->anomaly_update_only_on_allow) {
       /* Always update, but skip if anomalous and flag is set */

@@ -82,8 +82,10 @@ void shell_source_operation_begin(const char *input, size_t length)
 void shell_source_operation_prechecked(void);
 void shell_source_operation_end(void);
 /* Allocating adapters reserve one operation-owned arena, reused by internal
- * views and released by operation_end. False means allocation failure and
- * leaves no active operation. Allocation-free boundaries never call this. */
+ * views and released by operation_end. Persistent bracket facts and temporary
+ * conditional value analysis have simultaneous capacity. False means allocation
+ * failure and leaves no active operation. Allocation-free boundaries never
+ * call this. */
 bool shell_source_operation_begin_owned(const char *input, size_t length)
     SHELL_NONNULL(1);
 /* Internal consumers explicitly share this operation. Application callbacks
@@ -109,6 +111,13 @@ typedef struct {
 shell_source_workspace_scope_t
 shell_source_workspace_begin(const char *source, size_t length, void *buffer,
                              size_t size) SHELL_NONNULL(1);
+/* Bind caller storage even below the temporary inline-scratch threshold.
+ * buffer is required, including for zero capacity; exhaustion never falls
+ * back to operation-local storage. Retained consumers preserve its lifetime. */
+shell_source_workspace_scope_t
+shell_source_workspace_begin_retained(const char *source, size_t length,
+                                      void *buffer, size_t size)
+    SHELL_NONNULL(1, 3);
 void shell_source_workspace_end(shell_source_workspace_scope_t previous);
 size_t shell_source_scratch_mark(void);
 void *shell_source_scratch_take(size_t size);

@@ -5266,8 +5266,10 @@ static void delimiter_workspace(void) {
   while (shell_tokenizer_next(&lexer, &token))
     documents += token.type == SHELL_TOKEN_HEREDOC;
   CHECK(!lexer.heredoc_error && documents == 1);
-  CHECK(shell_dep_graph_parse(source, at, "/workspace", &limits, &graph) ==
-        SHELL_DEP_EWORKSPACE);
+  shell_dep_limits_t fixed_limits = limits;
+  CHECK(shell_dep_workspace_size(NULL, &fixed_limits.workspace_size));
+  CHECK(shell_dep_graph_parse(source, at, "/workspace", &fixed_limits,
+                              &graph) == SHELL_DEP_EWORKSPACE);
   size_t original_size = limits.workspace_size;
   void *larger = realloc(limits.workspace, original_size + length);
   CHECK(larger);
@@ -5809,6 +5811,9 @@ static void cwd(void) {
 int main(void) {
   limits = SHELL_DEP_LIMITS_DEFAULT;
   CHECK(shell_dep_workspace_size(NULL, &limits.workspace_size));
+  size_t source_capacity;
+  CHECK(shell_source_workspace_size(8192, &source_capacity));
+  limits.workspace_size += source_capacity;
   limits.workspace = malloc(limits.workspace_size);
   CHECK(limits.workspace);
   heredocs();

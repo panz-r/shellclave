@@ -65,6 +65,7 @@ static void test_nodes(void) {
             SHELL_CONDITIONAL_STRING_EQUAL)                                    \
   CMD_FIELD(conditional_negated, false, true)                                  \
   CMD_FIELD(conditional_truth, 0, 1)                                           \
+  CMD_FIELD(conditional_arithmetic_unresolved, false, true)                    \
   CMD_FIELD(conditional_unresolved, false, true)                               \
   CMD_FIELD(arithmetic_expression, NULL, "1")                                  \
   CMD_FIELD(arithmetic_expression_length, 0, 1)                                \

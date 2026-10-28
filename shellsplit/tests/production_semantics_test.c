@@ -116,6 +116,61 @@ static void test_source_scratch_array_reservations(void) {
   shell_source_operation_end();
 }
 
+static void test_owned_conditional_workspace(void) {
+  static const struct {
+    const char *prefix, *opening, *tail;
+    int spaces;
+  } cases[] = {
+      /* Eight/nine raw brackets straddle the inline index capacity. The
+       * trailing command's bracket candidate prepares that persistent index. */
+      {"printf '[[[['; ", "[[", "tail[[", 0},
+      {"printf '[[[[['; ", "[[", "tail[[", 0},
+      /* A long operand also needs value scratch without a spilled index. */
+      {"printf before; ", "[[", "tail", 512},
+      {"printf '[[[[['; ", "[[", "tail[[", 512},
+      {"printf before; ", "[\\\n[", "tail", 512},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+    char source[1024];
+    int n = snprintf(source, sizeof(source), "%s%s '%*s1' -eq 1 ]]; %s",
+                     cases[c].prefix, cases[c].opening, cases[c].spaces, "",
+                     cases[c].tail);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    size_t complete = (size_t)n;
+    for (unsigned malformed = 0; malformed < 2; ++malformed) {
+      if (malformed)
+        strcat(source, "; printf \"$(unfinished");
+      size_t length = strlen(source);
+      shell_process_status_t expected =
+          malformed ? SHELL_PROCESS_EPARSE : SHELL_PROCESS_OK;
+      shell_command_info_t *flat = NULL;
+      size_t flat_count = 0;
+      CHECK(shell_process_command(source, length, NULL, &flat, &flat_count) ==
+            expected);
+      CHECK(flat_count == (malformed ? 0u : 3u));
+      CHECK(malformed ? flat == NULL : flat != NULL);
+      shell_command_infos_free(flat, flat_count);
+      shell_processed_commands_t processed = {0};
+      CHECK(shell_process_commands(source, length, NULL, &processed) ==
+            expected);
+      CHECK(processed.command_count == (malformed ? 0u : 3u));
+      CHECK(malformed ? processed.commands == NULL
+                      : processed.commands != NULL);
+      shell_processed_commands_free(&processed);
+      shell_netstring_buffer_t sequence = {0};
+      size_t count = 0;
+      bool features = false;
+      CHECK(shell_build_netargv_sequence_buffer(source, length, NULL, &sequence,
+                                                &count, &features) == expected);
+      CHECK(count == (malformed ? 0u : 2u));
+      CHECK(malformed ? sequence.data == NULL : sequence.data != NULL);
+      CHECK(features == !malformed);
+      shell_netstring_buffer_free(&sequence);
+      source[complete] = 0;
+    }
+  }
+}
+
 static void test_logical_comment_boundaries(void) {
   const shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
                                  .strict_mode = true};
@@ -6787,6 +6842,7 @@ static void test_adjacent_named_fd_boundaries(void) {
 
 int main(void) {
   test_source_scratch_array_reservations();
+  test_owned_conditional_workspace();
   test_quoted_literal_bytes();
   test_logical_comment_boundaries();
   test_comment_boundary_io();

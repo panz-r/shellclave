@@ -27,6 +27,8 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
     fputs("; unresolved pathname", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION)
     fputs("; unresolved condition", output);
+  if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC)
+    fputs("; unresolved arithmetic", output);
   if (result->has_dynamic_substitution_io)
     fputs("; dynamic substitution I/O present", output);
   fputc('\n', output);

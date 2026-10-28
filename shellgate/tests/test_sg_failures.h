@@ -11,6 +11,13 @@ void sg_test_alloc_fail_at(size_t allocation_index);
 void sg_test_alloc_reset(void);
 size_t sg_test_alloc_count(void);
 
+/* Inspect calculated lifetimes/capacities without allocating large inputs. */
+typedef struct {
+  size_t graph, source, reusable, total, index;
+} sg_test_eval_layout_t;
+bool sg_test_eval_workspace_layout(size_t length, sg_test_eval_layout_t *out)
+    SHELL_NONNULL(2);
+
 void sg_test_anomaly_op_fail_at(size_t operation_index);
 void sg_test_anomaly_op_reset(void);
 size_t sg_test_anomaly_op_count(void);

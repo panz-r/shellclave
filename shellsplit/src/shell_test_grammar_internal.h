@@ -1,6 +1,8 @@
 #ifndef SHELL_TEST_GRAMMAR_INTERNAL_H
 #define SHELL_TEST_GRAMMAR_INTERNAL_H
 
+#include "shell_numeric_predicate_internal.h"
+
 #include "shell_contract.h"
 #include "shell_file_predicate_internal.h"
 #include <stdbool.h>
@@ -150,10 +152,8 @@ static inline SHELL_NONNULL(1) shell_test_roles_t
     if (spelling[0] == '-' && spelling[1] == 'o')
       roles |= SHELL_TEST_OR_JOIN;
   } else if (length == 3 && spelling[0] == '-') {
-    if ((!memcmp(spelling, "-eq", 3)) || (!memcmp(spelling, "-ne", 3)) ||
-        (!memcmp(spelling, "-lt", 3)) || (!memcmp(spelling, "-le", 3)) ||
-        (!memcmp(spelling, "-gt", 3)) ||
-        (!memcmp(spelling, "-ge", 3))
+    if (shell_numeric_comparison(spelling, length) !=
+        SHELL_NUMERIC_NONE
 #define FILE_COMPARISON_ROLE(kind, name, ordinal, operator_word)               \
   || (!memcmp(spelling, operator_word, 3))
             SHELL_FILE_COMPARISONS(FILE_COMPARISON_ROLE)

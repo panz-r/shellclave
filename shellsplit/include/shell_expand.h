@@ -80,6 +80,20 @@ typedef enum {
    * expansion. RESOLVED requires one NUL-free record, including 0:, for an
    * empty string. */
   SHELL_EXPAND_WORD_CONDITIONAL,
+  /* Supply a dependency-resolved pure arithmetic expression for the complete
+   * conditional operand. One NUL-free record is required; an empty expression
+   * means zero. Active tilde prefixes require this resolution too; resolve
+   * them against application-supplied state before arithmetic interpretation.
+   * A decimal result is sufficient. Establish the value for every
+   * reaching state without executing shell code. The original operand's
+   * recursive interpretation must itself be within the admitted pure subset;
+   * a numerical result alone does not discharge possible hidden effects.
+   * Otherwise return UNRESOLVED. Scalar references remaining
+   * in the returned expression are not resolved results. Returned bytes are
+   * expanded arithmetic text: shell expansions and backslash continuations
+   * are invalid. Source dependencies
+   * and substitution inspection obligations remain after resolution. */
+  SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC,
 } shell_expand_word_purpose_t;
 
 /* Source/word/owner spans borrow immutable source for this operation.

@@ -36,6 +36,12 @@ directories, add large fuzz corpora, or globally suppress warnings. Run the
 ASan/UBSan configuration for changes that touch parsing, memory ownership,
 serialization, or concurrency; run TSan for policy/context synchronization.
 
+Reference-shell conformance tests pay process startup and sanitizer costs for
+each probe. Cover operand spellings separately from shared operator truth
+tables, and cross dimensions where their interaction matters. Check source
+framing once per source; vary captured values and reference locales in their
+own checks so invariant probe results are not recomputed.
+
 Differential parser oracles must provide sufficient source workspace to each
 compared path. Size strict fast-parser and lexical-iterator storage with
 `shell_source_workspace_size()`, and bind scratch for internal syntax and
@@ -106,8 +112,9 @@ The implementation owners and private interfaces are:
 | Whole-source and scoped byte admission | `shell_source_admission.c`, `shell_source_admission_internal.h` |
 | Lexical iteration, control/list/draft grammar and borrowed command construction | `shell_tokenizer_full.c`, `shell_tokenizer_full_internal.h`, `shell_source_draft_internal.h` |
 | Retained source/draft collection | `shell_source.c` |
-| Literal arithmetic grammar and value proofs | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
+| Arithmetic grammar, literal value proofs and conditional scalar-reference analysis | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
 | Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Numeric comparison identities and relational operations | `shell_numeric_predicate_internal.h` |
 | Filesystem predicate spellings, aliases and semantic ordinals | `shell_file_predicate_internal.h` |
 | Builtin test argument-count grammar, admission, bounded grammar-role projection and eager expression evaluation | `shell_test_grammar_internal.h`, `shell_test_admission_internal.h`, `shell_test.c`, `shell_test_projection_impl.h`, `shell_test_internal.h` |
 | Shared builtin word projection and scalar cardinality | `shell_builtin_word_internal.h` |
@@ -242,8 +249,8 @@ conditional operands as ordinary arguments or apply conditional expansion rules
 to builtin arguments.
 
 Shared C/C++ rejection fixtures in `shellsplit/tests/syntax_boundary_cases.h`
-own the unsupported integer-comparison sentinel, both operand spans
-and the continued operator spelling. Keep these fixtures valid Bash as unary
+own the unsupported regex-comparison sentinel, both operand spans
+and the continued operator spelling. Keep these fixtures valid Bash as
 predicate coverage grows.
 Each harness retains its own API assertions and contextual wrappers. Python
 Bash qualification cases and explicit predicate expectations stay independent
@@ -431,3 +438,14 @@ Markdown links. Example tests cover policy outcomes, runtime uncertainty,
 partial results, and evaluation failures against the shipping library.
 Keep public prose organized by caller behavior; implementation history and
 private data-structure notes belong in code comments or commit messages.
+
+Numeric conditional operands use arithmetic interpretation; `test`/`[` operands
+use prepared decimal integer values. Keep these grammar boundaries separate.
+Direct scalar reads have ENV_READ relations, with logical names borrowed from
+source or retained graph workspace and no assignment values. The arithmetic
+resolver purpose supplies a pure dependency-resolved expression, not shell
+execution. Unresolved arithmetic interpretation qualifies incomplete graph
+coverage and blocks policy ALLOW; preserve this qualification through nested
+imports, early-stop modes and anomaly updates. A coverage boundary retains
+later syntax while withholding state-derived effects and CWD proofs. Predicate
+and resolver tests must verify both visible dependencies and that qualification.

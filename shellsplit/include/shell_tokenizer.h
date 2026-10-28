@@ -96,6 +96,15 @@ typedef enum {
   SHELL_CONDITIONAL_FILE_NEWER,
   SHELL_CONDITIONAL_FILE_OLDER,
   SHELL_CONDITIONAL_FILE_SAME,
+  /* Numeric comparisons use arithmetic expressions, unlike test/[ decimal
+   * integer arguments. Terminal tests use a decimal descriptor argument. */
+  SHELL_CONDITIONAL_NUMERIC_EQUAL,
+  SHELL_CONDITIONAL_NUMERIC_NOT_EQUAL,
+  SHELL_CONDITIONAL_NUMERIC_LESS,
+  SHELL_CONDITIONAL_NUMERIC_LESS_EQUAL,
+  SHELL_CONDITIONAL_NUMERIC_GREATER,
+  SHELL_CONDITIONAL_NUMERIC_GREATER_EQUAL,
+  SHELL_CONDITIONAL_TERMINAL,
 } shell_conditional_predicate_t;
 
 /**

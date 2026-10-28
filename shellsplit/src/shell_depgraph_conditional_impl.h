@@ -19,6 +19,40 @@ typedef struct {
   shell_test_program_t *program;
 } dep_condition_context_t;
 
+/* Boolean reachability and semantic coverage are separate. A barrier inside
+ * this owner also disqualifies later primaries and operand expansions. */
+static SHELL_NONNULL(1) bool dep_condition_qualified(
+    const dep_condition_context_t *ctx, bool active, size_t position) {
+  return active &&
+         !ctx->graph->nodes[ctx->owner].cmd.conditional_arithmetic_unresolved &&
+         position < *ctx->context->semantic_barrier &&
+         dep_owner_phase_active(ctx->context, ctx->owner,
+                                DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
+}
+
+/* Read documents never carry assignment values. Logical names borrow source,
+ * callback payloads or retained decoded operand storage in the graph arena. */
+static SHELL_NONNULL(1, 3) void dep_condition_reference(const char *name,
+                                                        size_t length,
+                                                        void *context) {
+  dep_condition_context_t *ctx = context;
+  if (ctx->graph->node_count == ctx->max_nodes ||
+      ctx->graph->edge_count == ctx->max_edges || length > UINT32_MAX) {
+    ctx->graph->status |= SHELL_DEP_STATUS_TRUNCATED;
+    return;
+  }
+  uint32_t document = ctx->graph->node_count++;
+  ctx->graph->nodes[document] =
+      (shell_dep_node_t){.type = SHELL_NODE_DOC,
+                         .doc = {.kind = SHELL_DOC_ENVVAR,
+                                 .name = name,
+                                 .name_len = (uint32_t)length}};
+  shell_dep_edge_t *edge = &ctx->graph->edges[ctx->graph->edge_count++];
+  dep_init_edge(edge, document, ctx->owner, SHELL_EDGE_ENV, SHELL_DIR_FORWARD,
+                SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
+  edge->flags = SHELL_DEP_EDGE_FLAG_ENV_READ;
+}
+
 /* Completion follows the last primary in this subtree, including skipped
  * primaries. Carry its parsed boundary through the existing traversal so guard
  * release precedes later operands without rescanning or reordering events. */
@@ -107,18 +141,19 @@ static SHELL_NONNULL(1, 5) shell_dep_error_t
     result->end = (uint32_t)primary->end;
     shell_conditional_value_t values[2] = {0};
     dep_file_comparison_operand_t operands[2] = {0};
+    bool arithmetic_unresolved = false;
     for (unsigned i = 0; i < primary->operand_count; ++i) {
       operands[i].source =
           (dep_token_t){ctx->context->cmd + primary->operands[i],
                         (uint32_t)primary->operand_lengths[i]};
-      bool reached =
-          active && dep_owner_phase_active(ctx->context, ctx->owner,
-                                           DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
+      bool reached = dep_condition_qualified(ctx, active, primary->operands[i]);
       if (reached && primary->predicate != SHELL_CONDITIONAL_VARIABLE_SET) {
         error = dep_resolve_word(ctx->graph, ctx->context, &operands[i].source,
                                  ctx->cwd, ctx->owner,
-                                 SHELL_EXPAND_WORD_CONDITIONAL, true,
-                                 UINT32_MAX, &operands[i].value);
+                                 shell_conditional_numeric(primary->predicate)
+                                     ? SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC
+                                     : SHELL_EXPAND_WORD_CONDITIONAL,
+                                 true, UINT32_MAX, &operands[i].value);
         if (error != SHELL_DEP_OK)
           return error;
         const shell_dep_word_value_t *value = operands[i].value;
@@ -129,8 +164,27 @@ static SHELL_NONNULL(1, 5) shell_dep_error_t
         if (value && value->resolved)
           values[i] = (shell_conditional_value_t){value->first,
                                                   value->first_length, true};
-        if ((!value || !value->resolved) && operands[i].dynamic)
+        if (!shell_conditional_numeric(primary->predicate) &&
+            (!value || !value->resolved) && operands[i].dynamic)
           ctx->graph->nodes[ctx->owner].cmd.conditional_unresolved = true;
+        if (shell_conditional_numeric(primary->predicate) ||
+            primary->predicate == SHELL_CONDITIONAL_TERMINAL) {
+          if (!shell_conditional_visit_parameters(operands[i].source.start,
+                                                  operands[i].source.len,
+                                                  dep_condition_reference, ctx))
+            return SHELL_DEP_ETRUNC;
+        }
+        if (shell_conditional_numeric(primary->predicate)) {
+          shell_arithmetic_scalar_result_t source_facts =
+              shell_conditional_arithmetic_operand(
+                  operands[i].source.start, operands[i].source.len, NULL, 0,
+                  false, dep_condition_reference, ctx);
+          bool unresolved = !values[i].known && (source_facts.references ||
+                                                 source_facts.unresolved);
+          if (!values[i].known && source_facts.unresolved)
+            ctx->graph->nodes[ctx->owner].cmd.conditional_unresolved = true;
+          arithmetic_unresolved |= unresolved;
+        }
       }
       error = dep_connect_expansions_kind(
           ctx->graph, ctx->max_nodes, ctx->max_edges, ctx->cwd_size,
@@ -140,8 +194,23 @@ static SHELL_NONNULL(1, 5) shell_dep_error_t
       if (error != SHELL_DEP_OK)
         return error;
     }
-    if (active && dep_owner_phase_active(ctx->context, ctx->owner,
-                                         DEP_SNAPSHOT_BODY_WORD, UINT32_MAX)) {
+    /* Bash expands both operands before interpreting either arithmetic
+     * value. The coverage barrier starts after those visible effects. */
+    if (arithmetic_unresolved) {
+      ctx->graph->nodes[ctx->owner].cmd.conditional_arithmetic_unresolved =
+          true;
+      ctx->graph->status |= SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC;
+      shell_test_forget_condition_presence(ctx->program);
+      uint32_t boundary = (uint32_t)primary->end;
+      if (boundary < *ctx->context->semantic_barrier)
+        *ctx->context->semantic_barrier = boundary;
+    }
+    /* A nested substitution can introduce a barrier while expanding either
+     * operand. Recheck coverage before publishing predicate observations. */
+    bool qualified = dep_condition_qualified(ctx, active, primary->end);
+    if (active && !qualified)
+      shell_test_forget_condition_presence(ctx->program);
+    if (qualified) {
       if (primary->predicate >= SHELL_CONDITIONAL_FILE_NEWER &&
           primary->predicate <= SHELL_CONDITIONAL_FILE_SAME) {
         for (unsigned i = 0; i < 2; ++i) {
@@ -167,12 +236,12 @@ static SHELL_NONNULL(1, 5) shell_dep_error_t
                                      primary->predicate);
     }
     bool truth = false;
-    bool known =
-        shell_conditional_evaluate(ctx->context->cmd, primary, values, &truth);
+    bool known = qualified && shell_conditional_evaluate(
+                                  ctx->context->cmd, primary, values, &truth);
     shell_test_set_condition_result(ctx->program, index, known, truth);
     if (shell_source_scratch_exhausted())
       return SHELL_DEP_ETRUNC;
-    if (primary->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
+    if (primary->predicate == SHELL_CONDITIONAL_VARIABLE_SET && qualified)
       return dep_test_body_status_at(ctx->graph, ctx->streams, ctx->context,
                                      ctx->owner, index, true, &result->status);
     result->status = known

@@ -164,9 +164,12 @@ static bool shellsplit_test_depgraph_invariants(
       error != SHELL_DEP_ETRUNC && error != SHELL_DEP_EPARSE &&
       error != SHELL_DEP_EWORKSPACE && error != SHELL_DEP_EEXPAND)
     return false;
-  if ((error == SHELL_DEP_OK && graph->status != SHELL_DEP_STATUS_OK) ||
+  if ((error == SHELL_DEP_OK &&
+       (graph->status & ~SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC) !=
+           SHELL_DEP_STATUS_OK) ||
       (error == SHELL_DEP_ETRUNC &&
-       graph->status != SHELL_DEP_STATUS_TRUNCATED) ||
+       (graph->status & ~SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC) !=
+           SHELL_DEP_STATUS_TRUNCATED) ||
       ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
         error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND) &&
        graph->status != SHELL_DEP_STATUS_ERROR) ||
@@ -210,7 +213,8 @@ static bool shellsplit_test_depgraph_invariants(
              : ((edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                                  SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                                  SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
-                                 SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
+                                 SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP |
+                                 SHELL_DEP_EDGE_FLAG_ENV_READ)) != 0 ||
                 ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
                  (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
                 ((edge->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
@@ -443,8 +447,11 @@ static bool shellsplit_test_depgraph_invariants(
                      : !shellsplit_test_span_in_input(input, length,
                                                       node->doc.path,
                                                       node->doc.path_len)) ||
-                !shellsplit_test_span_in_input(input, length, node->doc.name,
-                                               node->doc.name_len) ||
+                ((node->doc.kind == SHELL_DOC_ENVVAR && !node->doc.value)
+                     ? node->doc.name == NULL || node->doc.name_len == 0
+                     : !shellsplit_test_span_in_input(input, length,
+                                                      node->doc.name,
+                                                      node->doc.name_len)) ||
                 ((node->doc.flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)
                      ? node->doc.kind != SHELL_DOC_FILE ||
                            node->doc.value == NULL ||

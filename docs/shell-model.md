@@ -66,10 +66,11 @@ pipeline timing. Redirection support includes files, combined output, heredocs,
 here-strings, named descriptors, duplication, moves, and closes.
 
 Extglob requires `extglob` enabled by the executor before Bash parses source.
-Shell-option mutations in submitted source are rejected. Supported arithmetic
-uses numeric literals, operators, and bounded nesting. Variable
-lookup, dynamic arithmetic, and mutation remain unsupported, including in
-substring offsets and lengths.
+Shell-option mutations in submitted source are rejected. Arithmetic commands, expansions, and substring offsets and lengths support
+numeric literals, operators, and bounded nesting. Variable lookup, dynamic
+arithmetic, and mutation remain unsupported in those forms. Numeric operands
+in `[[ … ]]` additionally support scalar references with qualified semantic
+coverage; see [numeric predicates](#numeric-predicates-and-terminal-tests).
 
 Arithmetic whitespace consists of space, tab and LF. Backslash-LF continues
 the expression. CR, vertical tab and form feed remain significant bytes;
@@ -194,7 +195,7 @@ literal value; `! (x)` instead negates a grouped condition.
 Supported primaries compose with lexical `!`, `&&`, `||` and parentheses inside
 `[[ … ]]`. Negation binds first, then `&&`, then `||`; grouping overrides that
 precedence. Binary pathname comparisons are described below. Wider patterns,
-regex, ordering/numeric comparisons and variable-attribute predicates remain
+regex, string-ordering comparisons and variable-attribute predicates remain
 UNSUPPORTED. Lists and outer `&&`/`||` connectors also compose conditional
 commands.
 
@@ -351,6 +352,124 @@ Nested executables still require argv-policy matches. Unresolved condition
 values in either operand set `SG_EXPANSION_UNRESOLVED_CONDITION`, independently of unresolved
 argv/paths and substitution-inspection requirements. Anomaly sequences retain
 one empty executable with the `CT` marker per conditional stage.
+
+### Numeric predicates and terminal tests
+
+All six integer comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`) are
+supported in conditional commands and the `test`/`[` builtins. Their operand
+rules differ. Builtins validate signed decimal `intmax_t` values; conditional
+commands interpret expanded operands as arithmetic expressions. Thus
+`test 010 -eq 10` is true, while `[[ 010 -eq 8 ]]` is true. Quote expressions
+containing spaces: `[[ '2 + 3' -eq 5 ]]` has two arithmetic operands. Empty
+conditional arithmetic strings mean zero. The existing checked arithmetic
+proof rules apply, including UNKNOWN for supported expressions outside the
+proof domain. Invalid builtin integers remain argument errors during eager
+Boolean evaluation, rather than ordinary false predicates.
+
+Conditional arithmetic first projects the original shell word, reducing active
+constant arithmetic expansions before interpreting the resulting expression.
+Quote-protected expansion spellings remain literal data and are unsupported
+arithmetic values. Resolver records likewise contain expanded expression bytes;
+shell expansion syntax and backslash-newline processing do not apply to them.
+Pure expansions outside the numerical proof domain remain unknown; composed
+unresolved expansion text requires whole-operand resolution.
+
+Active tilde prefixes also require whole-operand resolution before arithmetic
+interpretation. For example, `~+0` denotes a directory-stack expansion, whereas
+`'~+0'`, `\~+0` and `~+0''` supply literal arithmetic complement. Prefix
+classification retains quote cancellation and remains effective when another
+expansion follows, such as `~+0/$((1))`. Analysis never consults the host's
+HOME, user database or directory stack. The application supplies qualified
+state through `SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC`; unresolved values
+retain the arithmetic coverage blocker and prevent policy ALLOW. Raw tilde
+spellings do not create guessed scalar ENV reads. Explicit parameter reads and
+executable-substitution inspection requirements remain represented.
+
+
+Retained ENV-read names always borrow immutable source or caller-owned graph
+workspace. Graph construction binds even small source arenas without falling
+back to temporary thread-local storage. Insufficient capacity returns
+`EWORKSPACE`; add the capacity from `shell_source_workspace_size()` and retry.
+
+Arithmetic operands can read statically named scalar variables. Direct reads
+are retained as `ENVVAR --ENV(ENV_READ)--> CMD` dependencies. These include
+identifiers such as `count` in `[[ count+1 -gt 0 ]]`, and scalar parameters such as `"$count"`.
+Statically established prefix and postfix mutations (`++count`, `count--`)
+remain unsupported, including in skipped branches and when known word
+expansions compose the operator and identifier. Adjacent signs on literals,
+such as `1--2`, and separated signs, such as `count + +1`, retain their pure
+operator meanings. Conditional framing can still be COMPLETE when semantic
+analysis rejects a mutation; Shellgate reports its existing parse rejection.
+The name helpers return each logical identifier. A read document has no
+assigned value: `value` is NULL and `value_len` is zero. Existing unflagged
+ENV edges describe assignments and retain their source value spans.
+ENV denotes shell-variable dependencies, including shell-local variables;
+it does not assert export, presence or a known value. The library never reads
+the embedding process's environment. Direct dependencies do not enumerate
+recursive arithmetic hidden in unknown variable contents.
+These are conservative may-read facts. Operator operands are traversed even
+when the selector is positional or special: `[[ "${1:-$fallback}" -eq 0 ]]`
+records a read of `fallback`, without inventing an ENV variable named `1`.
+Length selectors and name enumeration remain distinct from scalar value reads.
+Quote protection in word and pattern operands determines which nested reads
+are active. The shared source scanner preserves enclosing quote context through nested
+patterns and defaults, including re-expanded ANSI-C fragments. For example,
+`[[ "${v#${u:-$'$fallback'}}" -eq 0 ]]` retains reads of `v`, `u`, and
+`fallback`. Source dependencies remain present after whole-word resolution;
+the metadata does not assert that every fallback executes on every path.
+Builtin `test`/`[` arguments expand eagerly before their redirect list. Their
+direct parameter reads remain dependencies even when subsequent setup prevents
+the builtin body from running. Filesystem predicate checks remain body effects.
+Builtin `test`/`[` admission still requires proven argv cardinality; complex
+parameter operands outside that proof remain unsupported.
+
+
+Unknown arithmetic contents can introduce additional variable reads or effects.
+A reached unresolved operand sets `conditional_arithmetic_unresolved` and
+`SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC`. This is incomplete semantic coverage,
+not syntax failure, resource truncation or merely unknown numerical truth.
+Later source owners remain available for lexical policy inspection, but their
+execution-state-dependent byte routes and CWD proofs are not qualified.
+The boundary also applies to later primaries within the same conditional.
+Their filesystem observations and truth/presence proofs are withheld; a nested
+substitution can introduce this boundary while an operand is expanding.
+Earlier observations and the lexical nested command subjects remain available.
+The graph therefore cannot establish complete effect coverage across this
+boundary. The same qualification propagates from potentially executing nested
+substitutions, including redirect process substitutions and process-backed
+`$(<word)` reads.
+Known skipped operands do not introduce this coverage blocker.
+
+`SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC` requests a dependency-resolved pure
+expression for one complete arithmetic operand. Return one NUL-free netargv
+record; `1:3,` supplies three and `0:,` supplies zero. The application must
+establish that value for every reaching state, without executing shell code.
+The application must also establish that the original recursive interpretation
+has only admitted pure arithmetic semantics. Providing a numerical result of
+an interpretation with hidden effects does not satisfy this contract; return
+UNRESOLVED when that proof is unavailable. A normalized decimal result is
+sufficient once those requirements hold. Scalar references, mutations and
+other unsupported expressions are invalid resolved results and fail with
+EEXPAND. An unknown value remains UNRESOLVED. Pure values clear the interpretation
+blocker even when the bounded evaluator cannot prove their numerical result.
+Source ENV dependencies and substitution-inspection obligations remain.
+
+Shellgate exposes `SG_EXPANSION_UNRESOLVED_ARITHMETIC` independently of ordinary
+unresolved strings and paths. It evaluates visible argv-policy subjects but
+returns UNDETERMINED while this blocker remains, unless a definite DENY or
+REJECT takes precedence. This includes zero-subject conditions and early-stop
+modes. Blocked evaluations may receive diagnostic scores for their retained lexical
+stage sequence, but do not train anomaly models or update adaptive history. Applications can supply
+qualified values or apply their own explicit exact-source approval process.
+
+`-t` tests terminal status in all three forms. Its operand uses signed decimal
+validation, not arithmetic expression evaluation. Invalid conditional operands
+have a nonzero result and obey conditional negation and short circuiting;
+invalid builtin operands retain argument-error semantics. Negative descriptor
+numbers and values outside the executor's descriptor range cannot be terminals.
+Other terminal status remains UNKNOWN: analysis never calls host `isatty()`.
+These observations consume no bytes and create no content READ or WRITE edge.
+Builtin `-t` retains its existing small-argument and implicit-fd-1 rules.
 
 ### Filesystem predicates
 
@@ -570,14 +689,24 @@ Builtin test evaluation is eager. Argument substitutions and reached predicates
 remain represented even when another operand determines a Boolean result.
 Possible predicate errors are separate from false values: `test x -o 1 -eq
 invalid` fails with an argument error despite its nonempty first operand.
-Known string tests and literal comparisons contribute truth; other supported
-predicates remain conservative, including error alternatives where applicable.
+Known string tests, literal comparisons and integer comparisons contribute
+truth. The six numeric operators `-eq`, `-ne`, `-lt`, `-le`, `-gt` and `-ge`
+use signed decimal integers in `test` and `[`, including surrounding ASCII
+whitespace and an optional sign. Leading zeros do not select octal. Both
+operands must fit `intmax_t`; empty, malformed and overflowing values produce
+an argument error. Captured argument values are validated and converted once
+before repeated state evaluation. Unknown operands retain possible Boolean and
+argument-error outcomes. These builtin rules are separate from Bash's
+arithmetic-expression interpretation inside `[[ ... ]]`.
+Other supported predicates remain conservative, including error alternatives
+where applicable.
 Uncertain operator roles never produce a truth proof. Existing rejection of
 potential array-subscript re-evaluation applies throughout these expressions.
 
 The terminal predicate `test -t fd` validates a signed decimal integer, with
 surrounding ASCII whitespace allowed. Invalid or overflowing operands cause a
-builtin argument error; terminal status remains UNKNOWN. In general expressions
+builtin argument error. Negative values and values beyond the descriptor range
+are false; other terminal status remains UNKNOWN. In general expressions
 with at least four effective arguments, `-t` immediately before `-a` or `-o`
 tests fd 1 and leaves that word as a connector. The full expression's argument
 count controls this rule even inside parentheses; `[` excludes its closing

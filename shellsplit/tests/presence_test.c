@@ -1096,7 +1096,7 @@ int main(int argc, char **argv) {
       {"test '(' -t -o ')'", SHELL_CONDITIONAL_FALSE},
       {"test -t -o x", SHELL_CONDITIONAL_TRUE},
       {"CONFIG=; test '(' -t -o -v CONFIG ')'", SHELL_CONDITIONAL_TRUE},
-      {"test x -o 1 -eq invalid", SHELL_CONDITIONAL_UNKNOWN},
+      {"test x -o 1 -eq invalid", SHELL_CONDITIONAL_FALSE},
       {"test -v inherited_unknown", SHELL_CONDITIONAL_UNKNOWN},
       {"test -v inherited_unknown -o ! -v inherited_unknown",
        SHELL_CONDITIONAL_TRUE},

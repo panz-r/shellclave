@@ -970,7 +970,8 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
                        const char **value, size_t *length, void *context) {
   comparison_resolver_t *resolver = context;
   /* Nested executable children can query their own argv independently. */
-  if (request->purpose != SHELL_EXPAND_WORD_CONDITIONAL)
+  if (request->purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
+      request->purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC)
     return SHELL_EXPAND_UNRESOLVED;
   CHECK(resolver->calls < 2);
   unsigned index = resolver->calls++;
@@ -1086,6 +1087,506 @@ static void check_conditional_observation_order(void) {
     CHECK(reads_document == cases[c].reaches_suffix);
     CHECK(reads_process == cases[c].reaches_suffix);
   }
+}
+
+/* Numeric builtin arguments are decimal integers, unlike arithmetic operands
+ * in [[ ... ]]. Verify their effects through the public graph continuation. */
+static void count_arithmetic_reference(const char *name, size_t length,
+                                       void *context) {
+  CHECK(length == 5 && !memcmp(name, "count", length));
+  ++*(unsigned *)context;
+}
+
+static void check_scalar_arithmetic_boundary(void) {
+  unsigned references = 0;
+  const char expression[] = "count + 2 * 3";
+  shell_arithmetic_scalar_result_t scalar =
+      shell_arithmetic_analyze_scalar(expression, sizeof(expression) - 1,
+                                      count_arithmetic_reference, &references);
+  CHECK(scalar.result.supported && !scalar.result.known && scalar.references);
+  CHECK(references == 1);
+  CHECK(
+      !shell_arithmetic_analyze(expression, sizeof(expression) - 1).supported);
+  static const char *const rejected[] = {"count=1", "count[0]"};
+  for (unsigned i = 0; i < sizeof(rejected) / sizeof(*rejected); ++i) {
+    scalar = shell_arithmetic_analyze_scalar(rejected[i], strlen(rejected[i]),
+                                             NULL, NULL);
+    CHECK(!scalar.result.supported);
+  }
+  scalar = shell_arithmetic_analyze_scalar("2#10 + 3", 8, NULL, NULL);
+  CHECK(scalar.result.supported && scalar.result.known &&
+        scalar.result.value == 5 && !scalar.references);
+  static const char *const mutations[] = {
+      "++count",   "--count",   "++ count",   "--\tcount",  "count++",
+      "count--",   "count++1",  "count--1",   "count ++ 1", "!++count",
+      "- --count", "++++count", "0&&++count", "1||count--", "0?++count:1",
+  };
+  for (unsigned i = 0; i < sizeof(mutations) / sizeof(*mutations); ++i) {
+    scalar = shell_arithmetic_analyze_scalar(mutations[i], strlen(mutations[i]),
+                                             NULL, NULL);
+    CHECK(!scalar.result.supported && scalar.mutation);
+  }
+  static const char *const pure[] = {
+      "1--2",     "++2",      "--2",       "count + +1", "count - -1",
+      "+ +count", "- -count", "--(count)", "++(count)",  "1||count",
+  };
+  for (unsigned i = 0; i < sizeof(pure) / sizeof(*pure); ++i) {
+    scalar =
+        shell_arithmetic_analyze_scalar(pure[i], strlen(pure[i]), NULL, NULL);
+    CHECK(scalar.result.supported && !scalar.mutation);
+  }
+}
+
+static void check_arithmetic_mutation_rejection(void) {
+  static const char *const operands[] = {
+      "++count",     "--count",      "'++ count'",        "'count++1'",
+      "'! --count'", "'0&&++count'", "'1||count--'",      "'0?++count:1'",
+      "'+'+count",   "+\\\n+count",  "\"++count\"$((0))", "'count'$((0))++1",
+  };
+  for (unsigned i = 0; i < sizeof(operands) / sizeof(*operands); ++i)
+    for (unsigned side = 0; side < 2; ++side) {
+      char source[256];
+      snprintf(source, sizeof(source),
+               "cat <before; [[ %s -eq %s ]]; cat <after",
+               side ? "0" : operands[i], side ? operands[i] : "0");
+      current = source;
+      CHECK(shell_parse_draft(source, strlen(source), NULL, draft) ==
+            SHELL_SOURCE_COMPLETE);
+      CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
+                                  graph) == SHELL_DEP_EPARSE);
+      CHECK(graph->status == SHELL_DEP_STATUS_ERROR && !graph->node_count &&
+            !graph->edge_count && !graph->cwd_buf.len);
+    }
+  /* Pure scalar operators still publish direct reads and coverage status. */
+  parse("[[ 'count + +1' -eq 0 ]]");
+  CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+  unsigned reads = 0;
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    if (graph->edges[e].flags == SHELL_DEP_EDGE_FLAG_ENV_READ) {
+      CHECK(shell_dep_doc_env_name_equals(
+          &graph->nodes[graph->edges[e].from].doc, "count", 5));
+      ++reads;
+    }
+  CHECK(reads == 1);
+}
+
+static void check_numeric_conditional_contract(void) {
+  static const struct {
+    const char *source;
+    shell_conditional_truth_t truth;
+  } cases[] = {
+      {"[[ 2 -eq 2 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ 2 -ne 2 ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ -2 -lt 1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ 2 -le 1 ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ 3 -gt 2 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ 3 -ge 3 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '2+3' -eq 5 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '1--2' -eq 3 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ ++2 -eq 2 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ --2 -eq 2 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ 010 -eq 8 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '' -eq 0 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '0&&count' -eq 0 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '1||count' -eq 1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '0?count:1' -eq 1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ 2#10 -eq 2 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '~+0' -eq -1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ \\~+0 -eq -1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ ~+0'' -eq -1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ ~''+0 -eq -1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ \"$((~0))\" -eq -1 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ $((2+3)) -eq 5 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ 1$((2)) -eq 12 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ \"$((2+3))\" -eq 5 ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ -t -0 ]]", SHELL_CONDITIONAL_UNKNOWN},
+      {"[[ -t 0 ]]", SHELL_CONDITIONAL_UNKNOWN},
+      {"[[ -t -1 ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ -t 2147483648 ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ -t invalid ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ ! -t invalid ]]", SHELL_CONDITIONAL_TRUE},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+    parse(cases[i].source);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          cases[i].truth);
+    CHECK(!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC));
+    for (unsigned e = 0; e < graph->edge_count; ++e)
+      CHECK(graph->edges[e].type != SHELL_EDGE_READ);
+  }
+  static const char *const protected_sources[] = {
+      "[[ '$((1))' -eq 1 ]]",
+      "[[ \"\\$((1))\" -eq 1 ]]",
+      "[[ '$((1))'+\"$((0))\" -eq 1 ]]",
+      "[[ $'\\x24((1))' -eq 1 ]]",
+      "[[ '1\\\n+2' -eq 3 ]]",
+  };
+  for (unsigned i = 0;
+       i < sizeof(protected_sources) / sizeof(*protected_sources); ++i) {
+    CHECK(shell_parse_draft(protected_sources[i], strlen(protected_sources[i]),
+                            NULL, draft) == SHELL_SOURCE_COMPLETE);
+    CHECK(shell_dep_graph_parse(protected_sources[i],
+                                strlen(protected_sources[i]), NULL, &limits,
+                                graph) == SHELL_DEP_EPARSE);
+    CHECK(graph->node_count == 0);
+  }
+  size_t fixed;
+  CHECK(shell_dep_workspace_size(&limits, &fixed));
+  shell_dep_limits_t small = limits;
+  small.workspace_size = fixed;
+  CHECK(shell_dep_graph_parse("[[ count -eq 0 ]]", strlen("[[ count -eq 0 ]]"),
+                              NULL, &small, graph) == SHELL_DEP_EWORKSPACE);
+  CHECK(graph->node_count == 0);
+  parse("[[ count -eq 0 ]]");
+  shell_dep_graph_t *saved = malloc(sizeof(*saved));
+  CHECK(saved != NULL);
+  memcpy(saved, graph, sizeof(*saved));
+  shell_source_result_t other;
+  CHECK(shell_parse_draft("[[ '12345678' -eq 1 ]]",
+                          strlen("[[ '12345678' -eq 1 ]]"), NULL,
+                          &other) == SHELL_SOURCE_COMPLETE);
+  for (unsigned e = 0; e < saved->edge_count; ++e)
+    if (saved->edges[e].flags == SHELL_DEP_EDGE_FLAG_ENV_READ)
+      CHECK(shell_dep_doc_env_name_equals(
+          &saved->nodes[saved->edges[e].from].doc, "count", 5));
+  free(saved);
+  static const char *const tildes[] = {
+      "~",     "~+0",     "~-0",    "~+0/$((1))", "~+0/$value",
+      "~user", "~+\\\n0", "name=~", "name=x:~",
+  };
+  static const char *const numeric_ops[] = {"-eq", "-ne", "-lt",
+                                            "-le", "-gt", "-ge"};
+  /* Prefix classification precedes comparison. Exercise all operators with
+   * one prefix, and every prefix spelling on both sides with equality. */
+  for (unsigned t = 0; t < sizeof(tildes) / sizeof(*tildes); ++t)
+    for (unsigned op = 0; op < (t == 0 ? 6u : 1u); ++op)
+      for (unsigned side = 0; side < 2; ++side) {
+        char source[256];
+        snprintf(source, sizeof(source), "[[ ! %s %s %s ]] || cat <fallback",
+                 side ? "-1" : tildes[t], numeric_ops[op],
+                 side ? tildes[t] : "-1");
+        parse(source);
+        CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+              SHELL_CONDITIONAL_UNKNOWN);
+        CHECK(graph->nodes[condition_node()].cmd.conditional_unresolved);
+        CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+        for (unsigned e = 0; e < graph->edge_count; ++e)
+          if (graph->edges[e].flags == SHELL_DEP_EDGE_FLAG_ENV_READ)
+            CHECK(shell_dep_doc_env_name_equals(
+                &graph->nodes[graph->edges[e].from].doc, "value", 5));
+      }
+  for (unsigned unresolved = 0; unresolved < 2; ++unresolved) {
+    comparison_resolver_t resolver = {
+        .values = {"1:3,"}, .words = {"~"}, .unresolved = {unresolved}};
+    const char *source = "[[ ~ -eq -1 ]] || cat <fallback";
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/workspace",
+                                         &limits, graph, resolve_comparison,
+                                         &resolver, NULL) == SHELL_DEP_OK);
+    CHECK(resolver.calls == 1);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          (unresolved ? SHELL_CONDITIONAL_UNKNOWN : SHELL_CONDITIONAL_FALSE));
+    CHECK(!!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC) ==
+          !!unresolved);
+    CHECK(reads_file("fallback") == !unresolved);
+  }
+  parse("[[ -z x && ~+0 -eq -1 ]]");
+  CHECK(!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC));
+  static const char *const operands[] = {"count", "\"$count\"", "\"${count}\""};
+  for (unsigned i = 0; i < sizeof(operands) / sizeof(*operands); ++i) {
+    char source[256];
+    snprintf(source, sizeof(source), "cat <before; [[ %s -gt 0 ]]; cat <after",
+             operands[i]);
+    parse(source);
+    CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_arithmetic_unresolved);
+    CHECK(reads_file("before"));
+    CHECK(!reads_file("after"));
+    bool dependency = false, later = false;
+    for (unsigned e = 0; e < graph->edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph->edges[e];
+      if (edge->type == SHELL_EDGE_ENV &&
+          edge->flags == SHELL_DEP_EDGE_FLAG_ENV_READ) {
+        const shell_dep_doc_t *doc = &graph->nodes[edge->from].doc;
+        CHECK(doc->value == NULL && doc->value_len == 0);
+        CHECK(shell_dep_doc_env_name_equals(doc, "count", 5));
+        char name[5];
+        size_t written;
+        CHECK(shell_dep_doc_write_env_name(doc, name, sizeof(name), &written));
+        CHECK(written == 5 && !memcmp(name, "count", 5));
+        dependency = true;
+      }
+    }
+    for (unsigned n = condition_node() + 1; n < graph->node_count; ++n)
+      if (graph->nodes[n].type == SHELL_NODE_CMD) {
+        CHECK(!graph->nodes[n].cmd.cwd_known);
+        later = true;
+      }
+    CHECK(dependency && later);
+  }
+  static const char *const parameter_sources[] = {
+      "[[ \"${count:-$fallback}\" -gt 0 ]]",
+      "[[ \"${count:-'$fallback'}\" -gt 0 ]]",
+      "test \"$count\" -gt \"$fallback\"",
+  };
+  for (unsigned i = 0;
+       i < sizeof(parameter_sources) / sizeof(*parameter_sources); ++i) {
+    parse(parameter_sources[i]);
+    bool count_read = false, fallback_read = false;
+    for (unsigned e = 0; e < graph->edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph->edges[e];
+      if (edge->type == SHELL_EDGE_ENV &&
+          edge->flags == SHELL_DEP_EDGE_FLAG_ENV_READ) {
+        const shell_dep_doc_t *doc = &graph->nodes[edge->from].doc;
+        count_read |= shell_dep_doc_env_name_equals(doc, "count", 5);
+        fallback_read |= shell_dep_doc_env_name_equals(doc, "fallback", 8);
+      }
+    }
+    CHECK(count_read && fallback_read);
+  }
+  parse("[[ count -eq 0 ]]; { cat; } <relative-after");
+  for (unsigned n = 0; n < graph->node_count; ++n)
+    if (graph->nodes[n].type == SHELL_NODE_DOC &&
+        graph->nodes[n].doc.kind == SHELL_DOC_FILE)
+      CHECK(!graph->nodes[n].doc.cwd_known);
+  parse("[[ count -eq 0 ]]; time printf after");
+  CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+  parse("[[ co$((1)) -eq 0 ]]");
+  CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    if (graph->edges[e].type == SHELL_EDGE_ENV)
+      CHECK(shell_dep_doc_env_name_equals(
+          &graph->nodes[graph->edges[e].from].doc, "co1", 3));
+  parse("unset later; [[ count -eq 0 && -v later ]]");
+  CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+        SHELL_CONDITIONAL_UNKNOWN);
+  CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+  parse("[[ -z x && count -gt 0 ]] && cat <skipped");
+  CHECK(!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC));
+  CHECK(!reads_file("skipped"));
+}
+
+static void check_nested_arithmetic_coverage(void) {
+  static const char *const sources[] = {
+      "cat < <( [[ count -eq 0 ]]; cat <inchild ); cat <after",
+      "printf \"%s\" \"$(< <( [[ count -eq 0 ]]; cat <inchild ))\"; cat <after",
+      "printf \"$( [[ count -eq 0 ]]; cat <inchild )\"; cat <after",
+  };
+  for (unsigned i = 0; i < sizeof(sources) / sizeof(*sources); ++i) {
+    parse(sources[i]);
+    CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+    CHECK(!reads_file("inchild"));
+    CHECK(!reads_file("after"));
+  }
+  parse("[[ -z x && $( [[ count -eq 0 ]] ) -eq 0 ]]");
+  CHECK(!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC));
+}
+
+static void check_conditional_coverage_barrier(void) {
+  static const char *const tails[] = {
+      "count -eq 0 && \"$path\" -nt other",
+      "count -eq 0 || literal -ef other",
+      "count -eq 0 && ! ( -f \"$path\" || -d literal )",
+      "count -eq 0 || ( -v present && -e literal )",
+      "\"$( [[ count -eq 0 ]] )\" -nt other",
+      "-f \"$( [[ count -eq 0 ]] )\"",
+      "-n \"$( [[ count -eq 0 ]] )\" && -d literal",
+  };
+  for (unsigned i = 0; i < sizeof(tails) / sizeof(*tails); ++i) {
+    char source[512];
+    snprintf(source, sizeof(source),
+             "present=; [[ -e before && ( %s ) ]]; cat <after", tails[i]);
+    parse(source);
+    CHECK(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          SHELL_CONDITIONAL_UNKNOWN);
+    unsigned observations = 0;
+    for (unsigned e = 0; e < graph->edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph->edges[e];
+      CHECK(edge->type != SHELL_EDGE_FILE_COMPARE);
+      if (edge->type == SHELL_EDGE_FILE_TEST) {
+        const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+        CHECK(doc->path_len == 6 && !memcmp(doc->path, "before", 6));
+        ++observations;
+      }
+    }
+    CHECK(observations == 1 && !reads_file("after"));
+  }
+  parse("[[ -z x && count -eq 0 || -f literal ]]");
+  CHECK(!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC));
+  unsigned tests = 0;
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    tests += graph->edges[e].type == SHELL_EDGE_FILE_TEST;
+  CHECK(tests == 1);
+
+  current = "[[ count -eq 0 && \"$path\" -nt other ]]";
+  comparison_resolver_t resolver = {.values = {"1:0,", "6:target,"},
+                                    .words = {"count", "\"$path\""}};
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve_comparison,
+                                       &resolver, NULL) == SHELL_DEP_OK);
+  CHECK(resolver.calls == 2 && graph->status == SHELL_DEP_STATUS_OK);
+  unsigned comparisons = 0;
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    comparisons += graph->edges[e].type == SHELL_EDGE_FILE_COMPARE;
+  CHECK(comparisons == 1 && shell_dep_graph_validate(graph).valid);
+}
+
+static void check_parameter_operand_dependencies(void) {
+  static const struct {
+    const char *word;
+    bool fallback, count, builtin_scalar;
+  } cases[] = {
+      {"\"${count#${count:-$'$fallback'}}\"", true, true, false},
+      {"\"${1:-$fallback}\"", true, false, false},
+      {"\"${10:-${count:-$fallback}}\"", true, true, false},
+      {"\"${@:-$fallback}\"", true, false, false},
+      {"\"${*:-$fallback}\"", true, false, false},
+      {"\"${?:-$fallback}\"", true, false, false},
+      {"\"${-:-$fallback}\"", true, false, false},
+      {"\"${##$fallback}\"", true, false, false},
+      {"\"${?##$fallback}\"", true, false, false},
+      {"\"${?\\\n##$fallback}\"", true, false, false},
+      {"\"${1:-'$fallback'}\"", true, false, false},
+      {"${1:-'$fallback'}", false, false, false},
+      {"\"${1#'$fallback'}\"", false, false, false},
+      {"\"${#count}\"", false, true, true},
+      {"\"${#1}\"", false, false, true},
+      {"\"${#?}\"", false, false, true},
+      {"\"${#}\"", false, false, true},
+      {"\"${!}\"", false, false, true},
+      {"\"${!prefix*}\"", false, false, false},
+      {"\"${1\\\n0:-$fallback}\"", true, false, false},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
+    for (unsigned form = 0; form < 4; ++form) {
+      char source[512];
+      snprintf(source, sizeof(source),
+               form == 0   ? "[[ %s -eq 0 ]]"
+               : form == 1 ? "test %s -eq 0"
+               : form == 2 ? "[ %s -eq 0 ]"
+                           : "[[ -t %s ]]",
+               cases[i].word);
+      current = source;
+      /* Builtin admission deliberately rejects complex parameter operators
+       * whose argv cardinality it cannot establish. Keep that boundary. */
+      if ((form == 1 || form == 2) && !cases[i].builtin_scalar) {
+        CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace",
+                                    &limits, graph) == SHELL_DEP_EPARSE);
+        continue;
+      }
+      parse(source);
+      for (unsigned resolved = 0; resolved < (form == 0 ? 2u : 1u);
+           ++resolved) {
+        if (resolved) {
+          comparison_resolver_t resolver = {.values = {"1:0,"},
+                                            .words = {cases[i].word}};
+          CHECK(shell_dep_graph_parse_resolved(
+                    source, strlen(source), "/workspace", &limits, graph,
+                    resolve_comparison, &resolver, NULL) == SHELL_DEP_OK);
+          CHECK(resolver.calls == 1);
+          CHECK(!(graph->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC));
+        }
+        bool fallback = false, count = false;
+        for (unsigned e = 0; e < graph->edge_count; ++e)
+          if (graph->edges[e].flags == SHELL_DEP_EDGE_FLAG_ENV_READ) {
+            const shell_dep_doc_t *doc =
+                &graph->nodes[graph->edges[e].from].doc;
+            bool f = shell_dep_doc_env_name_equals(doc, "fallback", 8);
+            bool c = shell_dep_doc_env_name_equals(doc, "count", 5);
+            CHECK(f || c);
+            CHECK(!doc->value && !doc->value_len);
+            fallback |= f;
+            count |= c;
+          }
+        CHECK(fallback == cases[i].fallback && count == cases[i].count);
+      }
+    }
+  parse("[[ -z x && ${1:-$fallback} -eq 0 ]]");
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    CHECK(graph->edges[e].flags != SHELL_DEP_EDGE_FLAG_ENV_READ);
+  parse("test x -o \"$fallback\" -eq 0");
+  bool read = false;
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    read |= graph->edges[e].flags == SHELL_DEP_EDGE_FLAG_ENV_READ;
+  CHECK(read);
+}
+
+static void check_builtin_argument_read_phase(void) {
+  static const struct {
+    const char *source;
+    unsigned reads;
+  } cases[] = {
+      {"test \"$count\" -eq 0", 1},
+      {"test \"$count\" -eq 0 1>&- 2>&1", 1},
+      {"[ \"$count\" -eq 0 ] 1>&- 2>&1", 1},
+      {"1>&- 2>&1 test \"$count\" -eq 0", 1},
+      {"test \"$count\" -eq \"$fallback\" 1>&- 2>&1", 2},
+      {"test x -o \"$count\" -eq invalid 1>&- 2>&1", 1},
+      {"false && test \"$count\" -eq 0", 0},
+      {"{ test \"$count\" -eq 0; } 1>&- 2>&1", 0},
+      {"test -f \"$count\" 1>&- 2>&1", 1},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+    for (unsigned resolved = 0; resolved < 2; ++resolved) {
+      if (resolved)
+        parse_test_operator(cases[i].source, "1:0,");
+      else
+        parse(cases[i].source);
+      unsigned reads = 0;
+      for (unsigned e = 0; e < graph->edge_count; ++e) {
+        const shell_dep_edge_t *edge = &graph->edges[e];
+        if (edge->flags == SHELL_DEP_EDGE_FLAG_ENV_READ) {
+          const shell_dep_doc_t *doc = &graph->nodes[edge->from].doc;
+          CHECK(shell_dep_doc_env_name_equals(doc, "count", 5) ||
+                shell_dep_doc_env_name_equals(doc, "fallback", 8));
+          ++reads;
+        }
+        CHECK(edge->type != SHELL_EDGE_FILE_TEST);
+      }
+      CHECK(reads == cases[i].reads);
+    }
+  }
+}
+
+static void check_builtin_integer_comparisons(void) {
+  static const struct {
+    const char *expression;
+    bool success;
+  } cases[] = {
+      {"2 -eq 2", true},
+      {"2 -eq 3", false},
+      {"2 -ne 3", true},
+      {"2 -ne 2", false},
+      {"-2 -lt 1", true},
+      {"2 -lt 1", false},
+      {"2 -le 2", true},
+      {"3 -le 2", false},
+      {"3 -gt 2", true},
+      {"2 -gt 3", false},
+      {"3 -ge 3", true},
+      {"2 -ge 3", false},
+      {"010 -eq 10", true},
+      {"' +10 ' -eq 10", true},
+      {"-9223372036854775808 -lt 0", true},
+      {"9223372036854775807 -gt 0", true},
+      {"9223372036854775808 -eq 0", false},
+      {"'' -eq 0", false},
+      {"invalid -ne 0", false},
+      {"x -o 1 -eq invalid", false},
+      {"! 1 -eq invalid", false},
+      {"-t -1", false},
+      {"-t 2147483648", false},
+      {"! -t -1", true},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
+    for (unsigned bracket = 0; bracket < 2; ++bracket) {
+      char source[256];
+      snprintf(source, sizeof(source), "%s %s%s && cat <numeric-success",
+               bracket ? "[" : "test", cases[i].expression,
+               bracket ? " ]" : "");
+      parse(source);
+      CHECK(reads_file("numeric-success") == cases[i].success);
+    }
 }
 
 static void check_file_comparison_continuations(void) {
@@ -2181,6 +2682,14 @@ int main(int argc, char **argv) {
   check_file_predicate_nul_argument();
   check_file_predicate_unresolved_paths();
   check_comparison_operand_contexts();
+  check_scalar_arithmetic_boundary();
+  check_arithmetic_mutation_rejection();
+  check_numeric_conditional_contract();
+  check_builtin_argument_read_phase();
+  check_builtin_integer_comparisons();
+  check_nested_arithmetic_coverage();
+  check_conditional_coverage_barrier();
+  check_parameter_operand_dependencies();
   check_file_comparison_continuations();
   check_test_grammar_refinement();
   check_expansion_regions();

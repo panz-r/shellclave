@@ -3771,6 +3771,192 @@ TEST(variable_presence_contract) {
   sg_gate_free(gate);
 }
 
+static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
+    resolve_numeric_condition(const shell_expand_word_request_t *request,
+                              const char **value, size_t *length,
+                              void *context) {
+  if (request->purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC)
+    return SHELL_EXPAND_UNRESOLVED;
+  *value = context;
+  *length = strlen(*value);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+TEST(builtin_argument_read_setup_contract) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"test * -eq 0", "\"[\" * -eq 0 ]"}, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  static const char *const cases[] = {
+      "test \"$count\" -eq 0 1>&- 2>&1",
+      "[ \"$count\" -eq 0 ] 1>&- 2>&1",
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+    sg_result_t result;
+    ASSERT_SG_OK(eval_cmd(gate, cases[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+    ASSERT(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV);
+    ASSERT(!(result.unresolved_expansion_flags &
+             SG_EXPANSION_UNRESOLVED_ARITHMETIC));
+    ASSERT(result.subcommands[0].env_count == 0);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(numeric_condition_policy_contract) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"cat *", "printf *"}, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, "[[ 2 -gt 1 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ ~+0 -eq -1 ]] || cat fallback", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_UNDETERMINED &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ '~+0' -eq -1 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ \"${1:-$fallback}\" -eq 0 ]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_UNDETERMINED &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ count -gt 0 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(result.unresolved_expansion_flags &
+         SG_EXPANSION_UNRESOLVED_ARITHMETIC);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ \"$count\" -gt 0 ]]; cat after", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 1);
+  ASSERT(result.subcommands[0].unresolved_expansion_flags &
+         SG_EXPANSION_UNRESOLVED_ARITHMETIC);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -z x && count -gt 0 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !(result.unresolved_expansion_flags &
+           SG_EXPANSION_UNRESOLVED_ARITHMETIC));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_ALLOW));
+  ASSERT_SG_OK(
+      eval_cmd(gate, "cat before; [[ count -gt 0 ]]; cat after", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && result.short_circuited);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 1e300, NULL));
+  size_t vocabulary = test_anomaly_vocabulary(gate);
+  ASSERT_SG_OK(
+      eval_cmd(gate, "[[ count -gt 0 ]]; printf blocked-new", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         test_anomaly_vocabulary(gate) == vocabulary);
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, resolve_numeric_condition, "1:3,"));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ count -gt 0 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !(result.unresolved_expansion_flags &
+           SG_EXPANSION_UNRESOLVED_ARITHMETIC));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ \"${1:-$fallback}\" -eq 0 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  /* The application supplies a state with HOME=3 and proves its pure value. */
+  ASSERT_SG_OK(eval_cmd(gate, "[[ ~ -gt 0 ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, resolve_numeric_condition,
+                                               "7:count=1,"));
+  ASSERT(eval_cmd(gate, "[[ count -gt 0 ]]", &result) == SG_ERR_EXPAND);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, resolve_numeric_condition,
+                                               "6:$((1)),"));
+  ASSERT(eval_cmd(gate, "[[ count -gt 0 ]]", &result) == SG_ERR_EXPAND);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(eval_cmd(gate, "[[ '$((1))' -eq 1 ]]", &result) == SG_ERR_PARSE);
+  static const char *const mutation_values[] = {"7:++count,", "8:count++1,"};
+  for (unsigned i = 0; i < sizeof(mutation_values) / sizeof(*mutation_values);
+       ++i) {
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(
+        gate, resolve_numeric_condition, (void *)mutation_values[i]));
+    ASSERT(eval_cmd(gate, "[[ count -eq 0 ]]", &result) == SG_ERR_EXPAND);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  }
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, NULL, NULL));
+  static const char *const mutation_sources[] = {
+      "[[ ++count -eq 0 ]]",
+      "[[ --count -eq 0 ]]",
+      "[[ 'count++1' -eq 0 ]]",
+      "[[ '0&&++count' -eq 0 ]]",
+      "[[ -z x && ++count -eq 0 ]]",
+      "[[ \"++count\"$((0)) -eq 0 ]]",
+      "cat before; [[ ++count -eq 0 ]]",
+  };
+  for (unsigned i = 0; i < sizeof(mutation_sources) / sizeof(*mutation_sources);
+       ++i) {
+    ASSERT(eval_cmd(gate, mutation_sources[i], &result) == SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT);
+  }
+  ASSERT_SG_OK(eval_cmd(gate, "[[ 'count + +1' -eq 0 ]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_UNDETERMINED &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC));
+  ASSERT(test_policy_replace_cpl(gate, true, "cat after", false) == ST_OK);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ count -gt 0 ]]; cat after", &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY && result.subcommand_count == 1);
+  sg_gate_free(gate);
+}
+
+TEST(conditional_coverage_and_retained_workspace) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"cat *", "printf *"}, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 1e300, NULL));
+  size_t vocabulary = test_anomaly_vocabulary(gate);
+  static const char *const cases[] = {
+      "[[ count -eq 0 && \"$path\" -nt other ]]; cat \"$arg\"",
+      "[[ count -eq 0 || -f literal ]]; cat \"$arg\"",
+      "[[ count -eq 0 && -n \"$(printf child)\" ]]; cat \"$arg\"",
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+    sg_result_t result;
+    ASSERT_SG_OK(eval_cmd(gate, cases[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.truncated);
+    ASSERT(result.unresolved_expansion_flags &
+           SG_EXPANSION_UNRESOLVED_ARITHMETIC);
+    ASSERT(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV);
+    ASSERT(result.subcommand_count == (i == 2 ? 2 : 1));
+    ASSERT(test_anomaly_vocabulary(gate) == vocabulary);
+  }
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, true, "printf child", false));
+  sg_result_t denied;
+  ASSERT_SG_OK(eval_cmd(gate, cases[2], &denied));
+  ASSERT(denied.verdict == SG_VERDICT_DENY);
+
+  /* Force retained decoded names alongside both path and anomaly analysis,
+   * using the public hint with alignment variation and a long comment. */
+  const size_t length = 65536;
+  char *source = malloc(length + 1);
+  ASSERT(source != NULL);
+  const char *prefix = "[[ co$((1)) -eq 0 ]]; cat after; #";
+  memcpy(source, prefix, strlen(prefix));
+  memset(source + strlen(prefix), 'x', length - strlen(prefix));
+  source[length] = 0;
+  size_t hint = sg_gate_evaluate_size_hint(length);
+  size_t alignment = shell_dep_workspace_alignment();
+  char *storage = malloc(hint + alignment);
+  ASSERT(storage != NULL);
+  for (size_t offset = 0; offset < alignment; ++offset) {
+    sg_result_t result;
+    ASSERT_SG_OK(sg_gate_evaluate(gate, source, length, storage + offset, hint,
+                                  &result));
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.truncated);
+    ASSERT(result.unresolved_expansion_flags &
+           SG_EXPANSION_UNRESOLVED_ARITHMETIC);
+    ASSERT(test_anomaly_vocabulary(gate) == vocabulary);
+  }
+  free(storage);
+  free(source);
+  sg_gate_free(gate);
+}
+
 TEST(filesystem_predicate_contract) {
   sg_gate_t *gate =
       gate_with_rules((const char *[]){"test -N *", "\"[\" -G * ]"}, 2);
@@ -7512,6 +7698,31 @@ TEST(helper_contracts) {
   size_t long_length = 16u * 1024u * 1024u;
   ASSERT(sg_gate_evaluate_size_hint(long_length) >= long_length * 8);
   ASSERT(sg_gate_evaluate_size_hint(SIZE_MAX / 4) == SIZE_MAX);
+
+  /* Inspect large-source lifetimes without allocating multi-gigabyte arenas.
+   * These inequalities exercise the retained/reusable capacity contract. */
+  static const size_t layout_lengths[] = {0, 128, 65536, 16u * 1024u * 1024u};
+  for (unsigned i = 0; i < sizeof(layout_lengths) / sizeof(*layout_lengths);
+       ++i) {
+    size_t length = layout_lengths[i];
+    sg_test_eval_layout_t layout;
+    if (!sg_test_eval_workspace_layout(length, &layout)) {
+      /* Large source arenas can exceed SIZE_MAX on narrower platforms. */
+      ASSERT(sg_gate_evaluate_size_hint(length) == SIZE_MAX);
+      continue;
+    }
+    ASSERT(layout.reusable >= layout.graph);
+    ASSERT((layout.reusable - layout.graph) % shell_dep_workspace_alignment() ==
+           0);
+    ASSERT(layout.reusable >= layout.index + layout.source);
+    ASSERT(layout.reusable >=
+           layout.index + 4 * (length + SHELL_DEP_CWD_BUF_SIZE + 1u));
+    ASSERT(layout.total == layout.reusable + layout.source);
+    ASSERT(sg_test_eval_workspace_size(length) >= layout.total);
+  }
+  sg_test_eval_layout_t exhausted;
+  ASSERT(!sg_test_eval_workspace_layout(SIZE_MAX, &exhausted));
+  ASSERT(!sg_test_eval_workspace_layout(SIZE_MAX / 4, &exhausted));
 
   sg_gate_t *g = sg_gate_new();
   ASSERT(g != NULL);
@@ -15854,6 +16065,9 @@ int main(int argc, char **argv) {
   RUN(nested_feature_rejection_contract);
   RUN(static_arithmetic_literal_contract);
   RUN(variable_presence_contract);
+  RUN(builtin_argument_read_setup_contract);
+  RUN(numeric_condition_policy_contract);
+  RUN(conditional_coverage_and_retained_workspace);
   RUN(filesystem_predicate_contract);
   RUN(conditional_string_contract);
   RUN(builtin_test_grammar_contract);

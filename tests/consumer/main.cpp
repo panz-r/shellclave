@@ -257,6 +257,36 @@ static bool check_depgraph_workspace_api() {
                SHELL_FILE_COMPARE_NEWER;
         }
       ok = ok && comparisons == 1;
+      const char numeric[] = "[[ '2+3' -eq 5 ]]";
+      ok = ok &&
+           shell_parse_draft(numeric, sizeof(numeric) - 1, nullptr, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           draft->headers[0].conditional_predicate ==
+               SHELL_CONDITIONAL_NUMERIC_EQUAL &&
+           shell_dep_graph_parse_with_fast(numeric, sizeof(numeric) - 1, ".",
+                                           &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_TRUE;
+      const char dependent[] = "[[ count -gt 0 ]]";
+      ok = ok &&
+           shell_dep_graph_parse(dependent, sizeof(dependent) - 1, ".", &limits,
+                                 &graph) == SHELL_DEP_OK &&
+           (graph.status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC) &&
+           graph.nodes[0].cmd.conditional_arithmetic_unresolved &&
+           shell_dep_graph_validate(&graph).valid;
+      unsigned env_reads = 0;
+      for (unsigned i = 0; ok && i < graph.edge_count; ++i) {
+        const shell_dep_edge_t *edge = &graph.edges[i];
+        if (edge->type != SHELL_EDGE_ENV ||
+            edge->flags != SHELL_DEP_EDGE_FLAG_ENV_READ)
+          continue;
+        const shell_dep_doc_t *doc = &graph.nodes[edge->from].doc;
+        ok = ok && doc->value == nullptr && doc->value_len == 0 &&
+             shell_dep_doc_env_name_equals(doc, "count", 5);
+        ++env_reads;
+      }
+      ok = ok && env_reads == 1;
+
       char many_words[SHELL_DEP_MAX_TOKENS * 2 + 4] = "cmd";
       std::size_t many_length = 3;
       for (unsigned i = 1; i < SHELL_DEP_MAX_TOKENS; ++i) {

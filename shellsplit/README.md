@@ -222,14 +222,34 @@ capacity is distinct from final expanded argc. Smaller graph limits remain
 configurable; capacity exhaustion reports truncation. Public retained arrays
 and workspace sizes depend on this capacity; rebuild consumers after updating.
 
-Graph construction uses one temporary workspace. Allocating processor/tokenizer,
+Graph construction uses caller-provided workspace. Allocating processor/tokenizer,
 abstraction, transformation, and sequence APIs manage their own source scratch.
+Their owned arenas reserve temporary storage for conditional values alongside
+persistent bracket facts, including when a bracket index spills out of inline
+storage.
 Allocation-free APIs accept caller scratch for delimiter normalization,
 non-evicting indexed-subscript boundary records, compiled conditional programs,
 pattern evaluation, prepared builtin-test arguments, expression nodes and
 bounded grammar projection. Obtain sufficient capacity from
 `shell_source_workspace_size()` rather than estimating bytes. A public tokenizer retains facts between calls
 in its supplied buffer; independent live iterators require distinct buffers.
+
+Conditional arithmetic first projects the original shell word, reducing active
+constant arithmetic expansions before interpreting the resulting expression.
+Quote-protected expansion spellings remain literal data and are unsupported
+arithmetic values. Resolver records likewise contain expanded expression bytes;
+shell expansion syntax and backslash-newline processing do not apply to them.
+Pure expansions outside the numerical proof domain remain unknown; composed
+unresolved expansion text requires whole-operand resolution.
+
+Retained ENV-read names always borrow immutable source or caller-owned graph
+workspace. Graph construction binds even small source arenas without falling
+back to temporary thread-local storage. Insufficient capacity returns
+`EWORKSPACE`; add the capacity from `shell_source_workspace_size()` and retry.
+Unresolved arithmetic also withholds filesystem observations and truth/presence
+proofs for later primaries in the same conditional. Lexical commands remain
+available for policy inspection; check the graph's arithmetic coverage status
+before relying on complete effect analysis.
 
 Dependency-graph parsing uses caller-owned scratch for source analysis,
 static predicate evaluation and descriptor-route resolution. Measure its fixed
@@ -285,3 +305,15 @@ non-overlap requirements documented by the API.
 ## API migration
 
 See [migration notes](../docs/migration.md) when updating an existing consumer.
+
+Numeric conditions support `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge` and terminal
+checks with `-t`. Builtins use decimal integer arguments; `[[ ... ]]` numeric
+comparisons use arithmetic expressions. Statically named scalar reads have ENV
+edges flagged ENV_READ and no assignment value. Unresolved arithmetic carries
+an explicit semantic-coverage flag; later source remains available for lexical
+inspection without qualified state proofs. Applications can provide pure,
+dependency-resolved operand values through the arithmetic resolver purpose.
+Coverage qualifications propagate from potentially executing nested substitutions,
+including redirect process substitutions and optimized file reads. ENV read
+dependencies retain nested parameter re-expansion context after resolver capture.
+See [numeric predicates](../docs/shell-model.md#numeric-predicates-and-terminal-tests).

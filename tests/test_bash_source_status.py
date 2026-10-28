@@ -106,8 +106,7 @@ class SourceStatusContract(unittest.TestCase):
                     timeout=10)
                 self.assertTrue(reference.stderr)
                 self.assertEqual(self.classify(source), 2)
-        for source in (b"[[ x =~ y ]]", b"[[ x < y ]]", b"[[ x > y ]]",
-                       b"[[ 1 -eq 1 ]]"):
+        for source in (b"[[ x =~ y ]]", b"[[ x < y ]]", b"[[ x > y ]]"):
             with self.subTest(unsupported=source):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), 4)

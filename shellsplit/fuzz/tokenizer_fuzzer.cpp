@@ -5365,6 +5365,17 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
     if (validate_depgraph(input, length, error, &graph, &limits[i]))
       return 1;
     if (i == 0) {
+      /* ENV_READ names may borrow the reusable graph workspace. Materialize
+       * those names before constructing the comparison graph in that arena. */
+      std::vector<std::string> retained_names(graph.node_count);
+      for (uint32_t node = 0; node < graph.node_count; ++node) {
+        shell_dep_node_t &item = graph.nodes[node];
+        if (item.type == SHELL_NODE_DOC && item.doc.kind == SHELL_DOC_ENVVAR &&
+            item.doc.value == nullptr) {
+          retained_names[node].assign(item.doc.name, item.doc.name_len);
+          item.doc.name = retained_names[node].data();
+        }
+      }
       /* The supplied path consumes the same strict parse as the public path.
        * Compare real results, not arbitrary source/metadata combinations. */
       shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};

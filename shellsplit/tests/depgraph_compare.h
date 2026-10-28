@@ -48,8 +48,12 @@ static inline SHELL_NONNULL(1, 2) const
     SHELLSPLIT_COMPARE_FIELD(cwd_absolute);
   }
   if (a->kind == SHELL_DOC_HEREDOC || a->kind == SHELL_DOC_ENVVAR) {
-    SHELLSPLIT_COMPARE_FIELD(name);
     SHELLSPLIT_COMPARE_FIELD(name_len);
+    if (a->kind == SHELL_DOC_ENVVAR && !a->value && !b->value) {
+      if (a->name_len && memcmp(a->name, b->name, a->name_len))
+        return "ENV read name";
+    } else
+      SHELLSPLIT_COMPARE_FIELD(name);
   }
   if (a->kind != SHELL_DOC_FILE ||
       (a->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)) {
@@ -77,6 +81,7 @@ static inline SHELL_NONNULL(1, 2) const
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_negated);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_truth);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_unresolved);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_arithmetic_unresolved);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression_length);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_truth);

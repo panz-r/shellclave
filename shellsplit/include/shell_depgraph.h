@@ -85,6 +85,13 @@ typedef enum {
   SHELL_DEP_STATUS_OK = 0,
   SHELL_DEP_STATUS_TRUNCATED = 1 << 0,
   SHELL_DEP_STATUS_ERROR = 1 << 1,
+  /* Arithmetic may interpret unknown variable/expansion contents as code.
+   * The graph retains visible dependencies but has incomplete semantic
+   * coverage, including potentially executing nested substitutions in redirect
+   * and optimized file-read operands. State-derived facts beyond that boundary
+   * are not qualified; later primaries in the same conditional withhold
+   * filesystem observations and truth/presence proofs too. */
+  SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC = 1 << 2,
 } shell_dep_status_t;
 
 typedef enum {
@@ -234,6 +241,12 @@ typedef enum {
    * opening a document. Its source and target can be numeric or Bash named
    * descriptors. */
   SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP = 1 << 3,
+  /* ENVVAR -> CMD scalar read, including shell-local variables. The document
+   * has a logical name and NULL/zero value, never an assignment. This records
+   * a conservative direct dependency, including scalar reads in positional/
+   * special parameter operands; it does not establish export, presence,
+   * unconditional execution or a complete recursive value. */
+  SHELL_DEP_EDGE_FLAG_ENV_READ = 1 << 23,
   /* FILE_TEST flags identify metadata predicates. SYMLINK inspects the link;
    * all other predicates follow it. Flags may be combined for uncertain
    * operator roles. NONEMPTY tests whether the size is greater than zero.
@@ -268,10 +281,14 @@ typedef enum {
  * bytes; cwd_buf_size in limits is the effective bound checked during parsing.
  * Values from 2 through the buffer maximum are valid. A value of 1 is
  * rejected because even the NUL-terminated root path cannot fit; 0 selects
- * the default. `workspace` is caller-owned scratch storage used only while
- * parsing, evaluating static predicates and resolving descriptor routes; it
- * is never retained by the graph and need not be initialized or cleared by
- * the caller between parses.
+ * the default. `workspace` is caller-owned storage for parsing, predicate
+ * analysis and descriptor routes. Logical ENV_READ names can borrow its
+ * source-analysis tail. Keep that storage valid and
+ * unchanged while those names are used, or copy the names before reusing it.
+ * Graphs without workspace-backed ENV_READ names retain no workspace storage.
+ * Graph construction never retains names in temporary thread-local scratch.
+ * Insufficient caller arena capacity returns EWORKSPACE. The workspace need
+ * not be initialized or cleared before parsing.
  * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as source
  * scratch for delimiter normalization, non-evicting subscript boundaries,
  * compiled conditional programs (even simple literal expressions), pattern
@@ -401,7 +418,10 @@ typedef struct {
   bool conditional_negated; /* Parity of lexical ! operators. */
   shell_conditional_truth_t conditional_truth;
   bool conditional_unresolved; /* A reached expanded operand remains unknown. */
-  const char *arithmetic_expression; /* Borrowed content for ARITHMETIC. */
+  bool
+      conditional_arithmetic_unresolved; /* Arithmetic interpretation lacks
+                                          * a dependency-resolved pure value. */
+  const char *arithmetic_expression;     /* Borrowed content for ARITHMETIC. */
   uint32_t arithmetic_expression_length;
   shell_arithmetic_truth_t arithmetic_truth;
   bool
@@ -592,9 +612,13 @@ typedef struct {
  *   HERESTRING: value/value_len (content; an expandable word can receive
  *               incoming SUBST edges before its READ edge supplies owner)
  *   ENVVAR:    name/name_len, value/value_len (borrowed assignment spelling;
- *              ENVVAR_APPEND distinguishes `+=` from `=`)
+ *              ENVVAR_APPEND distinguishes `+=` from `=`); ENV_READ uses a
+ *              logical name and NULL/zero value instead of an assignment
  *
- * Fields ordinarily borrow source spans. An internal expansion-aware graph's
+ * Fields ordinarily borrow source spans. ENV_READ names can instead borrow
+ * the caller's graph workspace; preserve it until those names are no longer
+ * used, or copy the logical names before reusing the workspace.
+ * An internal expansion-aware graph's
  * RESOLVED_PATH value instead borrows its resolver's decoded payload for the
  * lifetime of that graph. IMPLICIT paths are library-owned and valid for the
  * graph lifetime; no resolver callback or quote removal applies to them.
@@ -733,6 +757,9 @@ typedef struct {
  * are cleared instead; the status remains TRUNCATED, never ERROR.
  * Syntax-analysis exhaustion supplies no qualified prefix and returns this
  * same truncation outcome with empty counts and CWD storage.
+ * SHELL_DEP_OK can carry SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC: direct
+ * dependencies and later syntax are retained, but semantic effect coverage
+ * and downstream execution-state proofs are not complete.
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
@@ -1306,10 +1333,11 @@ bool shell_dep_doc_write_content(const shell_dep_doc_t *doc, char *destination,
                                  size_t destination_size, size_t *written)
     SHELL_NONNULL(1, 4);
 
-/** Measure or write an ENVVAR document's quote-removed identifier. The write
+/** Measure or write an ENVVAR document's logical identifier. Assignment names
+ * are quote-removed; ENV_READ names are already logical bytes. The write
  * API is failure-atomic and does not add a NUL terminator. Other document
  * kinds and malformed assignment spans are rejected. The destination must not
- * overlap the borrowed assignment word, including its value; this caller
+ * overlap borrowed name/assignment storage, including its value; this caller
  * precondition is not checked at runtime. */
 bool shell_dep_doc_env_name_length(const shell_dep_doc_t *doc,
                                    size_t *name_length) SHELL_NONNULL(1, 2);

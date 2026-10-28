@@ -256,12 +256,13 @@ typedef struct {
    * classification. */
   bool has_dynamic_substitution_io;
   uint32_t violation_dropped_count;
-  /* Aggregate unresolved argv/path information over the retained constructed
-   * graph, including group-owned I/O and commands omitted by policy early-stop
-   * or output truncation, including nested pathname expansions whose final
-   * I/O edge disappeared after a failed open. Independent of rendering. A
-   * truncated graph covers only retained metadata; failures before graph
-   * construction completes do not provide complete expansion information. */
+  /* Aggregate unresolved argv/path/conditional/arithmetic information over the
+   * retained constructed graph, including group-owned I/O and commands omitted
+   * by policy early-stop or output truncation, including nested pathname
+   * expansions whose final I/O edge disappeared after a failed open.
+   * Independent of rendering. A truncated graph covers only retained metadata;
+   * failures before graph construction completes do not provide complete
+   * expansion information. */
   uint32_t unresolved_expansion_flags;
   bool has_violations;
 
@@ -270,8 +271,10 @@ typedef struct {
    * anomaly_score: bits per anomaly stage (higher = more anomalous).
    *                 Stages include supported nested command, backtick,
    *                 process, and heredoc-body substitutions in Shellsplit's
-   *                 deterministic child-before-parent analysis order. Dynamic
-   *                 arithmetic is rejected before anomaly stage collection.
+   *                 deterministic child-before-parent analysis order.
+   * Unresolved conditional arithmetic can be scored as a lexical stage
+   *                 sequence; it blocks policy allowance and model/history
+   *                 updates until resolved.
    *                 This is distinct from subcommand_count, which
    *                 describes policy-evaluable graph commands. A redirect-only
    *                 simple command is one anomaly stage even though it has no
@@ -385,6 +388,9 @@ enum {
   /* An expanded conditional string remains unresolved, independently of argv.
    */
   SG_EXPANSION_UNRESOLVED_CONDITION = 1u << 2,
+  /* Numeric conditional contents may introduce unmodeled arithmetic effects.
+   * This blocks ALLOW until a pure dependency-resolved value is supplied. */
+  SG_EXPANSION_UNRESOLVED_ARITHMETIC = 1u << 3,
 };
 
 /* --- LIFECYCLE --- */
@@ -792,9 +798,12 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
  * Return a recommended initial evaluation-buffer size for a command of
  * `cmd_len` bytes. The estimate includes both command/result storage and the
  * aligned bounded workspace: persistent expansion metadata plus depgraph,
- * source-sized path decoding and identity comparison scratch. Expansion
- * callbacks can require additional workspace for resolved path bytes as well
- * as result-prefix space; violation details can also require more result space.
+ * retained source storage for ENV-read names, source-sized path decoding and
+ * identity comparison scratch, and source scratch for anomaly analysis.
+ * Retained names stay valid while subsequent analysis reuses graph storage.
+ * Expansion callbacks can require additional workspace for resolved path bytes
+ * as well as result-prefix space; violation details can also require more
+ * result space.
  */
 size_t sg_gate_evaluate_size_hint(size_t cmd_len);
 

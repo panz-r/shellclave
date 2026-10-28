@@ -73,16 +73,18 @@ bool shell_source_operation_begin_owned(const char *input, size_t length) {
   shell_source_operation_begin(input, length);
   if (source_operation.depth != 1)
     return true;
-  /* One conservative sizing scan, not another syntax pass. Source without
-   * documents or many brackets needs no arena. Flat delimiters retain their
-   * two-byte bound, plus the measured bracket-record storage; only grouped
-   * delimiter spelling needs the source-sized printer bound. Quoted/data
-   * bracket occurrences may overreserve records, not a whole printer arena. */
-  bool document = false, grouped = false;
+  /* One conservative sizing scan, not another syntax pass. Conditional words
+   * need the source-sized value allowance alongside persistent bracket facts.
+   * Flat documents otherwise retain their two-byte delimiter bound. Spilling
+   * the bracket index must preserve the ordinary temporary scratch capacity.
+   * Raw quoted/data markers may overreserve without changing admission. */
+  bool document = false, grouped = false, conditional = false;
   size_t brackets = 0;
   for (size_t i = 0; i < length; i++) {
     SHELL_SOURCE_WORD_SCAN(1);
     brackets += input[i] == '[';
+    conditional |= input[i] == '[' &&
+                   shell_source_logical_next_is(input, length, i, '[', NULL);
     document |= input[i] == '<' &&
                 shell_source_logical_next_is(input, length, i, '<', NULL);
     grouped |= shell_source_heredoc_fragment_open(input, length, i) ||
@@ -90,18 +92,19 @@ bool shell_source_operation_begin_owned(const char *input, size_t length) {
   }
   source_operation.arrays.count = brackets;
   bool array_storage = brackets > SHELL_SOURCE_INLINE_ARRAYS;
-  if (!document && !array_storage)
+  if (!document && !array_storage && !conditional)
     return true;
   size_t size = 0;
-  bool printer = document && grouped;
+  bool source_sized = conditional || (document && grouped);
   bool sized = true;
-  if (printer)
+  if (source_sized)
     sized = shell_source_workspace_size(length, &size);
   else {
+    size = sizeof(source_operation.scratch);
     if (document) {
-      sized = length <= SIZE_MAX / 2;
+      sized = length <= (SIZE_MAX - size) / 2;
       if (sized)
-        size = 2 * length;
+        size += 2 * length;
     }
     size_t padding = _Alignof(shell_source_array_boundary_t) - 1;
     if (brackets) {
@@ -162,10 +165,9 @@ void shell_source_operation_index(shell_source_index_t *index) {
   source_operation.generation = 1;
 }
 
-shell_source_workspace_scope_t shell_source_workspace_begin(const char *source,
-                                                            size_t length,
-                                                            void *buffer,
-                                                            size_t size) {
+static shell_source_workspace_scope_t
+source_workspace_begin(const char *source, size_t length, void *buffer,
+                       size_t size, bool retained) {
   uintptr_t begin = (uintptr_t)source;
   shell_source_workspace_scope_t previous = {
       source_operation.workspace,
@@ -188,7 +190,8 @@ shell_source_workspace_scope_t shell_source_workspace_begin(const char *source,
     source_operation.workspace_end = begin + length;
     source_operation.arrays = (shell_source_array_index_t){0};
   }
-  bool replace = buffer && size > sizeof(source_operation.scratch) &&
+  bool replace = buffer &&
+                 (retained || size > sizeof(source_operation.scratch)) &&
                  buffer != source_operation.workspace;
   previous.share_arrays = previous.inherit && !replace;
   if (!previous.share_arrays && previous.arrays.prepared &&
@@ -202,6 +205,19 @@ shell_source_workspace_scope_t shell_source_workspace_begin(const char *source,
     source_operation.arrays = (shell_source_array_index_t){0};
   }
   return previous;
+}
+
+shell_source_workspace_scope_t shell_source_workspace_begin(const char *source,
+                                                            size_t length,
+                                                            void *buffer,
+                                                            size_t size) {
+  return source_workspace_begin(source, length, buffer, size, false);
+}
+
+shell_source_workspace_scope_t
+shell_source_workspace_begin_retained(const char *source, size_t length,
+                                      void *buffer, size_t size) {
+  return source_workspace_begin(source, length, buffer, size, true);
 }
 
 void shell_source_workspace_end(shell_source_workspace_scope_t previous) {

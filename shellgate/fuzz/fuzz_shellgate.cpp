@@ -2606,6 +2606,11 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
   size_t workspace_size;
   if (!shell_dep_workspace_size(&limits, &workspace_size))
     invariant_failure("generated brace graph workspace sizing failed");
+  size_t source_size;
+  if (!shell_source_workspace_size(item.command.size(), &source_size) ||
+      source_size > SIZE_MAX - workspace_size)
+    invariant_failure("generated brace source workspace sizing failed");
+  workspace_size += source_size;
   size_t alignment = shell_dep_workspace_alignment();
   static std::vector<char> workspace;
   workspace.resize(workspace_size + alignment - 1);

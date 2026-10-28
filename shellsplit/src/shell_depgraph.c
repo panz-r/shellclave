@@ -165,6 +165,10 @@ bool shell_dep_doc_env_name_length(const shell_dep_doc_t *doc,
                                    size_t *name_length) {
   *name_length = 0;
 
+  if (doc->kind == SHELL_DOC_ENVVAR && !doc->value) {
+    *name_length = doc->name_len;
+    return true;
+  }
   shell_source_decoded_assignment_t assignment;
   if (!dep_doc_env_assignment(doc, NULL, NULL, &assignment))
     return false;
@@ -189,6 +193,11 @@ bool shell_dep_doc_write_env_name(const shell_dep_doc_t *doc, char *destination,
   size_t needed = 0;
   if (!shell_dep_doc_env_name_length(doc, &needed) || destination_size < needed)
     return false;
+  if (doc->kind == SHELL_DOC_ENVVAR && !doc->value) {
+    memcpy(destination, doc->name, needed);
+    *written = needed;
+    return true;
+  }
   dep_doc_env_name_sink_t sink = {.destination = destination};
   shell_source_decoded_assignment_t assignment;
   if (!dep_doc_env_assignment(doc, dep_doc_env_name_byte, &sink, &assignment))
@@ -215,6 +224,9 @@ static bool dep_doc_env_name_match_byte(unsigned char byte, void *context) {
 
 bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
                                    size_t name_length) {
+  if (doc->kind == SHELL_DOC_ENVVAR && !doc->value)
+    return doc->name_len == name_length &&
+           (!name_length || !memcmp(doc->name, name, name_length));
   dep_doc_env_name_match_t match = {
       .name = name,
       .length = name_length,
@@ -2561,6 +2573,9 @@ typedef struct {
   uint32_t *owner_setup_stop;
   const uint32_t *owner_assignment_stop;
   bool effects_active;
+  /* Earliest source position beyond an unresolved arithmetic interpretation.
+   * Later owners retain syntax but cannot publish execution-state proofs. */
+  uint32_t *semantic_barrier;
   bool input_unit_recovery;
   dep_process_route_map_t *process_routes;
   dep_route_workspace_t *workspace;
@@ -3862,7 +3877,7 @@ static SHELL_NONNULL(1, 3) shell_source_workspace_scope_t
   if (limits->workspace) {
     dep_route_workspace_t *workspace = limits->workspace;
     shell_source_operation_index(&workspace->source_index);
-    return shell_source_workspace_begin(
+    return shell_source_workspace_begin_retained(
         source, length,
         (unsigned char *)limits->workspace + sizeof(dep_route_workspace_t),
         limits->workspace_size - sizeof(dep_route_workspace_t));
@@ -10169,7 +10184,10 @@ static SHELL_NONNULL(1) dep_execution_certainty_t
   (void)dep_snapshot_control_state(context, index);
   dep_execution_certainty_t execution =
       (dep_execution_certainty_t)frame->control.scoped_execution[index];
-  if (!context->effects_active)
+  uint32_t start = event < SHELL_MAX_GROUPS
+                       ? context->fast->groups[event].start
+                       : context->fast->cmds[event - SHELL_MAX_GROUPS].start;
+  if (!context->effects_active || start >= *context->semantic_barrier)
     execution = DEP_EXECUTION_NEVER;
   return execution;
 }
@@ -11026,6 +11044,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
    */
   if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
       purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
+      purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC &&
       !(graph->nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)) {
     size_t decoded_length;
     if (shell_process_measure_word_value(word->start, word->len,
@@ -11066,11 +11085,13 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
   if (result)
     *result = value;
   if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
-      purpose != SHELL_EXPAND_WORD_CONDITIONAL && value->dynamic &&
+      purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
+      purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC && value->dynamic &&
       !value->resolved)
     context->unresolved_paths[owner] = true;
   if (!eligible || purpose == SHELL_EXPAND_WORD_ARGUMENT ||
-      purpose == SHELL_EXPAND_WORD_CONDITIONAL || !value->resolved)
+      purpose == SHELL_EXPAND_WORD_CONDITIONAL ||
+      purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC || !value->resolved)
     return SHELL_DEP_OK;
 
   shell_dep_doc_t *doc = &graph->nodes[document].doc;
@@ -21547,7 +21568,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       owner_execution = dep_execution_compose(
           local_execution, (dep_execution_certainty_t)
                                control_execution[group_node[control_group]]);
-    if (!context->effects_active)
+    if (!context->effects_active ||
+        owner_order[owner_index].start >= *context->semantic_barrier)
       owner_execution = DEP_EXECUTION_NEVER;
     if (control_group >= 0 &&
         dep_group_setup_stopped(context, (uint32_t)control_group))
@@ -23492,6 +23514,22 @@ static SHELL_NONNULL(1) shell_dep_error_t
   return error;
 }
 
+/* Import semantic coverage independently of descriptor and exit-status
+ * imports. Only potentially executing children qualify the parent's facts.
+ * child is successfully constructed, out and context's coverage state are
+ * mutable, and opening points within context's immutable parent source.
+ * All pointer arguments remain required when active is false. */
+static SHELL_NONNULL(1, 2, 3, 4) void dep_import_child_coverage(
+    shell_dep_graph_t *out, const shell_dep_graph_t *child,
+    const dep_parse_context_t *context, const char *opening, bool active) {
+  if (active && (child->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC)) {
+    out->status |= SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC;
+    uint32_t boundary = (uint32_t)(opening - context->cmd);
+    if (boundary < *context->semantic_barrier)
+      *context->semantic_barrier = boundary;
+  }
+}
+
 /* A process-substitution redirect operand is one contiguous shell word:
  * `>(command)` or `<(command)`. Keep recursive routing in one place so a
  * redirect-only record owned by a completed group has the same semantics as a
@@ -23596,6 +23634,7 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
       context->resolver);
   if (error != SHELL_DEP_OK)
     return error;
+  dep_import_child_coverage(out, subgraph, context, target->start, active);
   if (subgraph->node_count == 0 && !active)
     return SHELL_DEP_OK;
 
@@ -23958,6 +23997,7 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
         context->resolver);
     if (error != SHELL_DEP_OK)
       return error;
+    dep_import_child_coverage(out, subgraph, context, operand.start, active);
     if (subgraph->node_count == 0)
       return SHELL_DEP_OK;
 
@@ -24283,6 +24323,8 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
             context->resolver);
         if (error != SHELL_DEP_OK)
           return error;
+        dep_import_child_coverage(out, subgraph, context, subshell.start,
+                                  executing);
         bool preserves_status =
             subgraph_streams->empty_kind == SHELL_SOURCE_BLANK ||
             (subgraph_streams->empty_kind == SHELL_SOURCE_COMMENT &&
@@ -25455,6 +25497,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     route_workspace->snapshot_frames[depth].prepared_source[owner] = UINT32_MAX;
   }
   dep_async_plan_t async = {0};
+  uint32_t semantic_barrier = UINT32_MAX;
   const dep_parse_context_t parse_context = {
       .cmd = cmd,
       .cmd_len = (uint32_t)cmd_len,
@@ -25474,6 +25517,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       .owner_assignment_stop = owner_assignment_stop,
       .owner_setup_stop = owner_setup_stop,
       .effects_active = effects_active,
+      .semantic_barrier = &semantic_barrier,
       .input_unit_recovery = depth == 0,
       .process_routes = &process_routes,
       .workspace = route_workspace,
@@ -25809,6 +25853,10 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       }
       dep_cwd_begin(&parse_context, group, event_cwd_offset, event_cwd_known,
                     event_cwd_absolute);
+      if (fast_result.groups[group].start >= semantic_barrier) {
+        *event_cwd_known = false;
+        *event_cwd_absolute = false;
+      }
       group_exec[group].cwd_offset = *event_cwd_offset;
       group_exec[group].cwd_known = *event_cwd_known;
       group_exec[group].cwd_absolute = *event_cwd_absolute;
@@ -26036,6 +26084,10 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     bool active = source_execution != DEP_EXECUTION_NEVER;
     dep_cwd_begin(&parse_context, source_event, range_cwd_offset,
                   range_cwd_known, range_cwd_absolute);
+    if (rstart >= semantic_barrier) {
+      *range_cwd_known = false;
+      *range_cwd_absolute = false;
+    }
 
     uint32_t cd_next_cwd_offset = *range_cwd_offset;
     bool cd_next_cwd_known = *range_cwd_known;
@@ -26126,6 +26178,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     node->cmd.conditional_predicate = SHELL_CONDITIONAL_PREDICATE_NONE;
     node->cmd.conditional_negated = false;
     node->cmd.conditional_unresolved = false;
+    node->cmd.conditional_arithmetic_unresolved = false;
     for (unsigned operand = 0; operand < 2; ++operand) {
       node->cmd.conditional_operands[operand] = NULL;
       node->cmd.conditional_operand_lengths[operand] = 0;
@@ -26295,6 +26348,22 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                              UINT32_MAX, &argument_values[word]);
         if (resolution_error != SHELL_DEP_OK)
           return dep_stop_graph_construction(out, resolution_error);
+        /* test/[ read their argument parameters before redirect setup,
+         * even when that setup later prevents the builtin body from running.
+         * Predicate effects below retain their separate body-phase guard. */
+        if (assignment_source->test && !conditional_command &&
+            word > effective_command &&
+            dep_owner_phase_active(&parse_context, cmd_node_idx,
+                                   DEP_SNAPSHOT_COMMAND_WORD, range->start)) {
+          dep_condition_context_t references = {.graph = out,
+                                                .max_nodes = max_nodes,
+                                                .max_edges = max_edges,
+                                                .owner = cmd_node_idx};
+          if (!shell_conditional_visit_parameters(
+                  argument->start, argument->len, dep_condition_reference,
+                  &references))
+            return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
+        }
         shell_source_substitution_scan_t scan = {0};
         dep_token_t fragment;
         argument_substitutions[word] =
@@ -27519,9 +27588,13 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
       } else if (n->doc.kind == SHELL_DOC_ENVVAR) {
         fprintf(fp, " name=\"");
         dep_dump_escaped_span(fp, n->doc.name, n->doc.name_len);
-        fprintf(fp, "\" value=\"");
-        dep_dump_escaped_span(fp, n->doc.value, n->doc.value_len);
         fputc('"', fp);
+        if (n->doc.value) {
+          fputs(" value=\"", fp);
+          dep_dump_escaped_span(fp, n->doc.value, n->doc.value_len);
+          fputc('"', fp);
+        } else
+          fputs(" reference", fp);
       } else if (n->doc.kind == SHELL_DOC_HEREDOC) {
         fprintf(fp, " delim=\"");
         dep_dump_escaped_span(fp, n->doc.name, n->doc.name_len);
@@ -28402,12 +28475,15 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
             : ((e->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                              SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                              SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
-                             SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
+                             SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP |
+                             SHELL_DEP_EDGE_FLAG_ENV_READ)) != 0 ||
                ((e->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
                 (e->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
                ((e->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                              SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 &&
                 e->type != SHELL_EDGE_SUBST) ||
+               ((e->flags & SHELL_DEP_EDGE_FLAG_ENV_READ) != 0 &&
+                e->type != SHELL_EDGE_ENV) ||
                ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
                 e->type != SHELL_EDGE_FD_OPEN) ||
                ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
@@ -28529,9 +28605,13 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            e->flags == SHELL_DEP_EDGE_FLAG_NONE && e->dir == SHELL_DIR_FORWARD;
       break;
     case SHELL_EDGE_ENV:
-      ok = (ft == SHELL_NODE_DOC && tt == SHELL_NODE_CMD) &&
+      ok = ft == SHELL_NODE_DOC && tt == SHELL_NODE_CMD &&
+           g->nodes[e->from].doc.kind == SHELL_DOC_ENVVAR &&
            e->source_fd == SHELL_DEP_FD_NONE &&
-           e->target_fd == SHELL_DEP_FD_NONE;
+           e->target_fd == SHELL_DEP_FD_NONE &&
+           (e->flags == SHELL_DEP_EDGE_FLAG_ENV_READ
+                ? g->nodes[e->from].doc.value == NULL
+                : e->flags == 0 && g->nodes[e->from].doc.value != NULL);
       break;
     case SHELL_EDGE_ARG:
       ok = dep_arg_edge_endpoints_valid(g, e, ft, tt);

@@ -25,6 +25,133 @@ class ConditionalCommands(unittest.TestCase):
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
+    def test_numeric_predicates(self):
+        pairs = (("2", "2"), ("-2", "1"), ("010", "8"),
+                 ("2#10", "2"), ("'2 + 3'", "5"), ("''", "0"),
+                 ("' +10 '", "10"), ("7", "3"), ("$((2+3))", "5"),
+                 ("1$((2))", "12"), ("'~+0'", "-1"), ("~+0''", "-1"))
+        # Operand decoding is shared by the six comparisons. Qualify every
+        # spelling with equality, then every operator/negation on <, = and >.
+        comparisons = [(left, right, "-eq", "") for left, right in pairs]
+        comparisons.extend(
+            (left, right, operator, negate)
+            for left, right in (("-2", "1"), ("-2", "-2"), ("1", "-2"))
+            for operator in ("-eq", "-ne", "-lt", "-le", "-gt", "-ge")
+            for negate in ("", "! "))
+        for left, right, operator, negate in comparisons:
+            source = f"[[ {negate}{left} {operator} {right} ]]"
+            with self.subTest(source=source):
+                self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+                truth = self.probe_result(source)
+                self.assertIn(truth, (1, 2))
+                self.assertEqual(self.bash_result(source).returncode,
+                                 0 if truth == 2 else 1)
+        for operand in ("-1", "2147483648", "invalid", "''"):
+            for negate in ("", "! "):
+                source = f"[[ {negate}-t {operand} ]]"
+                with self.subTest(source=source):
+                    truth = self.probe_result(source)
+                    status = self.bash_result(source).returncode
+                    self.assertEqual(status == 0, truth == 2)
+        for operand in ("count", '\"$count\"'):
+            self.assertEqual(self.probe_result(f"[[ {operand} -gt 0 ]]"), 0)
+
+    def test_numeric_tilde_expansion(self):
+        for word in ("~+0", "~-0", "~+0/$((1))"):
+            source = f"[[ {word} -eq -1 ]]"
+            self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+            self.assertNotEqual(self.bash_result(source).returncode, 0)
+            self.assertEqual(self.probe_result(source), 0)
+        self.assertEqual(self.bash_result("HOME=3; [[ ~ -eq 3 ]]").returncode, 0)
+
+    def test_numeric_mutation_boundary(self):
+        mutations = (
+            ("++count", 6), ("--count", 4), ("'++ count'", 6),
+            ("'count ++'", 6), ("'0&&++count'", 5),
+            ("'1||count--'", 5), ("'0?++count:1'", 5),
+            ("'+'+count", 6), ("+\\\n+count", 6),
+        )
+        for operand, final in mutations:
+            source = f"[[ {operand} -eq 0 ]]"
+            with self.subTest(source=source):
+                result = self.bash_result(
+                    "count=5; " + source + "; printf '%s' \"$count\"")
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b'')
+                self.assertEqual(result.stdout, str(final).encode())
+                self.assertEqual(self.probe_result(source, "--status"), 0)
+                rejected = subprocess.run([self.probe, "--truth", source],
+                                          capture_output=True, timeout=10)
+                self.assertEqual(rejected.returncode, 1)
+        for operand in ("++2", "--2", "'1--2'", "'1++2'", "'0&&count'",
+                        "'1||count'"):
+            source = f"[[ {operand} -eq 2 ]]"
+            with self.subTest(pure=source):
+                truth = self.probe_result(source)
+                self.assertEqual(self.bash_result(source).returncode,
+                                 0 if truth == 2 else 1)
+        for operand in ("'count + +1'", "'- -count'", "'--(count)'",
+                        "'++(count)'"):
+            source = f"[[ {operand} -eq 5 ]]"
+            with self.subTest(scalar=source):
+                result = self.bash_result(
+                    "count=5; " + source + "; printf '%s' \"$count\"")
+                self.assertEqual(result.stderr, b'')
+                self.assertEqual(result.stdout, b'5')
+                self.assertEqual(self.probe_result(source), 0)
+
+    def test_nested_pattern_default_reexpansion(self):
+        for fallback, expected in ((3, 0), (4, 1)):
+            source = ("unset u; v=3; fallback=" + str(fallback) +
+                      '; [[ "${v#${u:-$\'$fallback\'}}" -eq 0 ]]')
+            self.assertEqual(self.bash_result(source).returncode, expected)
+
+    def test_builtin_arguments_precede_failed_redirection(self):
+        for command in ('test "${count:?expanded-before-setup}" -eq 0',
+                        '[ "${count:?expanded-before-setup}" -eq 0 ]'):
+            result = self.bash_result('unset count; ' + command + ' 1>&- 2>&1')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'expanded-before-setup', result.stderr)
+            self.assertNotIn(b'Bad file descriptor', result.stderr)
+
+    def test_parameter_operand_quote_context(self):
+        cases = (
+            ('"${1:-$fallback}"', '3'),
+            ('"${1:-\'$fallback\'}"', "'3'"),
+            ("${1:-'$fallback'}", '$fallback'),
+            ('"${10:-$fallback}"', '3'),
+        )
+        for word, expected in cases:
+            with self.subTest(word=word):
+                result = self.bash_result("fallback=3; set --; printf '%s' " + word)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.decode(), expected)
+        result = self.bash_result(
+            "fallback=3; set -- '$fallbackx'; printf '%s' \"${1#'$fallback'}\"")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b'x')
+
+    def test_builtin_integer_comparison_reference(self):
+        pairs = (("2", "2"), ("-2", "1"), ("010", "10"),
+                 ("' +10 '", "10"), ("9223372036854775807", "0"),
+                 ("-9223372036854775808", "0"),
+                 ("9223372036854775808", "0"), ("''", "0"),
+                 ("invalid", "1"), ("2#10", "2"))
+        for left, right in pairs:
+            for operator in ("-eq", "-ne", "-lt", "-le", "-gt", "-ge"):
+                for form in (f"test {left} {operator} {right}",
+                             f"[ {left} {operator} {right} ]"):
+                    with self.subTest(source=form):
+                        status = self.bash_result(form).returncode
+                        self.assertIn(status, (0, 1, 2))
+                        # Observe the builtin's continuation through the public
+                        # graph's scalar-presence facts, without running source.
+                        source = ("unset __shellclave_numeric_result; { " + form +
+                                  "; } && __shellclave_numeric_result=; "
+                                  "[[ -v __shellclave_numeric_result ]]")
+                        self.assertEqual(self.probe_result(source),
+                                         2 if status == 0 else 1)
+
     def test_file_predicates(self):
         for op in ("-e", "-a", "-f", "-d", "-L", "-h", "-s", "-b", "-c", "-p", "-S",
                    "-r", "-w", "-x", "-u", "-g", "-k", "-O", "-G", "-N"):
@@ -390,26 +517,36 @@ class ConditionalCommands(unittest.TestCase):
         utf8 = next((name for name in available
                      if 'utf8' in name.lower().replace('-', '')), None)
         self.assertIsNotNone(utf8, 'install a UTF-8 locale for Bash conformance')
-        for locale in ('C', utf8):
-            for word, expanded in forms:
-                for value in ('', '日本*?[()]'):
-                    right = expanded(value)
-                    for left in (right, right + '!'):
-                        for operator in ('=', '==', '!='):
-                            for negate in ('', '! '):
-                                source = f'[[ {negate}"$left" {operator} {word} ]]'
-                                with self.subTest(source=source, value=value,
-                                                  left=left, locale=locale):
-                                    self.assertEqual(self.probe_result(source, '--status'), 0)
-                                    resolved = subprocess.run(
-                                        [self.probe, '--resolved', source, left, right],
-                                        capture_output=True, check=True, timeout=10)
-                                    truth = int(resolved.stdout)
-                                    expected = ((left == right) != (operator == '!=')) != bool(negate)
-                                    self.assertEqual(truth, 2 if expected else 1)
-                                    setup = f'left={shlex.quote(left)}; value={shlex.quote(value)}; '
-                                    self.assertEqual(self.bash_result(setup + source, locale=locale).returncode,
-                                                     0 if expected else 1)
+        # Cover each fragment form with empty/nonempty values and both match
+        # outcomes. Operator aliases and negation compose with a representative
+        # mixed operand; they do not need a Cartesian product with every form.
+        comparisons = [(word, expanded, '==', '') for word, expanded in forms]
+        word, expanded = forms[2]
+        comparisons.extend(
+            (word, expanded, operator, negate)
+            for operator in ('=', '==', '!=')
+            for negate in ('', '! ', '! ! ')
+            if (operator, negate) != ('==', ''))
+        for word, expanded, operator, negate in comparisons:
+            source = f'[[ {negate}"$left" {operator} {word} ]]'
+            with self.subTest(source=source):
+                # Source framing is independent of callback values and locale.
+                self.assertEqual(self.probe_result(source, '--status'), 0)
+            for value in ('', '日本*?[()]'):
+                right = expanded(value)
+                for left in (right, right + '!'):
+                    with self.subTest(source=source, value=value, left=left):
+                        resolved = subprocess.run(
+                            [self.probe, '--resolved', source, left, right],
+                            capture_output=True, check=True, timeout=10)
+                        truth = int(resolved.stdout)
+                        expected = ((left == right) != (operator == '!=')) != (negate == '! ')
+                        self.assertEqual(truth, 2 if expected else 1)
+                        setup = f'left={shlex.quote(left)}; value={shlex.quote(value)}; '
+                        for locale in ('C', utf8):
+                            with self.subTest(locale=locale):
+                                self.assertEqual(self.bash_result(setup + source, locale=locale).returncode,
+                                                 0 if expected else 1)
         for word in ('"$value"*', '"$value"?', '"$value"[ab]',
                      '"$value"[', '"$value"@(a|b)', 'pre$value.txt',
                      '"$value"${other}', '"$value"$(printf x)',
@@ -459,17 +596,27 @@ class ConditionalCommands(unittest.TestCase):
         self.assertIsNotNone(utf8, 'install a UTF-8 locale for Bash conformance')
         self.assertEqual(self.bash_result(
             "value=$'\\xc3\\xa9'; [[ ${#value} == 1 ]]", locale=utf8).returncode, 0)
-        # Matching must agree without consulting or changing the analyzer's locale.
-        for locale in ('C', utf8):
-            for left, right, matches in cases:
-                for operator in ('=', '==', '!='):
-                    for negate in ('', '! '):
-                        source = f'[[ {negate}{left} {operator} {right} ]]'
-                        with self.subTest(locale=locale, source=source):
-                            truth = (matches != (operator == '!=')) != bool(negate)
-                            self.assertEqual(self.bash_result(source, locale=locale).returncode,
-                                             0 if truth else 1)
-                            self.assertEqual(self.probe_result(source), 2 if truth else 1)
+        # Pattern decoding/matching has one implementation for all aliases.
+        # Keep every pattern and byte-boundary case in both reference locales;
+        # exercise aliases and negation on matching and nonmatching suffixes.
+        comparisons = [(left, right, matches, '==', '')
+                       for left, right, matches in cases]
+        comparisons.extend(
+            (left, '*.txt', matches, operator, negate)
+            for left, matches in (('file.txt', True), ('file.c', False))
+            for operator in ('=', '==', '!=')
+            for negate in ('', '! ')
+            if (operator, negate) != ('==', ''))
+        for left, right, matches, operator, negate in comparisons:
+            source = f'[[ {negate}{left} {operator} {right} ]]'
+            with self.subTest(source=source):
+                truth = (matches != (operator == '!=')) != bool(negate)
+                # The probe does not receive the reference shell's locale.
+                self.assertEqual(self.probe_result(source), 2 if truth else 1)
+                for locale in ('C', utf8):
+                    with self.subTest(locale=locale):
+                        self.assertEqual(self.bash_result(source, locale=locale).returncode,
+                                         0 if truth else 1)
 
     def test_tilde_comparisons(self):
         cases = (
@@ -617,7 +764,7 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ("[[ x == ? ]]", "[[ x =~ y ]]", "[[ 1 -eq 1 ]]"):
+        for source in ("[[ x == ? ]]", "[[ x =~ y ]]", "[[ x < y ]]"):
             with self.subTest(source=source):
                 self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 4)
@@ -671,7 +818,7 @@ class ConditionalCommands(unittest.TestCase):
                 with self.subTest(source=wrapped):
                     self.assertTrue(self.bash_result(wrapped, syntax=True).stderr)
                     self.assertEqual(self.probe_result(wrapped, "--status"), 2)
-        for source in ("[[ x =~ y ]]", "[[ x < y ]]", "[[ x > y ]]", "[[ 1 -eq 1 ]]"):
+        for source in ("[[ x =~ y ]]", "[[ x < y ]]", "[[ x > y ]]"):
             with self.subTest(unsupported=source):
                 reference = self.bash_result(source, syntax=True)
                 self.assertEqual(reference.returncode, 0)

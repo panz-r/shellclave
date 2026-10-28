@@ -340,8 +340,7 @@ static const char *const conditional_unsupported[] = {
     "[[ x == <(printf x) ]]",
     SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("file"),
     "[[ file " SHELLSPLIT_TEST_UNMODELED_BINARY_CONTINUED_WORD " other ]]",
-    "[[ x =~ y ]]",
-    "[[ 1 -eq 1 ]]",
+    "[[ x < y ]]",
 };
 
 #endif

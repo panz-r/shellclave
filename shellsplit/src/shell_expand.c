@@ -1,3 +1,4 @@
+#include "shell_arithmetic_internal.h"
 #include "shell_conditional_internal.h"
 #include "shell_expand_internal.h"
 #include "shell_netstring.h"
@@ -122,11 +123,17 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
   cache->offsets[offset] = (uint32_t)cache->count;
   /* Arguments and redirect operands share the argument-context expansion
    * rule; redirect purpose still controls resolver eligibility below. */
-  entry->value.dynamic =
-      request->purpose == SHELL_EXPAND_WORD_CONDITIONAL
-          ? shell_conditional_word_dynamic(request->word, request->word_length)
-          : shell_source_argument_has_dynamic_syntax(request->word,
-                                                     request->word_length);
+  if (request->purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC) {
+    shell_arithmetic_scalar_result_t facts =
+        shell_conditional_arithmetic_operand(
+            request->word, request->word_length, NULL, 0, false, NULL, NULL);
+    entry->value.dynamic = facts.references || facts.unresolved;
+  } else
+    entry->value.dynamic = request->purpose == SHELL_EXPAND_WORD_CONDITIONAL
+                               ? shell_conditional_word_dynamic(
+                                     request->word, request->word_length)
+                               : shell_source_argument_has_dynamic_syntax(
+                                     request->word, request->word_length);
   if (!entry->value.dynamic || !request->eligible || !cache->expand)
     return &entry->value;
   shell_expand_word_request_t query = {
@@ -157,10 +164,24 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
     cache->error = SHELL_DEP_EEXPAND;
     return NULL;
   }
-  if (request->purpose == SHELL_EXPAND_WORD_CONDITIONAL &&
+  if ((request->purpose == SHELL_EXPAND_WORD_CONDITIONAL ||
+       request->purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC) &&
       entry->value.count != 1) {
     cache->error = SHELL_DEP_EEXPAND;
     return NULL;
+  }
+  if (request->purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC) {
+    shell_arithmetic_scalar_result_t facts = shell_arithmetic_analyze_scalar(
+        entry->value.first_length ? entry->value.first : "",
+        entry->value.first_length, NULL, NULL);
+    if (!facts.result.supported ||
+        !shell_arithmetic_analyze(entry->value.first_length ? entry->value.first
+                                                            : "",
+                                  entry->value.first_length)
+             .supported) {
+      cache->error = SHELL_DEP_EEXPAND;
+      return NULL;
+    }
   }
   entry->value.resolved = true;
   return &entry->value;

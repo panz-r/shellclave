@@ -144,6 +144,19 @@ int main(void) {
   CHECK(gate_example_main() == EXIT_SUCCESS);
   sg_gate_t *gate = example_gate();
   CHECK(gate != NULL);
+  CHECK(sg_gate_set_reject_mask(gate, 0) == SG_OK);
+  size_t arithmetic_size = sg_gate_evaluate_size_hint(128);
+  char *arithmetic_buffer = malloc(arithmetic_size);
+  CHECK(arithmetic_buffer);
+  sg_result_t arithmetic_result;
+  const char arithmetic_source[] = "[[ count -eq 0 ]]";
+  CHECK(sg_gate_evaluate(gate, arithmetic_source, sizeof(arithmetic_source) - 1,
+                         arithmetic_buffer, arithmetic_size,
+                         &arithmetic_result) == SG_OK);
+  CHECK(report_is(arithmetic_source, SG_OK, &arithmetic_result,
+                  "argv policy UNDETERMINED; unresolved arithmetic\n"));
+  free(arithmetic_buffer);
+  CHECK(sg_gate_set_reject_mask(gate, SG_REJECT_MASK_DEFAULT) == SG_OK);
   static const char word_conditions[] =
       "argv policy ALLOW_CONDITIONAL; substitution inspection required; "
       "unresolved argv; dynamic substitution I/O present\n";

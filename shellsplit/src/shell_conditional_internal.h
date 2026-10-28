@@ -1,8 +1,10 @@
 #ifndef SHELL_CONDITIONAL_INTERNAL_H
 #define SHELL_CONDITIONAL_INTERNAL_H
 
+#include "shell_arithmetic_internal.h"
 #include "shell_contract.h"
 #include "shell_file_predicate_internal.h"
+#include "shell_numeric_predicate_internal.h"
 #include "shell_tokenizer.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -75,6 +77,7 @@ shell_conditional_arity(shell_conditional_predicate_t predicate) {
   case SHELL_CONDITIONAL_STRING_NONEMPTY:
   case SHELL_CONDITIONAL_STRING_EMPTY:
   case SHELL_CONDITIONAL_VARIABLE_SET:
+  case SHELL_CONDITIONAL_TERMINAL:
 #define FILE_ARITY(kind, name, ordinal, spelling, alias)                       \
   case SHELL_CONDITIONAL_FILE_##kind:
     SHELL_FILE_PREDICATES(FILE_ARITY)
@@ -87,6 +90,9 @@ shell_conditional_arity(shell_conditional_predicate_t predicate) {
   case SHELL_CONDITIONAL_FILE_NEWER:
   case SHELL_CONDITIONAL_FILE_OLDER:
   case SHELL_CONDITIONAL_FILE_SAME:
+#define NUMERIC_ARITY(kind, spelling) case SHELL_CONDITIONAL_NUMERIC_##kind:
+    SHELL_NUMERIC_COMPARISONS(NUMERIC_ARITY)
+#undef NUMERIC_ARITY
     return 2;
   default:
     return 0;
@@ -103,6 +109,23 @@ shell_conditional_file(shell_conditional_predicate_t predicate) {
   return predicate >= SHELL_CONDITIONAL_FILE_EXISTS &&
          predicate < SHELL_CONDITIONAL_FILE_EXISTS + SHELL_FILE_PREDICATE_COUNT;
 }
+
+static inline bool
+shell_conditional_numeric(shell_conditional_predicate_t predicate) {
+  return predicate >= SHELL_CONDITIONAL_NUMERIC_EQUAL &&
+         predicate <= SHELL_CONDITIONAL_NUMERIC_GREATER_EQUAL;
+}
+
+/* Obtain one static decoded arithmetic operand or use an already captured
+ * value. Active tilde prefixes require a whole-operand capture; literal
+ * complement remains arithmetic. Other opaque expansions also lack a numeric
+ * proof without a capture. Observer
+ * names borrow decoded operation storage when an observer is provided; that
+ * storage is retained for the output graph's workspace lifetime. */
+shell_arithmetic_scalar_result_t shell_conditional_arithmetic_operand(
+    const char *word, size_t length, const char *value, size_t value_length,
+    bool resolved, shell_arithmetic_reference_fn visitor, void *context)
+    SHELL_NONNULL(1);
 
 static inline uint32_t
 shell_conditional_features(shell_conditional_predicate_t predicate) {
@@ -124,6 +147,18 @@ bool shell_conditional_static_empty(const char *word, size_t length,
                                     bool *empty) SHELL_NONNULL(1, 3);
 bool shell_conditional_word_dynamic(const char *word, size_t length)
     SHELL_NONNULL(1);
+
+/* Record conservative direct scalar reads in an admitted conditional word.
+ * Selector traversal includes positional/special heads so their operator words
+ * are visited too; only scalar value reads become ENV names. These are may-read
+ * facts, not proof that each parameter operand executes on every path.
+ * Executable children own their own dependencies. Names borrow source or
+ * retained operation storage. The shared expansion scanner owns quote and
+ * re-expansion context. False reports bounded traversal or retained-name
+ * storage exhaustion. */
+bool shell_conditional_visit_parameters(const char *word, size_t length,
+                                        shell_arithmetic_reference_fn visitor,
+                                        void *context) SHELL_NONNULL(1, 3);
 
 /* Resolved values borrow validated NUL-free payloads. data may be NULL only
  * when length is zero; unknown values are obtained from static source or

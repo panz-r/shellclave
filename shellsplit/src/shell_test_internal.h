@@ -25,11 +25,14 @@ typedef struct {
   size_t length, value_length;
   bool known;
   bool number;
-  uint32_t token; /* Graph adapter argv ordinal; unused by the evaluator. */
+  intmax_t integer; /* Meaningful only when number is true. */
+  uint32_t token;   /* Graph adapter argv ordinal; unused by the evaluator. */
 } shell_test_value_t;
 
-/* Install one decoded or validated callback value and prepare numeric facts
- * once, before route-state evaluation can visit the program repeatedly. */
+/* Install one decoded or validated callback value and prepare decimal integer
+ * validity and value once, before route-state evaluation visits the program
+ * repeatedly. A known malformed integer is a builtin argument error, distinct
+ * from an unresolved value's possible success, false and error outcomes. */
 static inline SHELL_NONNULL(1, 2) void shell_test_set_value(
     shell_test_value_t *value, const char *data, size_t length) {
   shell_test_number_t number = {0};
@@ -39,6 +42,11 @@ static inline SHELL_NONNULL(1, 2) void shell_test_set_value(
   value->value_length = length;
   value->known = true;
   value->number = number.digits && !number.invalid;
+  value->integer = !value->number     ? 0
+                   : !number.negative ? (intmax_t)number.magnitude
+                   : number.magnitude == (uintmax_t)INTMAX_MAX + 1u
+                       ? INTMAX_MIN
+                       : -(intmax_t)number.magnitude;
 }
 typedef struct {
   uint16_t left, right;
@@ -92,6 +100,10 @@ bool shell_test_compile_conditional(const char *source,
  * leaves retain their state lookup; other primaries install captured truth. */
 void shell_test_set_condition_result(shell_test_program_t *program,
                                      unsigned index, bool known, bool truth)
+    SHELL_NONNULL(1);
+/* Unknown arithmetic can mutate bindings during evaluation. Forget presence
+ * leaves in this conditional program before any further state lookup. */
+void shell_test_forget_condition_presence(shell_test_program_t *program)
     SHELL_NONNULL(1);
 unsigned shell_test_evaluate(const shell_test_program_t *program,
                              shell_test_lookup_t lookup, void *context)

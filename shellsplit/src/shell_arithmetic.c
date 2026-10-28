@@ -7,6 +7,9 @@ typedef struct {
   size_t length, position;
   bool valid;
   bool uncertain_expansion;
+  bool scalar_names, references, evaluating, mutation;
+  shell_arithmetic_reference_fn visitor;
+  void *context;
 } arithmetic_parser_t;
 
 typedef struct {
@@ -222,6 +225,29 @@ static SHELL_NONNULL(1) arithmetic_value_t
   }
   if (shell_ascii_digit((unsigned char)p->source[p->position]))
     return number(p);
+  if (p->scalar_names &&
+      (shell_ascii_alpha((unsigned char)p->source[p->position]) ||
+       p->source[p->position] == '_')) {
+    size_t first = p->position++;
+    while (p->position < p->length &&
+           (shell_ascii_alnum((unsigned char)p->source[p->position]) ||
+            p->source[p->position] == '_'))
+      ++p->position;
+    size_t after = p->position;
+    skip_space(p);
+    /* Bash recognizes adjacent signs after a scalar token as postfix
+     * mutation, even when more expression bytes follow (count++1). */
+    if (match(p, "++") || match(p, "--")) {
+      p->mutation = true;
+      p->valid = false;
+      return (arithmetic_value_t){0};
+    }
+    p->position = after;
+    p->references |= p->evaluating;
+    if (p->visitor && p->evaluating)
+      p->visitor(p->source + first, p->position - first, p->context);
+    return (arithmetic_value_t){0};
+  }
   bool nested = match(p, "$((");
   if (!nested && !match(p, "(")) {
     p->valid = false;
@@ -249,12 +275,29 @@ static SHELL_NONNULL(1) arithmetic_value_t
 /* Consume unary chains forward and apply their operators backwards once,
  * without a recursive call or auxiliary stack for every source byte. Bash
  * treats adjacent signs on literals as unary operators (for example 1--2).
- * Mutation requires an lvalue, which the literal-only grammar excludes. */
+ * In scalar mode, adjacent signs followed by optional whitespace and a name
+ * are prefix mutation tokens. Reject them independently of branch execution;
+ * separated signs and pairs before numeric literals remain pure operators. */
 static SHELL_NONNULL(1) arithmetic_value_t
     unary(arithmetic_parser_t *p, size_t depth) {
   size_t start = p->position;
   for (;;) {
     skip_space(p);
+    if (p->scalar_names && p->position < p->length &&
+        (p->source[p->position] == '+' || p->source[p->position] == '-')) {
+      size_t saved = p->position;
+      if (match(p, "++") || match(p, "--")) {
+        skip_space(p);
+        if (p->position < p->length &&
+            (shell_ascii_alpha((unsigned char)p->source[p->position]) ||
+             p->source[p->position] == '_')) {
+          p->mutation = true;
+          p->valid = false;
+          return (arithmetic_value_t){0};
+        }
+      }
+      p->position = saved;
+    }
     if (!match(p, "+") && !match(p, "-") && !match(p, "!") && !match(p, "~"))
       break;
   }
@@ -300,9 +343,14 @@ static SHELL_NONNULL(1) arithmetic_value_t
       return left;
     }
     arithmetic_operator_t op = operators[selected].op;
+    bool evaluating = p->evaluating;
+    if (left.known &&
+        ((op == OP_AND && !left.value) || (op == OP_OR && left.value)))
+      p->evaluating = false;
     arithmetic_value_t right = parse_binary(
         p, operators[selected].precedence + !operators[selected].right,
         depth + 1);
+    p->evaluating = evaluating;
     if (left.known &&
         ((op == OP_AND && !left.value) || (op == OP_OR && left.value)))
       left = known(op == OP_OR);
@@ -318,11 +366,18 @@ static SHELL_NONNULL(1) arithmetic_value_t
   skip_space(p);
   if (!p->valid || !match(p, "?"))
     return condition;
+  bool evaluating = p->evaluating;
+  if (condition.known && !condition.value)
+    p->evaluating = false;
   arithmetic_value_t yes = parse_comma(p, depth + 1);
+  p->evaluating = evaluating;
   skip_space(p);
   if (!match(p, ":"))
     p->valid = false;
+  if (condition.known && condition.value)
+    p->evaluating = false;
   arithmetic_value_t no = conditional(p, depth + 1);
+  p->evaluating = evaluating;
   return condition.known ? (condition.value ? yes : no)
                          : (arithmetic_value_t){0};
 }
@@ -351,6 +406,34 @@ shell_arithmetic_result_t shell_arithmetic_analyze(const char *source,
   return (shell_arithmetic_result_t){supported, supported && value.known,
                                      supported && value.known ? value.value
                                                               : 0};
+}
+
+shell_arithmetic_scalar_result_t
+shell_arithmetic_analyze_scalar(const char *source, size_t length,
+                                shell_arithmetic_reference_fn visitor,
+                                void *context) {
+  /* Expanded values contain no shell lexical operations. In particular, a
+   * protected dollar or backslash cannot acquire source semantics here. */
+  if (memchr(source, '$', length) || memchr(source, '\\', length))
+    return (shell_arithmetic_scalar_result_t){0};
+  arithmetic_parser_t p = {.source = source,
+                           .length = length,
+                           .valid = true,
+                           .scalar_names = true,
+                           .evaluating = true,
+                           .visitor = visitor,
+                           .context = context};
+  skip_space(&p);
+  arithmetic_value_t value =
+      p.position == length ? known(0) : parse_comma(&p, 1);
+  skip_space(&p);
+  bool supported = p.valid && p.position == length;
+  bool proved =
+      supported && value.known && !p.uncertain_expansion && !p.references;
+  return (shell_arithmetic_scalar_result_t){
+      .result = {supported, proved, proved ? value.value : 0},
+      .references = p.references,
+      .mutation = p.mutation};
 }
 
 bool shell_arithmetic_substring_supported(const char *source, size_t length) {
