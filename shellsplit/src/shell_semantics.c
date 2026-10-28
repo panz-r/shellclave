@@ -870,13 +870,18 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
           shell_conditional_parse(input, input_length, token.position);
       if (condition.frame != SHELL_CONDITIONAL_COMPLETE)
         return true;
-      if (condition.predicate == SHELL_CONDITIONAL_VARIABLE_SET &&
-          semantic_variable_observer) {
-        shell_test_value_t value;
-        if (shell_test_prepare_value(input + condition.operands[0],
-                                     condition.operand_lengths[0], &value))
-          semantic_variable_observer(value.value, value.value_length,
-                                     semantic_token_context);
+      for (unsigned i = 0; semantic_variable_observer && i < condition.count;
+           ++i) {
+        const shell_condition_node_t *node = &condition.nodes[i];
+        if (node->operation == SHELL_CONDITION_PRIMARY &&
+            node->primary.predicate == SHELL_CONDITIONAL_VARIABLE_SET) {
+          shell_test_value_t value;
+          if (shell_test_prepare_value(input + node->primary.operands[0],
+                                       node->primary.operand_lengths[0],
+                                       &value))
+            semantic_variable_observer(value.value, value.value_length,
+                                       semantic_token_context);
+        }
       }
       shell_token_regions_t regions =
           shell_conditional_regions(input, &condition);

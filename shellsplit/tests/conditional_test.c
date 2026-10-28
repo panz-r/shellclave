@@ -3,6 +3,7 @@
 #include "shell_abstract.h"
 #include "shell_sequence.h"
 #include "shell_source.h"
+#include "shell_transform.h"
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 #include "test_source_scans.h"
 #endif
@@ -43,6 +44,10 @@ static void check_expansion_regions(void) {
        SHELL_TOKEN_REGION_CONDITIONAL,
        {"value", "\"pre"}},
       {"[[ -n ", 0, SHELL_TOKEN_REGION_CONDITIONAL, {NULL}},
+      {"[[ -n \"$left\" && -n \"$right",
+       2,
+       SHELL_TOKEN_REGION_CONDITIONAL,
+       {"\"$left\"", "\"$right"}},
       {"(( 1 + (2) ))", 1, SHELL_TOKEN_REGION_ARITHMETIC, {" 1 + (2) "}},
       {"(( 1 +", 1, SHELL_TOKEN_REGION_ARITHMETIC, {" 1 +"}},
       {"value", 1, SHELL_TOKEN_REGION_WORD, {"value"}},
@@ -66,6 +71,89 @@ static void check_expansion_regions(void) {
       CHECK(!memcmp(region->text, cases[i].words[j], region->length));
     }
   }
+}
+
+static void check_partial_condition_regions(void) {
+  static const struct {
+    unsigned groups;
+    const char *tail;
+    bool close_groups;
+    shell_conditional_frame_t frame;
+    unsigned regions;
+  } cases[] = {
+      {49, "", false, SHELL_CONDITIONAL_INCOMPLETE, 98},
+      {50, "", false, SHELL_CONDITIONAL_INCOMPLETE, 100},
+      {SHELL_CONDITIONAL_MAX_NODES, "", false, SHELL_CONDITIONAL_INCOMPLETE,
+       2 * SHELL_CONDITIONAL_MAX_NODES},
+      {SHELL_CONDITIONAL_MAX_NODES + 1, "", false, SHELL_CONDITIONAL_LIMIT,
+       2 * SHELL_CONDITIONAL_MAX_NODES},
+      {SHELL_CONDITIONAL_MAX_NODES - 1, "pending -nt \"unfinished", false,
+       SHELL_CONDITIONAL_INCOMPLETE, 2 * SHELL_CONDITIONAL_MAX_NODES},
+      {50, "last -ef end", true, SHELL_CONDITIONAL_LIMIT, 102},
+      {47, "last -ef end", true, SHELL_CONDITIONAL_COMPLETE, 96},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+    char source[4096] = "[[ ";
+    shell_token_region_t expected[2 * (SHELL_CONDITIONAL_MAX_NODES + 2)];
+    unsigned count = 0;
+    size_t used = strlen(source);
+    for (unsigned i = 0; i < cases[c].groups; ++i) {
+      expected[count++] = (shell_token_region_t){
+          source + used, 1, SHELL_TOKEN_REGION_CONDITIONAL};
+      expected[count++] = (shell_token_region_t){
+          source + used + 6, 1, SHELL_TOKEN_REGION_CONDITIONAL};
+      strcpy(source + used, "l -nt r && (");
+      used += strlen("l -nt r && (");
+    }
+    if (*cases[c].tail) {
+      bool pending = !cases[c].close_groups;
+      expected[count++] = (shell_token_region_t){
+          source + used, pending ? 7 : 4, SHELL_TOKEN_REGION_CONDITIONAL};
+      expected[count++] = (shell_token_region_t){
+          source + used + (pending ? 12 : 9),
+          pending ? strlen("\"unfinished") : 3, SHELL_TOKEN_REGION_CONDITIONAL};
+      strcpy(source + used, cases[c].tail);
+      used += strlen(cases[c].tail);
+    }
+    if (cases[c].close_groups) {
+      for (unsigned i = 0; i < cases[c].groups; ++i)
+        source[used++] = ')';
+      strcpy(source + used, " ]]");
+      used += strlen(" ]]");
+    }
+    current = source;
+    shell_conditional_t condition = shell_conditional_parse(source, used, 0);
+    CHECK(condition.frame == cases[c].frame);
+    shell_token_regions_t regions =
+        shell_conditional_regions(source, &condition);
+    CHECK(regions.count == cases[c].regions && regions.count <= count);
+    for (unsigned i = 0; i < regions.count; ++i) {
+      CHECK(regions.regions[i].text == expected[i].text);
+      CHECK(regions.regions[i].length == expected[i].length);
+      CHECK(regions.regions[i].context == SHELL_TOKEN_REGION_CONDITIONAL);
+      CHECK(regions.regions[i].text + regions.regions[i].length <=
+            source + used);
+    }
+    shell_source_status_t status =
+        cases[c].frame == SHELL_CONDITIONAL_LIMIT ? SHELL_SOURCE_TRUNCATED
+        : cases[c].frame == SHELL_CONDITIONAL_COMPLETE
+            ? SHELL_SOURCE_COMPLETE
+            : SHELL_SOURCE_INCOMPLETE;
+    CHECK(shell_parse_draft(source, used, NULL, draft) == status);
+  }
+
+  char source[4096] = "printf before; [[ ";
+  for (unsigned i = 0; i < 50; ++i)
+    strcat(source, "l -nt r && (");
+  strcat(source, "-n \"$(printf child)\"");
+  current = source;
+  CHECK(shell_parse_draft(source, strlen(source), NULL, draft) ==
+        SHELL_SOURCE_INCOMPLETE);
+  CHECK(draft->need == SHELL_SOURCE_NEEDS_CONDITIONAL);
+  CHECK(draft->prefix_length == strlen("printf before;") &&
+        draft->prefix.count == 1);
+  CHECK(draft->header_count == 3 && !draft->headers[1].complete &&
+        draft->headers[2].complete);
 }
 
 static void parse(const char *source) {
@@ -450,6 +538,21 @@ static void check_file_predicate_nul_argument(void) {
     }
   }
   CHECK(found);
+  current = "test \"$left\" -ef \"$right\"";
+  uint8_t unresolved[SHELL_DEP_MAX_NODES];
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve_nul_argument,
+                                       NULL, unresolved) == SHELL_DEP_OK);
+  CHECK(shell_dep_graph_validate(graph).valid && unresolved[0]);
+  unsigned operands = 0;
+  for (unsigned e = 0; e < graph->edge_count; ++e)
+    if (graph->edges[e].type == SHELL_EDGE_FILE_LEFT ||
+        graph->edges[e].type == SHELL_EDGE_FILE_RIGHT) {
+      const shell_dep_doc_t *doc = &graph->nodes[graph->edges[e].to].doc;
+      CHECK(doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME);
+      ++operands;
+    }
+  CHECK(operands == 2);
 }
 
 static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
@@ -461,6 +564,169 @@ static SHELL_NONNULL(1, 2, 3) shell_expand_status_t
   *value = context;
   *length = strlen(*value);
   return SHELL_EXPAND_RESOLVED;
+}
+
+static void check_comparison_operand_contexts(void) {
+  static const struct {
+    const char *word, *literal;
+    bool argument_dynamic, conditional_dynamic, empty;
+  } cases[] = {
+      {"*", "*", true, false, false},
+      {"file?.c", "file?.c", true, false, false},
+      {"[ab]", "[ab]", true, false, false},
+      {"{a,b}", "{a,b}", true, false, false},
+      {"@(a|b)", "@(a|b)", true, false, false},
+      {"'*'", "*", false, false, false},
+      {"\\*", "*", false, false, false},
+      {"'{a,b}'", "{a,b}", false, false, false},
+      {"\"$path\"", NULL, true, true, false},
+      {"''", "", false, false, true},
+  };
+  const char *const operators[] = {"-nt", "-ot", "-ef"};
+  uint8_t unresolved[SHELL_DEP_MAX_NODES];
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c)
+    for (unsigned form = 0; form < 3; ++form)
+      for (unsigned op = 0; op < 3; ++op)
+        for (unsigned side = 0; side < 2; ++side)
+          for (unsigned mode = 0; mode < 5; ++mode) {
+            char source[256];
+            int n = snprintf(source, sizeof(source), "%s %s %s %s %s",
+                             form == 0   ? "[["
+                             : form == 1 ? "test"
+                                         : "[",
+                             side ? "other" : cases[c].word, operators[op],
+                             side ? cases[c].word : "other",
+                             form == 0   ? "]]"
+                             : form == 1 ? ""
+                                         : "]");
+            CHECK(n > 0 && (size_t)n < sizeof(source));
+            current = source;
+            bool unsupported = form && cases[c].argument_dynamic &&
+                               !cases[c].conditional_dynamic;
+            shell_dep_error_t error;
+            if (!mode)
+              error = shell_dep_graph_parse(source, (size_t)n, "/workspace",
+                                            &limits, graph);
+            else
+              error = shell_dep_graph_parse_resolved(
+                  source, (size_t)n, "/workspace", &limits, graph,
+                  mode == 1 ? NULL : resolve_predicate_path,
+                  mode == 3   ? (void *)"6:actual,"
+                  : mode == 4 ? (void *)"0:,"
+                              : NULL,
+                  unresolved);
+            if (unsupported) {
+              /* Builtin admission requires a stable argv cardinality, before
+               * callback resolution or comparison attachment. */
+              CHECK(error == SHELL_DEP_EPARSE && !graph->node_count &&
+                    !graph->edge_count);
+              if (mode)
+                for (unsigned i = 0; i < SHELL_DEP_MAX_NODES; ++i)
+                  CHECK(!unresolved[i]);
+              continue;
+            }
+            CHECK(error == SHELL_DEP_OK);
+            CHECK(shell_dep_graph_validate(graph).valid);
+            bool dynamic =
+                form ? cases[c].argument_dynamic : cases[c].conditional_dynamic;
+            bool resolved = dynamic && mode >= 3;
+            bool empty = cases[c].empty || (dynamic && mode == 4);
+            if (!form) {
+              const shell_dep_cmd_t *command =
+                  &graph->nodes[condition_node()].cmd;
+              bool false_result = empty && (op == 2 || op == side);
+              CHECK(command->conditional_truth ==
+                    (false_result ? SHELL_CONDITIONAL_FALSE
+                                  : SHELL_CONDITIONAL_UNKNOWN));
+              CHECK(command->conditional_unresolved == (dynamic && !resolved));
+            }
+            unsigned count = 0, flagged = 0;
+            for (unsigned i = 0; mode && i < SHELL_DEP_MAX_NODES; ++i)
+              flagged += unresolved[i] != 0;
+            if (mode)
+              CHECK(flagged == (unsigned)(dynamic && !resolved));
+            for (unsigned e = 0; e < graph->edge_count; ++e) {
+              const shell_dep_edge_t *edge = &graph->edges[e];
+              if (edge->type !=
+                  (side ? SHELL_EDGE_FILE_RIGHT : SHELL_EDGE_FILE_LEFT))
+                continue;
+              ++count;
+              CHECK(graph->nodes[edge->from].file_comparison.empty_operands ==
+                    (unsigned)(empty ? 1u << side : 0));
+              const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+              CHECK(doc->flags == (resolved && !empty
+                                       ? SHELL_DEP_DOC_FLAG_RESOLVED_PATH
+                                   : dynamic ? SHELL_DEP_DOC_FLAG_DYNAMIC_NAME
+                                             : 0));
+              char identity[256] = "unchanged", expected[256];
+              size_t written = 17;
+              bool absolute = false;
+              bool identified = shell_dep_doc_file_identity_write(
+                  graph, doc, identity, sizeof(identity), &written, &absolute);
+              CHECK(identified == (!empty && (!dynamic || resolved)));
+              if (identified) {
+                n = snprintf(expected, sizeof(expected), "/workspace/%s",
+                             resolved ? "actual" : cases[c].literal);
+                CHECK(n > 0 && (size_t)n < sizeof(expected));
+                CHECK(absolute && written == (size_t)n &&
+                      !strcmp(identity, expected));
+              } else
+                CHECK(!written && !absolute && !strcmp(identity, "unchanged"));
+            }
+            CHECK(count == 1);
+          }
+
+  const char *const nested[] = {
+      "printf '%s' \"$(test \"$path\" -nt other)\"",
+      "cat <([ other -ot \"$path\" ])",
+  };
+  for (unsigned i = 0; i < sizeof(nested) / sizeof(*nested); ++i) {
+    current = nested[i];
+    CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                         &limits, graph, NULL, NULL,
+                                         unresolved) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(graph).valid);
+    unsigned flagged = 0;
+    for (unsigned n = 0; n < SHELL_DEP_MAX_NODES; ++n)
+      flagged += unresolved[n] != 0;
+    CHECK(flagged == 1);
+  }
+  current = "[[ x || * -nt other ]]";
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, NULL, NULL,
+                                       unresolved) == SHELL_DEP_OK);
+  for (unsigned i = 0; i < graph->node_count; ++i) {
+    CHECK(graph->nodes[i].type != SHELL_NODE_FILE_COMPARISON && !unresolved[i]);
+  }
+  current = "printf '%s' \"$( [[ * -nt other ]] )\"";
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, NULL, NULL,
+                                       unresolved) == SHELL_DEP_OK);
+  unsigned literal_operands = 0;
+  for (unsigned i = 0; i < graph->edge_count; ++i)
+    if (graph->edges[i].type == SHELL_EDGE_FILE_LEFT) {
+      const shell_dep_doc_t *doc = &graph->nodes[graph->edges[i].to].doc;
+      char identity[64];
+      size_t written;
+      bool absolute;
+      CHECK(!doc->flags &&
+            shell_dep_doc_file_identity_write(
+                graph, doc, identity, sizeof(identity), &written, &absolute));
+      CHECK(absolute && written == strlen("/workspace/*") &&
+            !strcmp(identity, "/workspace/*"));
+      ++literal_operands;
+    }
+  CHECK(literal_operands == 1);
+  current = "test \"$path\" -nt other";
+  shell_dep_limits_t truncated = limits;
+  truncated.max_nodes = 1;
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &truncated, graph, NULL, NULL,
+                                       unresolved) == SHELL_DEP_ETRUNC);
+  CHECK(graph->node_count == 1 && unresolved[0] &&
+        shell_dep_graph_validate(graph).valid);
+  for (unsigned i = graph->node_count; i < SHELL_DEP_MAX_NODES; ++i)
+    CHECK(!unresolved[i]);
 }
 
 static void check_file_predicate_unresolved_paths(void) {
@@ -723,6 +989,247 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
   return SHELL_EXPAND_RESOLVED;
 }
 
+static SHELL_NONNULL(1) bool reads_file(const char *path) {
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    const shell_dep_node_t *node = &graph->nodes[edge->from];
+    if (edge->type == SHELL_EDGE_READ && node->type == SHELL_NODE_DOC &&
+        node->doc.kind == SHELL_DOC_FILE &&
+        node->doc.path_len == strlen(path) &&
+        !memcmp(node->doc.path, path, node->doc.path_len))
+      return true;
+  }
+  return false;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
+    observe_comparison_branch(const shell_expand_word_request_t *request,
+                              const char **value, size_t *length,
+                              void *context) {
+  (void)value;
+  (void)length;
+  const char branch[] = "\"$(cat <important.txt)\"";
+  if (request->purpose == SHELL_EXPAND_WORD_CONDITIONAL &&
+      request->word_length == sizeof(branch) - 1 &&
+      !memcmp(request->source + request->word_offset, branch,
+              sizeof(branch) - 1))
+    ++*(unsigned *)context;
+  return SHELL_EXPAND_UNRESOLVED;
+}
+
+static void check_conditional_observation_order(void) {
+  static const struct {
+    const char *prefix;
+    bool reaches_suffix;
+  } cases[] = {
+      {"-e probe && -n \"$(printf x)\"", true},
+      {"! ( -e probe && -n \"$(printf x)\" )", true},
+      {"-e probe && ( -e other && -n \"$(printf x)\" )", true},
+      {"( -e probe && -n \"$(printf x)\" ) || "
+       "( -e other && -n \"$(printf y)\" )",
+       true},
+      {"-e probe && ( -z x && -n \"$(printf skipped)\" )", true},
+      {"-e probe && ( -n x || -n \"$(printf skipped)\" )", true},
+      {"-n x && -z x", true},
+      {"-z x && -n \"$(printf skipped)\"", true},
+      {"-n x || -n \"$(printf skipped)\"", false},
+  };
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+    char source[1024];
+    int length = snprintf(source, sizeof(source),
+                          "exec 63<<<seed 62<&-; [[ ( %s ) || "
+                          "-n \"$(read -r -u63 -n1 before)\"<(printf pipe)"
+                          "\"$(read -r -u62 -n1 after)\" ]]",
+                          cases[c].prefix);
+    CHECK(length > 0 && (size_t)length < sizeof(source));
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_source_scan_reset();
+#endif
+    parse(source);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    CHECK(shellsplit_test_observation_order_errors() == 0);
+#endif
+    /* The first read observes the persistent here-string. Only the later read
+     * can use the newly allocated process descriptor. Skipped operands retain
+     * source nodes but must not acquire either route. */
+    unsigned before = UINT32_MAX, after = UINT32_MAX, producer = UINT32_MAX;
+    for (unsigned n = 0; n < graph->node_count; ++n) {
+      const shell_dep_node_t *node = &graph->nodes[n];
+      if (node->type != SHELL_NODE_CMD || !node->cmd.token_count)
+        continue;
+      unsigned last = node->cmd.token_count - 1;
+      const char *word = node->cmd.tokens[last];
+      unsigned size = node->cmd.token_lens[last];
+      if (size == 6 && !memcmp(word, "before", 6))
+        before = n;
+      if (size == 5 && !memcmp(word, "after", 5))
+        after = n;
+      if (size == 4 && !memcmp(word, "pipe", 4))
+        producer = n;
+    }
+    CHECK(before != UINT32_MAX && after != UINT32_MAX &&
+          producer != UINT32_MAX);
+    bool reads_document = false, reads_process = false;
+    for (unsigned e = 0; e < graph->edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph->edges[e];
+      const shell_dep_node_t *origin = &graph->nodes[edge->from];
+      reads_document |= edge->type == SHELL_EDGE_READ && edge->to == before &&
+                        edge->target_fd == 63 &&
+                        origin->type == SHELL_NODE_DOC &&
+                        origin->doc.kind == SHELL_DOC_HERESTRING;
+      reads_process |= edge->type == SHELL_EDGE_SUBST &&
+                       edge->from == producer && edge->to == after &&
+                       edge->source_fd == 1 && edge->target_fd == 62;
+      CHECK(!(edge->type == SHELL_EDGE_SUBST && edge->from == producer &&
+              edge->to == before));
+    }
+    CHECK(reads_document == cases[c].reaches_suffix);
+    CHECK(reads_process == cases[c].reaches_suffix);
+  }
+}
+
+static void check_file_comparison_continuations(void) {
+  /* Ordinary executable arguments retain ARG relations; an active cat also
+   * has a possible stdin route. Explicit redirects below test file READs. */
+  parse("[[ \"$path\" -ef reference ]] && cat important.txt");
+  CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+        SHELL_CONDITIONAL_UNKNOWN);
+  bool cat_reads = false;
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    const shell_dep_node_t *target = &graph->nodes[edge->to];
+    cat_reads |= edge->type == SHELL_EDGE_READ &&
+                 target->type == SHELL_NODE_CMD && target->cmd.token_count &&
+                 target->cmd.token_lens[0] == 3 &&
+                 !memcmp(target->cmd.tokens[0], "cat", 3);
+  }
+  CHECK(cat_reads);
+
+  /* Expected false-kind masks are independent of the evaluator. In particular,
+   * unknown operands do not prevent an empty counterpart from proving false. */
+  static const struct {
+    const char *left, *right;
+    unsigned false_kinds, empty_operands;
+  } cases[] = {
+      {"\"$path\"", "reference", 0, 0},
+      {"reference", "\"$path\"", 0, 0},
+      {"\"$left\"", "\"$right\"", 0, 0},
+      {"''", "\"$path\"", SHELL_FILE_COMPARE_NEWER | SHELL_FILE_COMPARE_SAME,
+       1},
+      {"\"$path\"", "''", SHELL_FILE_COMPARE_OLDER | SHELL_FILE_COMPARE_SAME,
+       2},
+      {"''", "''", 7, 3},
+  };
+  const char *const operators[] = {"-nt", "-ot", "-ef"};
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c)
+    for (unsigned op = 0; op < 3; ++op)
+      for (unsigned negated = 0; negated < 2; ++negated)
+        for (unsigned join = 0; join < 2; ++join) {
+          bool known = (cases[c].false_kinds & (1u << op)) != 0;
+          shell_conditional_truth_t truth = !known ? SHELL_CONDITIONAL_UNKNOWN
+                                            : negated ? SHELL_CONDITIONAL_TRUE
+                                                      : SHELL_CONDITIONAL_FALSE;
+          bool reached = join ? truth != SHELL_CONDITIONAL_TRUE
+                              : truth != SHELL_CONDITIONAL_FALSE;
+          for (unsigned form = 0; form < 3; ++form) {
+            char source[256];
+            snprintf(source, sizeof(source),
+                     "%s %s%s %s %s %s %s cat <important.txt",
+                     form == 0   ? "[["
+                     : form == 1 ? "test"
+                                 : "[",
+                     negated ? "! " : "", cases[c].left, operators[op],
+                     cases[c].right,
+                     form == 0   ? "]]"
+                     : form == 1 ? ""
+                                 : "]",
+                     join ? "||" : "&&");
+            parse(source);
+            CHECK(reads_file("important.txt") == reached);
+            unsigned comparisons = 0;
+            for (unsigned i = 0; i < graph->node_count; ++i)
+              if (graph->nodes[i].type == SHELL_NODE_FILE_COMPARISON) {
+                ++comparisons;
+                CHECK(graph->nodes[i].file_comparison.empty_operands ==
+                      cases[c].empty_operands);
+              }
+            CHECK(comparisons == 1);
+            if (!form) {
+              const shell_dep_cmd_t *command =
+                  &graph->nodes[condition_node()].cmd;
+              CHECK(command->conditional_truth == truth);
+              CHECK(command->conditional_unresolved ==
+                    (cases[c].empty_operands != 3));
+            }
+          }
+
+          char source[256];
+          snprintf(source, sizeof(source),
+                   "[[ %s( %s %s %s ) %s -n \"$(cat <important.txt)\" ]]",
+                   negated ? "! " : "", cases[c].left, operators[op],
+                   cases[c].right, join ? "||" : "&&");
+          current = source;
+          unsigned requests = 0;
+          uint8_t unresolved[SHELL_DEP_MAX_NODES];
+          CHECK(shell_dep_graph_parse_resolved(
+                    source, strlen(source), "/workspace", &limits, graph,
+                    observe_comparison_branch, &requests,
+                    unresolved) == SHELL_DEP_OK);
+          CHECK(shell_dep_graph_validate(graph).valid);
+          CHECK(requests == (unsigned)reached);
+          CHECK(reads_file("important.txt") == reached);
+          unsigned owner = condition_node();
+          CHECK(unresolved[owner] == (cases[c].empty_operands != 3));
+          CHECK(graph->nodes[owner].cmd.conditional_unresolved ==
+                (cases[c].empty_operands != 3 || reached));
+        }
+
+  /* Captured emptiness and absent values must remain distinct when both source
+   * operands are dynamic. Nonempty captured paths still have unknown metadata.
+   */
+  static const struct {
+    const char *values[2];
+    unsigned false_kinds, empty_operands;
+  } captured[] = {
+      {{NULL, NULL}, 0, 0},
+      {{"0:,", NULL}, SHELL_FILE_COMPARE_NEWER | SHELL_FILE_COMPARE_SAME, 1},
+      {{NULL, "0:,"}, SHELL_FILE_COMPARE_OLDER | SHELL_FILE_COMPARE_SAME, 2},
+      {{"6:actual,", NULL}, 0, 0},
+      {{NULL, "6:actual,"}, 0, 0},
+      {{"0:,", "0:,"}, 7, 3},
+      {{"6:actual,", "6:actual,"}, 0, 0},
+  };
+  for (unsigned c = 0; c < sizeof(captured) / sizeof(*captured); ++c)
+    for (unsigned op = 0; op < 3; ++op) {
+      char source[128];
+      snprintf(source, sizeof(source),
+               "[[ \"$left\" %s \"$right\" ]] && cat <important.txt",
+               operators[op]);
+      current = source;
+      comparison_resolver_t resolver = {
+          .values = {captured[c].values[0], captured[c].values[1]},
+          .unresolved = {!captured[c].values[0], !captured[c].values[1]}};
+      uint8_t unresolved[SHELL_DEP_MAX_NODES];
+      CHECK(shell_dep_graph_parse_resolved(
+                source, strlen(source), "/workspace", &limits, graph,
+                resolve_comparison, &resolver, unresolved) == SHELL_DEP_OK);
+      CHECK(resolver.calls == 2 && shell_dep_graph_validate(graph).valid);
+      bool known_false = (captured[c].false_kinds & (1u << op)) != 0;
+      const shell_dep_cmd_t *command = &graph->nodes[condition_node()].cmd;
+      CHECK(
+          command->conditional_truth ==
+          (known_false ? SHELL_CONDITIONAL_FALSE : SHELL_CONDITIONAL_UNKNOWN));
+      CHECK(reads_file("important.txt") == !known_false);
+      CHECK(command->conditional_unresolved ==
+            (resolver.unresolved[0] || resolver.unresolved[1]));
+      CHECK(unresolved[condition_node()] == command->conditional_unresolved);
+      for (unsigned i = 0; i < graph->node_count; ++i)
+        if (graph->nodes[i].type == SHELL_NODE_FILE_COMPARISON)
+          CHECK(graph->nodes[i].file_comparison.empty_operands ==
+                captured[c].empty_operands);
+    }
+}
+
 static void check_comparisons(void) {
   current = "[[ ! 'left' != \"right\" ]]";
   CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
@@ -858,6 +1365,138 @@ static const shell_source_header_t *retained_condition(void) {
       return &draft->headers[h];
   CHECK(false);
   return NULL;
+}
+
+static void check_grouped_draft_summaries(void) {
+  static const struct {
+    const char *primary, *operands[2];
+    shell_conditional_predicate_t predicate;
+    unsigned children;
+  } cases[] = {
+      {"-n value", {"value", NULL}, SHELL_CONDITIONAL_STRING_NONEMPTY, 0},
+      {"left -nt right", {"left", "right"}, SHELL_CONDITIONAL_FILE_NEWER, 0},
+      {"-v CONFIG", {"CONFIG", NULL}, SHELL_CONDITIONAL_VARIABLE_SET, 0},
+      {"-n \"$(printf child)\"",
+       {"\"$(printf child)\"", NULL},
+       SHELL_CONDITIONAL_STRING_NONEMPTY,
+       1},
+  };
+  static const char *const tails[] = {"",   " \\",  " ]",  " ]\\", " ]\\\n",
+                                      " &", " |\\", " ]]", " ]]\\"};
+  for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c)
+    for (unsigned groups = 0; groups <= 3; ++groups)
+      for (unsigned mask = 0; mask < (1u << (groups + 1)); ++mask)
+        for (unsigned closed = 0; closed <= groups; ++closed)
+          for (unsigned tail = 0; tail < sizeof(tails) / sizeof(*tails);
+               ++tail) {
+            char source[512] = "printf before; [[ ";
+            bool negated = false;
+            for (unsigned level = 0; level <= groups; ++level) {
+              if (mask & (1u << level)) {
+                strcat(source, "! ");
+                negated = !negated;
+              }
+              if (level < groups)
+                strcat(source, "( ");
+            }
+            size_t primary_start = strlen(source);
+            strcat(source, cases[c].primary);
+            for (unsigned level = 0; level < closed; ++level)
+              strcat(source, " )");
+            strcat(source, tails[tail]);
+            current = source;
+            bool invalid = closed < groups && strchr(tails[tail], ']');
+            bool complete = !invalid && !strcmp(tails[tail], " ]]");
+            CHECK(shell_parse_draft(source, strlen(source), NULL, draft) ==
+                  (invalid    ? SHELL_SOURCE_INVALID
+                   : complete ? SHELL_SOURCE_COMPLETE
+                              : SHELL_SOURCE_INCOMPLETE));
+            if (invalid) {
+              CHECK(!draft->prefix_length && !draft->prefix.count);
+              continue;
+            }
+            const shell_source_header_t *header = retained_condition();
+            CHECK(header->complete == complete);
+            CHECK(header->conditional_predicate == cases[c].predicate);
+            CHECK(header->conditional_negated == negated);
+            unsigned operands = cases[c].operands[1] ? 2 : 1;
+            CHECK(header->conditional_operand_count == operands);
+            for (unsigned i = 0; i < operands; ++i) {
+              shell_source_span_t word = header->conditional_operands[i];
+              CHECK(word.start == (size_t)(strstr(source + primary_start,
+                                                  cases[c].operands[i]) -
+                                           source));
+              CHECK(word.length == strlen(cases[c].operands[i]));
+            }
+            CHECK(draft->header_count == 2 + cases[c].children);
+            if (cases[c].children)
+              CHECK(draft->headers[2].complete);
+            if (!complete) {
+              CHECK(draft->need == SHELL_SOURCE_NEEDS_CONDITIONAL);
+              CHECK(draft->prefix_length == strlen("printf before;") &&
+                    draft->prefix.count == 1);
+            }
+          }
+
+  static const struct {
+    const char *source;
+    shell_conditional_predicate_t predicate;
+    const char *operands[2];
+    bool negated;
+  } unfinished_words[] = {
+      {"[[ ! ( -n \"value]",
+       SHELL_CONDITIONAL_STRING_NONEMPTY,
+       {"\"value]", NULL},
+       true},
+      {"[[ ! ( -n \"value",
+       SHELL_CONDITIONAL_STRING_NONEMPTY,
+       {"\"value", NULL},
+       true},
+      {"[[ ! ( ! ( left -nt \"right",
+       SHELL_CONDITIONAL_FILE_NEWER,
+       {"left", "\"right"},
+       false},
+      {"[[ ! ( -n \"$(printf child",
+       SHELL_CONDITIONAL_STRING_NONEMPTY,
+       {"\"$(printf child", NULL},
+       true},
+  };
+  for (unsigned c = 0; c < sizeof(unfinished_words) / sizeof(*unfinished_words);
+       ++c) {
+    current = unfinished_words[c].source;
+    CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
+          SHELL_SOURCE_INCOMPLETE);
+    const shell_source_header_t *header = retained_condition();
+    CHECK(header->conditional_predicate == unfinished_words[c].predicate);
+    CHECK(header->conditional_negated == unfinished_words[c].negated);
+    unsigned count = unfinished_words[c].operands[1] ? 2 : 1;
+    CHECK(header->conditional_operand_count == count);
+    for (unsigned i = 0; i < count; ++i) {
+      shell_source_span_t span = header->conditional_operands[i];
+      const char *word = unfinished_words[c].operands[i];
+      CHECK(span.length == strlen(word));
+      CHECK(!memcmp(current + span.start, word, span.length));
+    }
+  }
+
+  /* A committed connector makes the summary compound even if its right term
+   * has not arrived. Lexical children remain available through their headers.
+   */
+  static const char *const compounds[] = {
+      "[[ -n value &&",
+      "[[ ( -n value ) ||",
+      "[[ ! ( -n value && -n \"$(printf child)\"",
+      "[[ ! ( -n value || ! ( -n child ) ) ]",
+  };
+  for (unsigned i = 0; i < sizeof(compounds) / sizeof(*compounds); ++i) {
+    current = compounds[i];
+    CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
+          SHELL_SOURCE_INCOMPLETE);
+    const shell_source_header_t *header = retained_condition();
+    CHECK(header->conditional_predicate == SHELL_CONDITIONAL_PREDICATE_NONE);
+    CHECK(!header->conditional_operand_count && !header->conditional_negated);
+    CHECK(draft->header_count == (strstr(current, "$(") ? 2u : 1u));
+  }
 }
 
 static void check_mixed_literal_comparisons(void) {
@@ -1219,6 +1858,274 @@ static void check_token_prefixes(void) {
   }
 }
 
+static void check_binary_and_compound_conditions(void) {
+  static const char *const comparisons[] = {"-nt", "-ot", "-ef"};
+  for (unsigned kind = 0; kind < 3; ++kind)
+    for (unsigned form = 0; form < 3; ++form) {
+      char source[160];
+      snprintf(source, sizeof(source), "%s left %s right %s",
+               form == 0   ? "[["
+               : form == 1 ? "test"
+                           : "[",
+               comparisons[kind],
+               form == 0   ? "]]"
+               : form == 1 ? ""
+                           : "]");
+      parse(source);
+      unsigned count = 0;
+      for (unsigned i = 0; i < graph->node_count; ++i) {
+        if (graph->nodes[i].type != SHELL_NODE_FILE_COMPARISON)
+          continue;
+        ++count;
+        CHECK(graph->nodes[i].file_comparison.predicates == (1u << kind));
+        CHECK(graph->nodes[i].file_comparison.empty_operands == 0);
+        unsigned left = 0, right = 0, owner = 0;
+        for (unsigned e = 0; e < graph->edge_count; ++e) {
+          const shell_dep_edge_t *edge = &graph->edges[e];
+          owner += edge->type == SHELL_EDGE_FILE_COMPARE && edge->to == i;
+          if (edge->from != i)
+            continue;
+          const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+          if (edge->type == SHELL_EDGE_FILE_LEFT) {
+            CHECK(doc->path_len == 4 && !memcmp(doc->path, "left", 4));
+            ++left;
+          } else if (edge->type == SHELL_EDGE_FILE_RIGHT) {
+            CHECK(doc->path_len == 5 && !memcmp(doc->path, "right", 5));
+            ++right;
+          }
+        }
+        CHECK(left == 1 && right == 1 && owner == 1);
+      }
+      CHECK(count == 1);
+    }
+  static const struct {
+    const char *source;
+    shell_conditional_truth_t truth;
+  } cases[] = {
+      {"[[ x && y ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '' || y ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ x || '' && '' ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ ( x || '' ) && '' ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ ! ( x && '' ) ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ !(x) ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ ! (x) ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ !<() ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '' -nt path ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ path -ot '' ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ '' -ef path ]]", SHELL_CONDITIONAL_FALSE},
+      {"[[ path -nt '' ]]", SHELL_CONDITIONAL_UNKNOWN},
+      {"[[ '' -ot path ]]", SHELL_CONDITIONAL_UNKNOWN},
+      {"[[ path -ef path ]]", SHELL_CONDITIONAL_UNKNOWN},
+      {"[[ -f path && -r path ]]", SHELL_CONDITIONAL_UNKNOWN},
+      {"[[ x || -n $(cat skipped) ]]", SHELL_CONDITIONAL_TRUE},
+      {"[[ '' && -n $(cat skipped) ]]", SHELL_CONDITIONAL_FALSE},
+      {"unset item; [[ -v item && -n $(cat skipped) ]]",
+       SHELL_CONDITIONAL_FALSE},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    parse(cases[i].source);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          cases[i].truth);
+    if (strstr(cases[i].source, "skipped"))
+      for (unsigned e = 0; e < graph->edge_count; ++e)
+        CHECK(graph->edges[e].type != SHELL_EDGE_SUBST);
+  }
+  parse("echo \"$( [[ first -ef second || -r third ]] )\"");
+  parse("test left \"$operator\" right");
+  unsigned comparisons_count = 0;
+  for (unsigned i = 0; i < graph->node_count; ++i)
+    if (graph->nodes[i].type == SHELL_NODE_FILE_COMPARISON) {
+      ++comparisons_count;
+      CHECK(graph->nodes[i].file_comparison.predicates == 7);
+    }
+  CHECK(comparisons_count == 1);
+  current = "[[ -n \"$left\" && -n \"$right";
+  CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
+        SHELL_SOURCE_INCOMPLETE);
+  CHECK(draft->headers[0].conditional_predicate ==
+            SHELL_CONDITIONAL_PREDICATE_NONE &&
+        draft->headers[0].conditional_operand_count == 0);
+  static const char *const join_prefixes[] = {
+      "[[ x &",     "[[ -n x |",   "[[ (x) &", "[[ ( -n x && x ) |",
+      "[[ (x) &\\", "[[ (x) |\\\n"};
+  for (unsigned i = 0; i < sizeof(join_prefixes) / sizeof(*join_prefixes);
+       ++i) {
+    char source[128];
+    snprintf(source, sizeof(source), "printf before; %s", join_prefixes[i]);
+    current = source;
+    CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
+          SHELL_SOURCE_INCOMPLETE);
+    CHECK(draft->need == SHELL_SOURCE_NEEDS_CONDITIONAL);
+    CHECK(draft->prefix_length == strlen("printf before;"));
+    CHECK(draft->prefix.count == 1);
+  }
+  current = "[[ \"$left\" -ef \"$right\" ]]";
+  resolved_value = "0:,";
+  resolved_length = 0;
+  calls = 0;
+  uint8_t empty_unresolved[SHELL_DEP_MAX_NODES];
+  CHECK(shell_dep_graph_parse_resolved(current, strlen(current), "/workspace",
+                                       &limits, graph, resolve, NULL,
+                                       empty_unresolved) == SHELL_DEP_OK);
+  CHECK(calls == 2 && graph->nodes[condition_node()].cmd.conditional_truth ==
+                          SHELL_CONDITIONAL_FALSE);
+  CHECK(!empty_unresolved[condition_node()]);
+  CHECK(!graph->nodes[condition_node()].cmd.conditional_unresolved);
+  unsigned comparison_node = UINT32_MAX;
+  for (unsigned i = 0; i < graph->node_count; ++i)
+    if (graph->nodes[i].type == SHELL_NODE_FILE_COMPARISON) {
+      comparison_node = i;
+      CHECK(graph->nodes[i].file_comparison.empty_operands == 3);
+    }
+  CHECK(comparison_node != UINT32_MAX);
+  unsigned empty_documents = 0;
+  for (unsigned i = 0; i < graph->edge_count; ++i) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    if (edge->from != comparison_node || (edge->type != SHELL_EDGE_FILE_LEFT &&
+                                          edge->type != SHELL_EDGE_FILE_RIGHT))
+      continue;
+    const shell_dep_doc_t *doc = &graph->nodes[edge->to].doc;
+    const char *spelling =
+        edge->type == SHELL_EDGE_FILE_LEFT ? "\"$left\"" : "\"$right\"";
+    CHECK(doc->path_len == strlen(spelling));
+    CHECK(!memcmp(doc->path, spelling, doc->path_len));
+    CHECK(doc->flags == SHELL_DEP_DOC_FLAG_DYNAMIC_NAME);
+    char identity[64];
+    size_t written;
+    bool absolute;
+    CHECK(!shell_dep_doc_file_identity_write(
+        graph, doc, identity, sizeof(identity), &written, &absolute));
+    empty_documents++;
+  }
+  CHECK(empty_documents == 2);
+  CHECK(shell_dep_graph_validate(graph).valid);
+  graph->nodes[comparison_node].file_comparison.predicates = 0;
+  CHECK(!shell_dep_graph_validate(graph).valid);
+  graph->nodes[comparison_node].file_comparison.predicates =
+      SHELL_FILE_COMPARE_SAME;
+  unsigned edges = graph->edge_count;
+  graph->edge_count = 1;
+  CHECK(!shell_dep_graph_validate(graph).valid);
+  graph->edge_count = edges;
+  CHECK(shell_dep_graph_validate(graph).valid);
+  shell_dep_limits_t small = limits;
+  small.max_nodes = 2;
+  current = "[[ first -nt second ]]";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &small,
+                              graph) == SHELL_DEP_ETRUNC);
+  CHECK(shell_dep_graph_validate(graph).valid);
+  char deep[512] = "[[ ";
+  for (unsigned i = 0; i < SHELL_CONDITIONAL_MAX_NODES / 2; ++i)
+    strcat(deep, "x && ");
+  strcat(deep, "x ]]");
+  current = deep;
+  CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
+        SHELL_SOURCE_TRUNCATED);
+}
+
+/* A syntax resource stop has no qualified prefix, even when complete commands
+ * precede it. Check each public consumer rather than only the private frame. */
+static void check_syntax_resource_stop(const char *source) {
+  current = source;
+  size_t length = strlen(source);
+  CHECK(shell_parse_draft(source, length, NULL, draft) ==
+        SHELL_SOURCE_TRUNCATED);
+  CHECK(!draft->prefix_length && !draft->prefix.count);
+  for (unsigned i = 0; i < draft->header_count; ++i)
+    CHECK(!draft->headers[i].complete);
+  shell_parse_result_t fast;
+  for (unsigned strict = 0; strict < 2; ++strict) {
+    shell_limits_t options = SHELL_LIMITS_DEFAULT;
+    options.strict_mode = strict != 0;
+    CHECK(shell_parse_fast(source, length, &options, &fast) == SHELL_ETRUNC);
+    CHECK(fast.status == SHELL_STATUS_TRUNCATED && !fast.count &&
+          !fast.group_count);
+  }
+  CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits, graph) ==
+        SHELL_DEP_ETRUNC);
+  CHECK(graph->status == SHELL_DEP_STATUS_TRUNCATED && !graph->node_count &&
+        !graph->edge_count && !graph->cwd_buf.len);
+  CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                        &fast, graph) == SHELL_DEP_ETRUNC);
+  CHECK(graph->status == SHELL_DEP_STATUS_TRUNCATED && !graph->node_count &&
+        !graph->edge_count && !graph->cwd_buf.len);
+  shell_command_t *commands = NULL;
+  size_t count = 0;
+  CHECK(shell_tokenize_commands(source, length, &commands, &count) ==
+        SHELL_TOKENIZE_EOVERFLOW);
+  CHECK(!commands && !count);
+  shell_processed_commands_t processed = {0};
+  CHECK(shell_process_commands(source, length, NULL, &processed) ==
+        SHELL_PROCESS_EOUTPUT_LIMIT);
+  CHECK(!processed.commands && !processed.command_count);
+  shell_abstract_command_t *abstract = NULL;
+  CHECK(shell_abstract_command_parse(source, length, &abstract) ==
+        SHELL_ABSTRACT_EOVERFLOW);
+  CHECK(!abstract);
+  shell_transformed_command_t **transformed = NULL;
+  CHECK(shell_transform_command_line(source, length, NULL, &transformed,
+                                     &count) == SHELL_TRANSFORM_EOVERFLOW);
+  CHECK(!transformed && !count);
+}
+
+static void check_syntax_resource_outcomes(void) {
+  char condition[2048] = "[[ ! ";
+  for (unsigned i = 0; i < 47; ++i)
+    strcat(condition, "x && ");
+  strcat(condition, "x ]]");
+  /* 48 primaries + 47 joins + one NOT fills all 96 nodes. */
+  CHECK(shell_conditional_parse(condition, strlen(condition), 0).count == 96);
+  parse(condition);
+  strcpy(condition, "[[ ");
+  for (unsigned i = 0; i < 48; ++i)
+    strcat(condition, "x && ");
+  strcat(condition, "x ]]");
+  static const char *const wrappers[] = {
+      "%s",        "printf before; %s",       "printf '%%s' \"$(%s)\"",
+      "cat <(%s)", "cat <<EOF\n$(%s)\nEOF\n", "printf '%%s' `%s`"};
+  for (unsigned i = 0; i < sizeof(wrappers) / sizeof(*wrappers); ++i) {
+    char source[4096];
+    int n = snprintf(source, sizeof(source), wrappers[i], condition);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    check_syntax_resource_stop(source);
+  }
+  strcpy(condition, "[[ ");
+  for (unsigned i = 0; i < SHELL_CONDITIONAL_MAX_NODES - 1; ++i)
+    strcat(condition, "(");
+  strcat(condition, "x");
+  for (unsigned i = 0; i < SHELL_CONDITIONAL_MAX_NODES - 1; ++i)
+    strcat(condition, ")");
+  strcat(condition, " ]]");
+  parse(condition);
+  char deep[4096];
+  strcpy(deep, "[[ ");
+  for (unsigned i = 0; i < SHELL_CONDITIONAL_MAX_NODES; ++i)
+    strcat(deep, "(");
+  strcat(deep, "x");
+  for (unsigned i = 0; i < SHELL_CONDITIONAL_MAX_NODES; ++i)
+    strcat(deep, ")");
+  strcat(deep, " ]]");
+  check_syntax_resource_stop(deep);
+  /* Shared list-group capacity is a resource stop too. */
+  strcpy(deep, "");
+  for (unsigned i = 0; i <= SHELL_MAX_GROUPS; ++i)
+    strcat(deep, "{ ");
+  strcat(deep, "printf x;");
+  for (unsigned i = 0; i <= SHELL_MAX_GROUPS; ++i)
+    strcat(deep, " };");
+  check_syntax_resource_stop(deep);
+  /* Syntax errors still precede range-output limits when validation finishes.
+   */
+  shell_limits_t small = SHELL_LIMITS_DEFAULT;
+  small.max_subcommands = 1;
+  small.strict_mode = true;
+  current = "printf first; printf second; [[ x && ]]";
+  shell_parse_result_t fast;
+  CHECK(shell_parse_fast(current, strlen(current), &small, &fast) ==
+        SHELL_EPARSE);
+  CHECK(fast.status == SHELL_STATUS_ERROR);
+}
+
 int main(int argc, char **argv) {
   graph = malloc(sizeof(*graph));
   draft = malloc(sizeof(*draft));
@@ -1265,14 +2172,21 @@ int main(int argc, char **argv) {
     }
     goto done;
   }
+  check_conditional_observation_order();
   check_body_setup();
+  check_binary_and_compound_conditions();
+  check_syntax_resource_outcomes();
   check_file_predicates();
   check_file_predicate_resolution();
   check_file_predicate_nul_argument();
   check_file_predicate_unresolved_paths();
+  check_comparison_operand_contexts();
+  check_file_comparison_continuations();
   check_test_grammar_refinement();
   check_expansion_regions();
+  check_partial_condition_regions();
   check_comparisons();
+  check_grouped_draft_summaries();
   check_mixed_literal_comparisons();
   check_tilde_comparisons();
   check_patterns();

@@ -334,6 +334,10 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
     if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       shell_conditional_t condition =
           shell_conditional_parse(source, length, start);
+      if (condition.frame == SHELL_CONDITIONAL_LIMIT) {
+        collector->failure = SHELL_SOURCE_TRUNCATED;
+        return false;
+      }
       if (condition.frame == SHELL_CONDITIONAL_INVALID ||
           condition.frame == SHELL_CONDITIONAL_UNSUPPORTED) {
         collector->failure = condition.frame == SHELL_CONDITIONAL_INVALID
@@ -610,10 +614,13 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
   if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE)
     goto done;
   if (out->prefix_length) {
-    if (!shell_tokenizer_complete_syntax_valid(source, out->prefix_length)) {
+    shell_error_t syntax =
+        shell_tokenizer_syntax_status(source, out->prefix_length, true);
+    if (syntax != SHELL_OK) {
       /* The diagnostic grammar already classified every modeled context.
        * Failure of this coarser strict boundary is not a new syntax proof. */
-      status = SHELL_SOURCE_UNSUPPORTED;
+      status = syntax == SHELL_ETRUNC ? SHELL_SOURCE_TRUNCATED
+                                      : SHELL_SOURCE_UNSUPPORTED;
       goto done;
     }
     shell_limits_t strict = limits ? *limits : SHELL_LIMITS_DEFAULT;

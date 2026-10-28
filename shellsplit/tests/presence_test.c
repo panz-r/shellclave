@@ -1165,8 +1165,16 @@ int main(int argc, char **argv) {
   static const char *const unsupported[] = {
       "[[ -v \"$name\" ]]", "[[ -v 1 ]]",
       "[[ -v 'a[0]' ]]",    "[[ -v 'a[$(printf marker)]' ]]",
-      "[[ -R name ]]",      "[[ -v name && -v other ]]",
+      "[[ -R name ]]",
   };
+  CHECK(truth("unset name other; [[ -v name && -v other ]]") ==
+        SHELL_CONDITIONAL_FALSE);
+  CHECK(truth("name=; other=; [[ -v name && -v other ]]") ==
+        SHELL_CONDITIONAL_TRUE);
+  CHECK(truth("[[ -v name && -v other ]] && [[ ! -v name ]]") ==
+        SHELL_CONDITIONAL_FALSE);
+  CHECK(truth("[[ ! ( -v name || -v other ) ]] && [[ -v other ]]") ==
+        SHELL_CONDITIONAL_FALSE);
   shell_source_result_t *draft = malloc(sizeof(*draft));
   CHECK(draft);
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(*unsupported); ++i) {

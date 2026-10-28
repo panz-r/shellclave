@@ -89,11 +89,15 @@ typedef struct {
   shell_command_kind_t kind;
   shell_source_span_t conditional_expression;  /* Content without [[ and ]]. */
   shell_source_span_t conditional_operands[2]; /* In source/expansion order. */
-  /* Complete: one operand for unary, two for comparison. Incomplete headers
-   * retain received operands, including an unfinished final word. */
+  /* Single-primary summary: complete headers have one operand for unary,
+   * two for comparison; incomplete headers retain received operands, including
+   * an unfinished final word, through unclosed groups and partial closing
+   * delimiters. Complete and incomplete compound expressions
+   * use zero and NONE; conditional_expression and collected executable
+   * children remain valid. */
   uint8_t conditional_operand_count;
   shell_conditional_predicate_t conditional_predicate;
-  bool conditional_negated; /* Parity of lexical ! operators. */
+  bool conditional_negated; /* Single-primary ! parity; false for compounds. */
   shell_source_span_t arithmetic_expression; /* Content without delimiters. */
   shell_source_span_t words[SHELL_DEP_MAX_TOKENS];
   uint32_t word_count, assignment_count;

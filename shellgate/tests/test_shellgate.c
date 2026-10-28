@@ -2888,7 +2888,9 @@ TEST(brace_group_maximum_depth_contract) {
   length += 3;
   command[length] = '\0';
   memset(&result, 0xA5, sizeof(result));
-  ASSERT(eval_cmd(gate, command, &result) == SG_ERR_PARSE);
+  ASSERT(eval_cmd(gate, command, &result) == SG_ERR_TRUNC);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && result.truncated &&
+         result.subcommand_truncated && !result.subcommand_count);
   sg_gate_free(gate);
 }
 
@@ -3793,6 +3795,26 @@ TEST(filesystem_predicate_contract) {
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
          result.subcommand_count == 1);
   sg_gate_free(gate);
+
+  gate = gate_with_rules((const char *[]){"test * -nt other"}, 1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  /* Unknown argv cardinality is rejected before callback resolution. */
+  ASSERT(eval_cmd(gate, "test * -nt other", &result) == SG_ERR_PARSE);
+  /* This operand has no slash/dot to create a separate ARG pathname.
+   * The comparison itself must supply path uncertainty. */
+  ASSERT_SG_OK(eval_cmd(gate, "test \"$path\" -nt other", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH));
+  ASSERT_SG_OK(eval_cmd(gate, "test '*' -nt other", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ * -nt other ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  sg_gate_free(gate);
 }
 
 TEST(conditional_string_contract) {
@@ -3803,6 +3825,21 @@ TEST(conditional_string_contract) {
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n x ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_REJECT);
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ source -nt target && -r source ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -e first || -f \"$path\" ]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_ALLOW &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH) &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x || -f \"$path\" ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ x || -n $(printf skipped) ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.requires_substitution_evaluation &&
+         !result.has_dynamic_substitution_io);
   static const char *const invalid_boundaries[] = {
       "[[ x == \"x\" ]", "[[ -n x ]",  "[[ x !",       "[[ x =\\",
       "[[ x\n]]",        "[[ ! x\n]]", "[[ ! ! x\n]]", "[[ '-n'\n]]",
@@ -14814,6 +14851,34 @@ TEST(anomaly_short_aligned_sequence_stays_finite) {
   sg_gate_free(g);
 }
 
+TEST(syntax_capacity_is_undetermined) {
+  char condition[512] = "[[ ";
+  for (unsigned i = 0; i < 48; ++i)
+    strcat(condition, "x && ");
+  strcat(condition, "x ]]");
+  sg_gate_t *gate = gate_with_rules((const char *[]){"printf *"}, 1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 5.0, NULL));
+  static const char *const wrappers[] = {"%s", "printf before; %s",
+                                         "printf '%%s' \"$(%s)\"", "cat <(%s)",
+                                         "cat <<EOF\n$(%s)\nEOF\n"};
+  for (unsigned mask = 0; mask < 2; ++mask) {
+    ASSERT_SG_OK(
+        sg_gate_set_reject_mask(gate, mask ? SHELL_FEAT_CONDITIONALS : 0));
+    for (unsigned i = 0; i < sizeof(wrappers) / sizeof(*wrappers); ++i) {
+      char source[1024];
+      snprintf(source, sizeof(source), wrappers[i], condition);
+      sg_result_t result;
+      ASSERT(eval_cmd(gate, source, &result) == SG_ERR_TRUNC);
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+      ASSERT(result.truncated && result.subcommand_truncated);
+      ASSERT(!result.subcommand_count && !result.short_circuited);
+      ASSERT_EQ_UINT(test_anomaly_vocabulary(gate), 0);
+    }
+  }
+  sg_gate_free(gate);
+}
+
 TEST(truncated_parse_without_subcommands_is_undetermined) {
   /* Group-owned redirect documents are built before their command bodies.
    * Fill the node budget with 32 groups and 96 documents: no CMD can fit, but
@@ -16001,6 +16066,7 @@ int main(int argc, char **argv) {
   printf("\nSeparate scores:\n");
   RUN(anomaly_short_aligned_sequence_stays_finite);
   RUN(truncated_parse_without_subcommands_is_undetermined);
+  RUN(syntax_capacity_is_undetermined);
 
   printf("\nBayesian combination:\n");
   RUN(anomaly_calibration_mode_changes);

@@ -74,8 +74,9 @@ authorization also depends on effects and application controls.
 Scalar-presence queries such as `[[ -v CONFIG ]]` can remain UNKNOWN with no
 unresolved-expansion flag. Applications requiring presence certainty inspect
 Shellsplit's `conditional_truth` and the possible continuations in its graph.
-Filesystem predicates can likewise remain UNKNOWN. Their FILE_TEST relations
-identify possible metadata checks for separate application authorization.
+Filesystem predicates can likewise remain UNKNOWN. FILE_TEST edges and
+FILE_COMPARISON nodes identify possible metadata checks for separate application
+authorization.
 
 ### What policy rules cover
 
@@ -170,7 +171,7 @@ pre-push verification use that same reference.
 
 | Area | Current analysis support |
 |---|---|
-| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, unary string and scalar-presence tests, literal comparisons and static `*` patterns in `[[ … ]]`, compound `test`/`[` expressions |
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, compound `[[ … ]]` conditions with string, presence and filesystem predicates, and compound `test`/`[` expressions |
 | Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
 | Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
 | Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, wider `[[ … ]]` predicates, dynamic or mutating arithmetic, and the builtin forms listed in the reference |

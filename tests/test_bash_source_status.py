@@ -44,7 +44,7 @@ class SourceStatusContract(unittest.TestCase):
             (b"1f() { :; }", 4),
             (b'"f"() { :; }', 4),
             (b"f\\ g() { :; }", 4),
-            (b"[[ input -nt other ]]", 4),
+            (b"[[ input -nt other ]]", 0),
             (b"((1 + 2))", 0),
             (b"echo ${x!}", 4),
             (b"echo ${x:}", 4),
@@ -89,6 +89,67 @@ class SourceStatusContract(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), expected)
+
+    def test_conditional_operator_positions(self):
+        for source in (b"[[ x -nt y -ot z ]]", b"[[ -n x == y ]]",
+                       b"[[ x == y -ef z ]]", b"[[ x -h y ]]",
+                       b"[[ x ! ", b"[[ x -nt y -o\\\nt z ]]",
+                       b"[[ ( -n x == y ) ]]",
+                       b'echo "$([[ x -nt y -ot z ]])"',
+                       b"cat <([[ x == y -ef z ]])"):
+            with self.subTest(source=source):
+                # -n can return zero after diagnosing malformed [[ grammar.
+                reference = subprocess.run(
+                    [self.bash, "--noprofile", "--norc", "-p", "-n"],
+                    input=source, capture_output=True,
+                    env=dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C"),
+                    timeout=10)
+                self.assertTrue(reference.stderr)
+                self.assertEqual(self.classify(source), 2)
+        for source in (b"[[ x =~ y ]]", b"[[ x < y ]]", b"[[ x > y ]]",
+                       b"[[ 1 -eq 1 ]]"):
+            with self.subTest(unsupported=source):
+                self.assertEqual(self.syntax(source), 0)
+                self.assertEqual(self.classify(source), 4)
+        for received, suffix in ((b"[[ x !", b"= y ]]"),
+                                 (b"[[ x !\\\n", b"= y ]]"),
+                                 (b"[[ x -nt y &", b"& -n z ]]")):
+            with self.subTest(received=received):
+                self.assertEqual(self.classify(received), 1)
+                self.assertEqual(self.syntax(received + suffix), 0)
+                self.assertEqual(self.classify(received + suffix), 0)
+
+    def test_grouped_conditional_closer_recovery(self):
+        for received in (b"[[ ( x ]", b"[[ ( -n x ]",
+                         b'[[ ( x == "x" ]', b"[[ ( x -nt y ]",
+                         b"[[ ( ( x ) ]", b"[[ ( x && -n y ]",
+                         b"[[ x || ( y ]", b"[[ ( x ]\\",
+                         b"[[ ( x ]\\\n", b'[[ ( x == "x" ]\\',
+                         b'[[ ( x == "x" ]]\\'):
+            with self.subTest(received=received):
+                self.assertEqual(self.classify(received), 2)
+                # Bash can report malformed [[ grammar with exit status zero.
+                # A received outer closer cannot be repaired by appending ).
+                for source in (received, received + b"\n] ) ]]"):
+                    environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C")
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-n"],
+                        input=source, capture_output=True, env=environment,
+                        timeout=10)
+                    self.assertTrue(result.stderr)
+        for received, suffix in ((b"[[ ( x ", b") ]]"),
+                                 (b"[[ ( x \\", b"\n) ]]"),
+                                 (b"[[ ( x == \"x\" \\", b"\n) ]]"),
+                                 (b"[[ ( ( -n x ) ", b") ]]"),
+                                 (b"[[ ( ( -n x ) \\", b"\n) ]]"),
+                                 (b"[[ ( ( -n x ) &", b"& -n y ) ]]"),
+                                 (b"[[ ( ( -n x ) |\\", b"\n| -n y ) ]]"),
+                                 (b"[[ ( x ) ]", b"]"),
+                                 (b"[[ x ]", b"]")):
+            with self.subTest(received=received, suffix=suffix):
+                self.assertEqual(self.classify(received), 1)
+                self.assertEqual(self.syntax(received + suffix), 0)
+                self.assertEqual(self.classify(received + suffix), 0)
 
     def test_arithmetic_command_framing(self):
         complete = [b"(( ))", b"((1 << 2))", b"((1+))",

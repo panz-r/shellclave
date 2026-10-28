@@ -20,6 +20,7 @@
 #include "shell_processor.h"
 #include "shell_processor_internal.h"
 #include "shell_semantics_internal.h"
+#include "shell_source_admission_internal.h"
 #include "shell_source_internal.h"
 #include "shell_test_internal.h"
 #include "shell_tokenizer.h"
@@ -40,13 +41,14 @@
 /* --- NAME HELPERS --- */
 
 static const char *dep_edge_names[] = {
-    "READ",  "WRITE",   "APPEND",   "PIPE", "ARG",       "ENV",
-    "SUBST", "SEQ",     "AND",      "OR",   "CWD",       "BACKGROUND",
-    "GROUP", "FD_OPEN", "FD_CLOSE", "TIME", "FILE_TEST",
+    "READ", "WRITE",      "APPEND",       "PIPE",      "ARG",
+    "ENV",  "SUBST",      "SEQ",          "AND",       "OR",
+    "CWD",  "BACKGROUND", "GROUP",        "FD_OPEN",   "FD_CLOSE",
+    "TIME", "FILE_TEST",  "FILE_COMPARE", "FILE_LEFT", "FILE_RIGHT",
 };
 
 static const char *dep_node_names[] = {
-    "CMD", "DOC", "GROUP", "ENDPOINT", "TIME", "FD",
+    "CMD", "DOC", "GROUP", "ENDPOINT", "TIME", "FD", "FILE_COMPARISON",
 };
 
 static const char *dep_doc_names[] = {
@@ -6426,7 +6428,9 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
     const dep_owner_routes_t *baseline,
     const dep_observation_program_t *program, uint32_t event);
 
-/* cursor is the last consumed event in this phase, or zero. */
+/* cursor is the last consumed event in this phase, or zero. The producer
+ * appends nondecreasing positions within each owner and phase. Equal-position
+ * events retain append order, including nested guard completions. */
 static SHELL_NONNULL(1, 2, 3, 4, 5, 7) bool dep_observation_pending(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline,
@@ -6840,18 +6844,16 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
       dep_read_prepare(&source->read, &source->tokens,
                        &source->prefix_assignments,
                        &context->workspace->snapshot_journal.read_observations);
-      if (graph->nodes[owner].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
-          graph->nodes[owner].cmd.conditional_predicate ==
-              SHELL_CONDITIONAL_VARIABLE_SET) {
-        const shell_dep_cmd_t *command = &graph->nodes[owner].cmd;
+      if (graph->nodes[owner].cmd.kind == SHELL_COMMAND_CONDITIONAL) {
+        shell_conditional_t condition = shell_conditional_parse(
+            context->cmd, context->cmd_len,
+            context->fast->cmds[context->node_range[owner]].start);
         source->test = shell_source_scratch_take_array(
             1, sizeof(*source->test), _Alignof(shell_test_program_t));
         if (!source->test)
           return false;
-        if (!shell_test_compile_presence(
-                command->conditional_operands[0],
-                command->conditional_operand_lengths[0],
-                command->conditional_negated, source->test))
+        if (!shell_test_compile_conditional(context->cmd, &condition,
+                                            source->test))
           return false;
       }
     }
@@ -24058,7 +24060,9 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
  * not replace this command's preceding substitution status. Other completions
  * supersede status without erasing earlier descriptor observations. A scoped
  * identity also closes completed guards without replacing completion status.
- * All synchronous children in one scanner-declared operand reuse its guard. */
+ * All synchronous children in one scanner-declared operand reuse its guard.
+ * Callers append nondecreasing positions per owner and phase, placing scoped
+ * identity transfers at the completed subtree's boundary before later words. */
 static SHELL_NONNULL(1, 2, 3) shell_dep_error_t dep_complete_substitution(
     const shell_dep_graph_t *graph, const dep_subgraph_streams_t *streams,
     const dep_parse_context_t *context, uint32_t owner, uint32_t position,
@@ -24126,6 +24130,12 @@ static SHELL_NONNULL(1, 2, 3) shell_dep_error_t dep_complete_substitution(
       .guard = guard,
       .previous_guard = previous_guard,
       .conditional = conditional};
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  if (phase == DEP_SNAPSHOT_BODY_WORD && source->observation_last[phase])
+    shellsplit_test_observation_order_record(
+        program->events[source->observation_last[phase] - 1].position,
+        program->events[event - 1].position);
+#endif
   if (source->observation_last[phase])
     program->events[source->observation_last[phase] - 1].next = event;
   else
@@ -24410,6 +24420,8 @@ static shell_dep_error_t dep_connect_word_substitutions(
       limits, depth, context, expansion_owner, snapshot_position,
       snapshot_phase, consumer_node, DEP_SUBST_SHELL_WORD);
 }
+
+#include "shell_depgraph_conditional_impl.h"
 
 /* Installed document spans belong to this command's execution stage. Advance
  * their declaration cursor alongside ordinary operands, so setup expands in
@@ -25192,6 +25204,19 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         shell_parse_fast(cmd, cmd_len, &strict_fast_limits, &fast_result);
   }
   dep_prepare_partial_groups(&fast_result);
+  /* Syntax-analysis exhaustion supplies no qualified structural prefix.
+   * A supplied truncated fast result also carries no byte-admission proof;
+   * validate that domain before returning. Ordinary parsing reuses its cached
+   * admission. Semantic inventory cannot establish support for the suffix. */
+  if (fast_err == SHELL_ETRUNC && fast_result.count == 0) {
+    shell_source_status_t bytes = shell_source_bytes_status(cmd, cmd_len);
+    if (bytes != SHELL_SOURCE_COMPLETE && bytes != SHELL_SOURCE_TRUNCATED) {
+      out->status = SHELL_DEP_STATUS_ERROR;
+      return SHELL_DEP_EPARSE;
+    }
+    out->status = SHELL_DEP_STATUS_TRUNCATED;
+    return SHELL_DEP_ETRUNC;
+  }
   shell_source_empty_kind_t empty = fast_result.count
                                         ? SHELL_SOURCE_NONEMPTY
                                         : shell_source_empty_kind(cmd, cmd_len);
@@ -25938,7 +25963,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     bool arithmetic_command = range->kind == SHELL_COMMAND_ARITHMETIC;
     bool conditional_command = range->kind == SHELL_COMMAND_CONDITIONAL;
     bool compound_command = arithmetic_command || conditional_command;
-    shell_conditional_t condition = {0};
+    shell_conditional_t condition;
     if (conditional_command)
       condition = shell_conditional_parse(cmd, cmd_len, range->start);
     size_t arithmetic_content = 0, arithmetic_end = 0, arithmetic_after = 0;
@@ -26100,6 +26125,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     node->cmd.conditional_operand_count = 0;
     node->cmd.conditional_predicate = SHELL_CONDITIONAL_PREDICATE_NONE;
     node->cmd.conditional_negated = false;
+    node->cmd.conditional_unresolved = false;
     for (unsigned operand = 0; operand < 2; ++operand) {
       node->cmd.conditional_operands[operand] = NULL;
       node->cmd.conditional_operand_lengths[operand] = 0;
@@ -26624,54 +26650,26 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
 
     if (conditional_command) {
       uint32_t body_table;
-      shell_dep_error_t body_error = dep_snapshot_phase_table(
+      shell_dep_error_t prepared = dep_snapshot_phase_table(
           out, streams, &parse_context, cmd_node_idx, UINT32_MAX,
           DEP_SNAPSHOT_BODY_WORD, &body_table);
-      if (body_error != SHELL_DEP_OK)
-        return dep_stop_graph_construction(out, body_error);
-      shell_conditional_value_t values[2] = {0};
-      for (unsigned operand_index = 0; operand_index < condition.operand_count;
-           ++operand_index) {
-        /* Finish each operand's synchronous expansions before the next value
-         * query or descriptor import. Recheck phase reachability while
-         * retaining lexical children independently of their execution effects.
-         */
-        bool body_active = dep_owner_phase_active(
-            &parse_context, cmd_node_idx, DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
-        dep_token_t operand = {
-            cmd + condition.operands[operand_index],
-            (uint32_t)condition.operand_lengths[operand_index]};
-        const shell_dep_word_value_t *value = NULL;
-        body_error =
-            condition.predicate == SHELL_CONDITIONAL_VARIABLE_SET
-                ? SHELL_DEP_OK
-                : dep_resolve_word(out, &parse_context, &operand,
-                                   out->cwd_buf.data + *range_cwd_offset,
-                                   cmd_node_idx, SHELL_EXPAND_WORD_CONDITIONAL,
-                                   body_active, UINT32_MAX, &value);
-        if (body_error != SHELL_DEP_OK)
-          return dep_stop_graph_construction(out, body_error);
-        if (value && value->resolved)
-          values[operand_index] = (shell_conditional_value_t){
-              value->first, value->first_length, true};
-        body_error = dep_connect_word_substitutions(
-            out, max_nodes, max_edges, effective_cwd_buf_size, streams,
-            &operand, out->cwd_buf.data + *range_cwd_offset, limits, depth,
-            &parse_context, cmd_node_idx, UINT32_MAX, DEP_SNAPSHOT_BODY_WORD,
-            cmd_node_idx);
-        if (body_error != SHELL_DEP_OK)
-          return dep_stop_graph_construction(out, body_error);
-        if (operand_index == 0)
-          dep_observe_conditional_file(out, &parse_context, max_nodes,
-                                       max_edges, cmd_node_idx, &operand, value,
-                                       condition.predicate);
-      }
-      bool truth;
-      if (shell_conditional_evaluate(cmd, &condition, values, &truth))
-        node->cmd.conditional_truth =
-            truth ? SHELL_CONDITIONAL_TRUE : SHELL_CONDITIONAL_FALSE;
-      if (shell_source_scratch_exhausted())
-        return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
+      if (prepared != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, prepared);
+      dep_snapshot_source_t *source =
+          &route_workspace->snapshot_sources
+               [parse_context.snapshot->prepared_source[cmd_node_idx]];
+      dep_condition_context_t evaluation = {
+          out,          max_nodes,
+          max_edges,    effective_cwd_buf_size,
+          streams,      out->cwd_buf.data + *range_cwd_offset,
+          limits,       depth,
+          cmd_node_idx, &parse_context,
+          &condition,   source->test};
+      dep_condition_result_t result;
+      shell_dep_error_t error = dep_evaluate_condition(
+          &evaluation, condition.root, active, NULL, &result);
+      if (error != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, error);
     }
 
     dep_snapshot_source_t *test_source =
@@ -26679,8 +26677,9 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                                                ->prepared_source[cmd_node_idx]];
     uint8_t test_status = DEP_STATUS_EITHER;
     if (test_source->test && active) {
-      shell_dep_error_t error = dep_test_body_status(
-          out, streams, &parse_context, cmd_node_idx, &test_status);
+      shell_dep_error_t error =
+          dep_test_body_status_at(out, streams, &parse_context, cmd_node_idx,
+                                  test_source->test->root, false, &test_status);
       if (error != SHELL_DEP_OK)
         return dep_stop_graph_construction(out, error);
       if (!conditional_command &&
@@ -26691,6 +26690,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
             cmd_node_idx, argument_values, parse_context.unresolved_paths};
         shell_test_observe_files(test_source->test, dep_observe_test_file,
                                  &context);
+        shell_test_observe_comparisons(test_source->test,
+                                       dep_observe_test_comparison, &context);
       }
       if (conditional_command)
         node->cmd.conditional_truth =
@@ -27469,6 +27470,9 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
       fprintf(fp, "\n");
     } else if (n->type == SHELL_NODE_FD) {
       fprintf(fp, "  [%u] FD inherited=%u\n", i, n->fd.number);
+    } else if (n->type == SHELL_NODE_FILE_COMPARISON) {
+      fprintf(fp, "  [%u] FILE_COMPARISON predicates=%#x empty=%#x\n", i,
+              n->file_comparison.predicates, n->file_comparison.empty_operands);
     } else if (n->type == SHELL_NODE_ENDPOINT) {
       const char *endpoint_kind =
           n->endpoint.reserved == DEP_ENDPOINT_TERMINAL_PIPE
@@ -27647,6 +27651,9 @@ typedef struct {
   bool endpoint_topology_valid[SHELL_DEP_MAX_NODES];
   uint32_t control_head[SHELL_DEP_MAX_NODES];
   uint32_t control_next[SHELL_DEP_MAX_EDGES];
+  uint16_t comparison_owner[SHELL_DEP_MAX_NODES];
+  uint16_t comparison_left[SHELL_DEP_MAX_NODES];
+  uint16_t comparison_right[SHELL_DEP_MAX_NODES];
   uint32_t control_indegree[SHELL_DEP_MAX_NODES];
 } dep_validation_index_t;
 
@@ -27702,6 +27709,12 @@ static SHELL_NONNULL(1, 2) void dep_validation_index_build(
     if (edge->from >= graph->node_count || edge->to >= graph->node_count)
       continue;
     index->edge_in_bounds[edge_index] = true;
+    if (edge->type == SHELL_EDGE_FILE_COMPARE)
+      index->comparison_owner[edge->to]++;
+    if (edge->type == SHELL_EDGE_FILE_LEFT)
+      index->comparison_left[edge->from]++;
+    if (edge->type == SHELL_EDGE_FILE_RIGHT)
+      index->comparison_right[edge->from]++;
 
     const shell_dep_node_t *from = &graph->nodes[edge->from];
     const shell_dep_node_t *to = &graph->nodes[edge->to];
@@ -27894,7 +27907,7 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
        i++) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_GRAPH_VALIDATION);
     const shell_dep_node_t *n = &g->nodes[i];
-    if (n->type > SHELL_NODE_FD) {
+    if (n->type > SHELL_NODE_FILE_COMPARISON) {
       r.valid = false;
       snprintf(r.errors[r.error_count].msg, 96, "node %u: invalid node type %u",
                i, n->type);
@@ -27917,9 +27930,11 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       if (n->cmd.kind == SHELL_COMMAND_CONDITIONAL &&
           (n->cmd.token_count || n->cmd.effective_command_known ||
            !n->cmd.conditional_expression ||
-           n->cmd.conditional_operand_count < 1 ||
+           (n->cmd.conditional_operand_count == 0 &&
+            n->cmd.conditional_predicate != SHELL_CONDITIONAL_PREDICATE_NONE) ||
            n->cmd.conditional_operand_count > 2 ||
-           !n->cmd.conditional_operands[0] ||
+           (n->cmd.conditional_operand_count &&
+            !n->cmd.conditional_operands[0]) ||
            (n->cmd.conditional_operand_count == 2 &&
             !n->cmd.conditional_operands[1]) ||
            n->cmd.conditional_operand_count !=
@@ -28144,6 +28159,16 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
           r.error_count++;
         }
       }
+    } else if (n->type == SHELL_NODE_FILE_COMPARISON) {
+      if (!n->file_comparison.predicates ||
+          (n->file_comparison.predicates & ~DEP_FILE_COMPARE_KINDS) ||
+          (n->file_comparison.empty_operands & ~3u) ||
+          index.comparison_owner[i] != 1 || index.comparison_left[i] != 1 ||
+          index.comparison_right[i] != 1) {
+        r.valid = false;
+        snprintf(r.errors[r.error_count++].msg, 96,
+                 "FILE_COMPARISON node %u: invalid kind, operands or owner", i);
+      }
     } else if (n->type == SHELL_NODE_FD) {
       if (n->fd.number > SHELL_DEP_FD_MAX || index.fd_duplicate[i] ||
           !index.fd_used[i]) {
@@ -28331,7 +28356,7 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       continue;
     }
 
-    if (e->type > SHELL_EDGE_FILE_TEST || e->dir > SHELL_DIR_UNDIR) {
+    if (e->type > SHELL_EDGE_FILE_RIGHT || e->dir > SHELL_DIR_UNDIR) {
       r.valid = false;
       r.errors[r.error_count].edge_idx = i;
       snprintf(r.errors[r.error_count].msg, 96,
@@ -28514,6 +28539,18 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
     case SHELL_EDGE_FILE_TEST:
       ok = ft == SHELL_NODE_CMD && tt == SHELL_NODE_DOC &&
            g->nodes[e->to].doc.kind == SHELL_DOC_FILE &&
+           e->source_fd == SHELL_DEP_FD_NONE &&
+           e->target_fd == SHELL_DEP_FD_NONE;
+      break;
+    case SHELL_EDGE_FILE_COMPARE:
+      ok = ft == SHELL_NODE_CMD && tt == SHELL_NODE_FILE_COMPARISON &&
+           e->flags == 0 && e->source_fd == SHELL_DEP_FD_NONE &&
+           e->target_fd == SHELL_DEP_FD_NONE;
+      break;
+    case SHELL_EDGE_FILE_LEFT:
+    case SHELL_EDGE_FILE_RIGHT:
+      ok = ft == SHELL_NODE_FILE_COMPARISON && tt == SHELL_NODE_DOC &&
+           g->nodes[e->to].doc.kind == SHELL_DOC_FILE && e->flags == 0 &&
            e->source_fd == SHELL_DEP_FD_NONE &&
            e->target_fd == SHELL_DEP_FD_NONE;
       break;

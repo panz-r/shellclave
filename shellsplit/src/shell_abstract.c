@@ -864,8 +864,7 @@ static SHELL_NONNULL(1, 2) void abstract_word_features(
   if (!redirect_operand && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
     shell_conditional_t condition =
         shell_conditional_parse(token->start, token->length, 0);
-    command->has_globs |= (shell_conditional_features(condition.predicate) &
-                           SHELL_FEAT_GLOBS) != 0;
+    command->has_globs |= (condition.features & SHELL_FEAT_GLOBS) != 0;
     regions = shell_conditional_regions(token->start, &condition);
   } else if (!redirect_operand) {
     regions = shell_token_regions(token, true);

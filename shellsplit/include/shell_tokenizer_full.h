@@ -229,6 +229,8 @@ typedef enum {
  * separate records. A separately written redirect-only command still has
  * tokens and its own record, even though it has no argv words.
  * On failure, writable outputs are NULL and 0.
+ * Bounded syntax-analysis exhaustion returns SHELL_TOKENIZE_EOVERFLOW,
+ * including limits reached inside executable substitutions or heredocs.
  */
 shell_tokenize_status_t
 shell_tokenize_commands(const char *input, size_t input_length,

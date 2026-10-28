@@ -55,7 +55,9 @@ typedef enum {
 /* Normalized conditional predicate. Bare words use STRING_NONEMPTY; = and ==
  * share STRING_EQUAL for literal RHSs. Active static stars use PATTERN_MATCH
  * or PATTERN_NOT_MATCH. VARIABLE_SET queries a statically named scalar; an
- * empty assigned value is set. Lexical ! parity is represented separately. */
+ * empty assigned value is set. Lexical ! parity is represented separately.
+ * Compound-expression summaries use PREDICATE_NONE and retain the complete
+ * expression span in the owning source, processor or graph command record. */
 typedef enum {
   SHELL_CONDITIONAL_PREDICATE_NONE = 0,
   SHELL_CONDITIONAL_STRING_NONEMPTY,
@@ -91,6 +93,9 @@ typedef enum {
   SHELL_CONDITIONAL_FILE_OWNED_BY_USER,
   SHELL_CONDITIONAL_FILE_OWNED_BY_GROUP,
   SHELL_CONDITIONAL_FILE_MODIFIED_SINCE_READ,
+  SHELL_CONDITIONAL_FILE_NEWER,
+  SHELL_CONDITIONAL_FILE_OLDER,
+  SHELL_CONDITIONAL_FILE_SAME,
 } shell_conditional_predicate_t;
 
 /**
@@ -201,19 +206,19 @@ typedef struct {
 
 /* Sufficient capacity for operation-local source-analysis scratch: delimiter
  * normalization (including literal command-fragment printing), non-evicting
- * subscript boundary facts, conditional-pattern evaluation, and compiled
- * builtin-test arguments, expression nodes and bounded ambiguous-grammar
- * projection. Pattern evaluation reserves projected units, a prefix table
- * and decoded subject bytes as needed.
- * Builtin-test programs remain live through graph construction and recursive
- * analysis. Public iterators retain subscript facts in the buffer
- * between next() calls.
- * No source is read and no storage is allocated.
- * Required output is cleared on arithmetic overflow (false). The buffer may
- * have any alignment and must not alias source or result storage. Existing
- * syntax/depth/output limits still apply independently of this byte bound.
- * Smaller buffers remain valid; reservations check capacity and arithmetic
- * independently and report exhaustion through the consuming API. */
+ * subscript boundary facts, compiled conditional programs, pattern evaluation,
+ * and compiled builtin-test arguments, expression nodes and bounded
+ * ambiguous-grammar projection. Pattern evaluation reserves projected units, a
+ * prefix table and decoded subject bytes as needed. Conditional and
+ * builtin-test programs remain live through graph construction and recursive
+ * analysis. Even simple literal conditional expressions can require this
+ * scratch. Public iterators retain subscript facts in the buffer between next()
+ * calls. No source is read and no storage is allocated. Required output is
+ * cleared on arithmetic overflow (false). The buffer may have any alignment and
+ * must not alias source or result storage. Existing syntax/depth/output limits
+ * still apply independently of this byte bound. Smaller buffers remain valid;
+ * reservations check capacity and arithmetic independently and report
+ * exhaustion through the consuming API. */
 bool shell_source_workspace_size(size_t source_length, size_t *workspace_size)
     SHELL_NONNULL(2);
 
@@ -360,9 +365,10 @@ typedef struct {
  * backslash-LF continuations, comments ending at LF) succeed with no range.
  * CR, VT and FF are ordinary word bytes, including CR before LF; no line-ending
  * normalization is performed. Only backslash-LF is a continuation.
- * Zero-length input remains SHELL_EINPUT. On truncation, completed ranges
- * remain available and result->status includes
- * SHELL_STATUS_TRUNCATED.
+ * Zero-length input remains SHELL_EINPUT. Truncation returns SHELL_ETRUNC and
+ * sets SHELL_STATUS_TRUNCATED. Range/output exhaustion can retain completed
+ * ranges. Syntax-analysis exhaustion, including conditional expression limits,
+ * leaves ranges and groups empty because no structural prefix is qualified.
  * In strict_mode, complete-source syntax validation precedes range/group
  * capacity checks: a malformed suffix is SHELL_EPARSE, not SHELL_ETRUNC.
  * Non-strict parsing retains diagnostic tolerance for unfinished source; its

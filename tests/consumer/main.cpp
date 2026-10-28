@@ -237,6 +237,26 @@ static bool check_depgraph_workspace_api() {
         ++file_checks;
       }
       ok = ok && file_checks == 1;
+      const char compound[] = "[[ first -nt second && -r first ]]";
+      ok = ok &&
+           shell_parse_draft(compound, sizeof(compound) - 1, nullptr, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           draft->headers[0].conditional_predicate ==
+               SHELL_CONDITIONAL_PREDICATE_NONE &&
+           draft->headers[0].conditional_operand_count == 0 &&
+           shell_dep_graph_parse_with_fast(compound, sizeof(compound) - 1, ".",
+                                           &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_UNKNOWN &&
+           shell_dep_graph_validate(&graph).valid;
+      unsigned comparisons = 0;
+      for (unsigned i = 0; ok && i < graph.node_count; ++i)
+        if (graph.nodes[i].type == SHELL_NODE_FILE_COMPARISON) {
+          ++comparisons;
+          ok = graph.nodes[i].file_comparison.predicates ==
+               SHELL_FILE_COMPARE_NEWER;
+        }
+      ok = ok && comparisons == 1;
       char many_words[SHELL_DEP_MAX_TOKENS * 2 + 4] = "cmd";
       std::size_t many_length = 3;
       for (unsigned i = 1; i < SHELL_DEP_MAX_TOKENS; ++i) {

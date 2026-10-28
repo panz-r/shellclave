@@ -3,7 +3,43 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
-## Unreleased: extended filesystem predicates
+## Unreleased: filesystem comparisons and compound conditions
+
+Binary pathname comparisons (`-nt`, `-ot`, `-ef`) now have retained
+FILE_COMPARISON nodes, with FILE_COMPARE ownership and ordered FILE_LEFT and
+FILE_RIGHT operand edges. Graph consumers must recognize these appended node
+and edge kinds. Comparison kind bits and known-empty operand bits belong to
+`shell_dep_file_comparison_t`; the existing unary FILE_TEST flags are unchanged.
+
+Resolved-empty dynamic comparison operands retain DYNAMIC_NAME and have no
+file identity. Inspect the owning comparison's `empty_operands` bits to
+distinguish known emptiness from an unresolved pathname; the dynamic flag alone
+does not establish unresolved-path output.
+
+`[[ … ]]` supports Boolean composition and grouping. Compound expressions retain
+their expression span and aggregate truth, with predicate NONE and operand
+count zero in the single-primary summary. Single-primary metadata remains
+available through grouping and negation. `conditional_unresolved` reports
+reached unresolved expanded operands in both forms. Rebuild consumers and query
+workspace sizes again after updating. Reserve the source-sized workspace tail
+for conditional programs, including simple literal conditions that previously
+needed no predicate scratch.
+
+Conditional expression limits and other explicit syntax-analysis capacity stops
+now propagate as resource outcomes through nested substitutions and heredocs.
+Fast parsing returns `SHELL_ETRUNC` with no ranges/groups, and graph construction
+returns `SHELL_DEP_ETRUNC` with an empty truncated graph. Shellgate returns
+`SG_ERR_TRUNC`, sets `truncated` and `subcommand_truncated`, and reports
+UNDETERMINED without subcommand results. The allocating tokenizer reports
+EOVERFLOW; command processing uses EOUTPUT_LIMIT, and abstraction/transformation
+use EOVERFLOW. These outcomes replace parse-error classifications for those
+capacity stops.
+
+Grouped drafts with a partial `]]` before a required `)` are INVALID, since
+appending cannot repair their delimiter order. Top-level partial closers and
+groups still awaiting a closer at an appendable EOF remain INCOMPLETE.
+This includes unfinished Boolean connectors and escaped line continuations
+after a completed subgroup.
 
 `[[ ... ]]`, `test` and `[` now model the complete unary pathname predicate
 family, adding access (`-r`, `-w`, `-x`), mode bits (`-u`, `-g`, `-k`), effective
@@ -155,7 +191,8 @@ storage uses the existing source workspace guarantee. Each array reservation
 checks multiplication, alignment padding and available capacity, including
 when a caller supplies a smaller workspace. Overflow and exhaustion propagate
 as the existing graph EWORKSPACE result without returning a partial graph.
-Include the source-sized tail even for pattern comparisons without heredocs.
+Include the source-sized tail for conditional programs without heredocs,
+including simple literal conditions.
 Rejections for `SHELL_FEAT_GLOBS` now report `glob pattern not allowed`;
 EWORKSPACE uses the diagnostic `Dependency workspace unavailable`.
 

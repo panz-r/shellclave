@@ -34,6 +34,12 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
   case SHELL_EDGE_FILE_TEST:
     return from == SHELL_NODE_CMD && to == SHELL_NODE_DOC &&
            graph->nodes[edge->to].doc.kind == SHELL_DOC_FILE;
+  case SHELL_EDGE_FILE_COMPARE:
+    return from == SHELL_NODE_CMD && to == SHELL_NODE_FILE_COMPARISON;
+  case SHELL_EDGE_FILE_LEFT:
+  case SHELL_EDGE_FILE_RIGHT:
+    return from == SHELL_NODE_FILE_COMPARISON && to == SHELL_NODE_DOC &&
+           graph->nodes[edge->to].doc.kind == SHELL_DOC_FILE;
   case SHELL_EDGE_WRITE:
   case SHELL_EDGE_APPEND:
     return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
@@ -179,7 +185,7 @@ static bool shellsplit_test_depgraph_invariants(
   for (uint32_t i = 0; i < graph->edge_count; i++) {
     const shell_dep_edge_t *edge = &graph->edges[i];
     if (edge->from >= graph->node_count || edge->to >= graph->node_count ||
-        edge->type > SHELL_EDGE_FILE_TEST || edge->dir > SHELL_DIR_UNDIR ||
+        edge->type > SHELL_EDGE_FILE_RIGHT || edge->dir > SHELL_DIR_UNDIR ||
         (edge->type == SHELL_EDGE_FILE_TEST
              ? (edge->flags == 0 ||
                 (edge->flags &
@@ -416,6 +422,11 @@ static bool shellsplit_test_depgraph_invariants(
           target_count != 1 || !target_valid ||
           target_mode != node->time.mode || target_timer_count != 1 ||
           target_time_id != i + 1)
+        return false;
+    } else if (node->type == SHELL_NODE_FILE_COMPARISON) {
+      if (!node->file_comparison.predicates ||
+          (node->file_comparison.predicates & ~7u) ||
+          (node->file_comparison.empty_operands & ~3u))
         return false;
     } else if (node->type == SHELL_NODE_FD) {
       if (node->fd.number > SHELL_DEP_FD_MAX)

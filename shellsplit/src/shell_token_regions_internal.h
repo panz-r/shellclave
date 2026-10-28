@@ -23,20 +23,34 @@ typedef struct {
  * source is the unchanged base used to obtain condition; its spans are valid
  * for that source, including an incomplete condition. */
 typedef struct {
-  shell_token_region_t regions[2];
+  /* A partial parse can retain a forest of primaries before their Boolean
+   * parents are emitted. Allow two operands per retained node, plus two for
+   * the pending primary, including when parsing stops at a resource limit. */
+  shell_token_region_t regions[2 * (SHELL_CONDITIONAL_MAX_NODES + 1)];
   unsigned count;
 } shell_token_regions_t;
 
 static inline SHELL_NONNULL(1, 2) shell_token_regions_t
     shell_conditional_regions(const char *source,
                               const shell_conditional_t *condition) {
-  return (shell_token_regions_t){.regions = {{source + condition->operands[0],
-                                              condition->operand_lengths[0],
-                                              SHELL_TOKEN_REGION_CONDITIONAL},
-                                             {source + condition->operands[1],
-                                              condition->operand_lengths[1],
-                                              SHELL_TOKEN_REGION_CONDITIONAL}},
-                                 .count = condition->operand_count};
+  shell_token_regions_t result;
+  result.count = 0;
+  for (unsigned i = 0; i < condition->count; ++i) {
+    const shell_condition_node_t *node = &condition->nodes[i];
+    if (node->operation != SHELL_CONDITION_PRIMARY)
+      continue;
+    for (unsigned j = 0; j < node->primary.operand_count; ++j)
+      result.regions[result.count++] = (shell_token_region_t){
+          source + node->primary.operands[j], node->primary.operand_lengths[j],
+          SHELL_TOKEN_REGION_CONDITIONAL};
+  }
+  if (condition->frame != SHELL_CONDITIONAL_COMPLETE)
+    for (unsigned j = 0; j < condition->pending.operand_count; ++j)
+      result.regions[result.count++] =
+          (shell_token_region_t){source + condition->pending.operands[j],
+                                 condition->pending.operand_lengths[j],
+                                 SHELL_TOKEN_REGION_CONDITIONAL};
+  return result;
 }
 
 /* A lexer-produced token borrows live immutable source. complete describes
@@ -54,9 +68,10 @@ static inline SHELL_NONNULL(1) shell_token_regions_t
         shell_conditional_parse(token->start, token->length, 0);
     return shell_conditional_regions(token->start, &condition);
   }
-  shell_token_regions_t result = {
-      .regions = {{token->start, token->length, SHELL_TOKEN_REGION_WORD}},
-      .count = 1};
+  shell_token_regions_t result;
+  result.regions[0] = (shell_token_region_t){token->start, token->length,
+                                             SHELL_TOKEN_REGION_WORD};
+  result.count = 1;
   if (token->type == SHELL_TOKEN_ARITHMETIC ||
       token->type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
     shell_tokenizer_arithmetic_content(token, complete, &result.regions[0].text,

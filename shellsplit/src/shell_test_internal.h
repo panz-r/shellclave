@@ -1,6 +1,7 @@
 #ifndef SHELL_TEST_INTERNAL_H
 #define SHELL_TEST_INTERNAL_H
 
+#include "shell_conditional_internal.h"
 #include "shell_depgraph.h"
 #include "shell_test_grammar_internal.h"
 #include <stdint.h>
@@ -47,6 +48,7 @@ typedef struct shell_test_program {
   shell_test_value_t *words;
   shell_test_node_t *nodes;
   shell_test_roles_t *operand_roles;
+  uint8_t *file_comparisons; /* Possible kinds at each binary operator word. */
   uint16_t count, root, word_count;
   bool active, proven_error, uncertain, bracket;
 } shell_test_program_t;
@@ -58,6 +60,9 @@ typedef void (*shell_test_presence_observer_t)(const char *name, size_t length,
                                                void *context);
 typedef void (*shell_test_file_observer_t)(const shell_test_value_t *word,
                                            unsigned tests, void *context);
+typedef void (*shell_test_comparison_observer_t)(
+    const shell_test_value_t *left, const shell_test_value_t *right,
+    unsigned predicates, void *context);
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -76,9 +81,18 @@ bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
 bool shell_test_refresh(shell_test_program_t *program) SHELL_NONNULL(1);
 /* Admission has proved that every grammar path ends in an argument error. */
 void shell_test_prove_error(shell_test_program_t *program) SHELL_NONNULL(1);
-bool shell_test_compile_presence(const char *word, size_t length, bool negated,
-                                 shell_test_program_t *program)
-    SHELL_NONNULL(1, 4);
+/* condition is a complete supported parse of this unchanged source. The
+ * program borrows decoded values from operation scratch; output storage is
+ * distinct. Tree node ordinals remain stable in the compiled program. */
+bool shell_test_compile_conditional(const char *source,
+                                    const shell_conditional_t *condition,
+                                    shell_test_program_t *program)
+    SHELL_NONNULL(1, 2, 3);
+/* index identifies a primary in a compiled conditional program. Presence
+ * leaves retain their state lookup; other primaries install captured truth. */
+void shell_test_set_condition_result(shell_test_program_t *program,
+                                     unsigned index, bool known, bool truth)
+    SHELL_NONNULL(1);
 unsigned shell_test_evaluate(const shell_test_program_t *program,
                              shell_test_lookup_t lookup, void *context)
     SHELL_NONNULL(1, 2, 3);
@@ -94,6 +108,9 @@ void shell_test_observe_presence(const shell_test_program_t *program,
 void shell_test_observe_files(const shell_test_program_t *program,
                               shell_test_file_observer_t observer,
                               void *context) SHELL_NONNULL(1, 2, 3);
+void shell_test_observe_comparisons(const shell_test_program_t *program,
+                                    shell_test_comparison_observer_t observer,
+                                    void *context) SHELL_NONNULL(1, 2, 3);
 /* Refine only facts implied by the desired Boolean result. Error alternatives
  * prevent false-result refinement. Callbacks own path-local fact storage. */
 bool shell_test_require(const shell_test_program_t *program, unsigned desired,

@@ -16,12 +16,14 @@ static _Thread_local unsigned default_generation;
 static _Thread_local bool default_index_borrowed;
 
 /* Shared source arena bound. Printer pieces, live nested delimiter values,
- * decoded subjects, conditional patterns and compiled builtin-test programs
- * use the front. Persistent subscript facts and iterator continuation records
- * use the tail. The value allowance covers pattern units, a literal run's
- * size_t prefix table, a decoded subject, prepared test arguments/nodes and
- * one bounded ambiguous-grammar chart with alignment. Test programs borrow
- * this arena through recursive analysis; chart storage is released on return.
+ * decoded subjects, conditional patterns, compiled conditional programs and
+ * compiled builtin-test programs use the front. Persistent subscript facts and
+ * iterator continuation records use the tail. The value allowance covers
+ * pattern units, a literal run's size_t prefix table, a decoded subject,
+ * conditional program nodes, prepared test arguments/nodes and one bounded
+ * ambiguous-grammar chart with alignment.
+ * These programs borrow this arena through recursive analysis; chart storage
+ * is released on return.
  * This bounds storage independently of syntax/depth/output capacities and
  * does not inspect source bytes. */
 bool shell_source_workspace_size(size_t length, size_t *size) {

@@ -756,7 +756,9 @@ sg_error_t sg_gate_set_violation_config_borrowed(
  * SG_ERR_MEMORY if the evaluation buffer cannot also hold the bounded
  * depgraph workspace or resolved-path analysis storage, SG_ERR_TRUNC if the
  * output buffer or bounded subcommand result array was too small (partial
- * results are still valid), or
+ * results are still valid), or syntax analysis exhausted its capacity. Syntax
+ * exhaustion supplies no subcommand results and sets `subcommand_truncated`
+ * with an UNDETERMINED verdict. Returns
  * SG_ERR_INVALID for invalid source or buffer sizes.
  * The error code reports the primary failure: `truncated` independently
  * reports incomplete result or diagnostic rendering, so it can also be true

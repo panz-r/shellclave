@@ -87,9 +87,9 @@ shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
  * narrower than complete shell grammar validation: it rejects impossible
  * operator chains while retaining the tokenizer's diagnostic tolerance for an
  * unfinished parenthesized group. These Boolean predicates also return false
- * on source-scratch exhaustion. Internal callers needing a classification
- * rather than bounded rejection establish an operation with sufficient
- * scratch and inspect shell_source_scratch_exhausted() before ending it. */
+ * on syntax or source-scratch exhaustion. Callers needing the resource outcome
+ * use shell_tokenizer_syntax_status(); an enclosing source operation can still
+ * distinguish scratch exhaustion through shell_source_scratch_exhausted(). */
 bool shell_tokenizer_list_syntax_valid(const char *input, size_t input_length);
 
 /* Whole-source byte-domain and strict syntax boundary for a complete one-shot
@@ -98,6 +98,15 @@ bool shell_tokenizer_list_syntax_valid(const char *input, size_t input_length);
  * expansions, groups, arithmetic, and here-documents. */
 bool shell_tokenizer_complete_syntax_valid(const char *input,
                                            size_t input_length);
+
+/* Same validation boundary and diagnostic/strict acceptance as above. Return
+ * SHELL_ETRUNC when bounded syntax analysis cannot finish; no prefix is
+ * qualified. SHELL_EPARSE remains coarse rejection, not a Bash-invalid proof.
+ * NULL input is accepted for rejection. No second diagnostic parse is needed.
+ */
+shell_error_t shell_tokenizer_syntax_status(const char *input,
+                                            size_t input_length,
+                                            bool require_complete);
 
 /* Identify a leading pipeline-modifier span that belongs to a directly timed
  * or negated compound command. The returned half-open span excludes the `{`

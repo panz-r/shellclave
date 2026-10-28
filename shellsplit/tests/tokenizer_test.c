@@ -8172,9 +8172,9 @@ static void test_continued_bash_compound_syntax_contract(void) {
       "(\\\n( count += 1 ))",
       "(\\\n( count += 1 ))",
       "(\\\n( count += 1 ))",
-      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
-      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
-      "[[\\\n file " SHELLSPLIT_TEST_UNMODELED_FILE_WORD " other ]]",
+      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_BINARY_WORD " other ]]",
+      "[\\\n[ file " SHELLSPLIT_TEST_UNMODELED_BINARY_WORD " other ]]",
+      "[[\\\n file " SHELLSPLIT_TEST_UNMODELED_BINARY_WORD " other ]]",
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -8564,12 +8564,16 @@ static void test_brace_group_maximum_contract(void) {
   process_error = shell_process_commands(input, length, NULL, &processed);
   dep_error = shell_dep_graph_parse(input, length, ".", NULL, &graph);
   bool rejected =
-      fast_error == SHELL_EPARSE && tokenize_error == SHELL_TOKENIZE_EPARSE &&
-      commands == NULL && command_count == 0 &&
-      process_error == SHELL_PROCESS_EPARSE && processed.commands == NULL &&
-      processed.command_count == 0 && processed.groups == NULL &&
-      processed.group_count == 0 && processed.group_io_ops == NULL &&
-      processed.group_io_op_count == 0 && dep_error == SHELL_DEP_EPARSE;
+      fast_error == SHELL_ETRUNC && fast.status == SHELL_STATUS_TRUNCATED &&
+      !fast.count && !fast.group_count &&
+      tokenize_error == SHELL_TOKENIZE_EOVERFLOW && commands == NULL &&
+      command_count == 0 && process_error == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      processed.commands == NULL && processed.command_count == 0 &&
+      processed.groups == NULL && processed.group_count == 0 &&
+      processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
+      dep_error == SHELL_DEP_ETRUNC &&
+      graph.status == SHELL_DEP_STATUS_TRUNCATED && !graph.node_count &&
+      !graph.edge_count;
   valid = valid && rejected;
   test("Brace-group maximum depth is consistent across high-level APIs", valid);
 }

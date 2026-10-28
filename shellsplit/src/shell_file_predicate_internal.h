@@ -32,4 +32,19 @@
 enum { SHELL_FILE_PREDICATE_COUNT = 0 SHELL_FILE_PREDICATES(SHELL_FILE_COUNT) };
 #undef SHELL_FILE_COUNT
 
+/* Binary pathname comparisons have ordered operands and their own graph
+ * representation. Ordinals map to comparison-node kind bits, independently
+ * of unary FILE_TEST flags and unary grammar roles. */
+#define SHELL_FILE_COMPARISONS(X)                                              \
+  X(NEWER, newer, 0, "-nt")                                                    \
+  X(OLDER, older, 1, "-ot")                                                    \
+  X(SAME, same, 2, "-ef")
+
+#define SHELL_FILE_COMPARISON_COUNT_ROW(kind, name, ordinal, spelling) +1
+enum {
+  SHELL_FILE_COMPARISON_COUNT =
+      0 SHELL_FILE_COMPARISONS(SHELL_FILE_COMPARISON_COUNT_ROW)
+};
+#undef SHELL_FILE_COMPARISON_COUNT_ROW
+
 #endif

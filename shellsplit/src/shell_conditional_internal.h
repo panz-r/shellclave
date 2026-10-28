@@ -13,15 +13,18 @@ typedef enum {
   SHELL_CONDITIONAL_INCOMPLETE,
   SHELL_CONDITIONAL_INVALID,
   SHELL_CONDITIONAL_UNSUPPORTED,
+  SHELL_CONDITIONAL_LIMIT,
 } shell_conditional_frame_t;
 
 /* Private recognition boundary for a possible command-position [[. Source is
  * immutable and readable through length; start <= length. Offsets borrow that
  * source. Wider predicates are unsupported without a Bash-validity claim.
  * after advances over every recognized construct, including received EOF.
- * Expected grammar-token prefixes at EOF remain INCOMPLETE; the source layer
- * owns whether this received boundary is still appendable or already closed.
- * Operands exclude those partial grammar tokens. */
+ * Grammar-token prefixes at EOF remain INCOMPLETE only when appending can
+ * complete them in their enclosing grammar. A received `]` after a completed
+ * primary cannot precede a missing group `)`. The source layer owns whether
+ * this received boundary is still appendable or already closed. Operands
+ * exclude those partial grammar tokens. */
 typedef struct {
   shell_conditional_frame_t frame;
   size_t content, end, after;
@@ -29,6 +32,33 @@ typedef struct {
   uint8_t operand_count;
   shell_conditional_predicate_t predicate;
   bool negated;
+} shell_conditional_primary_t;
+
+#define SHELL_CONDITIONAL_MAX_NODES 96
+typedef enum {
+  SHELL_CONDITION_PRIMARY,
+  SHELL_CONDITION_NOT,
+  SHELL_CONDITION_AND,
+  SHELL_CONDITION_OR,
+} shell_condition_operation_t;
+typedef struct {
+  shell_condition_operation_t operation;
+  uint16_t left, right;
+  shell_conditional_primary_t primary;
+} shell_condition_node_t;
+typedef struct {
+  shell_conditional_frame_t frame;
+  size_t content, end, after;
+  size_t operands[2], operand_lengths[2];
+  uint8_t operand_count;
+  shell_conditional_predicate_t predicate;
+  bool negated;
+  uint16_t count, root;
+  uint32_t features;
+  /* A received unfinished primary is separate from the public single-primary
+   * summary, so compound drafts can expose NONE without losing child spans. */
+  shell_conditional_primary_t pending;
+  shell_condition_node_t nodes[SHELL_CONDITIONAL_MAX_NODES];
 } shell_conditional_t;
 
 static inline bool
@@ -54,6 +84,9 @@ shell_conditional_arity(shell_conditional_predicate_t predicate) {
   case SHELL_CONDITIONAL_STRING_NOT_EQUAL:
   case SHELL_CONDITIONAL_PATTERN_MATCH:
   case SHELL_CONDITIONAL_PATTERN_NOT_MATCH:
+  case SHELL_CONDITIONAL_FILE_NEWER:
+  case SHELL_CONDITIONAL_FILE_OLDER:
+  case SHELL_CONDITIONAL_FILE_SAME:
     return 2;
   default:
     return 0;
@@ -84,7 +117,9 @@ shell_conditional_t shell_conditional_parse(const char *source, size_t length,
  * Static values use the shared effective fragment decoder. Dynamic values
  * include leading and assignment-shaped tilde expansion and remain unknown;
  * quoted expansions remain dynamic. The source scanner's unquoted-only view
- * is used solely for RHS admission. Neither operation executes expansion. */
+ * is used solely for RHS admission. Neither operation executes expansion.
+ * static_empty returns whether emptiness is known; its output is meaningful
+ * only on success. A false return establishes neither empty nor nonempty. */
 bool shell_conditional_static_empty(const char *word, size_t length,
                                     bool *empty) SHELL_NONNULL(1, 3);
 bool shell_conditional_word_dynamic(const char *word, size_t length)
@@ -105,7 +140,7 @@ typedef struct {
  * KMP prefix table with linear matching work. Never executes expansion or
  * allocates a heap. */
 bool shell_conditional_evaluate(const char *source,
-                                const shell_conditional_t *condition,
+                                const shell_conditional_primary_t *condition,
                                 const shell_conditional_value_t values[2],
                                 bool *truth) SHELL_NONNULL(1, 2, 3, 4);
 

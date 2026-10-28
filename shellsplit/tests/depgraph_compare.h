@@ -76,6 +76,7 @@ static inline SHELL_NONNULL(1, 2) const
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_predicate);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_negated);
     SHELLSPLIT_COMPARE_FIELD(cmd.conditional_truth);
+    SHELLSPLIT_COMPARE_FIELD(cmd.conditional_unresolved);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression_length);
     SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_truth);
@@ -133,6 +134,10 @@ static inline SHELL_NONNULL(1, 2) const
     break;
   case SHELL_NODE_FD:
     SHELLSPLIT_COMPARE_FIELD(fd.number);
+    break;
+  case SHELL_NODE_FILE_COMPARISON:
+    SHELLSPLIT_COMPARE_FIELD(file_comparison.predicates);
+    SHELLSPLIT_COMPARE_FIELD(file_comparison.empty_operands);
     break;
   }
   return NULL;

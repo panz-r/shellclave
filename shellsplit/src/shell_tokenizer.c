@@ -531,7 +531,7 @@ static SHELL_NONNULL(1,
         have_array_context && fast_lexical_token_at(&array_context, i) &&
         array_context.token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       shell_conditional_t condition = shell_conditional_parse(p, len, i);
-      *features |= shell_conditional_features(condition.predicate);
+      *features |= condition.features;
       shell_token_regions_t regions = shell_conditional_regions(p, &condition);
       for (unsigned operand = 0; operand < regions.count; ++operand) {
         const shell_token_region_t *region = &regions.regions[operand];
@@ -1282,12 +1282,14 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
    * and before bounded range/group collection can stop. A malformed suffix
    * must never become a valid truncated prefix. Nested consumers reuse the
    * established byte-domain guarantee within this source operation. */
-  if (!prevalidated &&
-      !(limits->strict_mode
-            ? shell_tokenizer_complete_syntax_valid(cmd, cmd_len)
-            : shell_tokenizer_list_syntax_valid(cmd, cmd_len))) {
-    result->status = SHELL_STATUS_ERROR;
-    return SHELL_EPARSE;
+  if (!prevalidated) {
+    shell_error_t syntax =
+        shell_tokenizer_syntax_status(cmd, cmd_len, limits->strict_mode);
+    if (syntax != SHELL_OK) {
+      result->status =
+          syntax == SHELL_ETRUNC ? SHELL_STATUS_TRUNCATED : SHELL_STATUS_ERROR;
+      return syntax;
+    }
   }
 
   /* The fast parser preserves lexical ranges for control compounds so the

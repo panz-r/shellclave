@@ -475,16 +475,11 @@ static SHELL_NONNULL(1) shell_process_status_t
   /* Preserve the processor API's input/grammar distinction at its validation
    * boundary. The fast parser deliberately reports every unsupported source
    * byte as a parse failure. */
-  if (!shell_source_bytes_valid(command_line, command_length))
-    return SHELL_PROCESS_EINPUT;
-
-  /* Unsupported control compounds are a semantic rejection, not a capacity
-   * result.  Detect them before the bounded fast parser can stop at an earlier
-   * command limit and otherwise hide a later `while`, `select`, or similar
-   * construct from canonical callers. */
-  if (command_length <= UINT32_MAX &&
-      shell_tokenizer_has_unsupported_semantics(command_line, command_length))
-    return SHELL_PROCESS_EPARSE;
+  shell_source_status_t bytes =
+      shell_source_bytes_status(command_line, command_length);
+  if (bytes != SHELL_SOURCE_COMPLETE)
+    return bytes == SHELL_SOURCE_TRUNCATED ? SHELL_PROCESS_EOUTPUT_LIMIT
+                                           : SHELL_PROCESS_EINPUT;
 
   shell_parse_result_t local = {0};
   shell_parse_result_t *target = parsed ? parsed : &local;
@@ -494,10 +489,18 @@ static SHELL_NONNULL(1) shell_process_status_t
   };
   shell_error_t error =
       shell_parse_fast(command_line, command_length, &strict_limits, target);
-  if (error == SHELL_OK)
-    return SHELL_PROCESS_OK;
   if (error == SHELL_EINPUT)
     return SHELL_PROCESS_EINPUT;
+  if (error == SHELL_EPARSE)
+    return SHELL_PROCESS_EPARSE;
+  if (error == SHELL_ETRUNC && target->count == 0)
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  /* Syntax analysis completed before any range-capacity stop. Inspect the
+   * entire source so a retained prefix cannot hide unsupported semantics. */
+  if (shell_tokenizer_has_unsupported_semantics(command_line, command_length))
+    return SHELL_PROCESS_EPARSE;
+  if (error == SHELL_OK)
+    return SHELL_PROCESS_OK;
   return error == SHELL_ETRUNC ? SHELL_PROCESS_EOUTPUT_LIMIT
                                : SHELL_PROCESS_EPARSE;
 }

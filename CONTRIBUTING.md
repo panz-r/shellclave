@@ -232,14 +232,55 @@ allocation alignment and scratch calculations use that type. The definition
 list and graph implementation fragments add no runtime registry or traversal.
 To extend this predicate family, append the public kind and flag, add its private
 definition row, and update independent tests and the shell-model reference.
+The separate binary-comparison catalog supplies operator spellings and
+ordinals for conditional parsing, builtin recognition and comparison-node kind
+bits. Binary comparisons do not consume unary predicate roles or edge flags.
+Comparison adapters supply their grammar's dynamic and known-empty operand
+facts together with existing captured values. The shared graph attachment
+checks pathname representation and stores these facts; it must not reclassify
+conditional operands as ordinary arguments or apply conditional expansion rules
+to builtin arguments.
 
 Shared C/C++ rejection fixtures in `shellsplit/tests/syntax_boundary_cases.h`
-own the unsupported binary pathname-comparison sentinel, both operand spans
+own the unsupported integer-comparison sentinel, both operand spans
 and the continued operator spelling. Keep these fixtures valid Bash as unary
 predicate coverage grows.
 Each harness retains its own API assertions and contextual wrappers. Python
 Bash qualification cases and explicit predicate expectations stay independent
 of the implementation list.
+
+Conditional framing and precedence live in `shell_conditional.c`; its bounded
+postorder tree retains lexical primaries and normalized negation. Comparison
+operator admission first recognizes received token prefixes, then uses the
+shared whole-word matcher before assigning the operator role. A punctuation
+boundary alone is insufficient: attached process substitutions remain part of
+the word. Build the
+single-primary summary during traversal, including enclosing negation when
+parsing stops inside a group. A consumed Boolean connector clears that summary
+before its right term is parsed. Final closing delimiters do not determine
+whether received primary metadata is available. Word-region
+consumers iterate every primary, including those skipped at execution. Partial
+parses can retain a forest whose Boolean parents have not yet been emitted;
+size operand-region storage for two operands per retained node and the pending
+primary, rather than applying the leaf bound for a completed tree. Graph
+branch expansion lives in `shell_depgraph_conditional_impl.h`, included after
+the word-expansion helpers. It reuses test-program truth and presence facts,
+and borrowed descriptor guards for uncertain branches. Keep subtree truth
+queries on stable prepared source metadata; avoid copying lazy snapshot state
+or reevaluating the entire expression for each primary. The traversal carries
+the end offset of each subtree's last primary alongside its truth, including
+skipped branches. Release its guard at that boundary, so observation positions remain
+nondecreasing within an owner and phase. Equal-position nested completions retain
+append order; the replay cursor relies on this order before opening later
+process descriptors. Binary file comparisons retain paired operands through
+their own graph nodes rather than independent unary FILE_TEST flags.
+
+Shared recursive syntax validation preserves `shell_error_t` resource outcomes
+through executable substitutions and heredoc visitors. The typed
+`shell_tokenizer_syntax_status` boundary owns that result; Boolean adapters are
+only acceptance queries. Syntax exhaustion qualifies no prefix and must reach
+graph and gate consumers before semantic inventory or policy evaluation.
+Range/output exhaustion after validation can still retain partial products.
 
 Test admission and compilation share the distinct terminal-predicate role and
 its numeric/implicit-operand rules. `shell_test_dispatch` owns the 0..4-argument

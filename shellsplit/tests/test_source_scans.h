@@ -95,4 +95,11 @@ typedef enum {
 void shellsplit_test_metadata_charge(shellsplit_test_metadata_kind_t kind);
 size_t shellsplit_test_metadata_work(shellsplit_test_metadata_kind_t kind);
 
+/* Record adjacent body-observation positions for one owner. Equal positions
+ * retain append order; decreasing positions break sequential replay. Reset
+ * through shellsplit_test_source_scan_reset(). No production instrumentation.
+ */
+void shellsplit_test_observation_order_record(size_t previous, size_t current);
+size_t shellsplit_test_observation_order_errors(void);
+
 #endif

@@ -32,7 +32,9 @@ typedef struct {
   size_t conditional_expression_length;
   const char *conditional_operands[2];
   size_t conditional_operand_lengths[2];
-  uint8_t conditional_operand_count; /* One for unary, two for comparison. */
+  /* One/two for a single primary; compound expressions use zero and NONE.
+   * conditional_expression retains the complete expression in either case. */
+  uint8_t conditional_operand_count;
   shell_conditional_predicate_t conditional_predicate;
   bool conditional_negated; /* Parity of lexical ! operators. */
   /* Arithmetic content borrows original_command, excluding its delimiters.
@@ -253,8 +255,10 @@ shell_process_command(const char *command_line, size_t command_length,
 /** Process supported canonical command records and return the complete
  * brace/subshell group descriptors from the same source. The fixed semantic
  * model accepts at most SHELL_MAX_SUBCOMMANDS ranges and returns
- * SHELL_PROCESS_EOUTPUT_LIMIT beyond that capacity. Group contents may be
- * simple-command lists, pipelines, and nested groups. Redirect-only simple
+ * SHELL_PROCESS_EOUTPUT_LIMIT beyond that capacity or when bounded syntax
+ * analysis cannot finish. Syntax-analysis stops supply no qualified output.
+ * Group contents may be simple-command lists, pipelines, and nested groups.
+ * Redirect-only simple
  * operations are omitted from `result->commands` as documented on
  * shell_processed_commands_t. Control compounds return SHELL_PROCESS_EPARSE.
  * The result owns all returned storage and is cleared on failure. */

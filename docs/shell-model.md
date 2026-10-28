@@ -155,6 +155,11 @@ Repeated unquoted `!` applies lexical negation. A bare word tests nonemptiness.
 Operators are recognized from shell syntax, including escaped line continuations, before
 expansion: `[[ '-n' ]]` tests a literal
 string, while `[[ -n ]]` is missing its required operand and is INVALID.
+Comparison operators must occupy a complete unquoted word. For example,
+`[[ left -nt<(printf child) ]]` is INVALID because the process substitution
+belongs to the same word as `-nt`. Separating them with whitespace gives the
+supported comparison `[[ left -nt <(printf child) ]]`. Escaped newlines join
+fragments without separating words.
 Static right operands may combine unquoted literals, single-, double- and
 ANSI-C-quoted fragments, escapes and active `*` characters. Concatenation and
 escaped line continuations are supported: `[[ xy == 'x'"y" ]]`,
@@ -180,14 +185,18 @@ Unquoted expansions such as `$pattern`, mixed dynamic patterns such as
 that cancels tilde expansion is supported: `~"$suffix"` has a literal tilde,
 while `~/"$suffix"` still requires tilde expansion and remains UNSUPPORTED
 as a right operand.
-Quoted or escaped `?`, brackets and parentheses remain literal bytes. Unquoted
-`?`, `[`, and extglob syntax remain outside this increment, including an
+Quoted or escaped `?`, brackets and parentheses remain literal bytes. In pattern
+right operands, unquoted `?`, `[`, and extglob syntax remain unsupported, including an
 unmatched `[` that Bash would treat literally.
+In a bare string primary, `!(x)` is an extglob-shaped word with a nonempty
+literal value; `! (x)` instead negates a grouped condition.
 
-Internal boolean combinations, parenthesized conditions, wider patterns, regex,
-ordering/numeric comparisons, binary pathname comparisons and variable-attribute
-predicates remain UNSUPPORTED.
-Lists and existing outer `&&`/`||` connectors compose supported conditions.
+Supported primaries compose with lexical `!`, `&&`, `||` and parentheses inside
+`[[ … ]]`. Negation binds first, then `&&`, then `||`; grouping overrides that
+precedence. Binary pathname comparisons are described below. Wider patterns,
+regex, ordering/numeric comparisons and variable-attribute predicates remain
+UNSUPPORTED. Lists and outer `&&`/`||` connectors also compose conditional
+commands.
 
 Newlines and comments are permitted before a primary, after lexical `!`, and
 after the operand of an explicit unary predicate or the right operand of a
@@ -222,9 +231,42 @@ Condition syntax and values use the fixed byte rules of the executor contract.
 Conditional metadata has kind `SHELL_COMMAND_CONDITIONAL`, an expression span,
 `conditional_operands[2]` in source order, `conditional_operand_count`, a
 normalized `conditional_predicate`, lexical `conditional_negated` parity, and
-no argv. Complete unary conditions have one operand; comparisons have two.
-Drafts retain the received operands, including an unfinished final word. Bare
-words normalize to STRING_NONEMPTY. Comparisons with literal-only RHSs use
+no argv. A single-primary condition has one operand for a unary predicate and
+two for a comparison. `!`, `&&`, `||` and parentheses compose supported
+primaries with Bash precedence and short-circuit evaluation. Compound results
+retain their complete expression and aggregate truth; the single-primary
+summary uses predicate NONE and zero operands. Grouping and negating a single
+primary preserve its summary, including drafts awaiting group closers or `]]`.
+For example, `[[ ! ( -n value )` retains operand `value` and negation parity
+while remaining INCOMPLETE. Consuming a complete `&&` or `||` changes the
+summary to NONE/zero even before its right term arrives. Expressions have a
+bounded representation of 96
+primary/operator nodes and at most 96 nested terms. Repeated lexical negations
+are normalized to their parity. Drafts report TRUNCATED when either limit is
+exceeded.
+
+Syntax-analysis resource stops propagate through nested command/process
+substitutions and expanding heredocs. They qualify no prefix: the fast parser
+returns `SHELL_ETRUNC` with empty ranges and groups, graph construction returns
+`SHELL_DEP_ETRUNC` with an empty truncated graph, and Shellgate returns
+`SG_ERR_TRUNC` with an UNDETERMINED verdict and no subcommand results.
+The allocating tokenizer reports `SHELL_TOKENIZE_EOVERFLOW`; command processing
+uses `SHELL_PROCESS_EOUTPUT_LIMIT`, while abstraction and transformation use
+their existing EOVERFLOW outcomes. Output-capacity stops can retain consistent
+partial products after syntax validation succeeds. A syntax-analysis stop
+makes no claim about the unexamined suffix.
+
+Recovery requires that appending can complete the enclosing grammar. For
+example, `[[ ( x ]` is INVALID: the missing `)` would have to precede the
+received `]`. In contrast, `[[ ( x ` can acquire `) ]]`, and `[[ ( x ) ]`
+can acquire its final `]`; both are INCOMPLETE.
+A completed subgroup can also await a Boolean connector or escaped line
+continuation before its enclosing group closes.
+
+Within these limits, incomplete drafts retain the received operands even when
+their containing groups and Boolean expressions are unfinished, including an
+unfinished final word. Bare words normalize to STRING_NONEMPTY. Comparisons
+with literal-only RHSs use
 STRING_EQUAL or STRING_NOT_EQUAL; active static stars use PATTERN_MATCH or
 PATTERN_NOT_MATCH. The expression preserves original spelling. Graph
 `conditional_truth` is FALSE, TRUE or UNKNOWN
@@ -239,17 +281,36 @@ any static prefix or suffix. Return one complete composed string rather than
 values for individual fragments. Static star patterns query only a dynamic
 left operand. Return ordinary final string bytes, without pattern escaping.
 Callback data is never parsed as shell syntax. An unresolved value on either
-side retains UNKNOWN comparison truth.
+side retains UNKNOWN string-comparison truth. Filesystem comparisons can still
+be decided by a known-empty counterpart under the rules below. Only reached
+operands request values.
+`conditional_unresolved` records unresolved expanded operands reached anywhere
+in a conditional expression, independently of filesystem or presence uncertainty.
 
-The predicate's truth refines subsequent continuations. A command substitution's
+The expression's truth refines subsequent continuations. Known short-circuit
+outcomes suppress the skipped operand's expansion and I/O effects while keeping
+its lexical executable children available to policy inspection. Unknown outcomes
+retain both possibilities and merge state conservatively. Syntax and supported
+semantics are checked throughout the expression, including skipped branches.
+A command substitution's
 exit status does not determine the string predicate: `[[ -n $(false) ]]` is
-false because its output is empty. Unresolved operand values retain both
-return outcomes. This model adds no runtime partial-execution recovery.
+false because its output is empty. When operand values leave the predicate
+undecided, both return outcomes remain possible. This model adds no runtime
+partial-execution recovery.
+
+Expansion-stop metadata records possible failures without evaluating runtime
+values. Even division by zero remains unproven under the arithmetic contract
+above. Later operands and their effects can therefore remain represented on
+possible successful expansion paths. Established setup and predicate facts
+determine conditional operand reachability; scanner failure flags alone do not
+establish that an operand is unreachable.
 
 Bash installs conditional redirects before expanding operands. The left
 operand's synchronous expansions finish before the right operand is queried or
 inherits descriptors. Nested substitutions retain relevant earlier descriptor
-observations and installed redirects; a proven setup failure
+observations and installed redirects. This ordering also holds across Boolean
+branches: completing a branch preserves its descriptor observations before
+later operands allocate process-substitution descriptors. A proven setup failure
 prevents their effects. For example, in `[[ -n $(cat) ]] <<<payload`, the nested `cat`
 receives the here-string. The condition itself
 consumes no stdin and produces no ordinary stdout. An unflagged process SUBST
@@ -267,6 +328,12 @@ can acquire LF before, within or after an expected token. Only prefixes reaching
 EOF retain this recovery: whitespace committing a lone `]`, extra literal
 bytes and prohibited raw newlines retain their existing error classifications.
 Partial grammar tokens do not become operand records.
+The same recovery applies to a received `&` or `|` at a Boolean-operator
+position, including after a grouped expression and across escaped line endings.
+Supported operators in illegal positions, such as the second comparison in
+`[[ x -nt y -ot z ]]` or the equality operator in `[[ -n x == y ]]`, are
+INVALID. Unmodeled operators in operator positions remain UNSUPPORTED without
+a Bash-validity judgment.
 
 Thus `printf before; [[ x == "x" ]` retains the qualified `printf before;`
 prefix. An open executable substitution retains its outer incomplete-input
@@ -313,9 +380,46 @@ precision, including available subsecond fields. Its result is independent of
 the graph's record of command reads.
 
 In `test` and `[`, argument-count and expression grammar distinguish unary
-`-a` from the binary `-a` conjunction. Binary pathname comparisons (`-nt`,
-`-ot`, `-ef`) remain opaque in those builtins and produce no FILE_TEST edges;
-they remain unsupported in conditional commands. Descriptor tests (`-t`), shell
+`-a` from the binary `-a` conjunction. Binary pathname comparisons are supported
+in all three forms: `left -nt right` tests a newer modification time,
+`left -ot right` tests an older modification time, and `left -ef right` tests
+filesystem identity (device and inode). They follow symlinks. `-nt` can succeed
+when only the left path exists; `-ot` can succeed when only the right exists.
+Equal timestamps make both time comparisons false. An empty left operand proves
+`-nt` false; an empty right proves `-ot` false; either empty operand proves `-ef`
+false. Other results remain UNKNOWN, including comparisons of identical pathname
+spellings: existence and filesystem identity remain runtime facts.
+An unresolved pathname supplies no evidence of emptiness. For example,
+`[[ "$path" -ef reference ]] && cat <important.txt` retains the possible read
+of `important.txt` until the condition is known false. A known-empty operand
+can decide the comparison even when the other operand is unknown; any reached
+unresolved operand still contributes to the command's uncertainty flags.
+
+A FILE_COMPARISON node retains possible comparison kinds and a known-empty
+operand bitmask. A FILE_COMPARE edge connects its owning CMD; FILE_LEFT and
+FILE_RIGHT edges connect its ordered FILE documents. These three descriptor-free
+relations are stored together, so truncation cannot leave an incomplete
+comparison. Documents preserve source spelling, resolved nonempty values and
+CWD facts; the comparison's empty bitmask records resolved empty values. Dynamic
+builtin operators retain possible comparison kinds and operand pairs selected by
+the argument grammar. These relations describe possible metadata observations
+and do not imply content reads. Builtin arguments expand eagerly before `test`
+or `[` evaluates its expression, including arguments in Boolean alternatives.
+Glob and brace spellings are literal pathname bytes inside `[[ … ]]`:
+`[[ * -nt other ]]` tests the file named `*`. In `test * -nt other`, ordinary
+argument expansion can select different pathnames or change the argument count;
+builtin admission rejects these unknown-cardinality forms. Quoting the wildcard
+makes it literal in all three forms. Admitted dynamic operands such as
+`test "$path" -nt other` have DYNAMIC_NAME FILE documents and set the owning
+command's unresolved-path output until resolved. Static conditional operands
+retain available lexical file identities using their recorded CWD.
+
+For a dynamic operand resolved to an empty string, the comparison's empty bit
+is authoritative. Its FILE document retains source spelling and DYNAMIC_NAME
+to prevent constructing a pathname identity from that spelling, while the
+owning command reports no unresolved path for the known-empty value.
+
+Descriptor tests (`-t`), shell
 option tests (`-o`) and variable-attribute tests (`-R`) are separate predicate
 families. Applications requiring complete metadata-check coverage must handle
 opaque operators conservatively.
@@ -450,7 +554,8 @@ argument count and effective argv bytes, so a quoted `'-v'` can still be an
 operator. The required final `]` and the reference Bash's special handling of
 small parenthesized expressions remain significant. They retain SIMPLE command
 kind, argv and ordinary policy subjects; conditional metadata is not populated
-for them. Internal Boolean combinations in `[[ … ]]` remain unsupported.
+for them. Conditional commands use `&&` and `||` for Boolean composition;
+builtin `test` and `[` retain their separate `-a`/`-o` grammar.
 
 Pinned Bash 5.3.20's one-argument dispatch uses the invocation's first argument,
 even when a parenthesized subexpression selected that dispatch. Consequently,
@@ -1128,11 +1233,11 @@ than a Bash syntax error.
 Bounded parsing and graph construction use caller-provided or documented small
 private scratch. `shell_source_workspace_size()` supplies a checked capacity
 bound for source analysis: delimiter normalization, persistent subscript
-boundaries and conditional-pattern evaluation. Graph construction adds that
-scratch, including decoded builtin-test arguments, compiled expressions and
-bounded ambiguous-grammar projection, to the fixed aligned
-`shell_dep_workspace_size()` prefix. Patterns and builtin
-tests can require this tail even without heredocs. Use
+boundaries, compiled conditional programs and conditional-pattern evaluation.
+Graph construction adds that scratch, including decoded builtin-test arguments,
+compiled expressions and bounded ambiguous-grammar projection, to the fixed
+aligned `shell_dep_workspace_size()` prefix. Even simple literal `[[ … ]]`
+expressions can require this tail without heredocs. Use
 `shell_dep_resolved_workspace_size()` when resolving words. Allocating
 higher-level APIs reserve their own temporary workspace and retain their
 failure-atomic output contracts.

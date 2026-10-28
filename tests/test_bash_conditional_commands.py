@@ -168,6 +168,90 @@ class ConditionalCommands(unittest.TestCase):
                         self.assertEqual(self.bash_result(source).returncode,
                                          0 if truth == 2 else 1)
 
+    def test_comparison_operand_expansion_contexts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("item*", "item-one", "unit?", "unita", "tag[ab]", "taga",
+                         "{left,right}", "left", "right"):
+                with open(os.path.join(directory, name), "w", encoding="ascii"):
+                    pass
+            prefix = "cd " + shlex.quote(directory) + "; "
+            for word, builtin_status in (("item*", 2), ("unit?", 2), ("tag[ab]", 1),
+                                         ("{left,right}", 2)):
+                quoted = shlex.quote(word)
+                forms = ((f"[[ {word} -ef {quoted} ]]", 0),
+                         (f"test {word} -ef {quoted}", builtin_status),
+                         (f"[ {word} -ef {quoted} ]", builtin_status),
+                         (f"test {quoted} -ef {quoted}", 0),
+                         (f"[ {quoted} -ef {quoted} ]", 0))
+                for source, expected in forms:
+                    with self.subTest(source=source):
+                        self.assertEqual(self.bash_result(prefix + source).returncode, expected)
+                        self.assertEqual(self.probe_result(source, "--status"), 0)
+
+    def test_binary_filesystem_reference(self):
+        # Qualify Bash's comparisons, including its asymmetric treatment of
+        # missing files.
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, "first")
+            second = os.path.join(directory, "second")
+            link = os.path.join(directory, "link")
+            hardlink = os.path.join(directory, "hardlink")
+            dangling = os.path.join(directory, "dangling")
+            missing = os.path.join(directory, "missing")
+            for path in (first, second):
+                with open(path, "w", encoding="ascii"):
+                    pass
+            os.symlink(first, link)
+            os.link(first, hardlink)
+            os.symlink(missing, dangling)
+            os.utime(first, ns=(1_700_000_000_000_000_000,) * 2)
+            os.utime(second, ns=(1_700_000_002_000_000_000,) * 2)
+            first_time = os.stat(first).st_mtime_ns
+            second_time = os.stat(second).st_mtime_ns
+            cases = ((first, second, first_time > second_time,
+                      first_time < second_time, False),
+                     (first, link, False, False, True),
+                     (first, hardlink, False, False, True),
+                     (first, dangling, True, False, False),
+                     (dangling, first, False, True, False),
+                     (first, missing, True, False, False),
+                     (missing, first, False, True, False),
+                     (missing, missing, False, False, False))
+            for left, right, newer, older, same in cases:
+                for op, expected in (("-nt", newer), ("-ot", older),
+                                     ("-ef", same)):
+                    expression = f"{shlex.quote(left)} {op} {shlex.quote(right)}"
+                    for source in (f"[[ {expression} ]]", f"test {expression}",
+                                   f"[ {expression} ]"):
+                        with self.subTest(source=source):
+                            self.assertEqual(self.bash_result(source).returncode,
+                                             0 if expected else 1)
+                    self.assertEqual(self.probe_result(f"[[ {expression} ]]"), 0)
+
+    def test_compound_conditional_reference(self):
+        cases = (("[[ -n x || -n $(printf unexpected >&2) ]]", 0, b""),
+                 ("[[ -z x && -n $(printf unexpected >&2) ]]", 1, b""),
+                 ("[[ -n x && -n $(printf reached >&2; printf x) ]]", 0, b"reached"),
+                 ("[[ -z x || -n $(printf reached >&2; printf x) ]]", 0, b"reached"),
+                 ("[[ -n x || -z x && -z x ]]", 0, b""),
+                 ("[[ ( -n x || -z x ) && -z x ]]", 1, b""),
+                 ("[[ ! ( -n x && -z x ) ]]", 0, b""),
+                 # Builtin arguments are expanded before test's expression
+                 # grammar is evaluated, unlike [['s conditional operands.
+                 ("test -z x -a -n $(printf reached >&2; printf x)", 1, b"reached"),
+                 ("[ -n x -o -n $(printf reached >&2; printf x) ]", 0, b"reached"))
+        for source, status, stderr in cases:
+            with self.subTest(source=source):
+                result = self.bash_result(source)
+                self.assertEqual((result.returncode, result.stderr), (status, stderr))
+                if source.startswith("[["):
+                    expected = 0 if stderr else 2 if status == 0 else 1
+                    self.assertEqual(self.probe_result(source), expected)
+        # Shell grammar is checked even where evaluation would short-circuit.
+        for source in ("[[ -n x || ( -n ) ]]", "[[ -z x && ( -n ) ]]"):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
+
     def test_exact_comparisons(self):
         pairs = (("x", '"x"'), ("x", '"y"'), ("''", '""'),
                  ("'*'", '"*"'), ("x", '"*"'),
@@ -186,6 +270,7 @@ class ConditionalCommands(unittest.TestCase):
                         self.assertIn(truth, (1, 2))
                         self.assertEqual(self.bash_result(source).returncode,
                                          0 if truth == 2 else 1)
+
         for source in ('[[ x == "x" # $(|)\n]]',
                        '[[ x == "x"\n]]',
                        '[[ x =\\\n= "x" ]]',
@@ -216,6 +301,76 @@ class ConditionalCommands(unittest.TestCase):
         result = self.bash_result(
             '[[ <(printf x) == "$(read -r -u63 -n1 value || exit 1; printf "%s" "$value" >&2)" ]] 2>&1')
         self.assertEqual(result.stdout, b"x")
+
+    def test_compound_descriptor_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            present = os.path.join(directory, "present")
+            with open(present, "w", encoding="ascii"):
+                pass
+            for exists, path in ((True, present),
+                                 (False, os.path.join(directory, "absent"))):
+                predicate = f"-e {shlex.quote(path)}"
+                prefixes = (
+                    (f'{predicate} && -n "$(printf x)"', exists),
+                    (f'! ( {predicate} && -n "$(printf x)" )', not exists),
+                    (f'{predicate} && ( {predicate} && -n "$(printf x)" )', exists),
+                    (f'{predicate} && ( -z x && -n "$(printf skipped)" )', False),
+                    (f'{predicate} && ( -n x || -n "$(printf skipped)" )', exists),
+                )
+                for prefix, truth in prefixes:
+                    # Reserve fd 63 for a here-string and leave fd 62 for the
+                    # process substitution. The surrounding subprocess deadline
+                    # bounds the asynchronous producer without timing the read.
+                    source = (
+                        'exec 63<<<seed 62<&-; '
+                        f'[[ ( {prefix} ) || '
+                        '-n "$(read -r -u63 -n1 before; printf \'%s\' "$before" >&2)"'
+                        '<(printf pipe)'
+                        '"$(read -r -u62 -n1 after; printf \'%s\' "$after" >&2)" ]] 2>&1')
+                    with self.subTest(source=source):
+                        result = self.bash_result(source)
+                        self.assertEqual(result.returncode, 0)
+                        self.assertEqual(result.stderr, b"")
+                        self.assertEqual(result.stdout, b"" if truth else b"sp")
+                        self.assertEqual(self.probe_result(source, "--status"), 0)
+
+    def test_compound_literal_truth(self):
+        primaries = ("-n x", "-z x", "-n ''", "! -n ''", "x == 'x'",
+                     "a.txt == *.txt", "'' -nt target", "target -ot ''",
+                     "'' -ef target", "'&&'", "'('", "!(x)")
+        for left in primaries:
+            for right in primaries:
+                for op in ("&&", "||"):
+                    source = f"[[ ( {left} ) {op} ( {right} ) ]]"
+                    with self.subTest(source=source):
+                        reference = self.bash_result(source)
+                        self.assertIn(reference.returncode, (0, 1))
+                        self.assertEqual(self.probe_result(source),
+                                         2 if reference.returncode == 0 else 1)
+
+    def test_compound_operator_prefixes(self):
+        for left in ("x", "-n x", "(x)", "( -n x && -z '' )"):
+            for received_op, suffix in (("&", "& y ]]"), ("|", "| y ]]"),
+                                        ("&\\", "\n& y ]]"), ("|\\", "\n| y ]]"),
+                                        ("&\\\n", "& y ]]"), ("|\\\n", "| y ]]")):
+                received = f"[[ {left} {received_op}"
+                with self.subTest(received=received):
+                    self.assertEqual(self.probe_result(received, "--status"), 1)
+                    if not received.endswith("\\"):
+                        for wrapper in ('printf "$(%s)"', 'cat <(%s)'):
+                            closed = wrapper % received
+                            self.assertNotEqual(self.bash_result(closed, syntax=True).returncode, 0)
+                            self.assertEqual(self.probe_result(closed, "--status"), 2)
+                    complete = received + suffix
+                    reference = self.bash_result(complete)
+                    self.assertIn(reference.returncode, (0, 1))
+                    self.assertEqual(self.probe_result(complete),
+                                     2 if reference.returncode == 0 else 1)
+            for op in ("&", "|", "&=", "|&"):
+                source = f"[[ {left} {op} y ]]"
+                with self.subTest(committed=source):
+                    self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
+                    self.assertEqual(self.probe_result(source, "--status"), 2)
 
     def test_mixed_literal_comparisons(self):
         forms = (
@@ -353,6 +508,27 @@ class ConditionalCommands(unittest.TestCase):
                         self.assertEqual(self.probe_result(source),
                                          0 if dynamic else 2 if truth else 1)
 
+    def test_grouped_draft_prefixes(self):
+        pairs = (
+            ('[[ ( -n value )', ' ]]'),
+            ('[[ ! ( -n value', ' ) ]]'),
+            ('[[ ! ( ! ( left -nt right )', ' ) ]]'),
+            ('[[ ! ( -n value ) ]', ']'),
+            ('[[ ! ( ! ( -n "value', '" ) ) ]]'),
+            ('[[ ! ( -n "$(printf child', ')" ) ]]'),
+        )
+        for received, completion in pairs:
+            with self.subTest(received=received):
+                self.assertEqual(self.probe_result(received, "--status"), 1)
+                complete = received + completion
+                self.assertEqual(self.bash_result(complete, syntax=True).returncode, 0)
+                self.assertEqual(self.probe_result(complete, "--status"), 0)
+                reference = self.bash_result(complete)
+                self.assertIn(reference.returncode, (0, 1))
+                truth = self.probe_result(complete)
+                if truth:
+                    self.assertEqual(reference.returncode, 0 if truth == 2 else 1)
+
     def test_token_prefixes(self):
         pairs = (
             ('[[ x ]', ']'),
@@ -412,9 +588,8 @@ class ConditionalCommands(unittest.TestCase):
         for source in ('[[ x ] ]]', '[[ x == "x" ] ]]', '[[ x ]x', '[[ x \\x', '[[ x\n]', '[[ x == "x" "]"'):
             with self.subTest(source=source):
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ('[[ x ! ', '[[ x =~', '[[ x == "x" &&'):
-            with self.subTest(source=source):
-                self.assertEqual(self.probe_result(source, "--status"), 4)
+        self.assertEqual(self.probe_result('[[ x ! ', "--status"), 2)
+        self.assertEqual(self.probe_result('[[ x =~', "--status"), 4)
 
     def test_extglob_operands(self):
         words = ("@(left|right)", "pre@(@(if|for|case)|tail)suffix",
@@ -442,11 +617,65 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ("[[ file -nt other ]]", "[[ file -\\\nnt other ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
-                       "[[ 1 -eq 1 ]]", "[[ (x) ]]", "[[ x && y ]]",
-                       "[[ x || y ]]"):
+        for source in ("[[ x == ? ]]", "[[ x =~ y ]]", "[[ 1 -eq 1 ]]"):
             with self.subTest(source=source):
                 self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
+                self.assertEqual(self.probe_result(source, "--status"), 4)
+
+    def test_binary_operator_word_boundaries(self):
+        # A process-substitution fragment concatenates with the operator's
+        # spelling. Only a standalone lexical word can select the comparison.
+        for operator in ("=", "==", "!=", "-nt", "-ot", "-ef"):
+            continued = "\\\n".join(operator)
+            for spelling in (operator, continued, operator + "\\\n"):
+                for fragment in ("<(printf child)", ">(printf child)",
+                                 "<\\\n(printf child)"):
+                    expression = f"left {spelling}{fragment}"
+                    for wrapper in ("[[ %s ]]", "[[ x || ( %s ) ]]",
+                                    'printf "$([[ %s ]])"', "cat <([[ %s ]])"):
+                        wrapped = wrapper % expression
+                        with self.subTest(source=wrapped):
+                            self.assertTrue(self.bash_result(wrapped, syntax=True).stderr)
+                            self.assertEqual(self.probe_result(wrapped, "--status"), 2)
+                    separated = f"[[ left {spelling} {fragment} ]]"
+                    with self.subTest(separated=separated):
+                        self.assertFalse(self.bash_result(separated, syntax=True).stderr)
+                        # Dynamic unquoted string-pattern RHSs remain outside
+                        # the supported subset; filesystem operands admit them.
+                        expected = 0 if operator.startswith("-") else 4
+                        self.assertEqual(self.probe_result(separated, "--status"), expected)
+        for source in ("[[ left -nt<(printf child", "[[ left ==>(printf child"):
+            with self.subTest(unfinished=source):
+                self.assertEqual(self.probe_result(source, "--status"), 2)
+
+    def test_misplaced_supported_operators(self):
+        for primary in ("x", "-n x", "x -nt y", "x == y"):
+            for operator in ("=", "==", "!=", "-nt", "-ot", "-ef", "-n", "-z",
+                             "-v", "-e", "-a", "-h", "-N", "!", "("):
+                # A bare word can consume a binary operator as its primary.
+                if primary == "x" and operator in ("=", "==", "!=", "-nt", "-ot", "-ef"):
+                    continue
+                source = f"[[ {primary} {operator} z ]]"
+                with self.subTest(source=source):
+                    reference = self.bash_result(source, syntax=True)
+                    # Bash can diagnose malformed [[ grammar while returning
+                    # zero from -n. The diagnostic establishes rejection.
+                    self.assertTrue(reference.stderr)
+                    self.assertEqual(self.probe_result(source, "--status"), 2)
+        for source in ("[[ x -nt y -o\\\nt z ]]", "[[ -n x =\\\n= y ]]",
+                       "[[ x !\\\n y ]]", "[[ x '-nt' y ]]",
+                       "[[ -n x '==' y ]]", "[[ ( x -nt y -ot z ) ]]",
+                       "[[ x && -n x == y ]]"):
+            for wrapper in ("%s", "{ %s; }", 'printf "$(%s)"', "cat <(%s)"):
+                wrapped = wrapper % source
+                with self.subTest(source=wrapped):
+                    self.assertTrue(self.bash_result(wrapped, syntax=True).stderr)
+                    self.assertEqual(self.probe_result(wrapped, "--status"), 2)
+        for source in ("[[ x =~ y ]]", "[[ x < y ]]", "[[ x > y ]]", "[[ 1 -eq 1 ]]"):
+            with self.subTest(unsupported=source):
+                reference = self.bash_result(source, syntax=True)
+                self.assertEqual(reference.returncode, 0)
+                self.assertFalse(reference.stderr)
                 self.assertEqual(self.probe_result(source, "--status"), 4)
 
     def test_newline_boundaries(self):

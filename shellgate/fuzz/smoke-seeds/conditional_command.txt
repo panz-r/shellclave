@@ -8,3 +8,6 @@
 test -g target -o -k other
 [[ -O target ]] && [ -G target ]
 printf "%s" "$( [[ -N target ]] && printf newer )"
+[[ source -nt target && ( -r source || -d target ) ]]
+test left "$operator" right
+[[ x || -n $(cat <skipped) ]]

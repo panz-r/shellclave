@@ -152,9 +152,13 @@ static inline SHELL_NONNULL(1) shell_test_roles_t
   } else if (length == 3 && spelling[0] == '-') {
     if ((!memcmp(spelling, "-eq", 3)) || (!memcmp(spelling, "-ne", 3)) ||
         (!memcmp(spelling, "-lt", 3)) || (!memcmp(spelling, "-le", 3)) ||
-        (!memcmp(spelling, "-gt", 3)) || (!memcmp(spelling, "-ge", 3)) ||
-        (!memcmp(spelling, "-nt", 3)) || (!memcmp(spelling, "-ot", 3)) ||
-        (!memcmp(spelling, "-ef", 3)))
+        (!memcmp(spelling, "-gt", 3)) ||
+        (!memcmp(spelling, "-ge", 3))
+#define FILE_COMPARISON_ROLE(kind, name, ordinal, operator_word)               \
+  || (!memcmp(spelling, operator_word, 3))
+            SHELL_FILE_COMPARISONS(FILE_COMPARISON_ROLE)
+#undef FILE_COMPARISON_ROLE
+    )
       roles |= SHELL_TEST_BINARY;
   }
   return roles;

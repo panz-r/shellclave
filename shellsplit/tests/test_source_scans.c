@@ -6,9 +6,11 @@ static _Thread_local size_t line_work;
 static _Thread_local uintptr_t watch_begin, watch_end;
 static _Thread_local size_t delimiter_work;
 static _Thread_local size_t metadata_work[SHELLSPLIT_TEST_WORK_COUNT];
+static _Thread_local size_t observation_order_errors;
 
 void shellsplit_test_source_scan_charge(size_t length) { scan_work += length; }
 void shellsplit_test_source_scan_reset(void) {
+  observation_order_errors = 0;
   scan_work = 0;
   line_work = 0;
   watch_begin = watch_end = 0;
@@ -41,4 +43,12 @@ void shellsplit_test_metadata_charge(shellsplit_test_metadata_kind_t kind) {
 }
 size_t shellsplit_test_metadata_work(shellsplit_test_metadata_kind_t kind) {
   return metadata_work[kind];
+}
+
+void shellsplit_test_observation_order_record(size_t previous, size_t current) {
+  observation_order_errors += current < previous;
+}
+
+size_t shellsplit_test_observation_order_errors(void) {
+  return observation_order_errors;
 }

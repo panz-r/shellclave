@@ -74,7 +74,8 @@ typedef enum {
   /* Dependency-analysis workspace was absent, misaligned, or too small, or a
    * source-scratch reservation overflowed. Workspace supports compound-group
    * descriptor snapshots, descriptor-route resolution and source analysis,
-   * including conditional-pattern evaluation and builtin-test programs. */
+   * including compiled conditional programs, pattern evaluation and
+   * builtin-test programs. */
   SHELL_DEP_EWORKSPACE = -4,
   /* The expansion callback failed or returned malformed canonical bytes. */
   SHELL_DEP_EEXPAND = -5,
@@ -98,6 +99,7 @@ typedef enum {
   SHELL_NODE_TIME,
   /* A descriptor inherited when the complete submitted command starts. */
   SHELL_NODE_FD,
+  SHELL_NODE_FILE_COMPARISON,
 } shell_dep_node_type_t;
 
 typedef enum {
@@ -113,11 +115,13 @@ typedef enum {
    * obtain the tab-stripped logical bytes. */
   SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS = 1 << 0,
   /* The FILE pathname is dynamic, for example through parameter or command
-   * expansion. `path` retains source spelling. Successful resolution clears
-   * DYNAMIC_NAME and sets RESOLVED_PATH, supplying the pathname in
-   * value/value_len. This applies to redirection targets,
-   * Bash `$(<word)` file-command substitutions,
-   * path-looking arguments and filesystem predicate operands. */
+   * expansion. `path` retains source spelling. Successful resolution to one
+   * nonempty pathname clears DYNAMIC_NAME and sets RESOLVED_PATH, supplying it
+   * in value/value_len. This applies to redirection targets, Bash `$(<word)`
+   * file-command substitutions, path-looking arguments and filesystem predicate
+   * operands. A resolved-empty binary comparison operand retains DYNAMIC_NAME
+   * and has no file identity; its comparison's empty_operands bit records
+   * certainty, and the operand does not contribute unresolved-path output. */
   SHELL_DEP_DOC_FLAG_DYNAMIC_NAME = 1 << 1,
   /* The heredoc delimiter was quoted and its body is literal. */
   SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL = 1 << 2,
@@ -139,10 +143,13 @@ typedef enum {
    * is data, never source to quote-remove. Ordinary public source-only parsers
    * do not set this flag. */
   SHELL_DEP_DOC_FLAG_RESOLVED_PATH = 1 << 5,
-  /* A reached FILE operand was statically empty after quote removal, or its
-   * resolved expansion yielded zero/multiple words or an empty pathname.
-   * Setup fails without opening the file. Source-only parsers also emit this
-   * flag. Unreached operands retain their source spelling without this flag. */
+  /* A reached redirect or file-command-substitution FILE operand was
+   * statically empty after quote removal, or its resolved expansion yielded
+   * zero/multiple words or an empty pathname. No file is opened: redirection
+   * setup fails, or the file command substitution fails in its child.
+   * Source-only parsers also emit this flag. Unreached operands retain their
+   * spelling without this flag. Binary file comparisons record empty paths
+   * in shell_dep_file_comparison_t.empty_operands instead. */
   SHELL_DEP_DOC_FLAG_EXPANSION_FAILED = 1 << 6,
   /* Bash-supplied resource, not an explicit source redirection. For FILE,
    * path/path_len borrow a library-owned immutable canonical pathname for
@@ -192,6 +199,11 @@ typedef enum {
    * or more possible tests; uncertain builtin argument roles can produce
    * conservative alternatives. The FILE retains pathname and CWD facts. */
   SHELL_EDGE_FILE_TEST = 16,
+  /* CMD -> FILE_COMPARISON -> ordered FILE operands. Metadata observations
+   * are descriptor-free and separate from content reads. */
+  SHELL_EDGE_FILE_COMPARE,
+  SHELL_EDGE_FILE_LEFT,
+  SHELL_EDGE_FILE_RIGHT,
 } shell_dep_edge_type_t;
 
 typedef enum {
@@ -211,7 +223,8 @@ typedef enum {
   /* This SUBST edge supplies a FILE document's runtime pathname. The value
    * affects I/O topology but is not itself command-word content for a later
    * Shellgate inspection. The dependency remains when expansion changes the
-   * receiving FILE DOC from DYNAMIC_NAME to RESOLVED_PATH or EXPANSION_FAILED.
+   * receiving FILE DOC from DYNAMIC_NAME to RESOLVED_PATH or EXPANSION_FAILED,
+   * or establishes a known-empty binary comparison operand.
    */
   SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME = 1 << 1,
   /* A setup-only FD_OPEN output binding used Bash/POSIX append mode (`>>` or
@@ -261,7 +274,8 @@ typedef enum {
  * the caller between parses.
  * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as source
  * scratch for delimiter normalization, non-evicting subscript boundaries,
- * conditional-pattern evaluation and compiled builtin-test programs.
+ * compiled conditional programs (even simple literal expressions), pattern
+ * evaluation and compiled builtin-test programs.
  * shell_source_workspace_size(command_length, &bytes) gives a sufficient
  * extra capacity. Without this tail, source analysis can return EWORKSPACE
  * even for inputs without heredocs; retry with sufficient source scratch.
@@ -365,9 +379,11 @@ typedef enum {
 typedef struct {
   shell_command_kind_t kind;
   /* Borrowed CONDITIONAL spans in source/expansion order, separate from argv.
-   * Filesystem operands also have FILE documents linked by FILE_TEST when a
-   * metadata check is possible. Empty paths are false; other filesystem truth
-   * remains unknown. Predicate truth includes lexical negation. EQUAL and
+   * Unary filesystem operands have FILE documents linked by FILE_TEST;
+   * binary comparisons link ordered FILE operands through FILE_COMPARISON
+   * nodes. Empty unary paths are false; binary empty operands follow their
+   * operator's rules. Other filesystem truth remains unknown. Predicate truth
+   * includes lexical negation. EQUAL and
    * NOT_EQUAL compare literal strings; PATTERN_MATCH and PATTERN_NOT_MATCH use
    * static RHS patterns with active stars. VARIABLE_SET queries scalar presence
    * from execution state, independently of string length or descriptor access;
@@ -376,10 +392,15 @@ typedef struct {
   uint32_t conditional_expression_length;
   const char *conditional_operands[2];
   uint32_t conditional_operand_lengths[2];
-  uint8_t conditional_operand_count; /* One for unary, two for comparison. */
+  /* Single-primary summaries: one unary operand or two comparison operands.
+   * Compound expressions use NONE and zero operands; their full borrowed
+   * expression and aggregate truth remain available. Grouping/negation of
+   * one primary retains the summary. */
+  uint8_t conditional_operand_count;
   shell_conditional_predicate_t conditional_predicate;
   bool conditional_negated; /* Parity of lexical ! operators. */
   shell_conditional_truth_t conditional_truth;
+  bool conditional_unresolved; /* A reached expanded operand remains unknown. */
   const char *arithmetic_expression; /* Borrowed content for ARITHMETIC. */
   uint32_t arithmetic_expression_length;
   shell_arithmetic_truth_t arithmetic_truth;
@@ -611,6 +632,27 @@ typedef struct {
   uint8_t flags; /* shell_dep_doc_flags_t */
 } shell_dep_doc_t;
 
+typedef enum {
+  SHELL_FILE_COMPARE_NEWER = 1u,
+  SHELL_FILE_COMPARE_OLDER = 2u,
+  SHELL_FILE_COMPARE_SAME = 4u,
+} shell_dep_file_comparison_kind_t;
+
+/* One possible binary metadata observation. FILE_COMPARE connects its CMD
+ * owner; FILE_LEFT and FILE_RIGHT connect ordered FILE operands. Empty operand
+ * documents retain their spelling, even when no filesystem lookup is needed.
+ * Known empty paths set empty_operands, not the FILE document's
+ * SHELL_DEP_DOC_FLAG_EXPANSION_FAILED flag.
+ * A resolved-empty dynamic operand retains DYNAMIC_NAME and has no file
+ * identity; its empty_operands bit records certainty, so it does not contribute
+ * unresolved-path output. Other operand flags follow the owning command's
+ * expansion context: wildcard/brace spellings are literal in [[ ... ]].
+ * Several bits denote alternative dynamic builtin operator interpretations. */
+typedef struct {
+  uint8_t predicates;
+  uint8_t empty_operands; /* Bit 0 left, bit 1 right: known empty pathname. */
+} shell_dep_file_comparison_t;
+
 typedef struct {
   shell_dep_node_type_t type;
   union {
@@ -620,6 +662,7 @@ typedef struct {
     shell_dep_endpoint_t endpoint;
     shell_dep_time_t time;
     shell_dep_fd_t fd;
+    shell_dep_file_comparison_t file_comparison;
   };
 } shell_dep_node_t;
 
@@ -629,8 +672,9 @@ typedef struct {
   shell_dep_edge_type_t type;
   shell_dep_edge_dir_t dir;
   uint32_t flags; /* shell_dep_edge_flags_t */
-  /* Descriptor pair for byte routes and setup bindings. FILE_TEST and other
-   * descriptor-free relations use SHELL_DEP_FD_NONE on both sides. Use it on
+  /* Descriptor pair for byte routes and setup bindings. FILE_TEST, binary
+   * comparison relations and other descriptor-free relations use
+   * SHELL_DEP_FD_NONE on both sides. Use it on
    * the non-descriptor side: DOC→owner READ is none→fd, owner→DOC WRITE is
    * fd→none, and PIPE is fd→fd. Shell-word and dynamic-FILE-name SUBST edges
    * terminate at none; an unflagged process-substitution route can instead
@@ -687,6 +731,8 @@ typedef struct {
  * A capacity stop may retain a consistent partial graph. If construction or
  * descriptor resolution cannot complete safely, counts and CWD storage length
  * are cleared instead; the status remains TRUNCATED, never ERROR.
+ * Syntax-analysis exhaustion supplies no qualified prefix and returns this
+ * same truncation outcome with empty counts and CWD storage.
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
@@ -1205,7 +1251,7 @@ shell_dep_error_t shell_dep_graph_parse_with_fast(
  * false and clears size on arithmetic overflow; no source bytes are inspected.
  * The extra reservation includes bounded metadata, a source-offset index and
  * shell_source_workspace_size() bytes for source-analysis scratch, including
- * conditional-pattern evaluation and builtin-test programs.
+ * compiled conditional programs, pattern evaluation and builtin-test programs.
  * Source and expansion payloads otherwise remain borrowed. */
 bool shell_dep_resolved_workspace_size(size_t command_length,
                                        const shell_dep_limits_t *limits,
@@ -1281,8 +1327,11 @@ bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
  * `link` is a symlink. It does not resolve symlinks or inspect the filesystem.
  * The document's dynamic-path classification is authoritative. Unresolved or
  * failed expansions and relative paths with an unknown CWD return false;
- * callback-resolved paths use their decoded value without reinterpreting it as
- * shell syntax. `absolute` distinguishes an actual
+ * callback-resolved nonempty paths use their decoded value without
+ * reinterpreting it as shell syntax. Known-empty comparison operands have no
+ * file identity and return false, including resolved-empty dynamic operands
+ * whose certainty is recorded in the comparison's empty_operands bits.
+ * `absolute` distinguishes an actual
  * absolute identity from one rooted at a relative initial CWD; compare it
  * along with the output bytes. `written` excludes the trailing NUL. On
  * failure outputs are cleared and the destination is unchanged.
@@ -1316,6 +1365,9 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp)
  * requires DOC→CMD/GROUP, WRITE/APPEND require an execution endpoint→DOC or
  * ENDPOINT, ENV requires DOC→CMD, ARG requires CMD↔DOC(FILE); FILE_TEST
  * requires CMD→DOC(FILE), predicate flags, and no source or target descriptor.
+ * Each FILE_COMPARISON has exactly one incoming FILE_COMPARE from a CMD and
+ * one outgoing FILE_LEFT and FILE_RIGHT to FILE documents. These relations
+ * have no descriptors or flags; kind and empty-operand bits belong to the node.
  * FD_OPEN is a forward setup binding: execution→DOC for output, DOC→execution
  * for input, execution→ENDPOINT for process-substitution output, or
  * execution/ENDPOINT→execution for descriptor routing. An internal retained

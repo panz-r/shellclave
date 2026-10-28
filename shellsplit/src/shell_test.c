@@ -4,14 +4,19 @@
 #include "shell_word_internal.h"
 #include <string.h>
 
+// clang-format off
 enum {
   TEST_FALSE,
+  TEST_TRUE,
   TEST_NONEMPTY,
   TEST_EMPTY,
   TEST_EQUAL,
   TEST_NOT_EQUAL,
+#define FILE_COMPARISON_OPERATION(kind, name, ordinal, spelling)               \
+  TEST_FILE_##kind,
+  SHELL_FILE_COMPARISONS(FILE_COMPARISON_OPERATION)
+#undef FILE_COMPARISON_OPERATION
   TEST_PRESENT,
-// clang-format off
 #define FILE_OPERATION(kind, name, ordinal, spelling, alias) TEST_FILE_##kind,
   SHELL_FILE_PREDICATES(FILE_OPERATION)
 #undef FILE_OPERATION
@@ -38,12 +43,22 @@ enum {
                  "filesystem role mapping");
 SHELL_FILE_PREDICATES(FILE_MAPPING)
 #undef FILE_MAPPING
+#define COMPARISON_MAPPING(kind, name, ordinal, spelling)                      \
+  _Static_assert(TEST_FILE_##kind == TEST_FILE_NEWER + ordinal,                \
+                 "builtin comparison ordinal");                                \
+  _Static_assert(SHELL_FILE_COMPARE_##kind ==                                  \
+                     (SHELL_FILE_COMPARE_NEWER << ordinal),                    \
+                 "binary comparison graph kind mapping");
+SHELL_FILE_COMPARISONS(COMPARISON_MAPPING)
+#undef COMPARISON_MAPPING
 _Static_assert((SHELL_TEST_FILE_ROLES &
                 (SHELL_TEST_AND_JOIN | SHELL_TEST_OR_JOIN)) == 0,
                "filesystem roles do not overlap Boolean connectors");
 
 _Static_assert(SHELL_DEP_MAX_TOKENS * 2u + 2u <= UINT16_MAX,
                "test expression ordinals fit retained private nodes");
+_Static_assert(SHELL_CONDITIONAL_MAX_NODES <= SHELL_DEP_MAX_TOKENS * 2u + 2u,
+               "conditional evaluation fits the shared bounded stacks");
 _Static_assert(sizeof(shell_test_value_t) + 2 * sizeof(shell_test_node_t) +
                        sizeof(shell_test_roles_t) + 8 +
                        2 * (SHELL_DEP_MAX_TOKENS + 1) *
@@ -111,9 +126,16 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
       kind = TEST_EQUAL;
     else if (is_word(p, op, "!="))
       kind = TEST_NOT_EQUAL;
+#define FILE_COMPARISON_PRIMARY(suffix, name, ordinal, spelling)               \
+  else if (is_word(p, op, spelling)) {                                         \
+    kind = TEST_FILE_##suffix;                                                 \
+  }
+    SHELL_FILE_COMPARISONS(FILE_COMPARISON_PRIMARY)
+#undef FILE_COMPARISON_PRIMARY
     else if (p->words[op].value_length == 3 && p->words[op].value[1] != 'n' &&
-             p->words[op].value[1] != 'o' && p->words[op].value[1] != 'e')
+             p->words[op].value[1] != 'o' && p->words[op].value[1] != 'e') {
       kind = TEST_OPAQUE_ERROR;
+    }
     /* -eq/-ne also validate integers; -ef/-nt/-ot inspect files. */
     if (is_word(p, op, "-eq") || is_word(p, op, "-ne"))
       kind = TEST_OPAQUE_ERROR;
@@ -326,6 +348,8 @@ bool shell_test_refresh(shell_test_program_t *program) {
   program->uncertain = false;
   if (count)
     memset(program->operand_roles, 0, count * sizeof(*program->operand_roles));
+  if (count)
+    memset(program->file_comparisons, 0, count);
   if (program->bracket) {
     if (!count || !is_word(program, count - 1, "]")) {
       program->uncertain = count && !words[count - 1].known;
@@ -392,29 +416,64 @@ bool shell_test_compile(shell_test_value_t *words, size_t count, bool bracket,
       count * 2 + 2, sizeof(*program->nodes), _Alignof(shell_test_node_t));
   program->operand_roles = shell_source_scratch_take_array(
       count, sizeof(*program->operand_roles), _Alignof(shell_test_roles_t));
-  if (!program->nodes || (!program->operand_roles && count))
+  program->file_comparisons = shell_source_scratch_take(count);
+  if (!program->nodes ||
+      ((!program->operand_roles || !program->file_comparisons) && count))
     return false;
   return shell_test_refresh(program);
 }
 
-void shell_test_prove_error(shell_test_program_t *program) {
-  program->proven_error = true;
+void shell_test_set_condition_result(shell_test_program_t *program,
+                                     unsigned index, bool known, bool truth) {
+  if (program->nodes[index].operation != TEST_PRESENT)
+    program->nodes[index].operation =
+        known ? truth ? TEST_TRUE : TEST_FALSE : TEST_OPAQUE;
 }
 
-bool shell_test_compile_presence(const char *word, size_t length, bool negated,
-                                 shell_test_program_t *program) {
-  shell_test_value_t *value = shell_source_scratch_take_array(
-      1, sizeof(*value), _Alignof(shell_test_value_t));
-  shell_test_node_t *nodes = shell_source_scratch_take_array(
-      2, sizeof(*nodes), _Alignof(shell_test_node_t));
-  if (!value || !nodes || !shell_test_prepare_value(word, length, value))
+bool shell_test_compile_conditional(const char *source,
+                                    const shell_conditional_t *condition,
+                                    shell_test_program_t *program) {
+  *program = (shell_test_program_t){.count = condition->count,
+                                    .word_count = condition->count,
+                                    .root = condition->root,
+                                    .active = true};
+  program->words = shell_source_scratch_take_array(
+      condition->count, sizeof(*program->words), _Alignof(shell_test_value_t));
+  program->nodes = shell_source_scratch_take_array(
+      condition->count, sizeof(*program->nodes), _Alignof(shell_test_node_t));
+  if (!program->words || !program->nodes)
     return false;
-  *program = (shell_test_program_t){
-      .words = value, .nodes = nodes, .word_count = 1, .active = true};
-  program->root = node(program, TEST_PRESENT, 0, 0);
-  if (negated)
-    program->root = node(program, TEST_NOT, program->root, 0);
+  memset(program->words, 0, condition->count * sizeof(*program->words));
+  for (unsigned i = 0; i < condition->count; ++i) {
+    const shell_condition_node_t *node = &condition->nodes[i];
+    unsigned operation = node->operation == SHELL_CONDITION_NOT   ? TEST_NOT
+                         : node->operation == SHELL_CONDITION_AND ? TEST_AND
+                         : node->operation == SHELL_CONDITION_OR  ? TEST_OR
+                                                                  : TEST_OPAQUE;
+    program->nodes[i] =
+        (shell_test_node_t){node->left, node->right, (uint8_t)operation};
+    if (node->operation != SHELL_CONDITION_PRIMARY)
+      continue;
+    program->nodes[i].left = (uint16_t)i;
+    if (node->primary.predicate == SHELL_CONDITIONAL_VARIABLE_SET) {
+      if (!shell_test_prepare_value(source + node->primary.operands[0],
+                                    node->primary.operand_lengths[0],
+                                    &program->words[i]))
+        return false;
+      program->nodes[i].operation = TEST_PRESENT;
+    } else {
+      shell_conditional_value_t unknown[2] = {0};
+      bool truth = false;
+      bool known =
+          shell_conditional_evaluate(source, &node->primary, unknown, &truth);
+      shell_test_set_condition_result(program, i, known, truth);
+    }
+  }
   return true;
+}
+
+void shell_test_prove_error(shell_test_program_t *program) {
+  program->proven_error = true;
 }
 
 static SHELL_NONNULL(1, 2, 3,
@@ -430,6 +489,9 @@ static SHELL_NONNULL(1, 2, 3,
             ? &p->words[n.left]
             : NULL;
     switch (n.operation) {
+    case TEST_TRUE:
+      result = SHELL_TEST_TRUE;
+      break;
     case TEST_FALSE:
       result = SHELL_TEST_FALSE;
       break;
@@ -468,6 +530,19 @@ static SHELL_NONNULL(1, 2, 3,
     case TEST_OPAQUE:
       result = 3u;
       break;
+    case TEST_FILE_NEWER:
+    case TEST_FILE_OLDER:
+    case TEST_FILE_SAME: {
+      bool empty_left = a->known && !a->value_length;
+      const shell_test_value_t *b = &p->words[n.right];
+      bool empty_right = b->known && !b->value_length;
+      bool known_false = n.operation == TEST_FILE_SAME
+                             ? empty_left || empty_right
+                         : n.operation == TEST_FILE_NEWER ? empty_left
+                                                          : empty_right;
+      result = known_false ? SHELL_TEST_FALSE : 3u;
+      break;
+    }
     case TEST_OPAQUE_ERROR:
       result = 7u;
       break;
@@ -533,6 +608,36 @@ void shell_test_observe_files(const shell_test_program_t *program,
       observer(&program->words[n.left],
                SHELL_DEP_EDGE_FLAG_FILE_TEST_EXISTS
                    << (n.operation - TEST_FILE_EXISTS),
+               context);
+    else if (n.operation == TEST_NOT)
+      stack[count++] = n.left;
+    else if (n.operation == TEST_AND || n.operation == TEST_OR) {
+      stack[count++] = n.right;
+      stack[count++] = n.left;
+    }
+  }
+}
+
+void shell_test_observe_comparisons(const shell_test_program_t *program,
+                                    shell_test_comparison_observer_t observer,
+                                    void *context) {
+  if (program->proven_error)
+    return;
+  if (program->uncertain) {
+    for (size_t i = 1; i + 1 < program->word_count; ++i)
+      if (program->file_comparisons[i])
+        observer(&program->words[i - 1], &program->words[i + 1],
+                 program->file_comparisons[i], context);
+    return;
+  }
+  uint16_t stack[SHELL_DEP_MAX_TOKENS * 2 + 2];
+  size_t count = 1;
+  stack[0] = program->root;
+  while (count) {
+    shell_test_node_t n = program->nodes[stack[--count]];
+    if (n.operation >= TEST_FILE_NEWER && n.operation <= TEST_FILE_SAME)
+      observer(&program->words[n.left], &program->words[n.right],
+               SHELL_FILE_COMPARE_NEWER << (n.operation - TEST_FILE_NEWER),
                context);
     else if (n.operation == TEST_NOT)
       stack[count++] = n.left;

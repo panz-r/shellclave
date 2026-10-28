@@ -10,6 +10,13 @@
 SHELL_FILE_PREDICATES(FILE_ORDINAL)
 #undef FILE_ORDINAL
 
+#define COMPARISON_ORDINAL(kind, name, ordinal, spelling)                      \
+  _Static_assert(SHELL_CONDITIONAL_FILE_##kind ==                              \
+                     SHELL_CONDITIONAL_FILE_NEWER + ordinal,                   \
+                 "binary filesystem predicate ordinal");
+SHELL_FILE_COMPARISONS(COMPARISON_ORDINAL)
+#undef COMPARISON_ORDINAL
+
 /* Newlines/comments are grammar trivia before a primary, after lexical !,
  * and after an explicit unary or binary predicate. An operator needs its
  * operand immediately; a bare operand needs the following token without a
@@ -74,6 +81,36 @@ static SHELL_NONNULL(1, 4, 5) conditional_token_t
     return CONDITIONAL_TOKEN_COMPLETE;
   }
   return CONDITIONAL_TOKEN_NONE;
+}
+
+#define COMPARISON_SPELLING(kind, name, ordinal, spelling) , spelling
+static const char *const binary_operators[] = {
+    "=", "==", "!=" SHELL_FILE_COMPARISONS(COMPARISON_SPELLING)};
+#undef COMPARISON_SPELLING
+
+/* This error boundary follows a primary with no legal supported operator here.
+ * Recognize complete supported words with the same lexical rules as admission;
+ * quoted words and concatenated substitutions are not lexical operators. Wider
+ * grammar remains unsupported without a Bash-validity judgment. */
+static SHELL_NONNULL(1) bool misplaced_supported_operator(const char *s,
+                                                          size_t n, size_t p) {
+  if (s[p] == '(')
+    return true;
+  size_t end;
+  if (!shell_source_skip_shell_word_impl(s, n, p, &end, true))
+    return false;
+  for (unsigned op = 0;
+       op < sizeof(binary_operators) / sizeof(binary_operators[0]); ++op)
+    if (plain(s, n, p, end, binary_operators[op]))
+      return true;
+#define FILE_OPERATOR(kind, name, ordinal, spelling, alias)                    \
+  if (plain(s, n, p, end, spelling) ||                                         \
+      (spelling[1] != alias[1] && plain(s, n, p, end, alias)))                 \
+    return true;
+  SHELL_FILE_PREDICATES(FILE_OPERATOR)
+#undef FILE_OPERATOR
+  return plain(s, n, p, end, "-n") || plain(s, n, p, end, "-z") ||
+         plain(s, n, p, end, "-v") || plain(s, n, p, end, "!");
 }
 
 /* Keep fully quoted RHSs on their existing admission path. Mixed dynamic
@@ -207,7 +244,7 @@ static SHELL_NONNULL(1, 5) bool comparison_rhs(
  * received executable children. Successful framing refines its exact span. */
 static SHELL_NONNULL(1, 5, 6) bool operand(const char *s, size_t n, size_t p,
                                            unsigned index,
-                                           shell_conditional_t *r,
+                                           shell_conditional_primary_t *r,
                                            size_t *end) {
   r->operand_count = (uint8_t)(index + 1);
   r->operands[index] = p;
@@ -222,17 +259,28 @@ static SHELL_NONNULL(1, 5, 6) bool operand(const char *s, size_t n, size_t p,
   return true;
 }
 
-shell_conditional_t shell_conditional_parse(const char *s, size_t n,
-                                            size_t start) {
-  shell_conditional_t r = {0};
-  size_t p;
-  if (!shell_source_match_logical_punctuation(s, n, start, "[[", &p))
-    return r;
-  p = shell_source_skip_escaped_line_endings(s, n, p);
-  /* Received [[ can still acquire a suffix and name an ordinary executable. */
-  if (p == n ||
-      (!shell_source_space((unsigned char)s[p]) && !strchr(";|&()<>", s[p])))
-    return r;
+static SHELL_NONNULL(1) bool condition_delimiter(const char *s, size_t n,
+                                                 size_t p) {
+  size_t after;
+  return (p < n && s[p] == ')') ||
+         token_at(s, n, p, "]]", &after) == CONDITIONAL_TOKEN_COMPLETE ||
+         shell_source_match_logical_punctuation(s, n, p, "&&", NULL) ||
+         shell_source_match_logical_punctuation(s, n, p, "||", NULL);
+}
+
+/* A received Boolean token can still acquire its second byte, including
+ * across an unfinished escaped line ending. Committed mismatches are not
+ * prefixes. This is shared by primary and grouped-expression boundaries. */
+static SHELL_NONNULL(1) bool condition_join_prefix(const char *s, size_t n,
+                                                   size_t p) {
+  size_t after;
+  return token_at(s, n, p, "&&", &after) == CONDITIONAL_TOKEN_PREFIX ||
+         token_at(s, n, p, "||", &after) == CONDITIONAL_TOKEN_PREFIX;
+}
+
+static SHELL_NONNULL(1) shell_conditional_primary_t
+    parse_primary(const char *s, size_t n, size_t p, bool inside_group) {
+  shell_conditional_primary_t r = {0};
   r.content = p;
   r.end = r.after = n;
   r.frame = SHELL_CONDITIONAL_INCOMPLETE;
@@ -316,21 +364,38 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
   if (p == n)
     return r;
   conditional_token_t closer = token_at(s, n, p, "]]", &after);
-  if (closer == CONDITIONAL_TOKEN_PREFIX)
+  if (closer == CONDITIONAL_TOKEN_PREFIX) {
+    /* Once `]` is received, appending cannot insert a required `)` before it.
+     * A lone continuation prefix can still acquire that group closer. */
+    if (inside_group && s[p] == ']')
+      r.frame = SHELL_CONDITIONAL_INVALID;
     return r;
-  if (!unary && s[p] != '\n' && s[p] != '#' &&
-      closer != CONDITIONAL_TOKEN_COMPLETE) {
-    static const char *const operators[] = {"=", "==", "!="};
-    for (unsigned op = 0; op < sizeof(operators) / sizeof(operators[0]); ++op) {
+  }
+  if (condition_join_prefix(s, n, p))
+    return r;
+  if (!unary && s[p] != '\n' && s[p] != '#' && !condition_delimiter(s, n, p)) {
+    for (unsigned op = 0;
+         op < sizeof(binary_operators) / sizeof(binary_operators[0]); ++op) {
       size_t operator_end;
       conditional_token_t operator_token =
-          token_at(s, n, p, operators[op], &operator_end);
+          token_at(s, n, p, binary_operators[op], &operator_end);
       if (operator_token == CONDITIONAL_TOKEN_PREFIX)
         return r;
       if (operator_token != CONDITIONAL_TOKEN_COMPLETE)
         continue;
-      r.predicate = op == 2 ? SHELL_CONDITIONAL_STRING_NOT_EQUAL
-                            : SHELL_CONDITIONAL_STRING_EQUAL;
+      /* Punctuation can terminate the spelling without ending its word:
+       * -nt<(...) is one word, not a comparison followed by an operand.
+       * Keep prefix recovery above, then apply the shared lexical boundary
+       * before assigning an operator role or collecting a right operand. */
+      if (!shell_source_match_plain_word(s, n, p, binary_operators[op],
+                                         strlen(binary_operators[op]),
+                                         &operator_end)) {
+        r.frame = SHELL_CONDITIONAL_INVALID;
+        return r;
+      }
+      r.predicate = op >= 3   ? SHELL_CONDITIONAL_FILE_NEWER + op - 3
+                    : op == 2 ? SHELL_CONDITIONAL_STRING_NOT_EQUAL
+                              : SHELL_CONDITIONAL_STRING_EQUAL;
       p = trivia(s, n, operator_end, false);
       if (p == n)
         return r;
@@ -341,7 +406,7 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
       }
       if (!operand(s, n, p, 1, &r, &end))
         return r;
-      if (!comparison_rhs(s, n, p, end, &r.predicate)) {
+      if (op < 3 && !comparison_rhs(s, n, p, end, &r.predicate)) {
         r.frame = SHELL_CONDITIONAL_UNSUPPORTED;
         return r;
       }
@@ -352,19 +417,214 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
       break;
     }
   }
-  if (closer == CONDITIONAL_TOKEN_PREFIX)
-    return r;
-  if (closer == CONDITIONAL_TOKEN_COMPLETE) {
-    r.frame = SHELL_CONDITIONAL_COMPLETE;
-    r.end = p;
-    r.after = after;
+  if (closer == CONDITIONAL_TOKEN_PREFIX) {
+    if (inside_group && s[p] == ']')
+      r.frame = SHELL_CONDITIONAL_INVALID;
     return r;
   }
-  /* Wider grammar is unsupported without a Bash-validity judgment. */
-  if (strchr("=&|<>()", s[p]) || s[p] == '!' || (s[p] == '-' && p + 1 < n))
+  if (condition_join_prefix(s, n, p))
+    return r;
+  if (condition_delimiter(s, n, p)) {
+    r.frame = SHELL_CONDITIONAL_COMPLETE;
+    r.end = p;
+    r.after = p;
+    return r;
+  }
+  if (misplaced_supported_operator(s, n, p))
+    r.frame = SHELL_CONDITIONAL_INVALID;
+  else if (strchr("=<>()", s[p]) || s[p] == '!' || (s[p] == '-' && p + 1 < n))
     r.frame = SHELL_CONDITIONAL_UNSUPPORTED;
   else
     r.frame = SHELL_CONDITIONAL_INVALID;
+  return r;
+}
+
+typedef struct {
+  const char *source;
+  size_t length, position;
+  shell_conditional_t *result;
+  unsigned depth;
+  bool compound;
+} condition_parser_t;
+
+/* The public single-primary summary follows parsing, including unfinished
+ * groups and closers. Consuming a Boolean connector clears it before parsing
+ * the right term; even a missing right term makes this a compound expression.
+ * Lexical operand storage remains in the tree and pending primary. */
+static SHELL_NONNULL(1) void condition_compound(condition_parser_t *p) {
+  p->compound = true;
+  p->result->predicate = SHELL_CONDITIONAL_PREDICATE_NONE;
+  p->result->operand_count = 0;
+  p->result->negated = false;
+  memset(p->result->operands, 0, sizeof(p->result->operands));
+  memset(p->result->operand_lengths, 0, sizeof(p->result->operand_lengths));
+}
+
+static SHELL_NONNULL(1) uint16_t
+    condition_node(condition_parser_t *p, shell_condition_operation_t operation,
+                   uint16_t left, uint16_t right,
+                   const shell_conditional_primary_t *primary) {
+  shell_conditional_t *r = p->result;
+  if (r->count == SHELL_CONDITIONAL_MAX_NODES) {
+    r->frame = SHELL_CONDITIONAL_LIMIT;
+    return UINT16_MAX;
+  }
+  uint16_t index = r->count++;
+  r->nodes[index] = (shell_condition_node_t){
+      .operation = operation, .left = left, .right = right};
+  if (primary) {
+    r->nodes[index].primary = *primary;
+    r->features |= shell_conditional_features(primary->predicate);
+  }
+  return index;
+}
+
+static uint16_t condition_or(condition_parser_t *p, bool inside_group)
+    SHELL_NONNULL(1);
+
+static SHELL_NONNULL(1) uint16_t
+    condition_term(condition_parser_t *p, bool inside_group) {
+  const char *s = p->source;
+  size_t n = p->length, after;
+  p->position = trivia(s, n, p->position, true);
+  size_t start = p->position;
+  bool negated = false;
+  while (start < n &&
+         token_at(s, n, start, "!", &after) == CONDITIONAL_TOKEN_COMPLETE) {
+    /* `!(...)` is an extglob word; `!` concatenated with a process
+     * substitution is also data. Only a complete standalone lexical word
+     * selects negation, as in the primary recognizer. */
+    size_t word_end;
+    if (!shell_source_skip_shell_word_impl(s, n, start, &word_end, true) ||
+        !plain(s, n, start, word_end, "!"))
+      break;
+    negated = !negated;
+    start = p->position = trivia(s, n, after, true);
+  }
+  if (start == n) {
+    p->result->frame = SHELL_CONDITIONAL_INCOMPLETE;
+    if (!p->compound)
+      p->result->negated = negated;
+    return UINT16_MAX;
+  }
+  if (++p->depth > SHELL_CONDITIONAL_MAX_NODES) {
+    p->result->frame = SHELL_CONDITIONAL_LIMIT;
+    return UINT16_MAX;
+  }
+  uint16_t result;
+  if (s[start] == '(') {
+    p->position++;
+    result = condition_or(p, true);
+    if (result != UINT16_MAX) {
+      p->position = trivia(s, n, p->position, true);
+      /* A completed subgroup may still acquire a Boolean connector or an
+       * escaped line ending before this group's required `)`. */
+      if (p->position == n || condition_join_prefix(s, n, p->position)) {
+        p->result->frame = SHELL_CONDITIONAL_INCOMPLETE;
+        result = UINT16_MAX;
+      } else if (s[p->position] != ')') {
+        p->result->frame = SHELL_CONDITIONAL_INVALID;
+        result = UINT16_MAX;
+      } else
+        p->position++;
+    }
+  } else {
+    shell_conditional_primary_t primary =
+        parse_primary(s, n, start, inside_group);
+    p->position = primary.after;
+    if (!p->compound) {
+      p->result->predicate = primary.predicate;
+      p->result->negated = primary.negated;
+      p->result->operand_count = primary.operand_count;
+      memcpy(p->result->operands, primary.operands, sizeof(primary.operands));
+      memcpy(p->result->operand_lengths, primary.operand_lengths,
+             sizeof(primary.operand_lengths));
+    }
+    if (primary.frame != SHELL_CONDITIONAL_COMPLETE) {
+      p->result->frame = primary.frame;
+      p->result->pending = primary;
+      p->result->features |= shell_conditional_features(primary.predicate);
+      result = UINT16_MAX;
+    } else
+      result = condition_node(p, SHELL_CONDITION_PRIMARY, 0, 0, &primary);
+  }
+  p->depth--;
+  /* Enclosing negation applies to the summary even when the child stopped at
+   * received EOF before its group or primary could become a completed node. */
+  if (!p->compound && negated)
+    p->result->negated = !p->result->negated;
+  if (result != UINT16_MAX && negated)
+    result = condition_node(p, SHELL_CONDITION_NOT, result, 0, NULL);
+  return result;
+}
+
+static SHELL_NONNULL(1) uint16_t
+    condition_and(condition_parser_t *p, bool inside_group) {
+  uint16_t left = condition_term(p, inside_group);
+  while (left != UINT16_MAX) {
+    size_t after;
+    p->position = trivia(p->source, p->length, p->position, true);
+    if (!shell_source_match_logical_punctuation(p->source, p->length,
+                                                p->position, "&&", &after))
+      break;
+    p->position = after;
+    condition_compound(p);
+    uint16_t right = condition_term(p, inside_group);
+    if (right == UINT16_MAX)
+      return right;
+    left = condition_node(p, SHELL_CONDITION_AND, left, right, NULL);
+  }
+  return left;
+}
+
+static uint16_t condition_or(condition_parser_t *p, bool inside_group) {
+  uint16_t left = condition_and(p, inside_group);
+  while (left != UINT16_MAX) {
+    size_t after;
+    p->position = trivia(p->source, p->length, p->position, true);
+    if (!shell_source_match_logical_punctuation(p->source, p->length,
+                                                p->position, "||", &after))
+      break;
+    p->position = after;
+    condition_compound(p);
+    uint16_t right = condition_and(p, inside_group);
+    if (right == UINT16_MAX)
+      return right;
+    left = condition_node(p, SHELL_CONDITION_OR, left, right, NULL);
+  }
+  return left;
+}
+
+shell_conditional_t shell_conditional_parse(const char *s, size_t n,
+                                            size_t start) {
+  shell_conditional_t r = {0};
+  size_t p, after;
+  if (!shell_source_match_logical_punctuation(s, n, start, "[[", &p))
+    return r;
+  p = shell_source_skip_escaped_line_endings(s, n, p);
+  if (p == n ||
+      (!shell_source_space((unsigned char)s[p]) && !strchr(";|&()<>", s[p])))
+    return r;
+  r.content = p;
+  r.end = r.after = n;
+  r.frame = SHELL_CONDITIONAL_COMPLETE;
+  r.features = SHELL_FEAT_CONDITIONALS;
+  condition_parser_t parser = {
+      .source = s, .length = n, .position = p, .result = &r};
+  r.root = condition_or(&parser, false);
+  if (r.root == UINT16_MAX)
+    return r;
+  p = trivia(s, n, parser.position, true);
+  conditional_token_t closer = token_at(s, n, p, "]]", &after);
+  if (closer != CONDITIONAL_TOKEN_COMPLETE) {
+    r.frame =
+        closer == CONDITIONAL_TOKEN_PREFIX || condition_join_prefix(s, n, p)
+            ? SHELL_CONDITIONAL_INCOMPLETE
+            : SHELL_CONDITIONAL_INVALID;
+    return r;
+  }
+  r.end = p;
+  r.after = after;
   return r;
 }
 
@@ -478,7 +738,7 @@ static SHELL_NONNULL(1, 5) bool match_pattern(const pattern_unit_t *units,
 /* condition supplies an admitted static star pattern. The enclosing operation
  * releases all temporary storage at its saved mark, including on failure. */
 static SHELL_NONNULL(1, 2, 3, 4) bool evaluate_pattern(
-    const char *source, const shell_conditional_t *condition,
+    const char *source, const shell_conditional_primary_t *condition,
     const shell_conditional_value_t *left, bool *matched) {
   const char *word = source + condition->operands[1];
   size_t length = condition->operand_lengths[1];
@@ -519,11 +779,37 @@ static SHELL_NONNULL(1, 2, 3, 4) bool evaluate_pattern(
 }
 
 bool shell_conditional_evaluate(const char *source,
-                                const shell_conditional_t *condition,
+                                const shell_conditional_primary_t *condition,
                                 const shell_conditional_value_t values[2],
                                 bool *truth) {
   if (condition->predicate == SHELL_CONDITIONAL_VARIABLE_SET)
     return false; /* Presence is a path-local graph fact, not a string value. */
+  if (condition->predicate >= SHELL_CONDITIONAL_FILE_NEWER &&
+      condition->predicate <= SHELL_CONDITIONAL_FILE_SAME) {
+    bool empty[2] = {false, false};
+    for (unsigned i = 0; i < 2; ++i) {
+      if (values[i].known)
+        empty[i] = values[i].length == 0;
+      else {
+        /* Unknown decoding cannot prove emptiness. Check each operand so a
+         * known-empty counterpart can still decide the comparison. */
+        bool static_empty;
+        empty[i] = shell_conditional_static_empty(
+                       source + condition->operands[i],
+                       condition->operand_lengths[i], &static_empty) &&
+                   static_empty;
+      }
+    }
+    bool false_result = condition->predicate == SHELL_CONDITIONAL_FILE_SAME
+                            ? empty[0] || empty[1]
+                        : condition->predicate == SHELL_CONDITIONAL_FILE_NEWER
+                            ? empty[0]
+                            : empty[1];
+    if (!false_result)
+      return false;
+    *truth = condition->negated;
+    return true;
+  }
   if (shell_conditional_file(condition->predicate)) {
     bool empty;
     if (values[0].known)

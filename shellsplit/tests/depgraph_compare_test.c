@@ -65,6 +65,7 @@ static void test_nodes(void) {
             SHELL_CONDITIONAL_STRING_EQUAL)                                    \
   CMD_FIELD(conditional_negated, false, true)                                  \
   CMD_FIELD(conditional_truth, 0, 1)                                           \
+  CMD_FIELD(conditional_unresolved, false, true)                               \
   CMD_FIELD(arithmetic_expression, NULL, "1")                                  \
   CMD_FIELD(arithmetic_expression_length, 0, 1)                                \
   CMD_FIELD(arithmetic_truth, SHELL_ARITHMETIC_UNKNOWN, SHELL_ARITHMETIC_ZERO) \
@@ -106,8 +107,8 @@ static void test_nodes(void) {
   /* All node kinds can retain different inactive union bytes. Assignment of
    * their active subobjects must not require clearing the whole union. */
   static const shell_dep_node_type_t kinds[] = {
-      SHELL_NODE_DOC, SHELL_NODE_GROUP, SHELL_NODE_TIME, SHELL_NODE_ENDPOINT,
-      SHELL_NODE_FD};
+      SHELL_NODE_DOC,      SHELL_NODE_GROUP, SHELL_NODE_TIME,
+      SHELL_NODE_ENDPOINT, SHELL_NODE_FD,    SHELL_NODE_FILE_COMPARISON};
   for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
     memset(&a, 0x55, sizeof(a));
     memset(&b, 0xaa, sizeof(b));
@@ -143,6 +144,13 @@ static void test_nodes(void) {
       b.fd.number = 2;
       break;
     case SHELL_NODE_CMD:
+      break;
+    case SHELL_NODE_FILE_COMPARISON:
+      a.file_comparison =
+          (shell_dep_file_comparison_t){SHELL_FILE_COMPARE_SAME, 0};
+      b.file_comparison = a.file_comparison;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.file_comparison.empty_operands = 1;
       break;
     }
     CHECK(shellsplit_test_node_difference(&a, &b) != NULL);

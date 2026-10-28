@@ -2636,9 +2636,9 @@ static void test_group_descriptor_limits(void) {
   command[length] = '\0';
   memset(&result, 0, sizeof(result));
   error = shell_parse_fast(command, length, NULL, &result);
-  test("One more nested brace group is rejected without overflowing",
-       error == SHELL_EPARSE && result.group_count <= SHELL_MAX_GROUPS &&
-           result.status == SHELL_STATUS_ERROR);
+  test("One more nested brace group reports syntax exhaustion",
+       error == SHELL_ETRUNC && !result.group_count && !result.count &&
+           result.status == SHELL_STATUS_TRUNCATED);
 }
 
 static void test_io_number_bounds(void) {
@@ -3595,9 +3595,11 @@ static void test_strict_operator_boundary_matrix(void) {
   shell_parse_result_t result = {0};
   shell_error_t nested_status =
       shell_parse_fast(nested, used, &strict, &result);
-  valid = valid && used < sizeof(nested) && nested_status == SHELL_EPARSE &&
-          result.status == SHELL_STATUS_ERROR;
-  test("Strict parser rejects malformed and over-nested operators", valid);
+  valid = valid && used < sizeof(nested) && nested_status == SHELL_ETRUNC &&
+          result.status == SHELL_STATUS_TRUNCATED && !result.count &&
+          !result.group_count;
+  test("Strict parser distinguishes malformed operators and nesting limits",
+       valid);
 }
 
 /* These semantic classifiers sit below the public processor adapters. Exercise
@@ -3650,13 +3652,13 @@ static void test_semantic_classifier_boundaries(void) {
       {"typeset map[key]", true},
       {"command -- declare \"arr[$(printf 0)]\"", true},
       {"declare scalar='[literal]'", false},
-      {SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"), true},
+      {SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("/tmp/x"), true},
       {"VALUE=x [[ $VALUE == x ]]", false},
       {">out [[ x ]]", false},
       {"VALUE=x then", false},
       {">out then", false},
       {"{ [[ -n value ]]; }", false},
-      {"echo $( " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x") " )",
+      {"echo $( " SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("/tmp/x") " )",
        true},
       {"(( count += 1 ))", true},
       {"! (( 1 ))", false},
@@ -3664,7 +3666,7 @@ static void test_semantic_classifier_boundaries(void) {
       {"time echo x", false},
       {"time eval echo hidden", true},
       {"time coproc echo hidden", true},
-      {"time " SHELLSPLIT_TEST_UNMODELED_FILE_CONDITION("/tmp/x"), true},
+      {"time " SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("/tmp/x"), true},
       {"time (( count += 1 ))", true},
       {"time shopt -s varredir_close", true},
       {"time command declare -a values", true},

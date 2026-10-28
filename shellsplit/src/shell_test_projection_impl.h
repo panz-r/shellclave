@@ -34,6 +34,22 @@ static SHELL_NONNULL(1) void project_visit(test_projection_t *p,
                                            test_projection_ref_t ref,
                                            bool collect);
 
+static SHELL_NONNULL(1) void project_comparison(test_projection_t *p,
+                                                size_t op) {
+  const shell_test_value_t *word = &p->program->words[op];
+  unsigned kinds = 0;
+  if (!word->known)
+    kinds = (1u << SHELL_FILE_COMPARISON_COUNT) - 1u;
+  else if (word->value_length == 3) {
+#define FILE_COMPARISON_PROJECT(kind, name, ordinal, spelling)                 \
+  if (!memcmp(word->value, spelling, 3))                                       \
+    kinds = SHELL_FILE_COMPARE_##kind;
+    SHELL_FILE_COMPARISONS(FILE_COMPARISON_PROJECT)
+#undef FILE_COMPARISON_PROJECT
+  }
+  p->program->file_comparisons[op] |= (uint8_t)kinds;
+}
+
 static SHELL_NONNULL(1) bool project_role(const test_projection_t *p,
                                           size_t word,
                                           shell_test_roles_t role) {
@@ -130,6 +146,8 @@ static SHELL_NONNULL(1) void project_visit(test_projection_t *p,
         project_rule(p, ref, collect, p->words[first].dynamic, none, none,
                      first + 1, project_unary_roles(&p->words[first]));
       } else {
+        if (collect && p->words[first + 1].dynamic)
+          project_comparison(p, first + 1);
         project_rule(p, ref, collect, p->words[first + 1].dynamic, none, none,
                      0, 0);
         project_rule(p, ref, collect, project_role(p, first, SHELL_TEST_NOT),
@@ -159,6 +177,8 @@ static SHELL_NONNULL(1) void project_visit(test_projection_t *p,
       }
       return;
     default:
+      if (collect && dispatch.kind == SHELL_TEST_DISPATCH_BINARY)
+        project_comparison(p, first + dispatch.first + 1);
       project_rule(p, ref, collect, true, none, none, 0, 0);
       return;
     }
@@ -222,6 +242,9 @@ static SHELL_NONNULL(1) void project_visit(test_projection_t *p,
                  project_unary_roles(head));
   } else if (count == 3) {
     const shell_builtin_test_word_t *next = &p->words[first + 1];
+    if (collect && (shell_test_lookahead(next->roles, next->dynamic) &
+                    SHELL_TEST_LOOKAHEAD_BINARY))
+      project_comparison(p, first + 1);
     project_rule(p, ref, collect,
                  shell_test_lookahead(next->roles, next->dynamic) &
                      SHELL_TEST_LOOKAHEAD_BINARY,

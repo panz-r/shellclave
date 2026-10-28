@@ -202,9 +202,17 @@ unresolved arguments can leave its path or predicate kind uncertain. Nonempty
 paths have UNKNOWN truth. Access checks and filesystem timestamps remain runtime
 facts, separate from file-content reads, writes and command execution.
 See [filesystem predicates](../docs/shell-model.md#filesystem-predicates).
-Binary pathname comparisons (`-nt`, `-ot`, `-ef`) remain opaque in `test` and `[`
-and do not produce FILE_TEST edges. Unary `-a` is an existence alias; builtin
-argument grammar distinguishes it from conjunction.
+Binary pathname comparisons (`-nt`, `-ot`, `-ef`) are supported in all three
+forms. FILE_COMPARISON nodes retain comparison kinds and ordered FILE operands
+through FILE_COMPARE, FILE_LEFT and FILE_RIGHT edges. These metadata observations
+retain runtime uncertainty and are distinct from content reads.
+
+Conditional commands support `!`, `&&`, `||` and parentheses, for example
+`[[ source.c -nt source.o && -r source.c ]]`. Known short-circuit outcomes omit
+skipped expansion effects; unknown outcomes retain possible effects. Compound
+results expose their full expression and aggregate truth, with NONE/zero in the
+single-primary predicate/operand summary. Unary `-a` is an existence alias;
+builtin argument grammar distinguishes it from conjunction.
 
 ## Dependency-graph workspace
 
@@ -217,16 +225,17 @@ and workspace sizes depend on this capacity; rebuild consumers after updating.
 Graph construction uses one temporary workspace. Allocating processor/tokenizer,
 abstraction, transformation, and sequence APIs manage their own source scratch.
 Allocation-free APIs accept caller scratch for delimiter normalization,
-non-evicting indexed-subscript boundary records, conditional-pattern
-evaluation, prepared builtin-test arguments, expression nodes and bounded
-grammar projection. Obtain sufficient capacity from
+non-evicting indexed-subscript boundary records, compiled conditional programs,
+pattern evaluation, prepared builtin-test arguments, expression nodes and
+bounded grammar projection. Obtain sufficient capacity from
 `shell_source_workspace_size()` rather than estimating bytes. A public tokenizer retains facts between calls
 in its supplied buffer; independent live iterators require distinct buffers.
 
 Dependency-graph parsing uses caller-owned scratch for source analysis,
 static predicate evaluation and descriptor-route resolution. Measure its fixed
 prefix once, add the queried source-scratch capacity, and align one reusable
-allocation. Pattern comparisons can require this tail even without heredocs.
+allocation. Conditional programs require this tail even for literal conditions
+without heredocs.
 Keep the command bytes, graph output, and workspace disjoint. Within an
 application function with an existing `command` span and `command_length`:
 
@@ -267,8 +276,9 @@ alignment; the example rounds up after adding source scratch. Applications
 with a different allocator can over-allocate and align manually. An absent,
 misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Use
 `shell_source_workspace_size()` to cover delimiter normalization, persistent
-subscript facts, conditional-pattern storage, compiled builtin-test arguments
-and expressions, and bounded ambiguous-grammar projection in the same tail.
+subscript facts, compiled conditional programs, pattern storage, compiled
+builtin-test arguments and expressions, and bounded ambiguous-grammar projection
+in the same tail. Even simple literal `[[ … ]]` expressions can require it.
 Command bytes, configuration, workspace, and graph output must obey the
 non-overlap requirements documented by the API.
 

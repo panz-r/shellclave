@@ -1476,15 +1476,9 @@ static SHELL_NONNULL(1, 2, 3) uint32_t
     }
     if (node->type != SHELL_NODE_CMD)
       continue;
-    if (node->cmd.kind == SHELL_COMMAND_CONDITIONAL) {
-      for (unsigned operand = 0; operand < node->cmd.conditional_operand_count;
-           ++operand) {
-        const shell_dep_word_value_t *value =
-            shell_expand_lookup(cache, node->cmd.conditional_operands[operand]);
-        if (value && value->dynamic && !value->resolved)
-          flags[ni] |= SG_EXPANSION_UNRESOLVED_CONDITION;
-      }
-    }
+    if (node->cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+        node->cmd.conditional_unresolved)
+      flags[ni] |= SG_EXPANSION_UNRESOLVED_CONDITION;
     for (uint32_t token = 0; token < node->cmd.token_count; token++) {
       SG_EXPANSION_WORK();
       const shell_dep_word_value_t *value =
@@ -3026,7 +3020,9 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
           edge->type == SHELL_EDGE_SEQ || edge->type == SHELL_EDGE_AND ||
           edge->type == SHELL_EDGE_OR || edge->type == SHELL_EDGE_BACKGROUND ||
           (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
-           edge->type == SHELL_EDGE_FILE_TEST && edge->from == endpoint) ||
+           (edge->type == SHELL_EDGE_FILE_TEST ||
+            edge->type == SHELL_EDGE_FILE_COMPARE) &&
+           edge->from == endpoint) ||
           (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
            edge->type == SHELL_EDGE_SUBST && edge->to == endpoint);
       if (!allowed)
@@ -4071,6 +4067,13 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                         .workspace_size = buf_size};
   shell_error_t ferr = shell_parse_fast(cmd, cmd_len, &lim, &fast);
   bool parse_truncated = ferr == SHELL_ETRUNC;
+  /* Syntax capacity can stop validation before any ranges are qualified.
+   * There is no complete analysis to inspect, score or classify by policy. */
+  if (parse_truncated && fast.count == 0) {
+    out->truncated = out->subcommand_truncated = true;
+    out->verdict = SG_VERDICT_UNDETERMINED;
+    return SG_ERR_TRUNC;
+  }
   /* A successful zero-range parse already establishes semantic trivia.
    * Do not override a parse error with a second, broader C-whitespace scan. */
   if (ferr == SHELL_OK && fast.count == 0) {
