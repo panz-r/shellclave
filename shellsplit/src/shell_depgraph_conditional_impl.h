@@ -25,7 +25,8 @@ static SHELL_NONNULL(1) bool dep_condition_qualified(
     const dep_condition_context_t *ctx, bool active, size_t position) {
   return active &&
          !ctx->graph->nodes[ctx->owner].cmd.conditional_arithmetic_unresolved &&
-         position < *ctx->context->semantic_barrier &&
+         !dep_coverage_position_blocked(*ctx->context->semantic_barrier,
+                                        position) &&
          dep_owner_phase_active(ctx->context, ctx->owner,
                                 DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
 }
@@ -199,11 +200,9 @@ static SHELL_NONNULL(1, 5) shell_dep_error_t
     if (arithmetic_unresolved) {
       ctx->graph->nodes[ctx->owner].cmd.conditional_arithmetic_unresolved =
           true;
-      ctx->graph->status |= SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC;
+      dep_record_arithmetic_status(ctx->graph);
       shell_test_forget_condition_presence(ctx->program);
-      uint32_t boundary = (uint32_t)primary->end;
-      if (boundary < *ctx->context->semantic_barrier)
-        *ctx->context->semantic_barrier = boundary;
+      dep_lower_coverage_boundary(ctx->context, (uint32_t)primary->end);
     }
     /* A nested substitution can introduce a barrier while expanding either
      * operand. Recheck coverage before publishing predicate observations. */

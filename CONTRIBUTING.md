@@ -113,12 +113,14 @@ The implementation owners and private interfaces are:
 | Lexical iteration, control/list/draft grammar and borrowed command construction | `shell_tokenizer_full.c`, `shell_tokenizer_full_internal.h`, `shell_source_draft_internal.h` |
 | Retained source/draft collection | `shell_source.c` |
 | Arithmetic grammar, literal value proofs and conditional scalar-reference analysis | `shell_arithmetic.c`, `shell_arithmetic_internal.h` |
-| Conditional framing, ordered operands, RHS admission, predicate properties, pattern matching and truth | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Conditional framing, ordered operands, predicate properties and truth orchestration | `shell_conditional.c`, `shell_conditional_internal.h` |
+| Conditional RHS admission, pattern projection, matching and scratch requirements | `shell_conditional_pattern_impl.h` |
+| Conditional arithmetic word projection and direct parameter observation | `shell_conditional_operand_impl.h` |
 | Numeric comparison identities and relational operations | `shell_numeric_predicate_internal.h` |
 | Filesystem predicate spellings, aliases and semantic ordinals | `shell_file_predicate_internal.h` |
 | Builtin test argument-count grammar, admission, bounded grammar-role projection and eager expression evaluation | `shell_test_grammar_internal.h`, `shell_test_admission_internal.h`, `shell_test.c`, `shell_test_projection_impl.h`, `shell_test_internal.h` |
 | Shared builtin word projection and scalar cardinality | `shell_builtin_word_internal.h` |
-| Whole-word expansion requests, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
+| Whole-word expansion requests, purpose properties, cached values and callback-result validation | `shell_expand.c`, `shell_expand_internal.h` |
 | Supported-operation inspection, builtin roles and semantic observers | `shell_semantics.c`, `shell_semantics_internal.h` |
 | Word-value operations, scalar identifier checks, public decoding adapters and diagnostic word rendering | `shell_word.c`, `shell_word_internal.h` |
 | Heredoc delimiter spelling and printer storage layout | `shell_heredoc.c`, `shell_heredoc_storage_internal.h` |
@@ -138,8 +140,9 @@ Shared inline interfaces have narrower responsibilities:
 - `shell_word_fragment_internal.h` owns nonrecursive quote/escape processing,
   ANSI-C decoding, effective fragment values and quote provenance.
 - `shell_word_decode_internal.h` supplies sinks and decoding loops for direct
-  emission into canonical buffers. Only the word implementation and processor's
-  direct emitter include it; declaration-only callers use `shell_word_internal.h`.
+  emission into canonical buffers and conditional arithmetic projection. The
+  word implementation, conditional implementation and processor's direct
+  emitter include it; declaration-only callers use `shell_word_internal.h`.
 
 Share selection and context facts that consumers interpret identically. Keep
 syntax recovery, borrowed-to-owned rebasing, graph execution effects and policy
@@ -169,6 +172,16 @@ rules stay aligned. Complete quote framing remains with the recursive source
 scanners; conditional admission uses those boundaries to skip nested syntax.
 The expansion module requests and validates whole-word callback values, while
 the conditional evaluator consumes those values to determine predicate truth.
+Private inline purpose predicates distinguish pathnames from conditional
+single-value requests. Keep these protocol properties in the expansion
+interface instead of repeating purpose lists in graph consumers.
+
+The conditional pattern and operand fragments share the conditional translation
+unit. Pattern admission and evaluation keep their quote-aware projection and
+scratch requirements together; common decoding sinks and overall truth
+evaluation remain in the including file. Semantic inspection invokes the
+conditional-owned operand-admission helper once at its existing traversal
+point. It checks skipped numeric operands too; graph reachability is separate.
 
 Variable presence belongs to graph execution state, independently of descriptor
 bindings and empty scalar values. Prepare observed names and mutation targets
@@ -180,6 +193,12 @@ Private graph implementation fragments group related execution-state operations:
 visibility, `shell_depgraph_test_impl.h` owns predicate observations, filesystem
 graph attachment, test lookup and outcome selection, and
 `shell_depgraph_presence_impl.h` owns presence facts, epochs and assumptions.
+`shell_depgraph_coverage_impl.h` owns semantic coverage recording, recursive
+coverage imports and source-position qualification. CWD facts use position
+qualification; effect qualification also requires active effects. Owner flags,
+presence invalidation and branch/setup reachability remain at their execution
+points. The conditional graph fragment owns ordered operand expansion and
+predicate evaluation.
 They are included at their dependency points in `shell_depgraph.c` and share its
 translation unit. They are not independent interfaces or installed headers.
 Route storage, mutation ordering, scope publication and recursive observation

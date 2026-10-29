@@ -870,21 +870,8 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
           shell_conditional_parse(input, input_length, token.position);
       if (condition.frame != SHELL_CONDITIONAL_COMPLETE)
         return true;
-      for (unsigned i = 0; i < condition.count; ++i) {
-        const shell_condition_node_t *node = &condition.nodes[i];
-        if (node->operation != SHELL_CONDITION_PRIMARY ||
-            !shell_conditional_numeric(node->primary.predicate))
-          continue;
-        for (unsigned operand = 0; operand < 2; ++operand) {
-          shell_arithmetic_scalar_result_t facts =
-              shell_conditional_arithmetic_operand(
-                  input + node->primary.operands[operand],
-                  node->primary.operand_lengths[operand], NULL, 0, false, NULL,
-                  NULL);
-          if (!facts.result.supported)
-            return true;
-        }
-      }
+      if (shell_conditional_operands_unsupported(input, &condition))
+        return true;
       for (unsigned i = 0; semantic_variable_observer && i < condition.count;
            ++i) {
         const shell_condition_node_t *node = &condition.nodes[i];

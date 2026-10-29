@@ -4,6 +4,28 @@
 #include "shell_depgraph.h"
 #include "shell_expand.h"
 
+/* Purpose properties belong to the whole-word resolution protocol. Callers
+ * supply a declared purpose; graph effects and value interpretation remain
+ * with their owners. Keep classification inline in all build profiles. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline bool
+shell_expand_purpose_is_path(shell_expand_word_purpose_t purpose) {
+  return purpose != SHELL_EXPAND_WORD_ARGUMENT &&
+         purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
+         purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline bool
+shell_expand_purpose_is_conditional(shell_expand_word_purpose_t purpose) {
+  return purpose == SHELL_EXPAND_WORD_CONDITIONAL ||
+         purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC;
+}
+
 /* Private whole-word resolution bridge. The owner/source are unchanged parser
  * spans. A resolved value was canonically validated by the application-facing
  * boundary; graph leaves consume these prechecked bytes without decoding them

@@ -127,6 +127,33 @@ shell_arithmetic_scalar_result_t shell_conditional_arithmetic_operand(
     bool resolved, shell_arithmetic_reference_fn visitor, void *context)
     SHELL_NONNULL(1);
 
+/* source is immutable and condition is its complete conditional parse.
+ * Admission visits every numeric operand, including skipped primaries; graph
+ * execution qualification is separate. Scratch exhaustion remains observable
+ * through the source operation. No framing or source correspondence recheck. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline SHELL_NONNULL(1, 2) bool shell_conditional_operands_unsupported(
+    const char *source, const shell_conditional_t *condition) {
+  for (unsigned i = 0; i < condition->count; ++i) {
+    const shell_condition_node_t *node = &condition->nodes[i];
+    if (node->operation != SHELL_CONDITION_PRIMARY ||
+        !shell_conditional_numeric(node->primary.predicate))
+      continue;
+    for (unsigned operand = 0; operand < 2; ++operand) {
+      shell_arithmetic_scalar_result_t facts =
+          shell_conditional_arithmetic_operand(
+              source + node->primary.operands[operand],
+              node->primary.operand_lengths[operand], NULL, 0, false, NULL,
+              NULL);
+      if (!facts.result.supported)
+        return true;
+    }
+  }
+  return false;
+}
+
 static inline uint32_t
 shell_conditional_features(shell_conditional_predicate_t predicate) {
   return SHELL_FEAT_CONDITIONALS |

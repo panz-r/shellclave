@@ -2584,6 +2584,8 @@ typedef struct {
   uint8_t *unresolved_paths;
 } dep_parse_context_t;
 
+#include "shell_depgraph_coverage_impl.h"
+
 /* Required construction context and a retained CMD/GROUP owner with its
  * inverse map already installed. */
 static SHELL_NONNULL(1, 2) bool dep_expansion_cwd_known(
@@ -10187,7 +10189,7 @@ static SHELL_NONNULL(1) dep_execution_certainty_t
   uint32_t start = event < SHELL_MAX_GROUPS
                        ? context->fast->groups[event].start
                        : context->fast->cmds[event - SHELL_MAX_GROUPS].start;
-  if (!context->effects_active || start >= *context->semantic_barrier)
+  if (dep_coverage_effects_blocked(context, start))
     execution = DEP_EXECUTION_NEVER;
   return execution;
 }
@@ -11042,9 +11044,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
    * prebuilt group documents must not advertise failure to descriptor replay
    * before their operand executes. Static paths need no callback/cache entry.
    */
-  if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
-      purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
-      purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC &&
+  if (eligible && shell_expand_purpose_is_path(purpose) &&
       !(graph->nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)) {
     size_t decoded_length;
     if (shell_process_measure_word_value(word->start, word->len,
@@ -11084,14 +11084,10 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
     return SHELL_DEP_EPARSE;
   if (result)
     *result = value;
-  if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
-      purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
-      purpose != SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC && value->dynamic &&
+  if (eligible && shell_expand_purpose_is_path(purpose) && value->dynamic &&
       !value->resolved)
     context->unresolved_paths[owner] = true;
-  if (!eligible || purpose == SHELL_EXPAND_WORD_ARGUMENT ||
-      purpose == SHELL_EXPAND_WORD_CONDITIONAL ||
-      purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC || !value->resolved)
+  if (!eligible || !shell_expand_purpose_is_path(purpose) || !value->resolved)
     return SHELL_DEP_OK;
 
   shell_dep_doc_t *doc = &graph->nodes[document].doc;
@@ -21568,8 +21564,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       owner_execution = dep_execution_compose(
           local_execution, (dep_execution_certainty_t)
                                control_execution[group_node[control_group]]);
-    if (!context->effects_active ||
-        owner_order[owner_index].start >= *context->semantic_barrier)
+    if (dep_coverage_effects_blocked(context, owner_order[owner_index].start))
       owner_execution = DEP_EXECUTION_NEVER;
     if (control_group >= 0 &&
         dep_group_setup_stopped(context, (uint32_t)control_group))
@@ -23512,22 +23507,6 @@ static SHELL_NONNULL(1) shell_dep_error_t
   out->status = error == SHELL_DEP_ETRUNC ? SHELL_DEP_STATUS_TRUNCATED
                                           : SHELL_DEP_STATUS_ERROR;
   return error;
-}
-
-/* Import semantic coverage independently of descriptor and exit-status
- * imports. Only potentially executing children qualify the parent's facts.
- * child is successfully constructed, out and context's coverage state are
- * mutable, and opening points within context's immutable parent source.
- * All pointer arguments remain required when active is false. */
-static SHELL_NONNULL(1, 2, 3, 4) void dep_import_child_coverage(
-    shell_dep_graph_t *out, const shell_dep_graph_t *child,
-    const dep_parse_context_t *context, const char *opening, bool active) {
-  if (active && (child->status & SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC)) {
-    out->status |= SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC;
-    uint32_t boundary = (uint32_t)(opening - context->cmd);
-    if (boundary < *context->semantic_barrier)
-      *context->semantic_barrier = boundary;
-  }
 }
 
 /* A process-substitution redirect operand is one contiguous shell word:
@@ -25853,7 +25832,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       }
       dep_cwd_begin(&parse_context, group, event_cwd_offset, event_cwd_known,
                     event_cwd_absolute);
-      if (fast_result.groups[group].start >= semantic_barrier) {
+      if (dep_coverage_position_blocked(semantic_barrier,
+                                        fast_result.groups[group].start)) {
         *event_cwd_known = false;
         *event_cwd_absolute = false;
       }
@@ -26084,7 +26064,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     bool active = source_execution != DEP_EXECUTION_NEVER;
     dep_cwd_begin(&parse_context, source_event, range_cwd_offset,
                   range_cwd_known, range_cwd_absolute);
-    if (rstart >= semantic_barrier) {
+    if (dep_coverage_position_blocked(semantic_barrier, rstart)) {
       *range_cwd_known = false;
       *range_cwd_absolute = false;
     }

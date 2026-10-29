@@ -164,8 +164,7 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
     cache->error = SHELL_DEP_EEXPAND;
     return NULL;
   }
-  if ((request->purpose == SHELL_EXPAND_WORD_CONDITIONAL ||
-       request->purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC) &&
+  if (shell_expand_purpose_is_conditional(request->purpose) &&
       entry->value.count != 1) {
     cache->error = SHELL_DEP_EEXPAND;
     return NULL;
