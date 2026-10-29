@@ -10826,8 +10826,9 @@ TEST(stream_resource_limit_contract) {
           limits.max_edges = limit;
         shell_dep_error_t status = shell_dep_graph_parse(
             sources[i], strlen(sources[i]), ".", &limits, &graph);
-        if ((status != SHELL_DEP_OK && status != SHELL_DEP_ETRUNC) ||
-            !shell_dep_graph_validate(&graph).valid) {
+        bool accepted = status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC;
+        bool valid = accepted && shell_dep_graph_validate(&graph).valid;
+        if (!valid) {
           printf("\n    stream limit: %s, dimension=%u limit=%u status=%d\n",
                  sources[i], dimension, limit, status);
           shell_dep_graph_dump(&graph, stdout);
@@ -10836,8 +10837,7 @@ TEST(stream_resource_limit_contract) {
           for (uint32_t error = 0; error < validation.error_count; error++)
             printf("    validation: %s\n", validation.errors[error].msg);
         }
-        ASSERT((status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC) &&
-               shell_dep_graph_validate(&graph).valid);
+        ASSERT(valid);
         ASSERT(graph.node_count <= limits.max_nodes &&
                graph.edge_count <= limits.max_edges);
       }

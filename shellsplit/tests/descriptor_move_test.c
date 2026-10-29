@@ -2,6 +2,7 @@
 #include "../src/shell_processor_internal.h"
 #include "depgraph_compare.h"
 #include "depgraph_invariants.h"
+#include "graph_fixture.h"
 #include "shell_depgraph.h"
 #include "shell_processor.h"
 #include <stdio.h>
@@ -79,10 +80,17 @@ static bool command_routes_exact(const shell_dep_graph_t *graph,
 /* One owner with many possible setup failures, rather than many short owners.
  * Every successful open registers an undo and every later open can fail. The
  * body observes a live save, preventing the non-observable numeric fast path.
- * Both repeated and distinct targets must retain the original tail route. */
-static void failure_prefix_scaling(const shell_dep_limits_t *limits,
-                                   shell_dep_graph_t *graph) {
+ * Both repeated and distinct targets must retain the original tail route.
+ * fixture owns graph[0] and, in allocator-test builds, a distinct graph[1];
+ * limits borrows writable workspace for both graph builds. */
+static SHELL_NONNULL(1, 2) void failure_prefix_scaling(
+    const shell_dep_limits_t *limits,
+    const shellsplit_graph_fixture_t *fixture) {
   static const char *const original[] = {"/tmp/prefix-original"};
+  shell_dep_graph_t *graph = fixture->graph[0];
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+  shell_dep_graph_t *reference = fixture->graph[1];
+#endif
   for (unsigned read = 0; read < 2; read++) {
     for (unsigned distinct = 0; distinct < 2; distinct++) {
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
@@ -184,14 +192,11 @@ static void failure_prefix_scaling(const shell_dep_limits_t *limits,
         CHECK(work <= 64 * count * height * height);
         CHECK(shellsplit_test_source_scan_work() <= 512 * used);
         previous_undo = undo;
-        shell_dep_graph_t *reference = malloc(sizeof(*reference));
-        CHECK(reference);
         shellsplit_test_failure_cleanup_reference(true);
         CHECK(shell_dep_graph_parse(source, used, "/", limits, reference) ==
               SHELL_DEP_OK);
         shellsplit_test_failure_cleanup_reference(false);
         CHECK(shellsplit_test_graph_equal(graph, reference));
-        free(reference);
 #endif
       }
     }
@@ -201,11 +206,12 @@ static void failure_prefix_scaling(const shell_dep_limits_t *limits,
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
 /* Compare complete public graphs with literal ordered execution of the same
  * undo leaves. Later operations change an old save, stop cleanup, or allocate
- * persistent descriptors: segment reuse must preserve every correlation. */
-static void failure_cleanup_cache_equivalence(const shell_dep_limits_t *limits,
-                                              shell_dep_graph_t *graph) {
-  shell_dep_graph_t *reference = malloc(sizeof(*reference));
-  CHECK(reference);
+ * persistent descriptors: segment reuse must preserve every correlation.
+ * graph and reference are distinct fixture-owned outputs; limits borrows the
+ * writable workspace shared by their sequential builds. */
+static SHELL_NONNULL(1, 2, 3) void failure_cleanup_cache_equivalence(
+    const shell_dep_limits_t *limits, shell_dep_graph_t *graph,
+    shell_dep_graph_t *reference) {
   const char *const scopes[] = {":", "{ :; }", "time { :; }", "\"$cmd\""};
   for (unsigned read = 0; read < 2; read++) {
     char direction = read ? '<' : '>';
@@ -278,7 +284,6 @@ static void failure_cleanup_cache_equivalence(const shell_dep_limits_t *limits,
     shellsplit_test_failure_cleanup_reference(false);
     CHECK(shellsplit_test_graph_equal(graph, reference));
   }
-  free(reference);
 }
 #endif
 
@@ -335,14 +340,19 @@ int main(void) {
     CHECK(processed.group_io_ops[0].kind == SHELL_GROUP_IO_FAILED_REDIRECT);
     shell_processed_commands_free(&processed);
   }
-  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  CHECK(shell_dep_workspace_size(&limits, &limits.workspace_size));
-  limits.workspace = malloc(limits.workspace_size);
-  shell_dep_graph_t *graph = malloc(sizeof(*graph));
-  CHECK(limits.workspace && graph);
-  failure_prefix_scaling(&limits, graph);
+  shellsplit_graph_fixture_t fixture;
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
-  failure_cleanup_cache_equivalence(&limits, graph);
+  const unsigned graph_count = 2;
+#else
+  const unsigned graph_count = 1;
+#endif
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_FIXED, 0,
+                                      graph_count, false, 0));
+  shell_dep_limits_t limits = fixture.limits;
+  shell_dep_graph_t *graph = fixture.graph[0];
+  failure_prefix_scaling(&limits, &fixture);
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+  failure_cleanup_cache_equivalence(&limits, graph, fixture.graph[1]);
 #endif
   static const char *const dispatch_a[] = {"/tmp/dispatch-a"};
   static const char *const dispatch_both[] = {"/tmp/dispatch-a",
@@ -986,8 +996,7 @@ int main(void) {
       fprintf(stderr, "move case %zu: %s (error %d)\n", i, cases[i].source,
               error);
       shell_dep_graph_dump(graph, stderr);
-      free(graph);
-      free(limits.workspace);
+      shellsplit_graph_fixture_destroy(&fixture);
       return EXIT_FAILURE;
     }
     CHECK(shellsplit_test_depgraph_invariants(
@@ -1650,9 +1659,10 @@ int main(void) {
                   "move capacity case%zu dimension%u bound%u status%d\n", i,
                   dimension, bound, status);
         CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
-        if (!shellsplit_test_depgraph_invariants(capacity_sources[i],
-                                                 strlen(capacity_sources[i]),
-                                                 status, graph, &limited)) {
+        bool valid = shellsplit_test_depgraph_invariants(
+            capacity_sources[i], strlen(capacity_sources[i]), status, graph,
+            &limited);
+        if (!valid) {
           fprintf(stderr,
                   "move graph case%zu dimension%u bound%u status%d\n%s\n", i,
                   dimension, bound, status, capacity_sources[i]);
@@ -1662,9 +1672,7 @@ int main(void) {
           for (uint32_t error = 0; error < validation.error_count; error++)
             fprintf(stderr, "%s\n", validation.errors[error].msg);
         }
-        CHECK(shellsplit_test_depgraph_invariants(capacity_sources[i],
-                                                  strlen(capacity_sources[i]),
-                                                  status, graph, &limited));
+        CHECK(valid);
       }
   static const struct {
     const char *source;
@@ -1987,8 +1995,7 @@ int main(void) {
     }
   }
 #endif
-  free(graph);
-  free(limits.workspace);
+  shellsplit_graph_fixture_destroy(&fixture);
   puts("descriptor move tests passed");
   return EXIT_SUCCESS;
 }

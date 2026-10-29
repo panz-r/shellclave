@@ -20,6 +20,18 @@ Test builds require Python 3.8+ and the pinned Bash 5.3.20 reference.
 `BUILD_TESTING=OFF` selects the library-only path in the
 [README](README.md#build-and-install).
 
+For a faster iterative test build with GCC or Clang, use a separate Debug build
+with optimization enabled. This keeps assertions enabled and reuses the build
+directory on subsequent runs:
+
+```sh
+cmake -S . -B build-optimized -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS_DEBUG='-O2 -g' -DCMAKE_CXX_FLAGS_DEBUG='-O2 -g' \
+  -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash"
+cmake --build build-optimized --parallel 2
+ctest --test-dir build-optimized --output-on-failure --parallel 1
+```
+
 Reference upgrades deliberately change the one modeled executor. Update the
 manifest, rerun conformance probes, and include all model adaptations in the
 same changeset. Contributor options include `SHELLCLAVE_BUILD_TOOLS`,
@@ -41,6 +53,11 @@ each probe. Cover operand spellings separately from shared operator truth
 tables, and cross dimensions where their interaction matters. Check source
 framing once per source; vary captured values and reference locales in their
 own checks so invariant probe results are not recomputed.
+
+The test-only `shellsplit_graph_fixture` static library provides caller-owned
+workspace and graph fixtures for Shellsplit tests. Its limits borrow the owned
+workspace; tests may adjust the supplied capacity without changing ownership.
+Keep deliberate missing, undersized and misaligned workspace tests explicit.
 
 Differential parser oracles must provide sufficient source workspace to each
 compared path. Size strict fast-parser and lexical-iterator storage with

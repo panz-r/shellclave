@@ -1,4 +1,5 @@
 #include "depgraph_invariants.h"
+#include "graph_fixture.h"
 #include "shell_depgraph.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,8 +123,11 @@ static void check_unresolved_equivalence(const shell_dep_graph_t *plain,
   }
 }
 
-static void test_nested_and_conditional_resolution(shell_dep_limits_t *limits,
-                                                   shell_dep_graph_t *graph) {
+/* graph and plain are distinct fixture-owned outputs. limits borrows writable
+ * workspace shared by their sequential graph builds. */
+static SHELL_NONNULL(1, 2, 3) void test_nested_and_conditional_resolution(
+    shell_dep_limits_t *limits, shell_dep_graph_t *graph,
+    shell_dep_graph_t *plain) {
   static const struct {
     const char *source;
     size_t arguments, redirects, files;
@@ -138,8 +142,6 @@ static void test_nested_and_conditional_resolution(shell_dep_limits_t *limits,
       {"cat $(<\"$IN\") | cat", 1, 0, 1, 1, true},
       {"cat < <(cat <\"$IN\")", 0, 1, 0, 1, true},
   };
-  shell_dep_graph_t *plain = malloc(sizeof(*plain));
-  CHECK(plain != NULL);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     const char *source = cases[i].source;
     size_t length = strlen(source);
@@ -187,19 +189,21 @@ static void test_nested_and_conditional_resolution(shell_dep_limits_t *limits,
       }
     }
   }
-  free(plain);
 }
 
 int main(void) {
-  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  shellsplit_graph_fixture_t graph_fixture;
+  CHECK(shellsplit_graph_fixture_init(&graph_fixture,
+                                      SHELLSPLIT_FIXTURE_RESOLVED, 256, 2,
+                                      false, shell_dep_workspace_alignment()));
+  shell_dep_limits_t limits = graph_fixture.limits;
+  void *workspace = graph_fixture.workspace;
+  shell_dep_graph_t *graph = graph_fixture.graph[0];
   size_t required;
   CHECK(shell_dep_resolved_workspace_size(256, NULL, &required));
-  void *workspace = malloc(required + shell_dep_workspace_alignment());
-  shell_dep_graph_t *graph = malloc(sizeof(*graph));
-  CHECK(workspace && graph);
-  limits.workspace = workspace;
   limits.workspace_size = required;
-  test_nested_and_conditional_resolution(&limits, graph);
+  test_nested_and_conditional_resolution(&limits, graph,
+                                         graph_fixture.graph[1]);
   uint8_t unresolved[SHELL_DEP_MAX_NODES];
   static const struct {
     const char *source;
@@ -357,8 +361,7 @@ int main(void) {
   CHECK(required == 0);
   CHECK(strcmp(shell_dep_error_string(SHELL_DEP_EEXPAND),
                "Word resolution failed") == 0);
-  free(graph);
-  free(workspace);
+  shellsplit_graph_fixture_destroy(&graph_fixture);
   puts("public word resolution tests passed");
   return 0;
 }

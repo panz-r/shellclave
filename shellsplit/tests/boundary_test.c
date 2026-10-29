@@ -3,6 +3,7 @@
 #include "../src/shell_pipeline_internal.h"
 #include "depgraph_compare.h"
 #include "depgraph_invariants.h"
+#include "graph_fixture.h"
 #include "shell_depgraph.h"
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 #include "test_source_scans.h"
@@ -53,7 +54,7 @@ static void parse(const char *source, shell_dep_limits_t *limits,
   if (status != SHELL_DEP_OK)
     fprintf(stderr, "source: %s\nstatus: %d\n", source, status);
   CHECK(status == SHELL_DEP_OK);
-  CHECK(shell_dep_graph_validate(graph).valid);
+  /* The invariant helper validates successful graphs before inspecting them. */
   CHECK(shellsplit_test_depgraph_invariants(source, strlen(source), status,
                                             graph, limits));
   for (uint32_t i = 0; i < graph->node_count; i++)
@@ -2008,13 +2009,12 @@ static void terminal_pipe_capacity(shell_dep_limits_t *limits,
 }
 
 int main(void) {
-  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  CHECK(
-      shell_dep_resolved_workspace_size(4096, &limits, &limits.workspace_size));
-  limits.workspace = malloc(limits.workspace_size);
-  shell_dep_graph_t *graph = malloc(sizeof(*graph));
-  shell_dep_graph_t *other = malloc(sizeof(*other));
-  CHECK(limits.workspace && graph && other);
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_RESOLVED,
+                                      4096, 2, false, 0));
+  shell_dep_limits_t limits = fixture.limits;
+  shell_dep_graph_t *graph = fixture.graph[0];
+  shell_dep_graph_t *other = fixture.graph[1];
   background_newlines(&limits, graph, other);
   async_completion(&limits, graph, other);
   async_inputs(&limits, graph, other);
@@ -2371,9 +2371,7 @@ int main(void) {
     previous = work;
   }
 #endif
-  free(other);
-  free(graph);
-  free(limits.workspace);
+  shellsplit_graph_fixture_destroy(&fixture);
   puts("inherited boundary graph tests passed");
   return 0;
 }

@@ -1,6 +1,7 @@
 #include "../src/shell_semantics_internal.h"
 #include "../src/shell_source_runtime_internal.h"
 #include "../src/shell_test_internal.h"
+#include "graph_fixture.h"
 #include "shell_depgraph.h"
 #include "shell_source.h"
 #include <stdio.h>
@@ -857,24 +858,15 @@ static void check_parenthesized_admission(void) {
 
 int main(int argc, char **argv) {
   current = "setup";
-  graph = malloc(sizeof(*graph));
-  CHECK(graph);
-  limits = SHELL_DEP_LIMITS_DEFAULT;
-  size_t bytes, scratch;
-  CHECK(shell_dep_workspace_size(&limits, &bytes));
-  CHECK(shell_source_workspace_size(8192, &scratch));
-  bytes += scratch;
-  size_t alignment = shell_dep_workspace_alignment();
-  bytes = (bytes + alignment - 1) / alignment * alignment;
-  void *workspace = aligned_alloc(alignment, bytes);
-  CHECK(workspace);
-  limits.workspace = workspace;
-  limits.workspace_size = bytes;
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 8192,
+                                      1, true, 0));
+  limits = fixture.limits;
+  graph = fixture.graph[0];
   if (argc == 3) {
     printf("%d\n",
            !strcmp(argv[1], "--test") ? test_truth(argv[2]) : truth(argv[2]));
-    free(workspace);
-    free(graph);
+    shellsplit_graph_fixture_destroy(&fixture);
     return 0;
   }
   check_observation_roles();
@@ -1227,8 +1219,7 @@ int main(int argc, char **argv) {
   CHECK(!graph->node_count && !graph->edge_count);
   limits.workspace_size = full;
   free(draft);
-  free(workspace);
-  free(graph);
+  shellsplit_graph_fixture_destroy(&fixture);
   puts("scalar presence tests passed");
   return 0;
 }

@@ -1,6 +1,7 @@
 #include "../src/shell_arithmetic_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 #include "arithmetic_cases.h"
+#include "graph_fixture.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
 #include "shell_source.h"
@@ -25,7 +26,6 @@ static const char *current = "setup";
 static shell_dep_graph_t *graph;
 static shell_source_result_t *draft;
 static shell_dep_limits_t limits;
-static void *workspace;
 
 static void parse(const char *source) {
   current = source;
@@ -237,24 +237,18 @@ static void check_mixed_sequences(void) {
 }
 
 int main(int argc, char **argv) {
-  graph = malloc(sizeof(*graph));
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE,
+                                      16384, 1, false, 0));
+  limits = fixture.limits;
+  graph = fixture.graph[0];
   draft = malloc(sizeof(*draft));
-  CHECK(graph && draft);
-  limits = SHELL_DEP_LIMITS_DEFAULT;
-  size_t bytes, source_bytes;
-  CHECK(shell_dep_workspace_size(&limits, &bytes));
-  CHECK(shell_source_workspace_size(16384, &source_bytes));
-  bytes += source_bytes;
-  workspace = malloc(bytes);
-  CHECK(workspace != NULL);
-  limits.workspace = workspace;
-  limits.workspace_size = bytes;
+  CHECK(draft);
   if (argc == 3 && strcmp(argv[1], "--truth") == 0) {
     parse(argv[2]);
     printf("%u\n", (unsigned)graph->nodes[0].cmd.arithmetic_truth);
-    free(workspace);
     free(draft);
-    free(graph);
+    shellsplit_graph_fixture_destroy(&fixture);
     return 0;
   }
 
@@ -513,8 +507,7 @@ int main(int argc, char **argv) {
     previous = work;
   }
 #endif
-  free(workspace);
   free(draft);
-  free(graph);
+  shellsplit_graph_fixture_destroy(&fixture);
   return 0;
 }

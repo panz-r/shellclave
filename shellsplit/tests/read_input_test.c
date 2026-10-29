@@ -4,6 +4,7 @@
 #include "../src/shell_tokenizer_full_internal.h"
 #include "depgraph_compare.h"
 #include "depgraph_invariants.h"
+#include "graph_fixture.h"
 #include "shell_depgraph.h"
 #include "shell_processor.h"
 #include "word_expansion_cases.h"
@@ -27,6 +28,11 @@
   } while (0)
 
 static const char *current_source;
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+/* The operand probe audits graph calls while processor checks in the same
+ * cases legitimately allocate their own result storage. */
+static bool audit_graph_allocations;
+#endif
 static shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
 static shell_dep_graph_t *graph, *other;
 
@@ -39,7 +45,7 @@ static void parse(const char *source) {
             "parse status: %d, graph status: %u, nodes: %u, edges: %u\n",
             status, graph->status, graph->node_count, graph->edge_count);
   CHECK(status == SHELL_DEP_OK);
-  CHECK(shell_dep_graph_validate(graph).valid);
+  /* The invariant helper validates successful graphs before inspecting them. */
   CHECK(shellsplit_test_depgraph_invariants(source, strlen(source), status,
                                             graph, &limits));
   shell_parse_result_t fast;
@@ -1787,11 +1793,19 @@ static void contextual_capabilities(void) {
   current_source = "unset fd; read -p\"$fd\" -e value <<<payload";
   CHECK(shell_tokenizer_has_unsupported_semantics(current_source,
                                                   strlen(current_source)));
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+  if (audit_graph_allocations)
+    CHECK(shellsplit_test_alloc_count() == 0);
+#endif
   shell_processed_commands_t processed = {0};
   CHECK(shell_process_commands(current_source, strlen(current_source), NULL,
                                &processed) == SHELL_PROCESS_EPARSE);
   CHECK(!processed.commands && !processed.command_count);
   shell_processed_commands_free(&processed);
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+  if (audit_graph_allocations)
+    shellsplit_test_alloc_fail_at(0);
+#endif
 }
 
 static void reachable_target_attributes(void) {
@@ -1879,6 +1893,10 @@ static void literal_target_refinement(void) {
    * must not silently guess the same literal target from an expansion. */
   CHECK(shell_tokenizer_has_unsupported_semantics(current_source,
                                                   strlen(current_source)));
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+  if (audit_graph_allocations)
+    CHECK(shellsplit_test_alloc_count() == 0);
+#endif
   shell_processed_commands_t processed = {0};
   CHECK(shell_process_commands(current_source, strlen(current_source), NULL,
                                &processed) == SHELL_PROCESS_EPARSE);
@@ -1886,6 +1904,10 @@ static void literal_target_refinement(void) {
         !processed.group_count && !processed.group_io_ops &&
         !processed.group_io_op_count);
   shell_processed_commands_free(&processed);
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+  if (audit_graph_allocations)
+    shellsplit_test_alloc_fail_at(0);
+#endif
 }
 
 static void exec_exit_elision(void) {
@@ -4050,10 +4072,7 @@ static void printf_elision_resolution(void) {
   current_source = "resolved workspace";
   size_t required;
   CHECK(shell_dep_resolved_workspace_size(512, &limits, &required));
-  void *workspace = realloc(limits.workspace, required);
-  CHECK(workspace != NULL);
-  limits.workspace = workspace;
-  limits.workspace_size = required;
+  CHECK(limits.workspace_size >= required);
   for (size_t i = 0; i < sizeof(shellsplit_test_printf_expansion_cases) /
                              sizeof(shellsplit_test_printf_expansion_cases[0]);
        i++) {
@@ -4479,11 +4498,12 @@ static void owner_fact_lifetimes(void) {
 
 int main(int argc, char **argv) {
   current_source = "workspace allocation";
-  CHECK(shell_dep_workspace_size(&limits, &limits.workspace_size));
-  limits.workspace = malloc(limits.workspace_size);
-  graph = malloc(sizeof(*graph));
-  other = malloc(sizeof(*other));
-  CHECK(limits.workspace && graph && other);
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_RESOLVED,
+                                      512, 2, false, 0));
+  limits = fixture.limits;
+  graph = fixture.graph[0];
+  other = fixture.graph[1];
   if (argc == 2 && !strcmp(argv[1], "--zero-prefix")) {
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
     shellsplit_test_alloc_fail_at(0);
@@ -4522,6 +4542,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--operand-classification")) {
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
     shellsplit_test_alloc_fail_at(0);
+    audit_graph_allocations = true;
 #endif
     numeric_operand_classification();
     signed_operand_refinement();
@@ -4538,6 +4559,7 @@ int main(int argc, char **argv) {
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
     CHECK(shellsplit_test_alloc_count() == 0);
     shellsplit_test_alloc_reset();
+    audit_graph_allocations = false;
 #endif
     goto done;
   }
@@ -4751,9 +4773,7 @@ int main(int argc, char **argv) {
   capacities();
   unknown_occupancy_capacity();
 done:
-  free(other);
-  free(graph);
-  free(limits.workspace);
+  shellsplit_graph_fixture_destroy(&fixture);
   puts("read input routing tests passed");
   return 0;
 }

@@ -1,5 +1,6 @@
 #include "../src/shell_token_regions_internal.h"
 #include "conditional_cases.h"
+#include "graph_fixture.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
 #include "shell_source.h"
@@ -2628,20 +2629,13 @@ static void check_syntax_resource_outcomes(void) {
 }
 
 int main(int argc, char **argv) {
-  graph = malloc(sizeof(*graph));
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 8192,
+                                      1, true, 0));
+  limits = fixture.limits;
+  graph = fixture.graph[0];
   draft = malloc(sizeof(*draft));
-  CHECK(graph && draft);
-  limits = SHELL_DEP_LIMITS_DEFAULT;
-  size_t bytes, scratch;
-  CHECK(shell_dep_workspace_size(NULL, &bytes));
-  CHECK(shell_source_workspace_size(8192, &scratch));
-  bytes += scratch;
-  size_t alignment = shell_dep_workspace_alignment();
-  bytes = (bytes + alignment - 1) / alignment * alignment;
-  void *workspace = aligned_alloc(alignment, bytes);
-  CHECK(workspace);
-  limits.workspace = workspace;
-  limits.workspace_size = bytes;
+  CHECK(draft);
   /* Conformance probe: both operands are dynamic; arguments supply their
    * complete final strings, not individual expansion-fragment values. */
   if (argc == 5 && !strcmp(argv[1], "--resolved")) {
@@ -3039,8 +3033,7 @@ int main(int argc, char **argv) {
   }
 #endif
 done:
-  free(workspace);
-  free(graph);
   free(draft);
+  shellsplit_graph_fixture_destroy(&fixture);
   return 0;
 }

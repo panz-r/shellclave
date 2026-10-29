@@ -520,6 +520,16 @@ if(BUILD_TESTING)
     SHELLSPLIT_TEST_ALLOCATOR SHELLSPLIT_TEST_SOURCE_SCANS)
   shellclave_add_production_test(shellsplit_descriptor_move_production_test
     shellsplit/tests/descriptor_move_test.c shellsplit)
+  add_library(shellsplit_graph_fixture STATIC shellsplit/tests/graph_fixture.c)
+  shellclave_project_target(shellsplit_graph_fixture)
+  target_include_directories(shellsplit_graph_fixture PRIVATE shellsplit/include)
+  shellclave_add_test(shellsplit_graph_fixture_test shellsplit/tests/graph_fixture_test.c shellsplit)
+  target_link_libraries(shellsplit_graph_fixture_test PRIVATE shellsplit_graph_fixture shellsplit)
+  set_property(TEST shellsplit_graph_fixture_test APPEND PROPERTY LABELS shellsplit)
+  foreach(fixture_case IN ITEMS presence conditional arithmetic boundary read_input descriptor_move source)
+    target_link_libraries(shellsplit_${fixture_case}_test PRIVATE shellsplit_graph_fixture shellsplit_test)
+    target_link_libraries(shellsplit_${fixture_case}_production_test PRIVATE shellsplit_graph_fixture shellsplit)
+  endforeach()
   target_compile_definitions(shellsplit_depgraph_test PRIVATE
     SHELLSPLIT_TEST_SOURCE_SCANS)
   # The dependency graph has no allocator-test dependency, so run its full
@@ -644,6 +654,7 @@ if(BUILD_TESTING)
   shellclave_register_production_test(shellgate_policy_sharing_test)
   shellclave_add_test(shellsplit_expand_test
     shellsplit/tests/expand_test.c shellsplit_test)
+  target_link_libraries(shellsplit_expand_test PRIVATE shellsplit_graph_fixture shellsplit_test)
   set_property(TEST shellgate_policy_sharing_test APPEND PROPERTY LABELS shellgate)
   target_include_directories(shellgate_corpus_test PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")

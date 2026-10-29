@@ -7,6 +7,7 @@
 #include "ansi_nul_cases.h"
 #include "ansi_parameter_cases.h"
 #include "control_word_cases.h"
+#include "graph_fixture.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
 #include "shell_source.h"
@@ -5271,7 +5272,8 @@ static void delimiter_workspace(void) {
   CHECK(shell_dep_graph_parse(source, at, "/workspace", &fixed_limits,
                               &graph) == SHELL_DEP_EWORKSPACE);
   size_t original_size = limits.workspace_size;
-  void *larger = realloc(limits.workspace, original_size + length);
+  void *original_workspace = limits.workspace;
+  void *larger = malloc(original_size + length);
   CHECK(larger);
   limits.workspace = larger;
   limits.workspace_size = original_size + length;
@@ -5307,6 +5309,8 @@ static void delimiter_workspace(void) {
         draft.heredocs[0].complete);
   content(&draft.heredocs[0].content, "x\n");
   free(legacy);
+  free(larger);
+  limits.workspace = original_workspace;
   free(source);
   free(scratch);
 }
@@ -5809,13 +5813,10 @@ static void cwd(void) {
 }
 
 int main(void) {
-  limits = SHELL_DEP_LIMITS_DEFAULT;
-  CHECK(shell_dep_workspace_size(NULL, &limits.workspace_size));
-  size_t source_capacity;
-  CHECK(shell_source_workspace_size(8192, &source_capacity));
-  limits.workspace_size += source_capacity;
-  limits.workspace = malloc(limits.workspace_size);
-  CHECK(limits.workspace);
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 8192,
+                                      0, false, 0));
+  limits = fixture.limits;
   heredocs();
   byte_domains();
   word_byte_source();
@@ -5868,7 +5869,7 @@ int main(void) {
   callback_index_work();
 #endif
   cwd();
-  free(limits.workspace);
+  shellsplit_graph_fixture_destroy(&fixture);
   puts("source, draft, and static CWD contracts passed");
   return 0;
 }
