@@ -463,37 +463,47 @@ static char *make_abstraction(shell_abstract_type_t type, size_t index) {
   return result;
 }
 
+static SHELL_NONNULL(1) bool abstract_type_found(shell_abstract_type_t *out,
+                                                 shell_abstract_type_t type) {
+  *out = type;
+  return true;
+}
+
 /**
- * Determine abstract type from token type and classify path
+ * Determine the abstract type from token type and path classification.
+ * Returns false, leaving *type untouched, for a word that has no abstraction;
+ * the type enum is unsigned-compatible, so absence is not encoded in it.
  */
-static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
-                                               const char *text, size_t len) {
+static SHELL_NONNULL(2, 4) bool try_abstract_type(shell_token_type_t tok_type,
+                                                  const char *text, size_t len,
+                                                  shell_abstract_type_t *type) {
   // Handle known types from tokenizer directly
   switch (tok_type) {
   case SHELL_TOKEN_VARIABLE:
   case SHELL_TOKEN_VARIABLE_QUOTED:
   case SHELL_TOKEN_SPECIAL_VAR: {
     shell_abstract_variable_info_t variable = {0};
-    return abstract_variable_info(text, len, &variable) ? variable.type
-                                                        : SHELL_ABSTRACT_EV;
+    return abstract_type_found(
+        type, abstract_variable_info(text, len, &variable) ? variable.type
+                                                           : SHELL_ABSTRACT_EV);
   }
 
   case SHELL_TOKEN_GLOB:
   case SHELL_TOKEN_EXTGLOB:
-    return SHELL_ABSTRACT_GB;
+    return abstract_type_found(type, SHELL_ABSTRACT_GB);
 
   case SHELL_TOKEN_ANSI_C_QUOTED:
-    return SHELL_ABSTRACT_STR;
+    return abstract_type_found(type, SHELL_ABSTRACT_STR);
 
   case SHELL_TOKEN_SUBSHELL:
   case SHELL_TOKEN_PROCESS_SUB:
-    return SHELL_ABSTRACT_CS;
+    return abstract_type_found(type, SHELL_ABSTRACT_CS);
 
   case SHELL_TOKEN_CONDITIONAL_COMMAND:
-    return SHELL_ABSTRACT_CT;
+    return abstract_type_found(type, SHELL_ABSTRACT_CT);
   case SHELL_TOKEN_ARITHMETIC:
   case SHELL_TOKEN_ARITHMETIC_COMMAND:
-    return SHELL_ABSTRACT_AR;
+    return abstract_type_found(type, SHELL_ABSTRACT_AR);
 
   default:
     break;
@@ -504,25 +514,25 @@ static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
     // Check for quoted strings first
     if ((text[0] == '"' && text[len - 1] == '"') ||
         (text[0] == '\'' && text[len - 1] == '\'')) {
-      return SHELL_ABSTRACT_STR;
+      return abstract_type_found(type, SHELL_ABSTRACT_STR);
     }
     // Check glob before path (path check catches relative paths with /)
     if (shell_source_word_has_glob(text, len)) {
-      return SHELL_ABSTRACT_GB;
+      return abstract_type_found(type, SHELL_ABSTRACT_GB);
     }
     abstract_path_shape_t shape = abstract_path_shape(text, len);
     if (is_absolute_path(&shape)) {
-      return SHELL_ABSTRACT_AP;
+      return abstract_type_found(type, SHELL_ABSTRACT_AP);
     }
     if (is_home_path(text, len)) {
-      return SHELL_ABSTRACT_HP;
+      return abstract_type_found(type, SHELL_ABSTRACT_HP);
     }
     if (is_relative_path(&shape, text)) {
-      return SHELL_ABSTRACT_RP;
+      return abstract_type_found(type, SHELL_ABSTRACT_RP);
     }
   }
 
-  return -1; // Not abstractable
+  return false;
 }
 
 /* Store the decoded static value of a path word; `original` keeps the exact
@@ -1020,12 +1030,14 @@ static SHELL_NONNULL(1, 2, 3, 4, 7) bool compound_abstract_append_literal(
   compound_abstract_literal_bounds(token, &start, &end);
   if (start == end)
     return true;
-  shell_abstract_type_t type = get_abstract_type(
-      SHELL_TOKEN_ARGUMENT, token->start + start, end - start);
-  return !compound_abstract_type_is_path(type) ||
-         compound_abstract_append(
-             command, elements, count, type, token->start + start, end - start,
-             token->position + start, token->is_quoted, indices);
+  shell_abstract_type_t type;
+  bool path = try_abstract_type(SHELL_TOKEN_ARGUMENT, token->start + start,
+                                end - start, &type) &&
+              compound_abstract_type_is_path(type);
+  return !path || compound_abstract_append(command, elements, count, type,
+                                           token->start + start, end - start,
+                                           token->position + start,
+                                           token->is_quoted, indices);
 }
 
 /* start <= end <= token->length, as supplied by the span iterator. */
@@ -1034,9 +1046,10 @@ static SHELL_NONNULL(1, 4) bool compound_abstract_count_literal(
   compound_abstract_literal_bounds(token, &start, &end);
   if (start == end)
     return true;
-  shell_abstract_type_t type = get_abstract_type(
-      SHELL_TOKEN_ARGUMENT, token->start + start, end - start);
-  if (!compound_abstract_type_is_path(type))
+  shell_abstract_type_t type;
+  if (!try_abstract_type(SHELL_TOKEN_ARGUMENT, token->start + start,
+                         end - start, &type) ||
+      !compound_abstract_type_is_path(type))
     return true;
   if (*count == SIZE_MAX)
     return false;
@@ -1286,15 +1299,15 @@ abstract_command_parse_impl(const char *command, size_t command_length,
       }
 
       // Get abstract type for this token
-      shell_abstract_type_t ab_type =
-          redirect_operand
-              ? SHELL_ABSTRACT_REDIR
-              : get_abstract_type(tok->type, tok->start, tok->length);
-      if (ab_type >= 0)
+      shell_abstract_type_t ab_type = SHELL_ABSTRACT_REDIR;
+      bool abstractable =
+          redirect_operand ||
+          try_abstract_type(tok->type, tok->start, tok->length, &ab_type);
+      if (abstractable)
         abstract_word_features(abst, tok, redirect_operand);
       redirect_operand = false;
 
-      if (ab_type < 0)
+      if (!abstractable)
         continue; // Not abstractable
 
       // Determine index
@@ -1821,8 +1834,9 @@ void shell_abstract_command_free(shell_abstract_command_t *cmd) {
 static const char *token_abbreviation(const shell_token_t *token) {
   if (token->length >= 2 && token->start[0] == '-')
     return "OPT";
-  shell_abstract_type_t type =
-      get_abstract_type(token->type, token->start, token->length);
+  shell_abstract_type_t type;
+  if (!try_abstract_type(token->type, token->start, token->length, &type))
+    return "STR";
   switch (type) {
   case SHELL_ABSTRACT_EV:
     return "EV";

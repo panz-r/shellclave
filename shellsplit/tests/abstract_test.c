@@ -1170,6 +1170,40 @@ static void test_runtime_expansion(void) {
   }
 }
 
+/* Expansion features describe the word whether or not the word itself has an
+ * abstraction, so a plain, an abstractable and a non-abstractable word are all
+ * checked against the same flags. */
+static void test_word_features_independent_of_abstraction(void) {
+  printf("\n=== Word Features Without Abstraction ===\n");
+  static const struct {
+    const char *source;
+    bool variables;
+    bool cmd_subst;
+  } cases[] = {
+      {"echo plain", false, false},
+      {"echo /etc/passwd", false, false},
+      {"echo ${HOME}/x", true, false},
+      {"echo pre${HOME}post", true, false},
+      {"echo pre$(date)post", false, true},
+      {"echo pre`date`post", false, true},
+      {"echo --opt=$HOME", true, false},
+      {"echo key=$(date)", false, true},
+      {"echo -n$HOME", true, false},
+      {"echo a=\"$HOME\"", true, false},
+      {"FOO=$HOME env", true, false},
+      {"FOO=$(date) env", false, true},
+      {"echo x-$HOME-y z", true, false},
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = parse_command(cases[i].source);
+    valid = result && result->has_variables == cases[i].variables &&
+            result->has_cmd_subst == cases[i].cmd_subst && valid;
+    shell_abstract_command_free(result);
+  }
+  TEST("word features do not depend on the word being abstracted", valid);
+}
+
 static void test_invalid_and_null_inputs(void) {
   printf("\n=== Invalid and Null Inputs ===\n");
 
@@ -1281,6 +1315,7 @@ int main(void) {
   test_classification_matrix();
   test_path_and_name_matrices();
   test_runtime_expansion();
+  test_word_features_independent_of_abstraction();
   test_invalid_and_null_inputs();
   test_type_sequence_matrix();
 
