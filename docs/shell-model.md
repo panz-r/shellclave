@@ -1344,10 +1344,14 @@ physical resolution, and unresolved operands remain runtime-dependent facts.
 
 Read `cwd_known` before using a stored CWD offset. FILE documents retain their
 own expansion-time CWD facts. `shell_dep_doc_file_identity_write()` provides a
-static lexical identity when available; its success and absolute/relative
-classification matter. Normalization removes redundant separators and `.`
-components while preserving `..`. Symlink resolution, existence, containment,
-and race-free access require application filesystem checks.
+static lexical identity when available; its success and the returned
+`shell_dep_file_identity_t` (length, absolute/relative classification, and
+`requires_directory`) matter. Normalization removes redundant separators and `.`
+components while preserving `..`. A trailing separator or terminal `.` is
+dropped from the bytes, so `file`, `file/` and `file/.` share one identity;
+`requires_directory` records that the latter two require a directory and follow
+a final symlink. Symlink resolution, existence, containment, and race-free
+access require application filesystem checks.
 
 ## Workspace, lifetimes, and errors
 

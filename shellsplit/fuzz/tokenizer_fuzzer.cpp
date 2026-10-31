@@ -1162,12 +1162,13 @@ static int test_fixed_oracles(void) {
         continue;
       found = true;
       char identity[512];
-      size_t written = 0;
-      bool absolute = false;
+      shell_dep_file_identity_t file_identity = {0, false, false};
+
       bool known = shell_dep_doc_file_identity_write(
-          &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+          &graph, &node.doc, identity, sizeof(identity), &file_identity);
       if (known != (fixture.identity != nullptr) ||
-          (known && (!absolute || std::strcmp(identity, fixture.identity))))
+          (known && (!file_identity.absolute ||
+                     std::strcmp(identity, fixture.identity))))
         return fixed_oracle_failure(__LINE__);
     }
     if (!found)
@@ -1241,12 +1242,13 @@ static int test_fixed_oracles(void) {
           node.doc.path_len != 3 || memcmp(node.doc.path, "out", 3))
         continue;
       char identity[256];
-      size_t length = 0;
-      bool absolute = false;
+      shell_dep_file_identity_t file_identity = {0, false, false};
+
       bool known = shell_dep_doc_file_identity_write(
-          &graph, &node.doc, identity, sizeof(identity), &length, &absolute);
+          &graph, &node.doc, identity, sizeof(identity), &file_identity);
       if (known != (item.identity != nullptr) ||
-          (known && (!absolute || length != strlen(item.identity) ||
+          (known && (!file_identity.absolute ||
+                     file_identity.length != strlen(item.identity) ||
                      strcmp(identity, item.identity))))
         return fixed_oracle_failure(__LINE__);
       found = true;
@@ -8910,13 +8912,13 @@ static void run_fixed_oracles() {
                   fixture.argument_dynamic;
       char identity[128];
       std::memset(identity, 'x', sizeof(identity));
-      size_t written = SIZE_MAX;
-      bool absolute = true;
+      shell_dep_file_identity_t file_identity = {SIZE_MAX, true, false};
+
       bool known = shell_dep_doc_file_identity_write(
-          &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+          &graph, &node.doc, identity, sizeof(identity), &file_identity);
       valid = valid && known == !fixture.argument_dynamic;
       if (!known) {
-        valid = valid && written == 0 && !absolute;
+        valid = valid && file_identity.length == 0 && !file_identity.absolute;
         for (char byte : identity)
           valid = valid && byte == 'x';
       }
@@ -8940,17 +8942,17 @@ static void run_fixed_oracles() {
         continue;
       files++;
       char identity[128];
-      size_t written = 0;
-      bool absolute = false;
+      shell_dep_file_identity_t file_identity = {0, false, false};
+
       bool known = shell_dep_doc_file_identity_write(
-          &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+          &graph, &node.doc, identity, sizeof(identity), &file_identity);
       valid = known == (fixture.cwd != nullptr) && node.doc.cwd_known == known;
       if (known) {
         std::string expected = std::string(fixture.cwd) + "/out";
-        valid = valid && absolute == fixture.absolute &&
-                written == expected.size() && identity == expected;
+        valid = valid && file_identity.absolute == fixture.absolute &&
+                file_identity.length == expected.size() && identity == expected;
       } else
-        valid = valid && written == 0 && !absolute;
+        valid = valid && file_identity.length == 0 && !file_identity.absolute;
     }
     if (!valid || files != 1) {
       fprintf(stderr, "tilde CWD identity oracle failed: %s\n", fixture.word);

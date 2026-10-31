@@ -343,27 +343,34 @@ static SHELL_NONNULL(1, 2, 6) bool dep_file_identity_plan(
   return true;
 }
 
-static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_file_identity_finish(
+static SHELL_NONNULL(1, 2, 3, 4) void dep_file_identity_finish(
     const shell_dep_doc_t *doc, const dep_file_identity_layout_t *layout,
-    char *destination, size_t *written, bool *absolute) {
+    char *destination, shell_dep_file_identity_t *identity) {
   if (!layout->path_absolute) {
     memcpy(destination, layout->cwd, layout->cwd_len);
     destination[layout->cwd_len] = '/';
   }
   destination[layout->combined_len] = '\0';
-  *written =
+  /* Normalization drops a trailing separator and a terminal `.` component,
+   * so record that the lookup required a directory before they disappear.
+   * The payload is nonempty, so the combined path has a last byte. */
+  unsigned char last = (unsigned char)destination[layout->combined_len - 1];
+  unsigned char previous =
+      layout->combined_len > 1
+          ? (unsigned char)destination[layout->combined_len - 2]
+          : 0;
+  identity->requires_directory =
+      last == '/' || (last == '.' && previous == '/');
+  identity->length =
       dep_normalize_path(destination, (uint32_t)layout->combined_len, false);
-  *absolute = layout->path_absolute || doc->cwd_absolute;
+  identity->absolute = layout->path_absolute || doc->cwd_absolute;
 }
 
-bool shell_dep_doc_file_identity_from_decoded(const shell_dep_graph_t *graph,
-                                              const shell_dep_doc_t *doc,
-                                              const char *decoded,
-                                              size_t length, char *destination,
-                                              size_t capacity, size_t *written,
-                                              bool *absolute) {
-  *written = 0;
-  *absolute = false;
+bool shell_dep_doc_file_identity_from_decoded(
+    const shell_dep_graph_t *graph, const shell_dep_doc_t *doc,
+    const char *decoded, size_t length, char *destination, size_t capacity,
+    shell_dep_file_identity_t *identity) {
+  *identity = (shell_dep_file_identity_t){0};
   dep_file_identity_layout_t layout;
   if (!dep_file_identity_plan(graph, doc, (unsigned char)decoded[0], length,
                               capacity, &layout))
@@ -371,7 +378,7 @@ bool shell_dep_doc_file_identity_from_decoded(const shell_dep_graph_t *graph,
   /* Copy the payload first: it may already occupy destination, before the
    * recorded CWD prefix is inserted. */
   memmove(destination + layout.prefix_len, decoded, length);
-  dep_file_identity_finish(doc, &layout, destination, written, absolute);
+  dep_file_identity_finish(doc, &layout, destination, identity);
   return true;
 }
 
@@ -386,22 +393,21 @@ static SHELL_NONNULL(3) bool dep_file_identity_write_byte(unsigned char byte,
 bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
                                        const shell_dep_doc_t *doc,
                                        char *destination,
-                                       size_t destination_size, size_t *written,
-                                       bool *absolute) {
-  *written = 0;
-  *absolute = false;
+                                       size_t destination_size,
+                                       shell_dep_file_identity_t *identity) {
+  *identity = (shell_dep_file_identity_t){0};
   if ((doc->kind != SHELL_DOC_FILE) || (!doc->path))
     return false;
   if (doc->flags & SHELL_DEP_DOC_FLAG_EXPANSION_FAILED)
     return false;
   if (doc->flags & SHELL_DEP_DOC_FLAG_IMPLICIT)
-    return shell_dep_doc_file_identity_from_decoded(
-        graph, doc, doc->path, doc->path_len, destination, destination_size,
-        written, absolute);
+    return shell_dep_doc_file_identity_from_decoded(graph, doc, doc->path,
+                                                    doc->path_len, destination,
+                                                    destination_size, identity);
   if (doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH) {
-    return shell_dep_doc_file_identity_from_decoded(
-        graph, doc, doc->value, doc->value_len, destination, destination_size,
-        written, absolute);
+    return shell_dep_doc_file_identity_from_decoded(graph, doc, doc->value,
+                                                    doc->value_len, destination,
+                                                    destination_size, identity);
   }
   if (doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)
     return false;
@@ -422,64 +428,7 @@ bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
   (void)shell_process_visit_word_value(
       doc->path, doc->path_len, dep_file_identity_write_byte,
       destination + layout.prefix_len, &decoded_len);
-  dep_file_identity_finish(doc, &layout, destination, written, absolute);
-  return true;
-}
-
-typedef struct {
-  unsigned char last;
-  unsigned char previous;
-  size_t length;
-} dep_path_tail_t;
-
-static SHELL_NONNULL(3) bool dep_path_tail_byte(unsigned char byte,
-                                                size_t position,
-                                                void *context) {
-  dep_path_tail_t *tail = context;
-  tail->previous = tail->last;
-  tail->last = byte;
-  tail->length = position + 1;
-  return true;
-}
-
-/* The identity drops a trailing separator and a terminal `.` component, but
- * either makes the lookup require a directory (and follow a final symlink). */
-static bool dep_path_tail_requires_directory(const dep_path_tail_t *tail) {
-  return tail->last == '/' ||
-         (tail->last == '.' && (tail->length == 1 || tail->previous == '/'));
-}
-
-bool shell_dep_doc_file_path_requires_directory(const shell_dep_doc_t *doc,
-                                                bool *requires_directory) {
-  *requires_directory = false;
-  if (doc->kind != SHELL_DOC_FILE || !doc->path ||
-      (doc->flags & SHELL_DEP_DOC_FLAG_EXPANSION_FAILED))
-    return false;
-  dep_path_tail_t tail = {0};
-  const char *decoded = NULL;
-  size_t decoded_length = 0;
-  if (doc->flags & SHELL_DEP_DOC_FLAG_IMPLICIT) {
-    decoded = doc->path;
-    decoded_length = doc->path_len;
-  } else if (doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH) {
-    decoded = doc->value;
-    decoded_length = doc->value_len;
-  } else if (doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) {
-    return false;
-  } else if (shell_process_visit_word_value(
-                 doc->path, doc->path_len, dep_path_tail_byte, &tail,
-                 &decoded_length) != SHELL_PROCESS_OK) {
-    return false;
-  }
-  if (decoded_length == 0)
-    return false;
-  if (decoded) {
-    tail.last = (unsigned char)decoded[decoded_length - 1];
-    tail.previous =
-        decoded_length > 1 ? (unsigned char)decoded[decoded_length - 2] : 0;
-    tail.length = decoded_length;
-  }
-  *requires_directory = dep_path_tail_requires_directory(&tail);
+  dep_file_identity_finish(doc, &layout, destination, identity);
   return true;
 }
 

@@ -660,19 +660,22 @@ static void check_comparison_operand_contexts(void) {
                                    : dynamic ? SHELL_DEP_DOC_FLAG_DYNAMIC_NAME
                                              : 0));
               char identity[256] = "unchanged", expected[256];
-              size_t written = 17;
-              bool absolute = false;
+              shell_dep_file_identity_t file_identity = {.length = 17,
+                                                         .absolute = false};
+
               bool identified = shell_dep_doc_file_identity_write(
-                  graph, doc, identity, sizeof(identity), &written, &absolute);
+                  graph, doc, identity, sizeof(identity), &file_identity);
               CHECK(identified == (!empty && (!dynamic || resolved)));
               if (identified) {
                 n = snprintf(expected, sizeof(expected), "/workspace/%s",
                              resolved ? "actual" : cases[c].literal);
                 CHECK(n > 0 && (size_t)n < sizeof(expected));
-                CHECK(absolute && written == (size_t)n &&
+                CHECK(file_identity.absolute &&
+                      file_identity.length == (size_t)n &&
                       !strcmp(identity, expected));
               } else
-                CHECK(!written && !absolute && !strcmp(identity, "unchanged"));
+                CHECK(!file_identity.length && !file_identity.absolute &&
+                      !strcmp(identity, "unchanged"));
             }
             CHECK(count == 1);
           }
@@ -708,12 +711,13 @@ static void check_comparison_operand_contexts(void) {
     if (graph->edges[i].type == SHELL_EDGE_FILE_LEFT) {
       const shell_dep_doc_t *doc = &graph->nodes[graph->edges[i].to].doc;
       char identity[64];
-      size_t written;
-      bool absolute;
+      shell_dep_file_identity_t file_identity = {0};
+
       CHECK(!doc->flags &&
             shell_dep_doc_file_identity_write(
-                graph, doc, identity, sizeof(identity), &written, &absolute));
-      CHECK(absolute && written == strlen("/workspace/*") &&
+                graph, doc, identity, sizeof(identity), &file_identity));
+      CHECK(file_identity.absolute &&
+            file_identity.length == strlen("/workspace/*") &&
             !strcmp(identity, "/workspace/*"));
       ++literal_operands;
     }
@@ -2493,10 +2497,10 @@ static void check_binary_and_compound_conditions(void) {
     CHECK(!memcmp(doc->path, spelling, doc->path_len));
     CHECK(doc->flags == SHELL_DEP_DOC_FLAG_DYNAMIC_NAME);
     char identity[64];
-    size_t written;
-    bool absolute;
-    CHECK(!shell_dep_doc_file_identity_write(
-        graph, doc, identity, sizeof(identity), &written, &absolute));
+    shell_dep_file_identity_t file_identity = {0};
+
+    CHECK(!shell_dep_doc_file_identity_write(graph, doc, identity,
+                                             sizeof(identity), &file_identity));
     empty_documents++;
   }
   CHECK(empty_documents == 2);

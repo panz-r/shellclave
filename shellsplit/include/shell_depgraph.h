@@ -1348,6 +1348,23 @@ bool shell_dep_doc_write_env_name(const shell_dep_doc_t *doc, char *destination,
 bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
                                    size_t name_length) SHELL_NONNULL(1, 2);
 
+/** Facts about a FILE document's lexical path identity, written together so a
+ * caller cannot use the bytes without the facts that qualify them. */
+typedef struct {
+  /** Identity length in bytes, excluding the trailing NUL. */
+  size_t length;
+  /** True for an actual absolute identity; false for one rooted at a relative
+   * initial CWD. Compare it along with the identity bytes. */
+  bool absolute;
+  /** True when the path ends with a separator or its final component is `.`.
+   * The identity bytes drop that suffix, but the lookup requires a directory
+   * and follows a final symlink, so `file`, `file/` and `file/.` share one
+   * identity yet are different lookups. Identity equality is deliberately
+   * unchanged: it stays a safe over-approximation of "may name the same
+   * file". Parent components are not considered. */
+  bool requires_directory;
+} shell_dep_file_identity_t;
+
 /** Write a static FILE document's lexical path identity into caller storage.
  * The result combines the document's recorded execution CWD with its decoded
  * path, then removes redundant separators and single-dot components. Parent
@@ -1359,42 +1376,19 @@ bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
  * reinterpreting it as shell syntax. Known-empty comparison operands have no
  * file identity and return false, including resolved-empty dynamic operands
  * whose certainty is recorded in the comparison's empty_operands bits.
- * `absolute` distinguishes an actual
- * absolute identity from one rooted at a relative initial CWD; compare it
- * along with the output bytes. `written` excludes the trailing NUL. On
- * failure outputs are cleared and the destination is unchanged.
+ * On failure `*identity` is zeroed and the destination is unchanged.
  * The caller supplies consistent graph/document metadata: when cwd_known is
  * true, cwd_offset references an installed, complete NUL-terminated entry in
  * the graph's CWD pool. Metadata and source spans remain immutable during
- * the call; destination and outputs must not overlap their storage. This
+ * the call; destination and `*identity` must not overlap their storage. This
  * function tests path availability and output capacity, not graph integrity.
- * Use shell_dep_graph_validate() if validating an externally supplied graph.
- *
- * The identity drops a trailing separator and a terminal `.` component, so
- * `file`, `file/` and `file/.` share one identity although `file/` and
- * `file/.` require a directory and follow a final symlink. Identity equality
- * is deliberately unchanged, which keeps it a safe over-approximation of
- * "may name the same file". Use shell_dep_doc_file_path_requires_directory()
- * when that distinction matters. */
+ * Use shell_dep_graph_validate() if validating an externally supplied graph. */
 bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
                                        const shell_dep_doc_t *doc,
                                        char *destination,
-                                       size_t destination_size, size_t *written,
-                                       bool *absolute)
-    SHELL_NONNULL(1, 2, 3, 5, 6);
-
-/** Report whether a FILE document's path syntactically requires a directory:
- * its decoded value ends with a separator, or its final component is `.`.
- * Such a path fails to open a non-directory and follows a final symlink,
- * unlike the same name without the suffix, yet both share one identity from
- * shell_dep_doc_file_identity_write(). Parent components are not considered.
- * Availability matches that function's source selection (static, implicit or
- * callback-resolved nonempty paths) but needs neither a known CWD nor output
- * storage. Returns false and clears the output for any other document. The
- * document is immutable during the call. */
-bool shell_dep_doc_file_path_requires_directory(const shell_dep_doc_t *doc,
-                                                bool *requires_directory)
-    SHELL_NONNULL(1, 2);
+                                       size_t destination_size,
+                                       shell_dep_file_identity_t *identity)
+    SHELL_NONNULL(1, 2, 3, 5);
 
 /**
  * Dump graph to FILE* for debugging.

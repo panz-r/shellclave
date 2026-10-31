@@ -4372,12 +4372,13 @@ TEST(cd_graph_visible_effects) {
   ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[writer].cmd.cwd_offset),
                 "/home/user");
   char identity[SHELL_DEP_CWD_BUF_SIZE];
-  size_t identity_len = 0;
-  bool identity_absolute = false;
+  shell_dep_file_identity_t file_identity = {.length = 0, .absolute = false};
+
   ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[redirect].doc,
                                            identity, sizeof(identity),
-                                           &identity_len, &identity_absolute));
-  ASSERT(identity_absolute && identity_len == strlen("/home/user/out") &&
+                                           &file_identity));
+  ASSERT(file_identity.absolute &&
+         file_identity.length == strlen("/home/user/out") &&
          strcmp(identity, "/home/user/out") == 0 &&
          shell_dep_graph_validate(&graph).valid);
 
@@ -4446,12 +4447,12 @@ TEST(cd_redirect_operand_ownership) {
                         (uint32_t)reader, SHELL_DEP_FD_NONE, 0));
     ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[reader].cmd.cwd_offset), "/");
     char identity[SHELL_DEP_CWD_BUF_SIZE];
-    size_t written;
-    bool absolute;
+    shell_dep_file_identity_t file_identity = {0};
+
     ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
                                              identity, sizeof(identity),
-                                             &written, &absolute));
-    ASSERT(absolute && written == strlen("/file") &&
+                                             &file_identity));
+    ASSERT(file_identity.absolute && file_identity.length == strlen("/file") &&
            strcmp(identity, "/file") == 0 &&
            shell_dep_graph_validate(&graph).valid);
   }
@@ -4460,7 +4461,7 @@ TEST(cd_redirect_operand_ownership) {
 
 /* A trailing separator or terminal `.` keeps one lexical identity but makes
  * the lookup require a directory; the identity bytes must not change. */
-TEST(file_path_requires_directory) {
+TEST(file_identity_requires_directory) {
   static const struct {
     const char *source;
     const char *word;
@@ -4477,24 +4478,28 @@ TEST(file_path_requires_directory) {
       {": >a.", "a.", false},
       {": >'a/'", "'a/'", true},
       {": >\\a\\/", "\\a\\/", true},
+      {": >/", "/", true},
+      {": >/tmp/regular//", "/tmp/regular//", true},
   };
   char baseline[SHELL_DEP_CWD_BUF_SIZE];
-  size_t baseline_length = 0;
-  bool absolute;
+  shell_dep_file_identity_t base_identity;
   shell_dep_graph_t graph;
   ASSERT(parse_cwd(": >regular", "/tmp", &graph) == SHELL_DEP_OK);
   int plain = find_file_doc(&graph, "regular");
   ASSERT(plain >= 0 && shell_dep_doc_file_identity_write(
                            &graph, &graph.nodes[plain].doc, baseline,
-                           sizeof(baseline), &baseline_length, &absolute));
+                           sizeof(baseline), &base_identity));
+  ASSERT(!base_identity.requires_directory && base_identity.absolute);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     ASSERT(parse_cwd(cases[i].source, "/tmp", &graph) == SHELL_DEP_OK);
     int file = find_file_doc(&graph, cases[i].word);
     ASSERT(file >= 0);
-    bool requires_directory = !cases[i].requires_directory;
-    ASSERT(shell_dep_doc_file_path_requires_directory(&graph.nodes[file].doc,
-                                                      &requires_directory));
-    ASSERT(requires_directory == cases[i].requires_directory);
+    char text[SHELL_DEP_CWD_BUF_SIZE];
+    shell_dep_file_identity_t identity;
+    ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                             text, sizeof(text), &identity));
+    ASSERT(identity.requires_directory == cases[i].requires_directory);
+    ASSERT(identity.length == strlen(text));
   }
   /* The three spellings of one name still share one identity. */
   static const char *const same[] = {": >regular/", ": >regular/.",
@@ -4507,29 +4512,30 @@ TEST(file_path_requires_directory) {
           graph.nodes[n].doc.kind == SHELL_DOC_FILE)
         file = (int)n;
     ASSERT(file >= 0);
-    char identity[SHELL_DEP_CWD_BUF_SIZE];
-    size_t written = 0;
+    char text[SHELL_DEP_CWD_BUF_SIZE];
+    shell_dep_file_identity_t identity;
     ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
-                                             identity, sizeof(identity),
-                                             &written, &absolute));
-    ASSERT(written == baseline_length &&
-           memcmp(identity, baseline, written) == 0);
+                                             text, sizeof(text), &identity));
+    ASSERT(identity.length == base_identity.length &&
+           memcmp(text, baseline, identity.length) == 0 &&
+           identity.absolute == base_identity.absolute &&
+           identity.requires_directory);
   }
-  /* Dynamic and non-file documents have no such property. */
+  /* Dynamic paths have no identity, so no facts either. */
   ASSERT(parse_cwd(": >$target/", "/tmp", &graph) == SHELL_DEP_OK);
   for (uint32_t n = 0; n < graph.node_count; n++) {
-    bool requires_directory = true;
+    char text[SHELL_DEP_CWD_BUF_SIZE];
+    shell_dep_file_identity_t identity = {1, true, true};
     if (graph.nodes[n].type == SHELL_NODE_DOC &&
         graph.nodes[n].doc.kind == SHELL_DOC_FILE)
-      ASSERT(!shell_dep_doc_file_path_requires_directory(&graph.nodes[n].doc,
-                                                         &requires_directory) &&
-             !requires_directory);
+      ASSERT(!shell_dep_doc_file_identity_write(
+                 &graph, &graph.nodes[n].doc, text, sizeof(text), &identity) &&
+             identity.length == 0 && !identity.absolute &&
+             !identity.requires_directory);
   }
   pass_count++;
 }
 
-/* Caller-supplied filesystem context is data, not dump structure: a hostile
- * initial CWD must not forge records or inject raw control bytes. */
 TEST(dump_escapes_working_directory) {
   static const char cwd[] = "/tmp/dir\nEdges:\n  [999] FORGED \"q\" \\b\r\t";
   shell_dep_graph_t graph;
@@ -5025,14 +5031,16 @@ TEST(dynamic_command_expansion_cwd) {
       bool after =
           item->doc.path_len == 5 && memcmp(item->doc.path, "after", 5) == 0;
       char identity[64];
-      size_t written = 0;
-      bool absolute = false;
+      shell_dep_file_identity_t file_identity = {.length = 0,
+                                                 .absolute = false};
+
       bool known = shell_dep_doc_file_identity_write(
-          &graph, &item->doc, identity, sizeof(identity), &written, &absolute);
+          &graph, &item->doc, identity, sizeof(identity), &file_identity);
       ASSERT(known == (!after || cases[i].later_known));
       if (known)
-        ASSERT(absolute && strcmp(identity, after ? "/workspace/after"
-                                                  : "/workspace/before") == 0);
+        ASSERT(file_identity.absolute &&
+               strcmp(identity,
+                      after ? "/workspace/after" : "/workspace/before") == 0);
     }
     ASSERT(shell_dep_graph_validate(&graph).valid);
   }
@@ -5057,36 +5065,38 @@ TEST(predecoded_file_identity) {
         continue;
       const shell_dep_doc_t *doc = &item->doc;
       char reference[128], decoded[128], identity[128];
-      size_t decoded_length, reference_length, written;
-      bool reference_absolute, absolute;
+      size_t decoded_length;
+      shell_dep_file_identity_t reference_identity, decoded_identity;
       ASSERT(shell_write_decoded_word(doc->path, doc->path_len, decoded,
                                       sizeof(decoded),
                                       &decoded_length) == SHELL_PROCESS_OK);
       bool known = shell_dep_doc_file_identity_write(
-          &graph, doc, reference, sizeof(reference), &reference_length,
-          &reference_absolute);
+          &graph, doc, reference, sizeof(reference), &reference_identity);
       memset(identity, 'x', sizeof(identity));
       ASSERT(shell_dep_doc_file_identity_from_decoded(
                  &graph, doc, decoded, decoded_length, identity,
-                 sizeof(identity), &written, &absolute) == known);
-      ASSERT(written == reference_length && absolute == reference_absolute);
+                 sizeof(identity), &decoded_identity) == known);
+      ASSERT(!memcmp(&decoded_identity, &reference_identity,
+                     sizeof(decoded_identity)));
       if (known) {
         ASSERT(strcmp(identity, reference) == 0);
         /* Preflight must leave every byte unchanged on insufficient storage. */
         memset(identity, 'x', sizeof(identity));
         ASSERT(!shell_dep_doc_file_identity_from_decoded(
-            &graph, doc, decoded, decoded_length, identity, 1, &written,
-            &absolute));
-        ASSERT(written == 0 && !absolute);
+            &graph, doc, decoded, decoded_length, identity, 1,
+            &decoded_identity));
+        ASSERT(decoded_identity.length == 0 && !decoded_identity.absolute &&
+               !decoded_identity.requires_directory);
         for (size_t j = 0; j < sizeof(identity); j++)
           ASSERT(identity[j] == 'x');
         /* In-place CWD insertion must not overwrite the decoded operand. */
         memcpy(identity, decoded, decoded_length);
         ASSERT(shell_dep_doc_file_identity_from_decoded(
             &graph, doc, identity, decoded_length, identity, sizeof(identity),
-            &written, &absolute));
+            &decoded_identity));
         ASSERT(strcmp(identity, reference) == 0 &&
-               written == reference_length && absolute == reference_absolute);
+               !memcmp(&decoded_identity, &reference_identity,
+                       sizeof(decoded_identity)));
       } else {
         for (size_t j = 0; j < sizeof(identity); j++)
           ASSERT(identity[j] == 'x');
@@ -5114,15 +5124,16 @@ TEST(tilde_file_identity) {
     const shell_dep_doc_t *doc = &graph.nodes[file].doc;
     char identity[128], decoded[128], expected[160];
     memset(identity, 'x', sizeof(identity));
-    size_t written = SIZE_MAX;
-    bool absolute = true;
+    shell_dep_file_identity_t file_identity = {.length = SIZE_MAX,
+                                               .absolute = true};
+
     bool known = shell_dep_doc_file_identity_write(
-        &graph, doc, identity, sizeof(identity), &written, &absolute);
+        &graph, doc, identity, sizeof(identity), &file_identity);
     if (known == shellsplit_test_tilde_words[i].argument_dynamic)
       printf("\n    tilde identity: %s known=%d\n", word, known);
     ASSERT(known == !shellsplit_test_tilde_words[i].argument_dynamic);
     if (!known) {
-      ASSERT(written == 0 && !absolute);
+      ASSERT(file_identity.length == 0 && !file_identity.absolute);
       for (size_t j = 0; j < sizeof(identity); j++)
         ASSERT(identity[j] == 'x');
       continue;
@@ -5133,12 +5144,12 @@ TEST(tilde_file_identity) {
                                     &decoded_length) == SHELL_PROCESS_OK);
     decoded[decoded_length] = '\0';
     snprintf(expected, sizeof(expected), "/workspace/%s", decoded);
-    ASSERT(absolute && written == strlen(expected));
+    ASSERT(file_identity.absolute && file_identity.length == strlen(expected));
     ASSERT_STR_EQ(identity, expected);
     memset(identity, 'x', sizeof(identity));
     ASSERT(!shell_dep_doc_file_identity_write(&graph, doc, identity, 1,
-                                              &written, &absolute));
-    ASSERT(written == 0 && !absolute);
+                                              &file_identity));
+    ASSERT(file_identity.length == 0 && !file_identity.absolute);
     for (size_t j = 0; j < sizeof(identity); j++)
       ASSERT(identity[j] == 'x');
   }
@@ -5164,22 +5175,23 @@ TEST(tilde_cwd_identity) {
     ASSERT(graph.nodes[file].doc.cwd_known == (cwd != NULL));
     char identity[128];
     memset(identity, 'x', sizeof(identity));
-    size_t written = SIZE_MAX;
-    bool absolute = true;
-    ASSERT(shell_dep_doc_file_identity_write(
-               &graph, &graph.nodes[file].doc, identity, sizeof(identity),
-               &written, &absolute) == (cwd != NULL));
+    shell_dep_file_identity_t file_identity = {.length = SIZE_MAX,
+                                               .absolute = true};
+
+    ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                             identity, sizeof(identity),
+                                             &file_identity) == (cwd != NULL));
     if (cwd) {
       ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset), cwd);
       ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[file].doc.cwd_offset), cwd);
       ASSERT(graph.nodes[pwd].cmd.cwd_absolute ==
              shellsplit_test_tilde_cwd[i].absolute);
-      ASSERT(absolute == shellsplit_test_tilde_cwd[i].absolute);
+      ASSERT(file_identity.absolute == shellsplit_test_tilde_cwd[i].absolute);
       char expected[128];
       snprintf(expected, sizeof(expected), "%s/out", cwd);
       ASSERT_STR_EQ(identity, expected);
     } else {
-      ASSERT(written == 0 && !absolute);
+      ASSERT(file_identity.length == 0 && !file_identity.absolute);
       for (size_t j = 0; j < sizeof(identity); j++)
         ASSERT(identity[j] == 'x');
     }
@@ -5193,8 +5205,8 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
                "cd /tmp/second && cat ./out",
                &graph) == SHELL_DEP_OK);
   char identities[3][128] = {{0}};
-  size_t lengths[3] = {0};
-  bool absolute = false;
+  shell_dep_file_identity_t facts[3] = {{0}};
+  shell_dep_file_identity_t file_identity = {.length = SIZE_MAX};
   uint32_t count = 0;
   for (uint32_t node = 0; node < graph.node_count; node++) {
     if (graph.nodes[node].type != SHELL_NODE_DOC ||
@@ -5206,8 +5218,8 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
     ASSERT(count < 3);
     ASSERT(shell_dep_doc_file_identity_write(
         &graph, &graph.nodes[node].doc, identities[count],
-        sizeof(identities[count]), &lengths[count], &absolute));
-    ASSERT(absolute);
+        sizeof(identities[count]), &facts[count]));
+    ASSERT(facts[count].absolute);
     count++;
   }
   ASSERT(count == 3 && strcmp(identities[0], "/tmp/first/out") == 0 &&
@@ -5215,7 +5227,6 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
          strcmp(identities[2], "/tmp/second/out") == 0);
 
   ASSERT(parse("printf x >out; cd / && cat ./out", &graph) == SHELL_DEP_OK);
-  bool origin_absolute[2] = {false, false};
   uint32_t origin_count = 0;
   for (uint32_t node = 0; node < graph.node_count; node++) {
     if (graph.nodes[node].type != SHELL_NODE_DOC ||
@@ -5228,11 +5239,10 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
     ASSERT(origin_count < 2);
     ASSERT(shell_dep_doc_file_identity_write(
         &graph, &graph.nodes[node].doc, identities[origin_count],
-        sizeof(identities[origin_count]), &lengths[origin_count],
-        &origin_absolute[origin_count]));
+        sizeof(identities[origin_count]), &facts[origin_count]));
     origin_count++;
   }
-  ASSERT(origin_count == 2 && !origin_absolute[0] && origin_absolute[1] &&
+  ASSERT(origin_count == 2 && !facts[0].absolute && facts[1].absolute &&
          strcmp(identities[0], "out") == 0 &&
          strcmp(identities[1], "/out") == 0);
 
@@ -5242,26 +5252,27 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
   ASSERT(parent_file >= 0 && local_file >= 0);
   ASSERT(shell_dep_doc_file_identity_write(
              &graph, &graph.nodes[parent_file].doc, identities[0],
-             sizeof(identities[0]), &lengths[0], &absolute) &&
-         !absolute && strcmp(identities[0], "../out") == 0);
+             sizeof(identities[0]), &facts[0]) &&
+         !facts[0].absolute && strcmp(identities[0], "../out") == 0);
   ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[local_file].doc,
                                            identities[1], sizeof(identities[1]),
-                                           &lengths[1], &absolute) &&
-         !absolute && strcmp(identities[1], "out") == 0);
+                                           &facts[1]) &&
+         !facts[1].absolute && strcmp(identities[1], "out") == 0);
 
   ASSERT(parse("printf x >/var/run/../tmp/out; cat /var/tmp/out", &graph) ==
          SHELL_DEP_OK);
   parent_file = find_file_doc(&graph, "/var/run/../tmp/out");
   local_file = find_file_doc(&graph, "/var/tmp/out");
   ASSERT(parent_file >= 0 && local_file >= 0);
-  ASSERT(shell_dep_doc_file_identity_write(
-             &graph, &graph.nodes[parent_file].doc, identities[0],
-             sizeof(identities[0]), &lengths[0], &absolute) &&
-         absolute && strcmp(identities[0], "/var/run/../tmp/out") == 0);
+  ASSERT(
+      shell_dep_doc_file_identity_write(&graph, &graph.nodes[parent_file].doc,
+                                        identities[0], sizeof(identities[0]),
+                                        &facts[0]) &&
+      facts[0].absolute && strcmp(identities[0], "/var/run/../tmp/out") == 0);
   ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[local_file].doc,
                                            identities[1], sizeof(identities[1]),
-                                           &lengths[1], &absolute) &&
-         absolute && strcmp(identities[1], "/var/tmp/out") == 0);
+                                           &facts[1]) &&
+         facts[1].absolute && strcmp(identities[1], "/var/tmp/out") == 0);
 
   ASSERT(parse("printf x >link/../out; cat ./out", &graph) == SHELL_DEP_OK);
   parent_file = find_file_doc(&graph, "link/../out");
@@ -5269,66 +5280,68 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
   ASSERT(parent_file >= 0 && local_file >= 0);
   ASSERT(shell_dep_doc_file_identity_write(
              &graph, &graph.nodes[parent_file].doc, identities[0],
-             sizeof(identities[0]), &lengths[0], &absolute) &&
-         !absolute && strcmp(identities[0], "link/../out") == 0);
+             sizeof(identities[0]), &facts[0]) &&
+         !facts[0].absolute && strcmp(identities[0], "link/../out") == 0);
   ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[local_file].doc,
                                            identities[1], sizeof(identities[1]),
-                                           &lengths[1], &absolute) &&
-         !absolute && strcmp(identities[1], "out") == 0);
+                                           &facts[1]) &&
+         !facts[1].absolute && strcmp(identities[1], "out") == 0);
 
   ASSERT(parse("cd /tmp/first; printf x >\"out\"; cat ./out; "
                "cd /tmp/second; cat ./out",
                &graph) == SHELL_DEP_OK);
   char too_small[4] = {'x', 'x', 'x', 'x'};
-  size_t written = SIZE_MAX;
+
   int file = find_file_doc(&graph, "\"out\"");
   ASSERT(file >= 0 &&
          !shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
                                             too_small, sizeof(too_small),
-                                            &written, &absolute) &&
-         written == 0 && too_small[0] == 'x');
+                                            &file_identity) &&
+         file_identity.length == 0 && too_small[0] == 'x');
 
   shell_dep_doc_t uncertain = graph.nodes[file].doc;
   uncertain.cwd_known = false;
-  written = SIZE_MAX;
+  file_identity.length = SIZE_MAX;
   ASSERT(!shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
-                                            sizeof(identities[0]), &written,
-                                            &absolute) &&
-         written == 0);
+                                            sizeof(identities[0]),
+                                            &file_identity) &&
+         file_identity.length == 0);
   uncertain.path = "/tmp/absolute";
   uncertain.path_len = (uint32_t)strlen(uncertain.path);
   ASSERT(shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
-                                           sizeof(identities[0]), &written,
-                                           &absolute) &&
-         absolute && strcmp(identities[0], "/tmp/absolute") == 0);
+                                           sizeof(identities[0]),
+                                           &file_identity) &&
+         file_identity.absolute && strcmp(identities[0], "/tmp/absolute") == 0);
   uncertain.path = "$runtime";
   uncertain.path_len = (uint32_t)strlen(uncertain.path);
   ASSERT(!shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
-                                            sizeof(identities[0]), &written,
-                                            &absolute) &&
-         written == 0);
+                                            sizeof(identities[0]),
+                                            &file_identity) &&
+         file_identity.length == 0);
   uncertain.path = "$'\\x00x'";
   uncertain.path_len = (uint32_t)strlen(uncertain.path);
   ASSERT(!shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
-                                            sizeof(identities[0]), &written,
-                                            &absolute) &&
-         written == 0);
+                                            sizeof(identities[0]),
+                                            &file_identity) &&
+         file_identity.length == 0);
 
   ASSERT(parse("cd /tmp/group && { printf x; } >out", &graph) == SHELL_DEP_OK);
   file = find_file_doc(&graph, "out");
   ASSERT(file >= 0 &&
          shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
                                            identities[0], sizeof(identities[0]),
-                                           &written, &absolute) &&
-         absolute && strcmp(identities[0], "/tmp/group/out") == 0);
+                                           &file_identity) &&
+         file_identity.absolute &&
+         strcmp(identities[0], "/tmp/group/out") == 0);
 
   ASSERT(parse("echo $(cd /tmp/nested && cat ./file)", &graph) == SHELL_DEP_OK);
   file = find_file_doc(&graph, "./file");
   ASSERT(file >= 0 &&
          shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
                                            identities[0], sizeof(identities[0]),
-                                           &written, &absolute) &&
-         absolute && strcmp(identities[0], "/tmp/nested/file") == 0);
+                                           &file_identity) &&
+         file_identity.absolute &&
+         strcmp(identities[0], "/tmp/nested/file") == 0);
 
   ASSERT(parse("{ curl URL; } | { sh; }", &graph) == SHELL_DEP_OK);
   int curl = find_nth_cmd(&graph, 0);
@@ -5953,18 +5966,19 @@ TEST(execution_stage_cwd_scope) {
     ASSERT(probe >= 0 && file >= 0);
     ASSERT(graph.nodes[probe].cmd.cwd_known == (cases[i].cwd != NULL));
     char identity[512];
-    size_t length = 0;
-    bool absolute = false;
+    shell_dep_file_identity_t file_identity = {.length = 0, .absolute = false};
+
     bool known = shell_dep_doc_file_identity_write(
-        &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
-        &absolute);
+        &graph, &graph.nodes[file].doc, identity, sizeof(identity),
+        &file_identity);
     ASSERT(known == (cases[i].cwd != NULL));
     if (known) {
       ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[probe].cmd.cwd_offset),
                     cases[i].cwd);
       char expected[512];
       snprintf(expected, sizeof(expected), "%s/relative", cases[i].cwd);
-      ASSERT(absolute && length == strlen(expected));
+      ASSERT(file_identity.absolute &&
+             file_identity.length == strlen(expected));
       ASSERT_STR_EQ(identity, expected);
     }
     ASSERT(shell_dep_graph_validate(&graph).valid);
@@ -5994,14 +6008,15 @@ TEST(file_command_substitution_cwd_context) {
     int file = find_file_doc(&graph, "relative");
     ASSERT(file >= 0);
     char identity[512];
-    size_t length = 0;
-    bool absolute = false;
+    shell_dep_file_identity_t file_identity = {.length = 0, .absolute = false};
+
     bool known = shell_dep_doc_file_identity_write(
-        &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
-        &absolute);
+        &graph, &graph.nodes[file].doc, identity, sizeof(identity),
+        &file_identity);
     ASSERT(known == (cases[i].identity != NULL));
     if (known) {
-      ASSERT(absolute && length == strlen(cases[i].identity));
+      ASSERT(file_identity.absolute &&
+             file_identity.length == strlen(cases[i].identity));
       ASSERT_STR_EQ(identity, cases[i].identity);
     }
     ASSERT(shell_dep_graph_validate(&graph).valid);
@@ -15162,18 +15177,19 @@ TEST(reachability_cwd_transitions) {
     int file = find_file_doc(&graph, shellsplit_test_cwd_reachability[i].file);
     ASSERT(file >= 0);
     char identity[512];
-    size_t length = 0;
-    bool absolute = false;
+    shell_dep_file_identity_t file_identity = {.length = 0, .absolute = false};
+
     bool known = shell_dep_doc_file_identity_write(
-        &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
-        &absolute);
+        &graph, &graph.nodes[file].doc, identity, sizeof(identity),
+        &file_identity);
     if (known != (expected != NULL) ||
         (known && strcmp(identity, expected) != 0))
       printf("    CWD case %zu: %s (identity %s)\n", i, source,
              known ? identity : "unknown");
     ASSERT(known == (expected != NULL));
     if (known)
-      ASSERT(absolute && length == strlen(expected) &&
+      ASSERT(file_identity.absolute &&
+             file_identity.length == strlen(expected) &&
              strcmp(identity, expected) == 0);
     ASSERT(shell_dep_graph_validate(&graph).valid);
     shell_parse_result_t fast = {0};
@@ -15210,12 +15226,12 @@ TEST(reachability_cwd_transitions) {
   int file = find_file_doc(&graph, "out");
   ASSERT(file >= 0);
   char identity[32];
-  size_t length;
-  bool absolute;
+  shell_dep_file_identity_t file_identity = {0};
+
   ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
-                                           identity, sizeof(identity), &length,
-                                           &absolute));
-  ASSERT(absolute && strcmp(identity, "/out") == 0);
+                                           identity, sizeof(identity),
+                                           &file_identity));
+  ASSERT(file_identity.absolute && strcmp(identity, "/out") == 0);
   pass_count++;
 }
 
@@ -15973,11 +15989,13 @@ TEST(static_empty_path_effects) {
           ASSERT((item->doc.flags & (SHELL_DEP_DOC_FLAG_DYNAMIC_NAME |
                                      SHELL_DEP_DOC_FLAG_RESOLVED_PATH)) == 0);
           char output[8] = "intact";
-          size_t written = 1;
-          bool absolute = true;
+          shell_dep_file_identity_t file_identity = {.length = 1,
+                                                     .absolute = true};
+
           ASSERT(!shell_dep_doc_file_identity_write(
-              &graph, &item->doc, output, sizeof(output), &written, &absolute));
-          ASSERT(written == 0 && !absolute && strcmp(output, "intact") == 0);
+              &graph, &item->doc, output, sizeof(output), &file_identity));
+          ASSERT(file_identity.length == 0 && !file_identity.absolute &&
+                 strcmp(output, "intact") == 0);
         }
         for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
           const shell_dep_edge_t *item = &graph.edges[edge];
@@ -16272,16 +16290,15 @@ TEST(resolved_substitution_argument_documents) {
           ASSERT(doc->path == strstr(source, words[i]) &&
                  doc->path_len == strlen(words[i]));
           char identity[64];
-          size_t written;
-          bool absolute;
+          shell_dep_file_identity_t file_identity = {0};
+
           ASSERT(shell_dep_doc_file_identity_write(
-              &graph, doc, identity, sizeof(identity), &written, &absolute));
-          ASSERT(absolute && written == doc->value_len &&
-                 memcmp(identity, doc->value, written) == 0);
-          bool requires_directory = true;
-          ASSERT(shell_dep_doc_file_path_requires_directory(
-                     doc, &requires_directory) &&
-                 requires_directory == (doc->value[doc->value_len - 1] == '/'));
+              &graph, doc, identity, sizeof(identity), &file_identity));
+          ASSERT(file_identity.absolute &&
+                 file_identity.length == doc->value_len &&
+                 memcmp(identity, doc->value, file_identity.length) == 0);
+          ASSERT(file_identity.requires_directory ==
+                 (doc->value[doc->value_len - 1] == '/'));
         }
         ASSERT(fixture.calls == 1 && arguments == (empty ? 0u : 2u) &&
                substitutions != 0 && shell_dep_graph_validate(&graph).valid);
@@ -18756,7 +18773,7 @@ int main(int argc, char **argv) {
   RUN(cwd_decoded_operand_matrix);
   RUN(cd_graph_visible_effects);
   RUN(cd_redirect_operand_ownership);
-  RUN(file_path_requires_directory);
+  RUN(file_identity_requires_directory);
   RUN(dump_escapes_working_directory);
   RUN(wrapper_cwd_semantics);
   RUN(continued_process_substitution_topology);

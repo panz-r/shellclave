@@ -3023,14 +3023,14 @@ static void quoted_byte_paths(void) {
             node->doc.path != strstr(source, cases[c].path))
           continue;
         char identity[128];
-        size_t written;
-        bool absolute;
-        CHECK(node->doc.cwd_known &&
-              shell_dep_doc_file_identity_write(&graph, &node->doc, identity,
-                                                sizeof(identity), &written,
-                                                &absolute));
-        CHECK(absolute && written == strlen(cases[c].identity) &&
-              !memcmp(identity, cases[c].identity, written));
+        shell_dep_file_identity_t file_identity = {0};
+
+        CHECK(node->doc.cwd_known && shell_dep_doc_file_identity_write(
+                                         &graph, &node->doc, identity,
+                                         sizeof(identity), &file_identity));
+        CHECK(file_identity.absolute &&
+              file_identity.length == strlen(cases[c].identity) &&
+              !memcmp(identity, cases[c].identity, file_identity.length));
         ++matches;
       }
       CHECK(matches == 1);
@@ -3066,13 +3066,14 @@ static void quoted_byte_paths(void) {
       if (node->type != SHELL_NODE_DOC || node->doc.kind != SHELL_DOC_FILE)
         continue;
       char identity[128];
-      size_t written;
-      bool absolute;
+      shell_dep_file_identity_t file_identity = {0};
+
       CHECK(shell_dep_doc_file_identity_write(
-          &graph, &node->doc, identity, sizeof(identity), &written, &absolute));
+          &graph, &node->doc, identity, sizeof(identity), &file_identity));
       static const char expected[] = "/workspace/résumé.txt";
-      CHECK(absolute && written == sizeof(expected) - 1 &&
-            !memcmp(identity, expected, written));
+      CHECK(file_identity.absolute &&
+            file_identity.length == sizeof(expected) - 1 &&
+            !memcmp(identity, expected, file_identity.length));
       ++matches;
     }
     CHECK(matches == 1);
@@ -5798,14 +5799,15 @@ static void cwd(void) {
       matched++;
       CHECK(node->doc.cwd_known == files[c].known);
       char path[64];
-      size_t written;
-      bool absolute;
+      shell_dep_file_identity_t file_identity = {0};
+
       CHECK(shell_dep_doc_file_identity_write(&graph, &node->doc, path,
-                                              sizeof(path), &written,
-                                              &absolute) == files[c].known);
+                                              sizeof(path), &file_identity) ==
+            files[c].known);
       if (files[c].known) {
-        CHECK(absolute && written == strlen("/workspace/input.c"));
-        CHECK(!memcmp(path, "/workspace/input.c", written));
+        CHECK(file_identity.absolute &&
+              file_identity.length == strlen("/workspace/input.c"));
+        CHECK(!memcmp(path, "/workspace/input.c", file_identity.length));
       }
     }
     CHECK(matched == 1);

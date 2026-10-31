@@ -237,12 +237,13 @@ static bool check_depgraph_workspace_api(void) {
           (graph.nodes[i].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)) {
         ++implicit;
         char path[10];
-        size_t written;
-        bool absolute;
-        ok = shell_dep_doc_file_identity_write(&graph, &graph.nodes[i].doc,
-                                               path, sizeof(path), &written,
-                                               &absolute) &&
-             absolute && written == 9 && strcmp(path, "/dev/null") == 0;
+        shell_dep_file_identity_t file_identity = {0};
+
+        ok =
+            shell_dep_doc_file_identity_write(&graph, &graph.nodes[i].doc, path,
+                                              sizeof(path), &file_identity) &&
+            file_identity.absolute && file_identity.length == 9 &&
+            strcmp(path, "/dev/null") == 0;
       }
     ok = ok && implicit == 1;
   }

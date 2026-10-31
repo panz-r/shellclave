@@ -25,11 +25,11 @@ shell_dep_error_t shell_dep_graph_parse_with_fast_resolver(
  * from graph. This consumes the payload, not the source spelling: no word
  * classification or decoding is repeated. Storage is readable for length
  * bytes; destination may overlap it. Unknown CWD and insufficient output
- * capacity return false, clear outputs, and leave destination unchanged. */
+ * capacity return false, zero the identity, and leave destination unchanged. */
 bool shell_dep_doc_file_identity_from_decoded(
     const shell_dep_graph_t *graph, const shell_dep_doc_t *doc,
     const char *decoded, size_t length, char *destination, size_t capacity,
-    size_t *written, bool *absolute) SHELL_NONNULL(1, 2, 3, 5, 7, 8);
+    shell_dep_file_identity_t *identity) SHELL_NONNULL(1, 2, 3, 5, 7);
 
 /* Normalize one decoded, nonempty, NUL-free lexical path in place. path has
  * length + 1 writable bytes and length <= UINT32_MAX. Removes single-dot and
