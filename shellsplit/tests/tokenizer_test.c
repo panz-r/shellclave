@@ -286,6 +286,9 @@ static void test_list_syntax_contract(void) {
       "# comment only",
       "for item in one; do :; done",
       "{ echo one; }",
+      "{\\\n echo one; }",
+      "{\\\n\\\n echo one; }",
+      "echo \"$({\\\n echo one; })\"",
       "( echo one; )",
       "{ echo one; } >/tmp/group.out 2>&1",
       "{ echo one; } >$(printf path)",
@@ -339,6 +342,8 @@ static void test_list_syntax_contract(void) {
       "{ ; }",
       "()",
       "{ echo one; } echo two",
+      "{\\\necho one; }",
+      "{echo one; }",
       "{ echo one; } 'echo two'",
       "( echo one; ) ! echo two",
       "{ echo one; } >",
@@ -380,13 +385,10 @@ static void test_list_syntax_contract(void) {
        valid_syntax);
 
   static const char *const modeled[] = {
-      "echo one;\n",
-      "echo one |\n cat",
-      "echo one |&\n cat",
-      "echo one &&\n cat",
-      "echo one ||\r\n cat",
-      "{ echo one; } |& { cat; }",
-      "! ! printf command |& cat",
+      "echo one;\n",         "echo one |\n cat",
+      "echo one |&\n cat",   "echo one &&\n cat",
+      "echo one ||\r\n cat", "{ echo one; } |& { cat; }",
+      "{\\\n echo one; }",   "! ! printf command |& cat",
   };
   bool public_contract = true;
   for (size_t i = 0; i < sizeof(modeled) / sizeof(modeled[0]); i++) {

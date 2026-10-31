@@ -207,10 +207,14 @@ static shell_error_t brace_groups_status(const char *input, size_t length) {
     /* Consume ordinary words as spans. Their literal braces are not compound
      * delimiters, and must not trigger repeated source-prefix reconstruction.
      */
+    /* Escaped line endings vanish before a reserved word is recognized, so
+     * the delimiter follows the next logical byte, as in the lexer. */
+    size_t brace_following =
+        c == '{' ? shell_source_logical_following(input, length, i) : length;
     bool possible_brace_open =
-        c == '{' && i + 1 < length &&
-        (shell_source_space((unsigned char)input[i + 1]) ||
-         input[i + 1] == '(');
+        c == '{' && brace_following < length &&
+        (shell_source_space((unsigned char)input[brace_following]) ||
+         input[brace_following] == '(');
     if ((c != '{' && c != '}' && c != '(' && c != ')' &&
          !shell_source_space((unsigned char)c) && !strchr("<>;|&", c)) ||
         (c == '{' && !possible_brace_open)) {
@@ -270,9 +274,7 @@ static shell_error_t brace_groups_status(const char *input, size_t length) {
         closing_brace = have_lexical_token && lexical_token.position == i &&
                         lexical_token.type == SHELL_TOKEN_GROUP_END;
     }
-    if (possible_brace_open && command_boundary && i + 1 < length &&
-        (shell_source_space((unsigned char)input[i + 1]) ||
-         input[i + 1] == '(')) {
+    if (possible_brace_open && command_boundary) {
       if (depth == SHELL_MAX_SUBCOMMANDS)
         return SHELL_ETRUNC;
       stack[depth++] = SHELL_GROUP_BRACE;
