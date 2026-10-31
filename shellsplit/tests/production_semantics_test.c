@@ -1981,6 +1981,35 @@ static void test_processed_command_conveniences(void) {
                                  &decoded_length) == SHELL_PROCESS_OK &&
         decoded_length == 2 && decoded.length == 2 && decoded.bytes[0] == 'a' &&
         decoded.bytes[1] == ' ');
+  /* Bash treats a word ending inside a quote as a syntax error, so it has no
+   * value; a final unquoted backslash is a literal byte. A visitor that
+   * stops before the end never reaches the open quote. */
+  static const char *const open_quote_words[] = {"'open", "\"open", "a'b\"c",
+                                                 "\"open\\"};
+  for (size_t i = 0; i < sizeof(open_quote_words) / sizeof(open_quote_words[0]);
+       ++i) {
+    size_t measured = 0;
+    CHECK(shell_measure_decoded_word(open_quote_words[i],
+                                     strlen(open_quote_words[i]),
+                                     &measured) == SHELL_PROCESS_EPARSE);
+    CHECK(shell_process_measure_word_value(open_quote_words[i],
+                                           strlen(open_quote_words[i]),
+                                           &measured) == SHELL_PROCESS_EPARSE);
+    CHECK(shell_measure_processed_word(open_quote_words[i],
+                                       strlen(open_quote_words[i]),
+                                       &measured) == SHELL_PROCESS_EPARSE);
+  }
+  decoded = (source_capture_t){.stop_after = 1};
+  decoded_length = SIZE_MAX;
+  CHECK(shell_visit_decoded_word("'open", strlen("'open"), capture_decoded_byte,
+                                 &decoded,
+                                 &decoded_length) == SHELL_PROCESS_OK &&
+        decoded_length == 1 && decoded.bytes[0] == 'o');
+  decoded_length = SIZE_MAX;
+  CHECK(shell_measure_decoded_word("abc\\", 4, &decoded_length) ==
+            SHELL_PROCESS_OK &&
+        decoded_length == 4);
+
   static const char *const control_words[] = {"$'\\c\\\\X'", "$'\\c\\'X'"};
   for (size_t i = 0; i < sizeof(control_words) / sizeof(control_words[0]);
        ++i) {

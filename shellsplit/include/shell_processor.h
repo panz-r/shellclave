@@ -301,6 +301,9 @@ typedef bool (*shell_decoded_word_visitor_t)(unsigned char byte,
  * return SHELL_PROCESS_EPARSE: their bytes depend on the execution locale,
  * which is not part of the supported shell contract. ASCII Unicode and byte
  * escapes remain supported; literal non-ASCII bytes are not restricted.
+ * A word that ends inside a quote has no value, as in Bash where it is a
+ * syntax error: it returns SHELL_PROCESS_EPARSE, unless the visitor stops
+ * traversal first. A final unquoted backslash is a literal byte.
  * Statically empty process substitutions contribute no bytes (`a<()b` decodes
  * to `ab`); nonempty substitutions retain source spelling. A zero-length
  * decoded payload does not determine argv presence: quoted empty fragments

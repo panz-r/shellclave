@@ -205,6 +205,8 @@ render_processed_word(const char *text, size_t length, char *destination,
     }
     out++;
   }
+  if (quote != '\0')
+    return SHELL_PROCESS_EPARSE; /* An unterminated quote has no value. */
   *written = out;
   return SHELL_PROCESS_OK;
 }

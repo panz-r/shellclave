@@ -938,11 +938,13 @@ static int test_normalization_matrix(void) {
         ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
         ST_TYPE_LITERAL},
        9},
-      {"echo 'unterminated",
-       "echo\tunterminated",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
-       2},
   };
+
+  /* Bash rejects a word that ends inside a quote, so it has no token value. */
+  {
+    shell_netstring_buffer_t unfinished = test_netargv("echo 'unterminated");
+    ASSERT(unfinished.data == NULL);
+  }
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_token_array_t typed = {0};

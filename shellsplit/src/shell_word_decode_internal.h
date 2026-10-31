@@ -90,7 +90,10 @@ static inline SHELL_NONNULL(1, 3) shell_process_status_t
     if (sink->stopped)
       return SHELL_PROCESS_OK;
   }
-  return SHELL_PROCESS_OK;
+  /* Bash reports a syntax error for a word that ends inside a quote, so it
+   * has no value. A visitor stop returned above is not this end of word. A
+   * final unquoted backslash is a literal byte, as in Bash. */
+  return quote == 0 ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE;
 }
 
 #endif
