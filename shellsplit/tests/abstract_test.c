@@ -1071,7 +1071,12 @@ static void test_runtime_expansion(void) {
                {"echo \"\"/etc/passwd", "$AP_1", "/etc/passwd", NULL},
                {"echo /tmp/hello\\ world", "$AP_1", "/tmp/hello world", NULL},
                {"echo ./a\\ b", "$RP_1", "/tmp/./a b", "/tmp/"},
-               {"echo \\~/note", "$RP_1", "/tmp/~/note", "/tmp/"}};
+               {"echo \\~/note", "$RP_1", "/tmp/~/note", "/tmp/"},
+               {"echo ~", "$HP_1", "/home/testuser", NULL},
+               {"echo ~/note", "$HP_1", "/home/testuser/note", NULL},
+               {"echo ~root", "$HP_1", NULL, NULL},
+               {"echo ~root/note", "$HP_1", NULL, NULL},
+               {"echo ~nosuchuser", "$HP_1", NULL, NULL}};
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_abstract_command_t *result = parse_command(cases[i].input);

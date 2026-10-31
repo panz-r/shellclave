@@ -1686,6 +1686,11 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
       }
       return finish_expanded_path(join_path(home, path + 2), ctx);
     }
+    /* `~name` names another user's home. The context carries no account
+     * database, and the analyzing host need not be the executing host, so
+     * the text is neither expanded nor known to be literal. */
+    if (path[0] == '~')
+      return NULL;
     return finish_expanded_path(strdup(path), ctx);
   }
 

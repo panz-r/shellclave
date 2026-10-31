@@ -998,7 +998,9 @@ static void test_abstraction_expansion(void) {
       .env = environment, .cwd = "/workspace", .resolve_symlinks = false};
   shell_abstract_command_t *command = parse_abstract(
       "printf \"$USER\" ~/child ~other ./relative /absolute $1 $?");
-  CHECK(command && shell_abstract_command_expand(command, &context));
+  /* `~other` names another user's home, which the context cannot supply:
+   * the command is incomplete, and every other element still resolves. */
+  CHECK(command && !shell_abstract_command_expand(command, &context));
   bool saw_user = false;
   bool saw_home = false;
   bool saw_other_home = false;
@@ -1017,8 +1019,7 @@ static void test_abstraction_expansion(void) {
                  strcmp(element->expanded, "/home/test/child") == 0;
     } else if (element->type == SHELL_ABSTRACT_HP &&
                strcmp(element->original, "~other") == 0) {
-      saw_other_home =
-          element->expanded && strcmp(element->expanded, "~other") == 0;
+      saw_other_home = element->expanded == NULL;
     } else if (element->type == SHELL_ABSTRACT_RP) {
       saw_relative = element->expanded &&
                      strcmp(element->expanded, "/workspace/./relative") == 0;

@@ -233,6 +233,9 @@ typedef struct {
  * subscript changes the result in ways an environment lookup cannot model, so
  * it returns NULL rather than the unmodified value. Path elements hold the
  * decoded word value, so escapes and quotes in the source are already removed.
+ * A home path resolves only for `~` and `~/…`, from HOME in the context. A
+ * `~name` form names another user's home directory, which the context cannot
+ * supply, so it returns NULL rather than the unexpanded text.
  *
  * Returns the expanded string (caller must free), or NULL when the element
  * cannot be resolved by this context or allocation fails.
@@ -251,9 +254,9 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
  * arithmetic, redirects, conditionals) are never expandable: they keep a NULL
  * `expanded` and do not affect the result, so a command with none returns
  * true. Returns false when any expandable element did not resolve, for
- * example an unset variable, a parameter operator, a missing HOME or an
- * allocation failure. All elements are still processed, so resolved elements
- * keep their values after a false result. */
+ * example an unset variable, a parameter operator, a missing HOME, a `~name`
+ * home path or an allocation failure. All elements are still processed, so
+ * resolved elements keep their values after a false result. */
 bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
                                    const shell_runtime_context_t *ctx)
     SHELL_NONNULL(1, 2);
