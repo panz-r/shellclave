@@ -35,14 +35,12 @@ void shell_tokenizer_arithmetic_content(const shell_token_t *token,
 }
 
 /* `{` and `}` are reserved words only as whole tokens: the next logical byte
- * must end the word, as in Bash. This is the one definition shared by the
- * lexer and the brace validator, so neither can disagree about it. Escaped
- * line endings vanish before the following byte is judged. A shell
- * metacharacter or the end of input ends the token, except a process
- * substitution, which continues it; `{x`, `}suffix`, `}2>out` and `{<(cmd)`
- * are words, not delimiters. Context (command
- * position, the preceding byte, group depth) is separate and belongs to each
- * caller. position < length indexes the brace. */
+ * must end the word, as in Bash. Escaped line endings vanish before that byte
+ * is judged. A shell metacharacter or the end of input ends the token, except
+ * a process substitution, which continues it; `{x`, `}suffix`, `}2>out` and
+ * `{<(cmd)` are words, not delimiters. Command position, the preceding byte
+ * and group depth are separate lexer context. position < length indexes the
+ * brace. */
 static bool brace_token_ends(const char *input, size_t length,
                              size_t position) {
   size_t following = shell_source_logical_following(input, length, position);
@@ -51,268 +49,6 @@ static bool brace_token_ends(const char *input, size_t length,
          (shell_source_word_separator(input[following]) &&
           !shell_source_process_substitution_open(input, length, following,
                                                   &open));
-}
-
-/* A closing brace is a reserved word only when it is also preceded by a list
- * terminator or newline. */
-static bool brace_group_close_delimiter(const char *input, size_t length,
-                                        size_t position, char before,
-                                        bool newline_separator) {
-  if (before != ';' && before != '&' && before != ')' && !newline_separator)
-    return false;
-  return brace_token_ends(input, length, position);
-}
-
-/* Validate POSIX brace-group delimiters before allocating token arrays.
- * Control/function syntax has already taken its separate diagnostic path.
- * Expansions, substitutions, comments, and heredoc bodies are opaque here:
- * their delimiters must not affect the surrounding compound-list stack. */
-static shell_error_t brace_groups_status(const char *input, size_t length) {
-  uint8_t stack[SHELL_MAX_SUBCOMMANDS];
-  size_t depth = 0;
-  bool saw_brace = false;
-  bool context_possible = true;
-  shell_tokenizer_state_t lexical;
-  shell_tokenizer_init_prechecked(&lexical, input, length);
-  shell_token_t lexical_token = {0};
-  bool have_lexical_token = false;
-  shell_source_pending_heredoc_t pending[SHELL_SOURCE_MAX_PENDING_HEREDOCS];
-  size_t pending_count = 0;
-  bool word_boundary = true;
-  for (size_t i = 0; i < length; i++) {
-    char c = input[i];
-    bool starts_word = word_boundary;
-    word_boundary = shell_source_word_separator(c);
-    if (c == ';' || c == '|' || c == '&' || c == '\n') {
-      context_possible = true;
-    }
-    if ((c == '\n') && pending_count > 0) {
-      size_t after = length;
-      /* This remains a lexical validator: an incomplete document leaves its
-       * body opaque through EOF, while strict higher-level APIs reject the
-       * same input through their fast-parser pass. */
-      (void)shell_source_skip_pending_heredoc_bodies(
-          input, length, shell_source_next_line(input, length, i), pending,
-          pending_count, &after);
-      pending_count = 0;
-      if (after == 0)
-        return SHELL_EPARSE;
-      i = after - 1;
-      continue;
-    }
-    if (c == '[') {
-      while (!have_lexical_token ||
-             lexical_token.position + lexical_token.length <= i) {
-        if (!shell_tokenizer_next(&lexical, &lexical_token))
-          break;
-        have_lexical_token = true;
-      }
-      if (have_lexical_token && lexical_token.position == i &&
-          lexical_token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
-        i += lexical_token.length - 1;
-        context_possible = false;
-        word_boundary = false;
-        continue;
-      }
-    }
-    if (c == '(') {
-      size_t content, end, after;
-      if (shell_source_arithmetic_command(input, length, i, &content, &end,
-                                          &after) ==
-          SHELL_ARITHMETIC_FRAME_COMPLETE) {
-        i = after - 1;
-        context_possible = false;
-        word_boundary = false;
-        continue;
-      }
-    }
-    if (c == '$' &&
-        shell_source_logical_next_is(input, length, i, '\'', NULL)) {
-      size_t quoted = 0;
-      if (shell_source_skip_complete_ansi_c_quote(input, length, i, &quoted)) {
-        i = quoted - 1;
-        continue;
-      }
-    }
-    if (c == '\'' || c == '"') {
-      i = shell_source_skip_quoted_text(input, length, i, c) - 1;
-      continue;
-    }
-    if (c == '\\' && i + 1 < length) {
-      size_t continued =
-          shell_source_skip_escaped_line_endings(input, length, i);
-      if (continued != i)
-        word_boundary = starts_word;
-      i = continued != i ? continued - 1 : i + 1;
-      continue;
-    }
-    if (shell_source_comment_starts(c, starts_word)) {
-      size_t line_end = shell_source_line_end(input, length, i);
-      if (line_end == length)
-        break;
-      /* Leave the physical newline visible so pending heredocs declared
-       * before the comment begin at the right body line. */
-      i = line_end - 1;
-      continue;
-    }
-    if (c == '`') {
-      i = shell_source_skip_quoted_text(input, length, i, '`') - 1;
-      continue;
-    }
-    if (c == '$' && shell_source_logical_next_is(input, length, i, '{', NULL)) {
-      size_t after = 0;
-      if (!shell_source_skip_parameter_expansion(input, length, i, &after))
-        return SHELL_EPARSE;
-      i = after - 1;
-      continue;
-    }
-    size_t substitution_open = 0;
-    if (c == '$' && shell_source_dollar_parentheses_open(input, length, i,
-                                                         &substitution_open)) {
-      i = shell_source_skip_balanced_parentheses(input, length,
-                                                 substitution_open) -
-          1;
-      continue;
-    }
-    /* Process substitutions are shell words whose parentheses are opaque to
-     * the surrounding compound-list stack, just like command substitutions.
-     * Skipping both delimiters together avoids treating their closing ')'
-     * as an unmatched subshell group inside a brace group. */
-    if ((c == '<' || c == '>') && shell_source_process_substitution_open(
-                                      input, length, i, &substitution_open)) {
-      i = shell_source_skip_balanced_parentheses(input, length,
-                                                 substitution_open) -
-          1;
-      word_boundary = false;
-      continue;
-    }
-    size_t operator_after = 0;
-    if (c == '<' && shell_source_match_logical_punctuation(
-                        input, length, i, "<<<", &operator_after)) {
-      /* Here-strings have a shell word operand but no deferred body. Treat
-       * the complete operator atomically so its latter `<<` is never queued
-       * as a heredoc declaration. */
-      i = operator_after - 1;
-      continue;
-    }
-    if (c == '<' && shell_source_match_logical_punctuation(
-                        input, length, i, "<<", &operator_after)) {
-      if (pending_count == sizeof(pending) / sizeof(pending[0]))
-        return SHELL_ETRUNC;
-      size_t delimiter = operator_after;
-      if (!shell_source_parse_heredoc_delimiter(input, length, &delimiter,
-                                                &pending[pending_count]))
-        return SHELL_EPARSE;
-      pending_count++;
-      i = delimiter - 1;
-      word_boundary = false;
-      continue;
-    }
-    /* Consume ordinary words as spans. Their literal braces are not compound
-     * delimiters, and must not trigger repeated source-prefix reconstruction.
-     */
-    bool possible_brace_open = c == '{' && brace_token_ends(input, length, i);
-    if ((c != '{' && c != '}' && c != '(' && c != ')' &&
-         !shell_source_space((unsigned char)c) && !strchr("<>;|&", c)) ||
-        (c == '{' && !possible_brace_open)) {
-      size_t after = 0;
-      if (shell_source_skip_shell_word_impl(input, length, i, &after, true) &&
-          after > i)
-        i = after - 1;
-      continue;
-    }
-    if (c != '{' && c != '}' && c != '(' && c != ')')
-      continue;
-    size_t previous = i;
-    bool newline_separator = false;
-    bool continued_line = false;
-    do {
-      continued_line = false;
-      while (previous > 0 &&
-             shell_source_space((unsigned char)input[previous - 1])) {
-        newline_separator = newline_separator || input[previous - 1] == '\n';
-        previous--;
-      }
-      if (previous > 0 && input[previous - 1] == '\\' &&
-          (previous < length && input[previous] == '\n')) {
-        previous--;
-        newline_separator = false;
-        continued_line = true;
-      }
-    } while (continued_line);
-    char before = previous ? input[previous - 1] : '\0';
-    bool closing_brace =
-        c == '}' && brace_group_close_delimiter(input, length, i, before,
-                                                newline_separator);
-    bool duplicate_brace_close =
-        c == '}' && saw_brace && depth == 0 && before == '}';
-    bool command_boundary =
-        (possible_brace_open || closing_brace || duplicate_brace_close) &&
-        context_possible &&
-        (previous == 0 || newline_separator || before == ';' || before == '|' ||
-         before == '&' || before == '(' || before == '{');
-    if (possible_brace_open || (closing_brace && before == '&')) {
-      /* Reuse forward lexical command position rather than reconstructing
-       * the prefix for every literal brace after a potentially long word.
-       * The iterator advances monotonically and keeps whole word spans. */
-      while (!have_lexical_token ||
-             lexical_token.position + lexical_token.length <= i) {
-        if (!shell_tokenizer_next(&lexical, &lexical_token))
-          break;
-        have_lexical_token = true;
-      }
-      if (possible_brace_open)
-        command_boundary = have_lexical_token && lexical_token.position == i &&
-                           lexical_token.type == SHELL_TOKEN_GROUP_START;
-      else
-        /* `&` terminates a brace list, but also occurs in redirect operators.
-         * Reuse the forward lexical context: a redirect pathname `}` is not
-         * a reserved group closer. Binary && still fails stage validation. */
-        closing_brace = have_lexical_token && lexical_token.position == i &&
-                        lexical_token.type == SHELL_TOKEN_GROUP_END;
-    }
-    if (possible_brace_open && command_boundary) {
-      if (depth == SHELL_MAX_SUBCOMMANDS)
-        return SHELL_ETRUNC;
-      stack[depth++] = SHELL_GROUP_BRACE;
-      saw_brace = true;
-      context_possible = true;
-    } else if (c == '(' &&
-               !(i > 0 && (input[i - 1] == '$' || input[i - 1] == '<' ||
-                           input[i - 1] == '>'))) {
-      if (depth == SHELL_MAX_SUBCOMMANDS)
-        return SHELL_ETRUNC;
-      stack[depth++] = SHELL_GROUP_SUBSHELL;
-      context_possible = true;
-    } else if (closing_brace || duplicate_brace_close) {
-      if (depth == 0) {
-        /* A reserved closing delimiter cannot start a command after a list
-         * operator: `echo; }` is not an argument-bearing simple command.
-         * A `}` elsewhere (for example, `echo }`) remains an ordinary word.
-         * Keep lexical and strict parsing aligned for a repeated closer too.
-         */
-        if (command_boundary || duplicate_brace_close)
-          return SHELL_EPARSE;
-        continue;
-      }
-      /* A reserved brace cannot close an ordinary parenthesized group. This
-       * is distinct from a literal `}` embedded in an argument. */
-      if (stack[depth - 1] != SHELL_GROUP_BRACE)
-        return SHELL_EPARSE;
-      depth--;
-      context_possible = false;
-    } else if (c == ')' && depth > 0) {
-      if (stack[depth - 1] != SHELL_GROUP_SUBSHELL)
-        return SHELL_EPARSE;
-      depth--;
-      context_possible = false;
-    } else if (possible_brace_open) {
-      /* Once a would-be opener is an ordinary word, later words cannot turn
-       * this same simple-command prefix back into compound syntax. */
-      context_possible = false;
-    }
-  }
-  return !saw_brace || depth == 0 ? SHELL_OK : SHELL_EPARSE;
 }
 
 /* Input is a required, domain-checked span. No grammar validation is needed
@@ -2338,11 +2074,6 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     return !require_complete || control == SHELL_CONTROL_SYNTAX_COMPLETE
                ? SHELL_OK
                : SHELL_EPARSE;
-  if (!draft) {
-    shell_error_t error = brace_groups_status(input, input_length);
-    if (error != SHELL_OK)
-      return error;
-  }
   if (!draft && (full_has_bare_redirect_group_operand(input, input_length) ||
                  full_has_redirect_prefix_group(input, input_length)))
     return SHELL_EPARSE;
@@ -2400,7 +2131,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     /* Diagnostic lexing keeps an unmatched '}' as a word, including in
      * unsupported function syntax. In modeled list grammar its reserved
      * command-position role nevertheless proves an unmatched close. */
-    if (draft && !literal_token && state.needs_stage &&
+    if (!literal_token && state.needs_stage &&
         token_is_plain_word(input, input_length, &token, "}"))
       return SHELL_EPARSE;
 
@@ -2603,8 +2334,12 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
       if (!state.needs_stage || state.redirect_operand)
         return SHELL_EPARSE;
       if (tokenizer.in_arithmetic) {
+        /* Diagnostics tolerate the unfinished expression, but it consumes
+         * the rest of the source, so an open brace group cannot close. */
         if (!draft)
-          return !require_complete ? SHELL_OK : SHELL_EPARSE;
+          return !require_complete && tokenizer.brace_group_depth == 0
+                     ? SHELL_OK
+                     : SHELL_EPARSE;
         draft->need = SHELL_SOURCE_NEEDS_ARITHMETIC;
         draft->incomplete_at = (uint32_t)token.position;
         break;
@@ -2889,6 +2624,10 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     }
     return SHELL_OK;
   }
+  /* An unclosed brace group is a syntax error even for the tolerant lexical
+   * API, unlike an incomplete parenthesized prefix, which diagnostics keep. */
+  if (tokenizer.brace_group_depth != 0)
+    return SHELL_EPARSE;
   if (require_complete &&
       (group_count != 0 || tokenizer.in_quotes || tokenizer.in_subshell ||
        tokenizer.paren_depth != 0 || tokenizer.brace_depth != 0 ||
