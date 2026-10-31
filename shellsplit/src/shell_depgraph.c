@@ -28,6 +28,7 @@
 #include "shell_tokenizer_full_internal.h"
 #include "shell_word_internal.h"
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27926,6 +27927,51 @@ static SHELL_NONNULL(1, 2) bool dep_validation_control_acyclic(
   return visited == graph->node_count;
 }
 
+/* Every validation failure goes through these helpers, so the result keeps
+ * three invariants without per-site discipline: a recorded error always makes
+ * the result invalid; each stored diagnostic adds exactly one to error_count;
+ * and nothing is stored once SHELL_DEP_MAX_VALIDATE_ERRORS entries exist.
+ * Later errors still mark the result invalid but are not described. Node
+ * diagnostics keep edge_idx zero; edge diagnostics record the edge. */
+#if defined(__GNUC__) || defined(__clang__)
+#define DEP_VALIDATION_PRINTF(string_index, first_argument)                    \
+  __attribute__((format(printf, string_index, first_argument)))
+#else
+#define DEP_VALIDATION_PRINTF(string_index, first_argument)
+#endif
+
+static SHELL_NONNULL(1, 3)
+    DEP_VALIDATION_PRINTF(3, 0) void dep_validation_record(
+        shell_dep_graph_validation_t *r, uint32_t edge_idx, const char *format,
+        va_list arguments) {
+  r->valid = false;
+  if (r->error_count == SHELL_DEP_MAX_VALIDATE_ERRORS)
+    return;
+  r->errors[r->error_count].edge_idx = edge_idx;
+  vsnprintf(r->errors[r->error_count].msg, sizeof(r->errors[0].msg), format,
+            arguments);
+  r->error_count++;
+}
+
+static SHELL_NONNULL(1, 2)
+    DEP_VALIDATION_PRINTF(2, 3) void dep_validation_error(
+        shell_dep_graph_validation_t *r, const char *format, ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  dep_validation_record(r, 0, format, arguments);
+  va_end(arguments);
+}
+
+static SHELL_NONNULL(1, 3)
+    DEP_VALIDATION_PRINTF(3, 4) void dep_validation_edge_error(
+        shell_dep_graph_validation_t *r, uint32_t edge_idx, const char *format,
+        ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  dep_validation_record(r, edge_idx, format, arguments);
+  va_end(arguments);
+}
+
 shell_dep_graph_validation_t
 shell_dep_graph_validate(const shell_dep_graph_t *g) {
   shell_dep_graph_validation_t r = {0};
@@ -27937,24 +27983,15 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
   if (g->node_count > SHELL_DEP_MAX_NODES ||
       g->edge_count > SHELL_DEP_MAX_EDGES ||
       g->cwd_buf.len > SHELL_DEP_CWD_BUF_SIZE) {
-    r.valid = false;
-    if (g->node_count > SHELL_DEP_MAX_NODES) {
-      snprintf(r.errors[r.error_count++].msg, 96,
-               "node_count %u exceeds capacity %u", g->node_count,
-               SHELL_DEP_MAX_NODES);
-    }
-    if (g->edge_count > SHELL_DEP_MAX_EDGES &&
-        r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS) {
-      snprintf(r.errors[r.error_count++].msg, 96,
-               "edge_count %u exceeds capacity %u", g->edge_count,
-               SHELL_DEP_MAX_EDGES);
-    }
-    if (g->cwd_buf.len > SHELL_DEP_CWD_BUF_SIZE &&
-        r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS) {
-      snprintf(r.errors[r.error_count++].msg, 96,
-               "cwd_buf.len %zu exceeds capacity %u", g->cwd_buf.len,
-               SHELL_DEP_CWD_BUF_SIZE);
-    }
+    if (g->node_count > SHELL_DEP_MAX_NODES)
+      dep_validation_error(&r, "node_count %u exceeds capacity %u",
+                           g->node_count, SHELL_DEP_MAX_NODES);
+    if (g->edge_count > SHELL_DEP_MAX_EDGES)
+      dep_validation_error(&r, "edge_count %u exceeds capacity %u",
+                           g->edge_count, SHELL_DEP_MAX_EDGES);
+    if (g->cwd_buf.len > SHELL_DEP_CWD_BUF_SIZE)
+      dep_validation_error(&r, "cwd_buf.len %zu exceeds capacity %u",
+                           g->cwd_buf.len, SHELL_DEP_CWD_BUF_SIZE);
     return r;
   }
 
@@ -27967,10 +28004,7 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_GRAPH_VALIDATION);
     const shell_dep_node_t *n = &g->nodes[i];
     if (n->type > SHELL_NODE_FILE_COMPARISON) {
-      r.valid = false;
-      snprintf(r.errors[r.error_count].msg, 96, "node %u: invalid node type %u",
-               i, n->type);
-      r.error_count++;
+      dep_validation_error(&r, "node %u: invalid node type %u", i, n->type);
       continue;
     }
     if (n->type == SHELL_NODE_CMD) {
@@ -27981,9 +28015,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            (n->cmd.token_count != 0 || n->cmd.effective_command_known ||
             !n->cmd.arithmetic_expression ||
             n->cmd.arithmetic_truth > SHELL_ARITHMETIC_NONZERO))) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count++].msg, 96,
-                 "CMD node %u: invalid arithmetic command metadata", i);
+        dep_validation_error(
+            &r, "CMD node %u: invalid arithmetic command metadata", i);
         continue;
       }
       if (n->cmd.kind == SHELL_COMMAND_CONDITIONAL &&
@@ -27999,73 +28032,54 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            n->cmd.conditional_operand_count !=
                shell_conditional_arity(n->cmd.conditional_predicate) ||
            n->cmd.conditional_truth > SHELL_CONDITIONAL_TRUE)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count++].msg, 96,
-                 "CMD node %u: invalid conditional metadata", i);
+        dep_validation_error(&r, "CMD node %u: invalid conditional metadata",
+                             i);
         continue;
       }
       if (n->cmd.token_count > SHELL_DEP_MAX_TOKENS) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count++].msg, 96,
-                 "CMD node %u: token_count %u exceeds capacity %u", i,
-                 n->cmd.token_count, SHELL_DEP_MAX_TOKENS);
+        dep_validation_error(&r,
+                             "CMD node %u: token_count %u exceeds capacity %u",
+                             i, n->cmd.token_count, SHELL_DEP_MAX_TOKENS);
         continue;
       }
       if (n->cmd.pipeline_negated !=
           ((n->cmd.pipeline_negation_count & 1u) != 0)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count++].msg, 96,
-                 "CMD node %u: inconsistent pipeline negation", i);
+        dep_validation_error(&r, "CMD node %u: inconsistent pipeline negation",
+                             i);
         if (r.error_count == SHELL_DEP_MAX_VALIDATE_ERRORS)
           continue;
       }
       if (n->cmd.cwd_offset >= g->cwd_buf.len) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: cwd_offset %u >= cwd_buf.len %zu", i,
-                 n->cmd.cwd_offset, g->cwd_buf.len);
-        r.error_count++;
+        dep_validation_error(&r,
+                             "CMD node %u: cwd_offset %u >= cwd_buf.len %zu", i,
+                             n->cmd.cwd_offset, g->cwd_buf.len);
       } else if (memchr(g->cwd_buf.data + n->cmd.cwd_offset, '\0',
                         g->cwd_buf.len - n->cmd.cwd_offset) == NULL) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: cwd at offset %u is not NUL-terminated", i,
-                 n->cmd.cwd_offset);
-        r.error_count++;
+        dep_validation_error(
+            &r, "CMD node %u: cwd at offset %u is not NUL-terminated", i,
+            n->cmd.cwd_offset);
       }
       if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
           ((n->cmd.effective_command_known &&
             n->cmd.effective_command_token >= n->cmd.token_count) ||
            n->cmd.effective_command_wrapper > SHELL_DEP_COMMAND_EXEC)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: invalid effective command", i);
-        r.error_count++;
+        dep_validation_error(&r, "CMD node %u: invalid effective command", i);
       }
       if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
           n->cmd.cwd_absolute && !n->cmd.cwd_known) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: absolute CWD is not known", i);
-        r.error_count++;
+        dep_validation_error(&r, "CMD node %u: absolute CWD is not known", i);
       }
       if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
           n->cmd.pipeline_time_mode > SHELL_PIPE_TIME_POSIX) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: invalid pipeline time mode %u", i,
-                 (unsigned)n->cmd.pipeline_time_mode);
-        r.error_count++;
+        dep_validation_error(&r, "CMD node %u: invalid pipeline time mode %u",
+                             i, (unsigned)n->cmd.pipeline_time_mode);
       }
       if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
           n->cmd.pipeline_time_mode <= SHELL_PIPE_TIME_POSIX &&
           !dep_time_owner_valid(g, n->cmd.pipeline_time_mode,
                                 n->cmd.pipeline_time_id)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: invalid pipeline time owner %u", i,
-                 n->cmd.pipeline_time_id);
-        r.error_count++;
+        dep_validation_error(&r, "CMD node %u: invalid pipeline time owner %u",
+                             i, n->cmd.pipeline_time_id);
       }
       if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
           (((n->cmd.pipe_stdin_source == UINT32_MAX) !=
@@ -28084,10 +28098,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            (n->cmd.pipe_stdout_target != UINT32_MAX &&
             (n->cmd.pipe_stdout_target >= g->node_count ||
              !dep_is_execution_node(g, n->cmd.pipe_stdout_target))))) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "CMD node %u: invalid effective pipe owner", i);
-        r.error_count++;
+        dep_validation_error(&r, "CMD node %u: invalid effective pipe owner",
+                             i);
       }
     } else if (n->type == SHELL_NODE_DOC) {
       const shell_dep_doc_t *doc = &n->doc;
@@ -28149,10 +28161,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       }
       if (!kind_valid || !spans_valid || (doc->flags & ~known_flags) != 0 ||
           !shape_valid) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "DOC node %u: invalid kind, flags, or payload shape", i);
-        r.error_count++;
+        dep_validation_error(
+            &r, "DOC node %u: invalid kind, flags, or payload shape", i);
       }
       if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
           doc->kind == SHELL_DOC_FILE &&
@@ -28160,49 +28170,35 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            (doc->cwd_known && (doc->cwd_offset >= g->cwd_buf.len ||
                                !memchr(g->cwd_buf.data + doc->cwd_offset, 0,
                                        g->cwd_buf.len - doc->cwd_offset))))) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "DOC node %u: invalid file CWD", i);
-        r.error_count++;
+        dep_validation_error(&r, "DOC node %u: invalid file CWD", i);
       }
     } else if (n->type == SHELL_NODE_GROUP) {
       if (n->group.pipeline_negated !=
           ((n->group.pipeline_negation_count & 1u) != 0)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count++].msg, 96,
-                 "GROUP node %u: inconsistent pipeline negation", i);
+        dep_validation_error(
+            &r, "GROUP node %u: inconsistent pipeline negation", i);
         continue;
       }
       if (n->group.pipeline_time_mode > SHELL_PIPE_TIME_POSIX) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "GROUP node %u: invalid pipeline time mode %u", i,
-                 (unsigned)n->group.pipeline_time_mode);
-        r.error_count++;
+        dep_validation_error(&r, "GROUP node %u: invalid pipeline time mode %u",
+                             i, (unsigned)n->group.pipeline_time_mode);
         continue;
       }
       if (!dep_time_owner_valid(g, n->group.pipeline_time_mode,
                                 n->group.pipeline_time_id)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "GROUP node %u: invalid pipeline time owner %u", i,
-                 n->group.pipeline_time_id);
-        r.error_count++;
+        dep_validation_error(&r,
+                             "GROUP node %u: invalid pipeline time owner %u", i,
+                             n->group.pipeline_time_id);
         continue;
       }
       if (n->group.kind != SHELL_GROUP_BRACE &&
           n->group.kind != SHELL_GROUP_SUBSHELL) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "GROUP node %u: invalid kind %u", i, n->group.kind);
-        r.error_count++;
+        dep_validation_error(&r, "GROUP node %u: invalid kind %u", i,
+                             n->group.kind);
         continue;
       }
       if (!n->group.start || n->group.length == 0) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "GROUP node %u: empty source span", i);
-        r.error_count++;
+        dep_validation_error(&r, "GROUP node %u: empty source span", i);
         continue;
       }
       if (n->group.parent != UINT32_MAX) {
@@ -28211,11 +28207,9 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
             g->nodes[n->group.parent].type == SHELL_NODE_GROUP &&
             index.group_parent_edge[i];
         if (!has_parent_edge) {
-          r.valid = false;
-          snprintf(r.errors[r.error_count].msg, 96,
-                   "GROUP node %u: invalid parent %u or containment edge", i,
-                   n->group.parent);
-          r.error_count++;
+          dep_validation_error(
+              &r, "GROUP node %u: invalid parent %u or containment edge", i,
+              n->group.parent);
         }
       }
     } else if (n->type == SHELL_NODE_FILE_COMPARISON) {
@@ -28224,16 +28218,14 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
           (n->file_comparison.empty_operands & ~3u) ||
           index.comparison_owner[i] != 1 || index.comparison_left[i] != 1 ||
           index.comparison_right[i] != 1) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count++].msg, 96,
-                 "FILE_COMPARISON node %u: invalid kind, operands or owner", i);
+        dep_validation_error(
+            &r, "FILE_COMPARISON node %u: invalid kind, operands or owner", i);
       }
     } else if (n->type == SHELL_NODE_FD) {
       if (n->fd.number > SHELL_DEP_FD_MAX || index.fd_duplicate[i] ||
           !index.fd_used[i]) {
-        r.valid = false;
-        snprintf(
-            r.errors[r.error_count++].msg, 96,
+        dep_validation_error(
+            &r,
             "FD node %u: invalid, duplicate, or unused inherited descriptor",
             i);
       }
@@ -28264,10 +28256,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
         target_time_id = g->nodes[target].group.pipeline_time_id;
       bool report_route_valid = false;
       if (n->time.report_external_fd_count > SHELL_DEP_TIME_MAX_EXTERNAL_FDS) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "TIME node %u: too many external report descriptors", i);
-        r.error_count++;
+        dep_validation_error(
+            &r, "TIME node %u: too many external report descriptors", i);
         continue;
       }
       topology_valid &= index.time_external_coverage[i] ==
@@ -28354,20 +28344,15 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
           !report_route_valid || !report_flags_valid || !topology_valid ||
           target_count != 1 || !target_valid || target_mode != n->time.mode ||
           target_timer_count != 1 || target_time_id != i + 1) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "TIME node %u: invalid mode, span, report fd, or target", i);
-        r.error_count++;
+        dep_validation_error(
+            &r, "TIME node %u: invalid mode, span, report fd, or target", i);
       }
     } else if (n->type == SHELL_NODE_ENDPOINT) {
       if (n->endpoint.reserved != 0 &&
           n->endpoint.reserved != DEP_ENDPOINT_TERMINAL_PIPE &&
           n->endpoint.reserved != DEP_ENDPOINT_PROCESS_PIPE) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "ENDPOINT node %u: unknown endpoint flags %u", i,
-                 n->endpoint.reserved);
-        r.error_count++;
+        dep_validation_error(&r, "ENDPOINT node %u: unknown endpoint flags %u",
+                             i, n->endpoint.reserved);
         continue;
       }
       if (n->endpoint.reserved == DEP_ENDPOINT_PROCESS_PIPE) {
@@ -28375,12 +28360,10 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
         bool output_direction = index.endpoint_output_direction[i];
         bool topology_valid = index.endpoint_topology_valid[i];
         if (!topology_valid || (!input_direction && !output_direction)) {
-          r.valid = false;
-          snprintf(r.errors[r.error_count].msg, 96,
-                   "ENDPOINT node %u: invalid process-pipe "
-                   "topology",
-                   i);
-          r.error_count++;
+          dep_validation_error(&r,
+                               "ENDPOINT node %u: invalid process-pipe "
+                               "topology",
+                               i);
         }
         continue;
       }
@@ -28391,11 +28374,9 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       if (!topology_valid || (!has_producer && !has_setup) ||
           (n->endpoint.reserved != DEP_ENDPOINT_TERMINAL_PIPE &&
            !has_consumer)) {
-        r.valid = false;
-        snprintf(r.errors[r.error_count].msg, 96,
-                 "ENDPOINT node %u: valid=%d producers=%d consumers=%d", i,
-                 topology_valid, has_producer, has_consumer);
-        r.error_count++;
+        dep_validation_error(
+            &r, "ENDPOINT node %u: valid=%d producers=%d consumers=%d", i,
+            topology_valid, has_producer, has_consumer);
       }
     }
   }
@@ -28407,20 +28388,14 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
     const shell_dep_edge_t *e = &g->edges[i];
 
     if (!index.edge_in_bounds[i]) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96, "OOB: from=%u to=%u nodes=%u",
-               e->from, e->to, g->node_count);
-      r.error_count++;
+      dep_validation_edge_error(&r, i, "OOB: from=%u to=%u nodes=%u", e->from,
+                                e->to, g->node_count);
       continue;
     }
 
     if (e->type > SHELL_EDGE_FILE_RIGHT || e->dir > SHELL_DIR_UNDIR) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96,
-               "invalid edge type %u or direction %u", e->type, e->dir);
-      r.error_count++;
+      dep_validation_edge_error(&r, i, "invalid edge type %u or direction %u",
+                                e->type, e->dir);
       continue;
     }
 
@@ -28430,12 +28405,9 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
         (e->target_fd != SHELL_DEP_FD_NONE &&
          e->target_fd != SHELL_DEP_FD_NAMED &&
          e->target_fd > SHELL_DEP_FD_MAX)) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96,
-               "descriptor outside supported range: source=%u target=%u",
-               e->source_fd, e->target_fd);
-      r.error_count++;
+      dep_validation_edge_error(
+          &r, i, "descriptor outside supported range: source=%u target=%u",
+          e->source_fd, e->target_fd);
       continue;
     }
 
@@ -28448,11 +28420,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
             ? e->target_fd_name != NULL && e->target_fd_name_len != 0
             : e->target_fd_name == NULL && e->target_fd_name_len == 0;
     if (!source_name_valid || !target_name_valid) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96,
-               "named descriptor is missing or has stray name metadata");
-      r.error_count++;
+      dep_validation_edge_error(
+          &r, i, "named descriptor is missing or has stray name metadata");
       continue;
     }
 
@@ -28476,11 +28445,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
                 e->type != SHELL_EDGE_FD_OPEN) ||
                ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
                 (e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0))) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96, "invalid flags %#x for %s edge",
-               e->flags, shell_dep_edge_type_name(e->type));
-      r.error_count++;
+      dep_validation_edge_error(&r, i, "invalid flags %#x for %s edge",
+                                e->flags, shell_dep_edge_type_name(e->type));
       continue;
     }
 
@@ -28490,12 +28456,9 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
                                e->target_fd == SHELL_DEP_FD_NONE
                          : e->dir == SHELL_DIR_FORWARD;
     if (!edge_form) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96,
-               "invalid direction or descriptors for %s edge",
-               shell_dep_edge_type_name(e->type));
-      r.error_count++;
+      dep_validation_edge_error(&r, i,
+                                "invalid direction or descriptors for %s edge",
+                                shell_dep_edge_type_name(e->type));
       continue;
     }
 
@@ -28638,29 +28601,23 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
     }
 
     if (!ok) {
-      r.valid = false;
-      r.errors[r.error_count].edge_idx = i;
-      snprintf(r.errors[r.error_count].msg, 96,
-               "type mismatch: %s(%s)->%s(%s) for %s edge",
-               shell_dep_node_type_name(ft),
-               ft == SHELL_NODE_DOC
-                   ? shell_dep_doc_kind_name(g->nodes[e->from].doc.kind)
-                   : "",
-               shell_dep_node_type_name(tt),
-               tt == SHELL_NODE_DOC
-                   ? shell_dep_doc_kind_name(g->nodes[e->to].doc.kind)
-                   : "",
-               shell_dep_edge_type_name(e->type));
-      r.error_count++;
+      dep_validation_edge_error(
+          &r, i, "type mismatch: %s(%s)->%s(%s) for %s edge",
+          shell_dep_node_type_name(ft),
+          ft == SHELL_NODE_DOC
+              ? shell_dep_doc_kind_name(g->nodes[e->from].doc.kind)
+              : "",
+          shell_dep_node_type_name(tt),
+          tt == SHELL_NODE_DOC
+              ? shell_dep_doc_kind_name(g->nodes[e->to].doc.kind)
+              : "",
+          shell_dep_edge_type_name(e->type));
     }
   }
 
   if (r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS &&
       !dep_validation_control_acyclic(g, &index)) {
-    r.valid = false;
-    snprintf(r.errors[r.error_count].msg, 96,
-             "control topology contains a cycle");
-    r.error_count++;
+    dep_validation_error(&r, "control topology contains a cycle");
   }
 
   return r;

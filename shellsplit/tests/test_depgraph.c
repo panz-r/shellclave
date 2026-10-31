@@ -534,6 +534,58 @@ TEST(supplied_fast_graph_equivalence) {
   pass_count++;
 }
 
+/* Every validation failure must leave a stored explanation, and a corrupt
+ * graph with more faults than the fixed diagnostic array holds must saturate
+ * it rather than overflow. */
+TEST(validation_diagnostic_invariants) {
+  shell_dep_graph_t graph;
+  ASSERT(parse("a;b;c;d;e;f;g;h;i;j;k;l;m;n;o;p;q;r;s;t", &graph) ==
+         SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+  ASSERT(graph.node_count > SHELL_DEP_MAX_VALIDATE_ERRORS);
+  for (uint32_t i = 0; i < graph.node_count; i++)
+    graph.nodes[i].type = (shell_dep_node_type_t)250;
+  shell_dep_graph_validation_t saturated = shell_dep_graph_validate(&graph);
+  ASSERT(!saturated.valid);
+  ASSERT(saturated.error_count == SHELL_DEP_MAX_VALIDATE_ERRORS);
+  for (uint32_t i = 0; i < saturated.error_count; i++) {
+    size_t length =
+        strnlen(saturated.errors[i].msg, sizeof(saturated.errors[i].msg));
+    ASSERT(length != 0 && length < sizeof(saturated.errors[i].msg));
+  }
+
+  /* Invalid and explained are the same fact for single faults of each kind. */
+  for (unsigned fault = 0; fault < 4; fault++) {
+    ASSERT(parse("! true", &graph) == SHELL_DEP_OK);
+    uint32_t command = UINT32_MAX;
+    for (uint32_t i = 0; i < graph.node_count; i++)
+      if (graph.nodes[i].type == SHELL_NODE_CMD)
+        command = i;
+    ASSERT(command != UINT32_MAX);
+    if (fault == 0)
+      graph.nodes[command].cmd.pipeline_negated =
+          !graph.nodes[command].cmd.pipeline_negated;
+    else if (fault == 1)
+      graph.nodes[command].cmd.token_count = SHELL_DEP_MAX_TOKENS + 1;
+    else if (fault == 2)
+      graph.cwd_buf.len = SHELL_DEP_CWD_BUF_SIZE + 1;
+    else
+      graph.node_count = SHELL_DEP_MAX_NODES + 1;
+    shell_dep_graph_validation_t validation = shell_dep_graph_validate(&graph);
+    ASSERT(!validation.valid && validation.error_count == 1);
+  }
+
+  /* An edge fault records which edge, distinct from node diagnostics. */
+  ASSERT(parse("a | b | c", &graph) == SHELL_DEP_OK);
+  ASSERT(graph.edge_count > 1);
+  uint32_t edge = graph.edge_count - 1;
+  graph.edges[edge].from = graph.node_count + 1;
+  shell_dep_graph_validation_t edge_fault = shell_dep_graph_validate(&graph);
+  ASSERT(!edge_fault.valid && edge_fault.error_count == 1);
+  ASSERT(edge_fault.errors[0].edge_idx == edge);
+  pass_count++;
+}
+
 TEST(graph_pipeline_negation_parity) {
   static const char *const sources[] = {"true", "{ true; }"};
   for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
@@ -18509,6 +18561,7 @@ int main(int argc, char **argv) {
   RUN(supplied_fast_parser_contract);
   RUN(supplied_fast_graph_equivalence);
   RUN(graph_pipeline_negation_parity);
+  RUN(validation_diagnostic_invariants);
 
   printf("\nOperators:\n");
   RUN(operator_matrix);
