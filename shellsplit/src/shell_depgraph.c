@@ -1153,8 +1153,14 @@ static SHELL_NONNULL(1, 3, 4) dep_cd_target_t
       continue;
 
     const dep_token_t *token = &tokens->tokens[i];
+    /* `cd -` takes no further argument. A following word only proves the
+     * failure if it must survive expansion; an unquoted expansion or a
+     * quoted list selector can disappear and leave a valid `cd -`. */
     if (dynamic)
-      return ambiguous ? DEP_CD_DYNAMIC : DEP_CD_INVALID;
+      return ambiguous || !shell_builtin_word_guarantees_argument(token->start,
+                                                                  token->len)
+                 ? DEP_CD_DYNAMIC
+                 : DEP_CD_INVALID;
     bool dynamic_word =
         shell_source_argument_has_dynamic_syntax(token->start, token->len);
     ambiguous = ambiguous || dynamic_word;

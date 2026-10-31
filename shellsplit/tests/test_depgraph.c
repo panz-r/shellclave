@@ -4166,6 +4166,9 @@ TEST(cwd_decoded_operand_matrix) {
       "cd <(pwd); pwd",
       "cd -; pwd",
       "cd -P -; pwd",
+      "cd - $MAYBE; pwd",
+      "cd - \"$@\"; pwd",
+      "cd - >output.txt; pwd",
       "cd -P /tmp; pwd",
       "cd -LP /tmp; pwd",
       "cd -Pe /tmp; pwd",
@@ -4195,8 +4198,9 @@ TEST(cwd_decoded_operand_matrix) {
   }
 
   static const char *const failed_cd_cases[] = {
-      "cd /tmp extra; pwd", "cd /tmp -P; pwd", "cd /tmp --; pwd", "cd -x; pwd",
-      "cd ''; pwd",         "cd -- ''; pwd",   "cd --help; pwd",
+      "cd - extra; pwd", "cd - \"$MAYBE\"; pwd", "cd /tmp extra; pwd",
+      "cd /tmp -P; pwd", "cd /tmp --; pwd",      "cd -x; pwd",
+      "cd ''; pwd",      "cd -- ''; pwd",        "cd --help; pwd",
   };
   for (size_t i = 0; i < sizeof(failed_cd_cases) / sizeof(failed_cd_cases[0]);
        i++) {
