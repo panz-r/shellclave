@@ -991,11 +991,29 @@ static void test_abstraction_shapes(void) {
   shell_abstract_command_free(NULL);
 }
 
+/* Positional and special parameters are shell state, supplied by callback. */
+static bool abstraction_parameter(shell_abstract_type_t type, const char *name,
+                                  void *context, const char **value,
+                                  size_t *value_length) {
+  (void)context;
+  if (type == SHELL_ABSTRACT_PV && strcmp(name, "1") == 0) {
+    *value = "first";
+  } else if (type == SHELL_ABSTRACT_SV && strcmp(name, "?") == 0) {
+    *value = "status";
+  } else {
+    return false;
+  }
+  *value_length = strlen(*value);
+  return true;
+}
+
 static void test_abstraction_expansion(void) {
   static const char *const environment[] = {"HOME=/home/test", "USER=alice",
-                                            "1=first", "?=status", NULL};
-  const shell_runtime_context_t context = {
-      .env = environment, .cwd = "/workspace", .resolve_symlinks = false};
+                                            NULL};
+  const shell_runtime_context_t context = {.env = environment,
+                                           .cwd = "/workspace",
+                                           .resolve_symlinks = false,
+                                           .parameters = abstraction_parameter};
   shell_abstract_command_t *command = parse_abstract(
       "printf \"$USER\" ~/child ~other ./relative /absolute $1 $?");
   /* `~other` names another user's home, which the context cannot supply:

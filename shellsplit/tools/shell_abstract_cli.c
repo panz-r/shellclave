@@ -14,6 +14,8 @@ void print_usage(const char *prog) {
   fprintf(stderr, "\nOptions:\n");
   fprintf(stderr, "  -f <file>   Read command from file (one per line)\n");
   fprintf(stderr, "  -e <env>    Add environment variable (VAR=value)\n");
+  fprintf(stderr, "  -p <param>  Set a positional or special parameter "
+                  "(1=value, ?=value)\n");
   fprintf(stderr, "  -c <cwd>    Set current working directory\n");
   fprintf(stderr, "  -x          Expand variables using environment\n");
   fprintf(stderr, "  -h          Show this help\n");
@@ -65,6 +67,33 @@ void print_element(shell_abstract_element_t *elem) {
   default:
     break;
   }
+}
+
+/* Positional and special parameters are shell state, not environment entries,
+ * so -p values reach expansion through the context's resolver. Fixed storage
+ * keeps option parsing allocation-free; arguments outlive every command. */
+enum { MAX_PARAMETERS = 16 };
+
+typedef struct {
+  const char *entries[MAX_PARAMETERS];
+  int count;
+} parameter_set_t;
+
+static bool lookup_parameter(shell_abstract_type_t type, const char *name,
+                             void *context, const char **value,
+                             size_t *value_length) {
+  (void)type;
+  const parameter_set_t *set = context;
+  size_t name_length = strlen(name);
+  for (int i = 0; i < set->count; i++) {
+    const char *entry = set->entries[i];
+    if (strncmp(entry, name, name_length) == 0 && entry[name_length] == '=') {
+      *value = entry + name_length + 1;
+      *value_length = strlen(*value);
+      return true;
+    }
+  }
+  return false;
 }
 
 void process_command(const char *cmd, const shell_runtime_context_t *ctx,
@@ -131,6 +160,7 @@ int main(int argc, char **argv) {
    * through every command processed below; neither needs heap ownership. */
   char cwd_buffer[4096];
   shell_runtime_context_t ctx = {0};
+  parameter_set_t parameters = {0};
   char **env_add = NULL;
   const char **env = NULL;
   char *command = NULL;
@@ -146,7 +176,7 @@ int main(int argc, char **argv) {
 
   // Parse arguments
   int opt;
-  while ((opt = getopt(argc, argv, "f:e:c:xh")) != -1) {
+  while ((opt = getopt(argc, argv, "f:e:c:p:xh")) != -1) {
     switch (opt) {
     case 'f':
       filename = optarg;
@@ -158,6 +188,10 @@ int main(int argc, char **argv) {
       break;
     case 'c':
       cwd = optarg;
+      break;
+    case 'p':
+      if (parameters.count < MAX_PARAMETERS)
+        parameters.entries[parameters.count++] = optarg;
       break;
     case 'x':
       expand = true;
@@ -214,6 +248,10 @@ int main(int argc, char **argv) {
   }
   env[idx] = NULL;
   ctx.env = env;
+  if (parameters.count > 0) {
+    ctx.parameters = lookup_parameter;
+    ctx.parameters_context = &parameters;
+  }
 
   if (filename) {
     // Read from file

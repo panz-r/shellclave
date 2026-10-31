@@ -222,6 +222,53 @@ static void run_case(unsigned cwd_mode, input_kind_t input_kind, size_t fail_at,
   CHECK(fclose(out) == 0 && fclose(err) == 0 && fclose(cli_stdin) == 0);
 }
 
+/* -p supplies positional and special parameters; an environment entry with
+ * such a name must not. Capture the expansion report for both. */
+static void run_parameter_case(bool with_parameters) {
+  fixture = (cli_fixture_t){.expected_cwd = "/workspace"};
+  char *args[12] = {"abstract-cli", "-c", "/workspace", "-x", "-e", "1=spoof"};
+  int count = 6;
+  if (with_parameters) {
+    args[count++] = "-p";
+    args[count++] = "1=actual";
+    args[count++] = "-p";
+    args[count++] = "?=0";
+  }
+  args[count++] = "echo $1 $?";
+  args[count] = NULL;
+  FILE *out = tmpfile(), *err = tmpfile();
+  cli_stdin = tmpfile();
+  CHECK(out && err && cli_stdin);
+  CHECK(fflush(stdout) == 0 && fflush(stderr) == 0);
+  int saved_out = dup(STDOUT_FILENO), saved_err = dup(STDERR_FILENO);
+  CHECK(saved_out >= 0 && saved_err >= 0);
+  CHECK(dup2(fileno(out), STDOUT_FILENO) >= 0);
+  CHECK(dup2(fileno(err), STDERR_FILENO) >= 0);
+  optind = 0;
+  opterr = 0;
+  int status = abstract_cli_main(count, args);
+  CHECK(fflush(stdout) == 0 && fflush(stderr) == 0);
+  CHECK(dup2(saved_out, STDOUT_FILENO) >= 0);
+  CHECK(dup2(saved_err, STDERR_FILENO) >= 0);
+  CHECK(close(saved_out) == 0 && close(saved_err) == 0);
+  CHECK(status == EXIT_SUCCESS && fixture.live == 0);
+  CHECK(fseek(out, 0, SEEK_SET) == 0);
+  char output[4096];
+  size_t length = fread(output, 1, sizeof(output) - 1, out);
+  output[length] = '\0';
+  CHECK(strstr(output, "spoof") == NULL);
+  if (with_parameters) {
+    CHECK(strstr(output, "$PV_1 -> actual") != NULL);
+    CHECK(strstr(output, "$SV_1 -> 0") != NULL);
+    CHECK(strstr(output, "did not resolve") == NULL);
+  } else {
+    CHECK(strstr(output, "$PV_1 ->") == NULL);
+    CHECK(strstr(output, "$SV_1 ->") == NULL);
+    CHECK(strstr(output, "(some elements did not resolve)") != NULL);
+  }
+  CHECK(fclose(out) == 0 && fclose(err) == 0 && fclose(cli_stdin) == 0);
+}
+
 int main(void) {
   for (unsigned cwd_mode = 0; cwd_mode < 3; cwd_mode++) {
     run_case(cwd_mode, COMMAND, 0, false, false, false);
@@ -236,6 +283,8 @@ int main(void) {
     for (size_t fail_at = 1; fail_at <= 3; fail_at++)
       run_case(cwd_mode, COMMAND, fail_at, false, false, false);
   }
+  run_parameter_case(false);
+  run_parameter_case(true);
   puts("abstract CLI ownership and operational failures passed");
   return 0;
 }

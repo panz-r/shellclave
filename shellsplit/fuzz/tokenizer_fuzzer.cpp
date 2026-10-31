@@ -5832,10 +5832,22 @@ static int test_abstraction(const char *input, size_t length) {
       return 1;
     }
   }
-  shell_runtime_context_t contexts[] = {{env, (char *)"/tmp", false},
-                                        {env, NULL, false},
-                                        {env, (char *)".", true},
-                                        {NULL, (char *)"/tmp", true}};
+  /* Positional and special parameters resolve only through the callback. */
+  struct Parameters {
+    static bool resolve(shell_abstract_type_t, const char *name, void *,
+                        const char **value, size_t *value_length) {
+      if (name[0] == '1')
+        return false;
+      *value = "v";
+      *value_length = 1;
+      return true;
+    }
+  };
+  shell_runtime_context_t contexts[] = {
+      {env, (char *)"/tmp", false, nullptr, nullptr},
+      {env, nullptr, false, Parameters::resolve, nullptr},
+      {env, (char *)".", true, nullptr, nullptr},
+      {nullptr, (char *)"/tmp", true, Parameters::resolve, nullptr}};
   for (shell_runtime_context_t &context : contexts) {
     for (size_t i = 0; i < count; i++) {
       char *expanded = shell_abstract_element_expand(elements[i], &context);

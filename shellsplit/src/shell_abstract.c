@@ -1640,6 +1640,25 @@ static char *join_path(const char *base, const char *path) {
   return result;
 }
 
+/* A positional or special parameter is shell state the caller may know, not an
+ * environment entry. Copy the callback's value, which need not outlive it. */
+static SHELL_NONNULL(1, 2) char *abstract_expand_parameter(
+    const shell_abstract_element_t *elem, const shell_runtime_context_t *ctx) {
+  const char *value = NULL;
+  size_t length = 0;
+  if (!ctx->parameters ||
+      !ctx->parameters(elem->type, elem->data.var.name, ctx->parameters_context,
+                       &value, &length))
+    return NULL;
+  char *copy = malloc(length + 1);
+  if (!copy)
+    return NULL;
+  if (length)
+    memcpy(copy, value, length);
+  copy[length] = '\0';
+  return copy;
+}
+
 char *shell_abstract_element_expand(shell_abstract_element_t *elem,
                                     const shell_runtime_context_t *ctx) {
   switch (elem->type) {
@@ -1649,6 +1668,8 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
     if (!elem->data.var.name ||
         !abstract_variable_is_plain(elem->original, strlen(elem->original)))
       return NULL;
+    if (elem->type != SHELL_ABSTRACT_EV)
+      return abstract_expand_parameter(elem, ctx);
 
     // Look up in environment
     if (ctx->env) {

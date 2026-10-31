@@ -1175,6 +1175,109 @@ static void test_runtime_expansion(void) {
   }
 }
 
+typedef struct {
+  const char *name;
+  const char *value;
+  unsigned calls;
+} parameter_fixture_t;
+
+static bool fixture_parameter(shell_abstract_type_t type, const char *name,
+                              void *context, const char **value,
+                              size_t *value_length) {
+  parameter_fixture_t *fixture = context;
+  fixture->calls++;
+  if ((type != SHELL_ABSTRACT_PV && type != SHELL_ABSTRACT_SV) ||
+      strcmp(name, fixture->name) != 0)
+    return false;
+  *value = fixture->value;
+  *value_length = strlen(fixture->value);
+  return true;
+}
+
+static char *expand_first(const char *input, const char *key,
+                          const shell_runtime_context_t *context) {
+  shell_abstract_command_t *result = parse_command(input);
+  shell_abstract_element_t *element =
+      result ? shell_abstract_command_find_element(result, key) : NULL;
+  char *expanded =
+      element ? shell_abstract_element_expand(element, context) : NULL;
+  shell_abstract_command_free(result);
+  return expanded;
+}
+
+/* Bash never reads `$1` or `$?` from the environment, so entries with those
+ * names must not resolve them; only the caller's callback can. */
+static void test_parameters_are_not_environment(void) {
+  printf("\n=== Positional And Special Parameters ===\n");
+  const char *environment[] = {"1=spoof", "?=spoof",       "10=spoof",
+                               "@=spoof", "USER=testuser", NULL};
+  static const struct {
+    const char *input;
+    const char *key;
+  } cases[] = {{"echo $1", "$PV_1"},
+               {"echo ${1}", "$PV_1"},
+               {"echo ${10}", "$PV_1"},
+               {"echo $?", "$SV_1"},
+               {"echo ${?}", "$SV_1"}};
+  shell_runtime_context_t no_callback = {
+      .env = environment, .cwd = "/tmp", .resolve_symlinks = false};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = parse_command(cases[i].input);
+    shell_abstract_element_t *element =
+        result ? shell_abstract_command_find_element(result, cases[i].key)
+               : NULL;
+    char *expanded =
+        element ? shell_abstract_element_expand(element, &no_callback) : NULL;
+    TEST(cases[i].input, element != NULL && expanded == NULL);
+    free(expanded);
+    shell_abstract_command_free(result);
+  }
+
+  parameter_fixture_t fixture = {"1", "actual", 0};
+  shell_runtime_context_t with_callback = {.env = environment,
+                                           .cwd = "/tmp",
+                                           .resolve_symlinks = false,
+                                           .parameters = fixture_parameter,
+                                           .parameters_context = &fixture};
+  char *positional = expand_first("echo $1", "$PV_1", &with_callback);
+  TEST("callback supplies a positional parameter",
+       positional && strcmp(positional, "actual") == 0 && fixture.calls == 1);
+  free(positional);
+  positional = expand_first("echo ${1}", "$PV_1", &with_callback);
+  TEST("braced positional parameter uses the callback",
+       positional && strcmp(positional, "actual") == 0);
+  free(positional);
+
+  fixture = (parameter_fixture_t){"?", "0", 0};
+  char *status = expand_first("echo $?", "$SV_1", &with_callback);
+  TEST("callback supplies a special parameter",
+       status && strcmp(status, "0") == 0);
+  free(status);
+
+  fixture = (parameter_fixture_t){"1", "", 0};
+  char *empty = expand_first("echo $1", "$PV_1", &with_callback);
+  TEST("an empty callback value resolves to an empty string",
+       empty && empty[0] == '\0');
+  free(empty);
+
+  fixture = (parameter_fixture_t){"2", "other", 0};
+  char *unknown = expand_first("echo $1", "$PV_1", &with_callback);
+  TEST("a callback that declines leaves the parameter unresolved",
+       unknown == NULL && fixture.calls == 1);
+  free(unknown);
+
+  /* The callback is for parameters only, and operators stay unresolved. */
+  fixture = (parameter_fixture_t){"1", "actual", 0};
+  char *variable = expand_first("echo $USER", "$EV_1", &with_callback);
+  TEST("named variables ignore the callback",
+       variable && strcmp(variable, "testuser") == 0 && fixture.calls == 0);
+  free(variable);
+  char *operator = expand_first("echo ${1:-x}", "$PV_1", &with_callback);
+  TEST("a parameter operator never reaches the callback",
+       operator == NULL && fixture.calls == 0);
+  free(operator);
+}
+
 /* Expansion features describe the word whether or not the word itself has an
  * abstraction, so a plain, an abstractable and a non-abstractable word are all
  * checked against the same flags. */
@@ -1320,6 +1423,7 @@ int main(void) {
   test_classification_matrix();
   test_path_and_name_matrices();
   test_runtime_expansion();
+  test_parameters_are_not_environment();
   test_word_features_independent_of_abstraction();
   test_invalid_and_null_inputs();
   test_type_sequence_matrix();

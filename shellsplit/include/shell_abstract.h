@@ -215,12 +215,36 @@ shell_abstract_command_get_element(shell_abstract_command_t *cmd, size_t index)
 /* --- PHASE 3: RUNTIME EXPANSION (OPTIONAL) --- */
 
 /**
- * Runtime context for expansion
+ * Supplies the value of one positional or special parameter. `type` is
+ * SHELL_ABSTRACT_PV or SHELL_ABSTRACT_SV and `name` is the parameter name
+ * without `$` or braces (`1`, `10`, `?`). Return true after storing the value
+ * in `*value` and its byte count in `*value_length`; the bytes may be empty
+ * (length zero, `*value` then unused), must not contain NUL, and need only
+ * stay valid until the callback's caller returns, since expansion copies
+ * them. Return false when the parameter has no known value. `context` is the
+ * context's `parameters_context`. The callback must not modify the element.
+ */
+typedef bool (*shell_parameter_resolver_t)(shell_abstract_type_t type,
+                                           const char *name, void *context,
+                                           const char **value,
+                                           size_t *value_length);
+
+/**
+ * Runtime context for expansion.
+ *
+ * Positional and special parameters are shell state, never environment
+ * entries: Bash does not read `$1` or `$?` from the environment, so `env` is
+ * consulted only for named variables. Callers who know such values supply
+ * them through `parameters`.
  */
 typedef struct {
   const char *const *env; // Environment variables (NULL-terminated)
   const char *cwd;        // Current working directory
   bool resolve_symlinks;
+  /* Optional. When NULL every positional and special parameter is unresolved.
+   * Not applied to named variables, which resolve only from env. */
+  shell_parameter_resolver_t parameters;
+  void *parameters_context; // Passed to parameters; may be NULL
 } shell_runtime_context_t;
 
 /**
@@ -230,10 +254,14 @@ typedef struct {
  * value; every other kind returns NULL. A variable resolves only for a plain
  * reference, `$name` or `${name}`: a parameter operator (`${name:-word}`,
  * `${name:+word}`, `${#name}`, `${!name}`, substrings, pattern edits) or a
- * subscript changes the result in ways an environment lookup cannot model, so
- * it returns NULL rather than the unmodified value. Path elements hold the
- * decoded word value, so escapes and quotes in the source are already removed.
- * A home path resolves only for `~` and `~/…`, from HOME in the context. A
+ * subscript changes the result in ways a lookup cannot model, so it returns
+ * NULL rather than the unmodified value. A named variable (EV) resolves from
+ * the context's environment only. A positional or special parameter (PV, SV)
+ * resolves only through the context's `parameters` callback and is never read
+ * from the environment, even from an entry named `1` or `?`. Path elements hold
+ * the decoded word value, so escapes and quotes in the source are already
+ * removed. A home path resolves only for `~` and `~/…`, from HOME in the
+ * context. A
  * `~name` form names another user's home directory, which the context cannot
  * supply, so it returns NULL rather than the unexpanded text.
  *
@@ -254,8 +282,9 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
  * arithmetic, redirects, conditionals) are never expandable: they keep a NULL
  * `expanded` and do not affect the result, so a command with none returns
  * true. Returns false when any expandable element did not resolve, for
- * example an unset variable, a parameter operator, a missing HOME, a `~name`
- * home path or an allocation failure. All elements are still processed, so
+ * example an unset variable, a positional or special parameter without a
+ * callback, a parameter operator, a missing HOME, a `~name` home path or an
+ * allocation failure. All elements are still processed, so
  * resolved elements keep their values after a false result. */
 bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
                                    const shell_runtime_context_t *ctx)
