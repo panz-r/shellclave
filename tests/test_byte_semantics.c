@@ -378,8 +378,11 @@ static void classification_and_policy(void) {
     char *buffer = malloc(size);
     CHECK(buffer);
     sg_result_t result;
+    /* A source that is only one comment line has no command to evaluate. */
+    bool blank = cases[i].source[0] == '#' && !strchr(cases[i].source, '\n');
     CHECK(sg_gate_evaluate(gate, cases[i].source, strlen(cases[i].source),
-                           buffer, size, &result) == SG_OK);
+                           buffer, size,
+                           &result) == (blank ? SG_BLANK : SG_OK));
     CHECK(result.verdict == cases[i].verdict && !result.truncated &&
           !result.short_circuited && !result.unresolved_expansion_flags);
     printf("policy[%zu]=%u\n", i, (unsigned)result.verdict);

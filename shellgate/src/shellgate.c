@@ -4121,7 +4121,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
    * Do not override a parse error with a second, broader C-whitespace scan. */
   if (ferr == SHELL_OK && fast.count == 0) {
     out->verdict = SG_VERDICT_ALLOW;
-    return SG_OK;
+    return SG_BLANK;
   }
   if (ferr == SHELL_EPARSE && fast.count == 0) {
     out->verdict = SG_VERDICT_REJECT;

@@ -5953,7 +5953,7 @@ TEST(eval_input_contract_matrix) {
     bool add_rule;
   } cases[] = {
       {"empty", "", SG_ERR_INVALID, SG_VERDICT_UNDETERMINED, false},
-      {"whitespace", "   ", SG_OK, SG_VERDICT_ALLOW, true},
+      {"whitespace", "   ", SG_BLANK, SG_VERDICT_ALLOW, true},
       {"unterminated quote", "echo \"unclosed", SG_ERR_PARSE, SG_VERDICT_REJECT,
        false},
       {"nested heredoc outside dialect", "echo $(cat <<EOF\nbody\nEOF)",
@@ -6397,7 +6397,7 @@ TEST(comment_only_source_does_not_trigger_feature_rejection) {
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_result_t result = {0};
-    ASSERT_SG_OK(eval_cmd(gate, cases[i], &result));
+    ASSERT(eval_cmd(gate, cases[i], &result) == SG_BLANK);
     ASSERT(result.verdict == SG_VERDICT_ALLOW);
     ASSERT(result.subcommand_count == 0);
     ASSERT(!result.requires_substitution_evaluation);

@@ -265,7 +265,11 @@ int main(void) {
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     sg_error_t error = sg_gate_evaluate(
         gate, cases[i].source, strlen(cases[i].source), buffer, size, &result);
-    CHECK(error == SG_OK && result.verdict == cases[i].verdict);
+    /* Source that is only a comment has no command: blank, with a vacuous
+     * verdict. A command followed by a comment is evaluated normally. */
+    bool blank = cases[i].source[0] == '#' && cases[i].commands == 0;
+    CHECK(error == (blank ? SG_BLANK : SG_OK) &&
+          result.verdict == cases[i].verdict);
     if (result.subcommand_count != cases[i].commands ||
         result.unresolved_expansion_flags != cases[i].unresolved ||
         result.requires_substitution_evaluation != cases[i].inspect ||

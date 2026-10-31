@@ -102,7 +102,7 @@ their effects alongside the command.
 | `VALUE=example git status --short` | One subject: `git status --short` | Prefix assignment effects |
 | `>report.txt` | No subject; `UNDETERMINED` | Redirection setup |
 | `VALUE=example` | No subject; `UNDETERMINED` | Shell-state assignment |
-| `# comment` | No subject; `ALLOW` | Policy-neutral source |
+| `# comment` | No subject; `ALLOW`, status `SG_BLANK` | Policy-neutral source |
 | `[[ -n word ]]` | No subject; `ALLOW` when conditionals are enabled | String truth and substitution dependencies |
 | `[[ -v CONFIG ]]` | No subject; `ALLOW` when conditionals are enabled | Scalar presence; an empty assigned value is set |
 | `[[ -f config.json ]]` | No subject; `ALLOW` when conditionals are enabled | Possible filesystem metadata check |
@@ -289,7 +289,8 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
                                                    sg_error_t error,
                                                    const sg_result_t *result) {
   fprintf(output, "%s: ", source);
-  if (error != SG_OK) {
+  /* Blank source has no subject and a vacuous ALLOW; it is not a failure. */
+  if (error != SG_OK && error != SG_BLANK) {
     fprintf(output, "evaluation failed (%d)\n", error);
     return;
   }

@@ -12,7 +12,8 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
                                                    sg_error_t error,
                                                    const sg_result_t *result) {
   fprintf(output, "%s: ", source);
-  if (error != SG_OK) {
+  /* Blank source has no subject and a vacuous ALLOW; it is not a failure. */
+  if (error != SG_OK && error != SG_BLANK) {
     fprintf(output, "evaluation failed (%d)\n", error);
     return;
   }
@@ -99,7 +100,7 @@ int main(void) {
     sg_error_t error =
         sg_gate_evaluate(gate, commands[i], length, buffer, size, &result);
     report_analysis(stdout, commands[i], error, &result);
-    if (error != SG_OK) {
+    if (error != SG_OK && error != SG_BLANK) {
       fprintf(stderr, "evaluation error %d\n", error);
       if (error == SG_ERR_MEMORY || error == SG_ERR_TRUNC)
         fputs("check capacity limits before retrying with a larger buffer\n",

@@ -3164,8 +3164,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                     buf_size, &result);
   /* Arbitrary bytes routinely form malformed shell syntax. Parse errors are
    * expected outcomes of the public evaluator, not harness failures. */
-  if (err != SG_OK && err != SG_ERR_PARSE && err != SG_ERR_TRUNC &&
-      err != SG_ERR_MEMORY)
+  if (err != SG_OK && err != SG_BLANK && err != SG_ERR_PARSE &&
+      err != SG_ERR_TRUNC && err != SG_ERR_MEMORY)
     invariant_failure("unexpected sg_gate_evaluate error");
   if (err == SG_ERR_MEMORY)
     return 0;
@@ -3185,7 +3185,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   validate_graph_result_prefix(&replay, replay_err, replay_buf, buf_size,
                                cmd.size());
 
-  if (err == SG_OK || err == SG_ERR_TRUNC) {
+  bool succeeded = err == SG_OK || err == SG_BLANK;
+  if (succeeded || err == SG_ERR_TRUNC) {
     size_t large_size = eval_buffer_size(cmd.size(), SG_DIAGNOSTIC_BUF_MIN);
     if (large_size == 0)
       return 0;
@@ -3202,7 +3203,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         large.verdict != SG_VERDICT_REJECT)
       validate_known_graph_result_prefix(&result, err, result_buf, buf_size,
                                          cmd.size());
-    if (err == SG_OK && (large_err != SG_OK || !results_equal(result, large))) {
+    if (succeeded && (large_err != err || !results_equal(result, large))) {
       std::fprintf(
           stderr,
           "buffer mismatch: small=%zu large=%zu errors=%d/%d "

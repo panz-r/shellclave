@@ -108,6 +108,9 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
 
 typedef enum {
   SG_OK = 0,
+  /* The source is valid but blank: whitespace, comments and escaped line
+   * endings only, so it has no command to evaluate. This is not an error. */
+  SG_BLANK = 1,
   SG_ERR_INVALID = -1,
   SG_ERR_MEMORY = -2,
   SG_ERR_PARSE = -3,
@@ -756,6 +759,12 @@ sg_error_t sg_gate_set_violation_config_borrowed(
  * and therefore cannot be evaluated by the argv policy model. It returns
  * `SG_OK` with `SG_VERDICT_UNDETERMINED` and a diagnostic `deny_reason`; it
  * never inherits authorization from an adjacent command.
+ *
+ * Valid blank source (whitespace, comments, escaped line endings; zero-length
+ * input is SG_ERR_INVALID) has no command to evaluate. It returns SG_BLANK with
+ * no subcommands and the vacuous verdict SG_VERDICT_ALLOW, so a caller that
+ * reads only the verdict is unaffected, while one that authorizes execution on
+ * SG_OK sees the distinct status.
  *
  * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_EXPAND
  * when an expansion callback fails or returns malformed canonical data,
