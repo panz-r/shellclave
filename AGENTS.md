@@ -74,3 +74,8 @@ Tests must respect caller preconditions. Test annotations with compiler
 diagnostics, rather than invoking functions with invalid required pointers or
 fabricated inconsistent internal objects. Keep runtime tests for malformed
 external input, meaningful NULL cases, and genuine operational failures.
+
+## Fix the cause of a warning, not the warning
+
+A diagnostic marks something wrong or fragile in the code. Resolve what it
+points at. Do not hide it. Likewise, do not weaken a failing check to make it pass.
