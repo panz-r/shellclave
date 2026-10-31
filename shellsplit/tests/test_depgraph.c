@@ -4458,6 +4458,76 @@ TEST(cd_redirect_operand_ownership) {
   pass_count++;
 }
 
+/* A trailing separator or terminal `.` keeps one lexical identity but makes
+ * the lookup require a directory; the identity bytes must not change. */
+TEST(file_path_requires_directory) {
+  static const struct {
+    const char *source;
+    const char *word;
+    bool requires_directory;
+  } cases[] = {
+      {": >regular", "regular", false},
+      {": >regular/", "regular/", true},
+      {": >regular/.", "regular/.", true},
+      {": >regular//", "regular//", true},
+      {": >.", ".", true},
+      {": >a/./b", "a/./b", false},
+      {": >a/..", "a/..", false},
+      {": >a..", "a..", false},
+      {": >a.", "a.", false},
+      {": >'a/'", "'a/'", true},
+      {": >\\a\\/", "\\a\\/", true},
+  };
+  char baseline[SHELL_DEP_CWD_BUF_SIZE];
+  size_t baseline_length = 0;
+  bool absolute;
+  shell_dep_graph_t graph;
+  ASSERT(parse_cwd(": >regular", "/tmp", &graph) == SHELL_DEP_OK);
+  int plain = find_file_doc(&graph, "regular");
+  ASSERT(plain >= 0 && shell_dep_doc_file_identity_write(
+                           &graph, &graph.nodes[plain].doc, baseline,
+                           sizeof(baseline), &baseline_length, &absolute));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    ASSERT(parse_cwd(cases[i].source, "/tmp", &graph) == SHELL_DEP_OK);
+    int file = find_file_doc(&graph, cases[i].word);
+    ASSERT(file >= 0);
+    bool requires_directory = !cases[i].requires_directory;
+    ASSERT(shell_dep_doc_file_path_requires_directory(&graph.nodes[file].doc,
+                                                      &requires_directory));
+    ASSERT(requires_directory == cases[i].requires_directory);
+  }
+  /* The three spellings of one name still share one identity. */
+  static const char *const same[] = {": >regular/", ": >regular/.",
+                                     ": >/tmp/regular//"};
+  for (size_t i = 0; i < sizeof(same) / sizeof(same[0]); i++) {
+    ASSERT(parse_cwd(same[i], "/tmp", &graph) == SHELL_DEP_OK);
+    int file = -1;
+    for (uint32_t n = 0; n < graph.node_count; n++)
+      if (graph.nodes[n].type == SHELL_NODE_DOC &&
+          graph.nodes[n].doc.kind == SHELL_DOC_FILE)
+        file = (int)n;
+    ASSERT(file >= 0);
+    char identity[SHELL_DEP_CWD_BUF_SIZE];
+    size_t written = 0;
+    ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                             identity, sizeof(identity),
+                                             &written, &absolute));
+    ASSERT(written == baseline_length &&
+           memcmp(identity, baseline, written) == 0);
+  }
+  /* Dynamic and non-file documents have no such property. */
+  ASSERT(parse_cwd(": >$target/", "/tmp", &graph) == SHELL_DEP_OK);
+  for (uint32_t n = 0; n < graph.node_count; n++) {
+    bool requires_directory = true;
+    if (graph.nodes[n].type == SHELL_NODE_DOC &&
+        graph.nodes[n].doc.kind == SHELL_DOC_FILE)
+      ASSERT(!shell_dep_doc_file_path_requires_directory(&graph.nodes[n].doc,
+                                                         &requires_directory) &&
+             !requires_directory);
+  }
+  pass_count++;
+}
+
 TEST(wrapper_cwd_semantics) {
   static const char *const dynamic_command_cases[] = {
       "command \"$target\"; pwd",
@@ -16176,6 +16246,10 @@ TEST(resolved_substitution_argument_documents) {
               &graph, doc, identity, sizeof(identity), &written, &absolute));
           ASSERT(absolute && written == doc->value_len &&
                  memcmp(identity, doc->value, written) == 0);
+          bool requires_directory = true;
+          ASSERT(shell_dep_doc_file_path_requires_directory(
+                     doc, &requires_directory) &&
+                 requires_directory == (doc->value[doc->value_len - 1] == '/'));
         }
         ASSERT(fixture.calls == 1 && arguments == (empty ? 0u : 2u) &&
                substitutions != 0 && shell_dep_graph_validate(&graph).valid);
@@ -18650,6 +18724,7 @@ int main(int argc, char **argv) {
   RUN(cwd_decoded_operand_matrix);
   RUN(cd_graph_visible_effects);
   RUN(cd_redirect_operand_ownership);
+  RUN(file_path_requires_directory);
   RUN(wrapper_cwd_semantics);
   RUN(continued_process_substitution_topology);
   RUN(continued_terminal_redirect_topology);

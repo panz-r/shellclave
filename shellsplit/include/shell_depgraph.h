@@ -1368,13 +1368,33 @@ bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
  * the graph's CWD pool. Metadata and source spans remain immutable during
  * the call; destination and outputs must not overlap their storage. This
  * function tests path availability and output capacity, not graph integrity.
- * Use shell_dep_graph_validate() if validating an externally supplied graph. */
+ * Use shell_dep_graph_validate() if validating an externally supplied graph.
+ *
+ * The identity drops a trailing separator and a terminal `.` component, so
+ * `file`, `file/` and `file/.` share one identity although `file/` and
+ * `file/.` require a directory and follow a final symlink. Identity equality
+ * is deliberately unchanged, which keeps it a safe over-approximation of
+ * "may name the same file". Use shell_dep_doc_file_path_requires_directory()
+ * when that distinction matters. */
 bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
                                        const shell_dep_doc_t *doc,
                                        char *destination,
                                        size_t destination_size, size_t *written,
                                        bool *absolute)
     SHELL_NONNULL(1, 2, 3, 5, 6);
+
+/** Report whether a FILE document's path syntactically requires a directory:
+ * its decoded value ends with a separator, or its final component is `.`.
+ * Such a path fails to open a non-directory and follows a final symlink,
+ * unlike the same name without the suffix, yet both share one identity from
+ * shell_dep_doc_file_identity_write(). Parent components are not considered.
+ * Availability matches that function's source selection (static, implicit or
+ * callback-resolved nonempty paths) but needs neither a known CWD nor output
+ * storage. Returns false and clears the output for any other document. The
+ * document is immutable during the call. */
+bool shell_dep_doc_file_path_requires_directory(const shell_dep_doc_t *doc,
+                                                bool *requires_directory)
+    SHELL_NONNULL(1, 2);
 
 /**
  * Dump graph to FILE* for debugging.

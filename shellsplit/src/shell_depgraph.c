@@ -426,6 +426,63 @@ bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
   return true;
 }
 
+typedef struct {
+  unsigned char last;
+  unsigned char previous;
+  size_t length;
+} dep_path_tail_t;
+
+static SHELL_NONNULL(3) bool dep_path_tail_byte(unsigned char byte,
+                                                size_t position,
+                                                void *context) {
+  dep_path_tail_t *tail = context;
+  tail->previous = tail->last;
+  tail->last = byte;
+  tail->length = position + 1;
+  return true;
+}
+
+/* The identity drops a trailing separator and a terminal `.` component, but
+ * either makes the lookup require a directory (and follow a final symlink). */
+static bool dep_path_tail_requires_directory(const dep_path_tail_t *tail) {
+  return tail->last == '/' ||
+         (tail->last == '.' && (tail->length == 1 || tail->previous == '/'));
+}
+
+bool shell_dep_doc_file_path_requires_directory(const shell_dep_doc_t *doc,
+                                                bool *requires_directory) {
+  *requires_directory = false;
+  if (doc->kind != SHELL_DOC_FILE || !doc->path ||
+      (doc->flags & SHELL_DEP_DOC_FLAG_EXPANSION_FAILED))
+    return false;
+  dep_path_tail_t tail = {0};
+  const char *decoded = NULL;
+  size_t decoded_length = 0;
+  if (doc->flags & SHELL_DEP_DOC_FLAG_IMPLICIT) {
+    decoded = doc->path;
+    decoded_length = doc->path_len;
+  } else if (doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH) {
+    decoded = doc->value;
+    decoded_length = doc->value_len;
+  } else if (doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) {
+    return false;
+  } else if (shell_process_visit_word_value(
+                 doc->path, doc->path_len, dep_path_tail_byte, &tail,
+                 &decoded_length) != SHELL_PROCESS_OK) {
+    return false;
+  }
+  if (decoded_length == 0)
+    return false;
+  if (decoded) {
+    tail.last = (unsigned char)decoded[decoded_length - 1];
+    tail.previous =
+        decoded_length > 1 ? (unsigned char)decoded[decoded_length - 2] : 0;
+    tail.length = decoded_length;
+  }
+  *requires_directory = dep_path_tail_requires_directory(&tail);
+  return true;
+}
+
 /* current_offset references an installed pool entry. rel is a decoded nonempty
  * static path; relative targets require a known incoming directory.
  * effective_size is the validated pool bound. */
