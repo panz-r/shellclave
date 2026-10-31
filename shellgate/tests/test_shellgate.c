@@ -4260,6 +4260,8 @@ TEST(static_arithmetic_literal_contract) {
       gate, "echo $((2#1010 + 8#17 + 16#ff + 36#Z + 37#A + 64#_@ + (2**3)))",
       &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "echo $((0x))", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   static const char *const invalid[] = {
       "echo $((08))",
       "echo $((2#))",
@@ -4267,7 +4269,6 @@ TEST(static_arithmetic_literal_contract) {
       "echo $((65#1))",
       "echo $((1 2))",
       "echo $((1 + ))",
-      "echo $((0x))",
       "((02#1))",
       "((010#1))",
       "((016#f))",

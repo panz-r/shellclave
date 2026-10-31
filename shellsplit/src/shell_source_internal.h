@@ -1681,7 +1681,7 @@ static inline SHELL_NONNULL(1, 4) bool shell_source_scan_arithmetic_number(
     if (prefix < length && (input[prefix] == 'x' || input[prefix] == 'X')) {
       position = prefix + 1;
       size_t digits_start = position;
-      size_t digits = 0;
+      /* Bash accepts a prefix without digits as zero. */
       for (;;) {
         SHELL_SOURCE_WORD_SCAN(1);
         size_t next =
@@ -1689,10 +1689,7 @@ static inline SHELL_NONNULL(1, 4) bool shell_source_scan_arithmetic_number(
         if (next >= length || !shell_ascii_xdigit((unsigned char)input[next]))
           break;
         position = next + 1;
-        digits++;
       }
-      if (digits == 0)
-        return false;
       *number = (shell_source_arithmetic_number_t){position, digits_start, 16};
       return true;
     }
