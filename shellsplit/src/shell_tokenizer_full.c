@@ -769,17 +769,6 @@ static bool parse_heredoc(shell_tokenizer_state_t *state, shell_token_t *token,
   return true;
 }
 
-static bool token_has_unescaped_dollar(const shell_token_t *token) {
-  for (size_t i = 0; i < token->length; i++) {
-    if (token->start[i] == '\\' && i + 1 < token->length) {
-      i++;
-    } else if (token->start[i] == '$') {
-      return true;
-    }
-  }
-  return false;
-}
-
 static bool parse_subshell(shell_tokenizer_state_t *state,
                            shell_token_t *token) {
   if (state->position >= state->length)
@@ -3093,6 +3082,39 @@ static SHELL_NONNULL(1, 3, 4) shell_tokenize_status_t
       input, input_length, allow_initial_time, commands, command_count);
 }
 
+/* A complete word token may contain several expansion forms regardless of its
+ * primary classification: a glob can embed a variable, and a quoted argument
+ * can embed a substitution. Heredoc delimiters and bodies are not words here;
+ * a delimiter is never expanded. */
+static bool token_is_expandable_word(shell_token_type_t type) {
+  return type == SHELL_TOKEN_COMMAND || type == SHELL_TOKEN_ARGUMENT ||
+         type == SHELL_TOKEN_GLOB || type == SHELL_TOKEN_EXTGLOB ||
+         type == SHELL_TOKEN_ARRAY_ASSIGNMENT;
+}
+
+/* Record the quote-aware expansions inside one word token. */
+static SHELL_NONNULL(1,
+                     2) void note_word_expansions(shell_command_t *command,
+                                                  const shell_token_t *token) {
+  shell_source_substitution_scan_t scan = {0};
+  size_t start, after;
+  shell_source_substitution_kind_t kind;
+  shell_source_scan_status_t status;
+  while ((status = shell_source_next_executable_substitution(
+              token->start, token->length, &scan, &start, &after, &kind)) ==
+         SHELL_SOURCE_SCAN_FOUND)
+    command->has_subshells |= kind == SHELL_SOURCE_SUBST_COMMAND ||
+                              kind == SHELL_SOURCE_SUBST_BACKTICK;
+  /* An unterminated expansion is tolerated lexically but establishes no
+   * feature, matching an unclosed command substitution. */
+  if (status != SHELL_SOURCE_SCAN_DONE)
+    return;
+  command->has_variables |= scan.has_variables ||
+                            scan.has_arithmetic_variables ||
+                            shell_tokenizer_token_has_variable(token);
+  command->has_arithmetic |= scan.has_arithmetic;
+}
+
 shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     const char *input, size_t input_length, bool allow_initial_time,
     shell_command_t **commands, size_t *command_count) {
@@ -3660,17 +3682,11 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     case SHELL_TOKEN_ARITHMETIC:
       current_cmd->has_arithmetic = true;
       break;
-    case SHELL_TOKEN_HEREDOC:
-      if (!token.is_quoted && token_has_unescaped_dollar(&token))
-        current_cmd->has_variables = true;
-      break;
     default:
       break;
     }
-    if ((token.type == SHELL_TOKEN_COMMAND ||
-         token.type == SHELL_TOKEN_ARGUMENT) &&
-        shell_tokenizer_token_has_variable(&token))
-      current_cmd->has_variables = true;
+    if (token_is_expandable_word(token.type))
+      note_word_expansions(current_cmd, &token);
 
     if (token.type == SHELL_TOKEN_PIPE || token.type == SHELL_TOKEN_PIPE_BOTH ||
         token.type == SHELL_TOKEN_SEMICOLON || token.type == SHELL_TOKEN_AND ||
