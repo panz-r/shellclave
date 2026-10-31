@@ -344,6 +344,8 @@ static void test_list_syntax_contract(void) {
       "{ echo one; } echo two",
       "{\\\necho one; }",
       "{echo one; }",
+      "{",
+      "echo one; {",
       "{ echo one; } 'echo two'",
       "( echo one; ) ! echo two",
       "{ echo one; } >",

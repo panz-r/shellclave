@@ -34,29 +34,51 @@ void shell_tokenizer_arithmetic_content(const shell_token_t *token,
   *content_length = end - open - 1;
 }
 
+/* Byte shape that must follow a `{` or `}` for it to be a reserved group
+ * delimiter. This is the one definition shared by the lexer and the brace
+ * validator, so neither can disagree about what a delimiter looks like. It is
+ * logical: escaped line endings vanish before the following byte is judged.
+ * An opener is followed by blank space, `(`, or the end of input. A closer is
+ * followed by the end of input, space, a list or pipe operator, `)`, a
+ * redirection operator, or a valid I/O number before a redirection, which
+ * keeps word-shaped text such as `}suffix` opaque and recognizes group
+ * redirections such as `}2>out`. Context (command position, the preceding
+ * byte, group depth) is separate and belongs to each caller.
+ * position < length indexes the brace. */
+static bool brace_delimiter_follows(const char *input, size_t length,
+                                    size_t position, bool opening) {
+  size_t following = shell_source_logical_following(input, length, position);
+  if (following == length)
+    return true;
+  char after = input[following];
+  if (shell_source_space((unsigned char)after))
+    return true;
+  if (opening)
+    return after == '(';
+  if (after == ';' || after == '|' || after == '&' || after == ')' ||
+      after == '<' || after == '>')
+    return true;
+  if (!shell_ascii_digit((unsigned char)after))
+    return false;
+  size_t cursor = 0;
+  uint32_t descriptor = 0;
+  return shell_source_parse_io_number(input, following, length, &cursor,
+                                      &descriptor) ==
+             SHELL_SOURCE_IO_NUMBER_VALID &&
+         (cursor = shell_source_skip_escaped_line_endings(input, length,
+                                                          cursor)) < length &&
+         (input[cursor] == '<' || input[cursor] == '>');
+}
+
 /* A closing brace is a reserved word only when it is separated from adjacent
- * shell words. Keep word-shaped text such as `}suffix` opaque to the group
- * stack, while recognizing group trailing redirections (`}2>out`). */
+ * shell words: preceded by a list terminator or newline, and followed by the
+ * shape above. */
 static bool brace_group_close_delimiter(const char *input, size_t length,
                                         size_t position, char before,
                                         bool newline_separator) {
   if (before != ';' && before != '&' && before != ')' && !newline_separator)
     return false;
-  size_t after = shell_source_logical_following(input, length, position);
-  if (after == length)
-    return true;
-  char following = input[after];
-  if (shell_source_space((unsigned char)following) || following == ';' ||
-      following == '|' || following == '&' || following == ')' ||
-      following == '<' || following == '>')
-    return true;
-  if (!shell_ascii_digit((unsigned char)following))
-    return false;
-  size_t cursor = after;
-  while (cursor < length && shell_ascii_digit((unsigned char)input[cursor]))
-    cursor++;
-  cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
-  return cursor < length && (input[cursor] == '<' || input[cursor] == '>');
+  return brace_delimiter_follows(input, length, position, false);
 }
 
 /* Validate POSIX brace-group delimiters before allocating token arrays.
@@ -207,14 +229,8 @@ static shell_error_t brace_groups_status(const char *input, size_t length) {
     /* Consume ordinary words as spans. Their literal braces are not compound
      * delimiters, and must not trigger repeated source-prefix reconstruction.
      */
-    /* Escaped line endings vanish before a reserved word is recognized, so
-     * the delimiter follows the next logical byte, as in the lexer. */
-    size_t brace_following =
-        c == '{' ? shell_source_logical_following(input, length, i) : length;
     bool possible_brace_open =
-        c == '{' && brace_following < length &&
-        (shell_source_space((unsigned char)input[brace_following]) ||
-         input[brace_following] == '(');
+        c == '{' && brace_delimiter_follows(input, length, i, true);
     if ((c != '{' && c != '}' && c != '(' && c != ')' &&
          !shell_source_space((unsigned char)c) && !strchr("<>;|&", c)) ||
         (c == '{' && !possible_brace_open)) {
@@ -483,16 +499,8 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
                       state->input, p, state->lexical_operand_end) == p);
   if (!state->lexical_command_position || operand)
     return false;
-  size_t following =
-      shell_source_logical_following(state->input, state->length, p);
-  if (opening) {
-    if (following < state->length &&
-        (!shell_source_space((unsigned char)state->input[following]) &&
-         state->input[following] != '('))
-      return false;
-  } else if (state->brace_group_depth == 0) {
+  if (!opening && state->brace_group_depth == 0)
     return false;
-  }
   if (!opening && p > 0) {
     size_t before = shell_source_skip_escaped_line_endings_backward(
         state->input, state->length, p);
@@ -504,25 +512,7 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
         preceding != ')')
       return false;
   }
-  if (following == state->length)
-    return true;
-  char after = state->input[following];
-  if (shell_source_space((unsigned char)after) || (opening && after == '(') ||
-      after == ';' || after == '|' || after == '&' || after == ')')
-    return true;
-  if (!opening && (after == '<' || after == '>'))
-    return true;
-  if (!opening && shell_ascii_digit((unsigned char)after)) {
-    size_t cursor = 0;
-    uint32_t descriptor = 0;
-    return shell_source_parse_io_number(state->input, following, state->length,
-                                        &cursor, &descriptor) ==
-               SHELL_SOURCE_IO_NUMBER_VALID &&
-           (cursor = shell_source_skip_escaped_line_endings(
-                state->input, state->length, cursor)) < state->length &&
-           (state->input[cursor] == '<' || state->input[cursor] == '>');
-  }
-  return false;
+  return brace_delimiter_follows(state->input, state->length, p, opening);
 }
 
 static size_t
