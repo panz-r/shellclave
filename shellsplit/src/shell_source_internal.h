@@ -1126,8 +1126,10 @@ static inline SHELL_NONNULL(1, 4) shell_source_heredoc_frame_t
   }
   size_t mark = shell_source_scratch_mark();
   shell_source_heredoc_delimiter_t delimiter;
-  if (!shell_source_prepare_heredoc(pending, &delimiter))
+  if (!shell_source_prepare_heredoc(pending, &delimiter)) {
+    shell_source_scratch_release(mark);
     return frame;
+  }
   for (size_t line = body_start; line < length;) {
     size_t after;
     bool prefix;
