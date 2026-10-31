@@ -5841,7 +5841,23 @@ static int test_abstraction(const char *input, size_t length) {
         (void)shell_path_category_from_path(expanded);
       free(expanded);
     }
-    if (!shell_abstract_command_expand(command, &context)) {
+    /* The result is true exactly when every variable and path element
+     * resolved; other kinds never expand and keep a NULL value. */
+    bool complete = true;
+    bool returned = shell_abstract_command_expand(command, &context);
+    for (size_t i = 0; i < count; i++) {
+      shell_abstract_type_t type = elements[i]->type;
+      bool expandable =
+          type == SHELL_ABSTRACT_EV || type == SHELL_ABSTRACT_PV ||
+          type == SHELL_ABSTRACT_SV || type == SHELL_ABSTRACT_AP ||
+          type == SHELL_ABSTRACT_RP || type == SHELL_ABSTRACT_HP;
+      if (!expandable && elements[i]->expanded != NULL) {
+        shell_abstract_command_free(command);
+        return 1;
+      }
+      complete &= !expandable || elements[i]->expanded != NULL;
+    }
+    if (returned != complete) {
       shell_abstract_command_free(command);
       return 1;
     }

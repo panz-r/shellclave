@@ -162,10 +162,8 @@ static void free_transformed_tokens(shell_transformed_token_t *tokens,
 /* Adjacent tokens come from the same command's valid source spans. */
 static SHELL_NONNULL(1, 2) bool transform_tokens_share_word(
     const shell_token_t *left, const shell_token_t *right) {
-  return !(shell_token_type_is_syntax(left->type) ||
-           left->type == SHELL_TOKEN_PROCESS_SUB) &&
-         !(shell_token_type_is_syntax(right->type) ||
-           right->type == SHELL_TOKEN_PROCESS_SUB) &&
+  return !shell_token_type_is_syntax(left->type) &&
+         !shell_token_type_is_syntax(right->type) &&
          shell_tokenizer_token_continues_word(right,
                                               left->position + left->length);
 }

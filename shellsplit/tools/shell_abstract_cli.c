@@ -107,14 +107,15 @@ void process_command(const char *cmd, const shell_runtime_context_t *ctx,
   // Expand if requested
   if (expand && ctx) {
     printf("\n--- Expansion ---\n");
-    if (shell_abstract_command_expand(result, ctx)) {
-      for (size_t i = 0; i < result->element_count; i++) {
-        if (result->elements[i]->expanded) {
-          printf("%s -> %s\n", result->elements[i]->abstraction,
-                 result->elements[i]->expanded);
-        }
+    bool complete = shell_abstract_command_expand(result, ctx);
+    for (size_t i = 0; i < result->element_count; i++) {
+      if (result->elements[i]->expanded) {
+        printf("%s -> %s\n", result->elements[i]->abstraction,
+               result->elements[i]->expanded);
       }
     }
+    if (!complete)
+      printf("(some elements did not resolve)\n");
   }
 
   printf("\n");

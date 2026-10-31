@@ -1057,7 +1057,21 @@ static void test_runtime_expansion(void) {
                {"cat ./file", "$RP_1", "/tmp/./file", "/tmp/"},
                {"echo $MISSING", "$EV_1", NULL, NULL},
                {"echo \"prefix $USER\"", "$EV_1", "testuser", NULL},
-               {"echo \"literal\"", "$STR_1", NULL, NULL}};
+               {"echo \"literal\"", "$STR_1", NULL, NULL},
+               {"echo \"${USER}\"", "$EV_1", "testuser", NULL},
+               {"echo \"${USER:-safe}\"", "$EV_1", NULL, NULL},
+               {"echo \"${MISSING:-safe}\"", "$EV_1", NULL, NULL},
+               {"echo \"${USER:+other}\"", "$EV_1", NULL, NULL},
+               {"echo \"${#USER}\"", "$EV_1", NULL, NULL},
+               {"echo \"${!USER}\"", "$EV_1", NULL, NULL},
+               {"echo \"${USER:1:2}\"", "$EV_1", NULL, NULL},
+               {"echo \"${USER#test}\"", "$EV_1", NULL, NULL},
+               {"echo \"${USER[0]}\"", "$EV_1", NULL, NULL},
+               {"echo \\/etc/passwd", "$AP_1", "/etc/passwd", NULL},
+               {"echo \"\"/etc/passwd", "$AP_1", "/etc/passwd", NULL},
+               {"echo /tmp/hello\\ world", "$AP_1", "/tmp/hello world", NULL},
+               {"echo ./a\\ b", "$RP_1", "/tmp/./a b", "/tmp/"},
+               {"echo \\~/note", "$RP_1", "/tmp/~/note", "/tmp/"}};
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_abstract_command_t *result = parse_command(cases[i].input);
@@ -1103,10 +1117,57 @@ static void test_runtime_expansion(void) {
 
   const char *empty_environment[] = {NULL};
   context.env = empty_environment;
-  valid = shell_abstract_command_expand(result, &context) && user && home &&
+  valid = !shell_abstract_command_expand(result, &context) && user && home &&
           user->expanded == NULL && home->expanded == NULL;
-  TEST("re-expansion clears stale values", valid);
+  TEST("re-expansion clears stale values and reports unresolved", valid);
   shell_abstract_command_free(result);
+
+  /* Elements without a runtime value do not make expansion incomplete. */
+  context.env = environment;
+  result = parse_command("echo \"literal\" *.txt $USER $(true)");
+  valid = result && shell_abstract_command_expand(result, &context);
+  user = valid ? shell_abstract_command_find_element(result, "$EV_1") : NULL;
+  valid = valid && user && user->expanded &&
+          strcmp(user->expanded, "testuser") == 0;
+  for (size_t i = 0; valid && i < result->element_count; i++)
+    valid = result->elements[i] == user || !result->elements[i]->expanded;
+  TEST("expansion ignores elements without runtime values", valid);
+  shell_abstract_command_free(result);
+
+  /* One unresolved element reports false but keeps the resolved ones. */
+  result = parse_command("echo $USER $MISSING \"${HOME:-x}\"");
+  valid = result && !shell_abstract_command_expand(result, &context);
+  user = valid ? shell_abstract_command_find_element(result, "$EV_1") : NULL;
+  shell_abstract_element_t *missing =
+      valid ? shell_abstract_command_find_element(result, "$EV_2") : NULL;
+  shell_abstract_element_t *operator =
+      valid ? shell_abstract_command_find_element(result, "$EV_3") : NULL;
+  valid = valid && user && user->expanded &&
+          strcmp(user->expanded, "testuser") == 0 && missing &&
+          !missing->expanded && operator && !operator->expanded;
+  TEST("partial expansion keeps resolved values", valid);
+  shell_abstract_command_free(result);
+
+  /* Classification follows the decoded value of the word. */
+  static const struct {
+    const char *input;
+    const char *key;
+    bool absolute;
+    bool relative;
+  } paths[] = {{"echo \\/etc/passwd", "$AP_1", true, false},
+               {"echo \"\"/etc/passwd", "$AP_1", true, false},
+               {"echo /tmp/hello\\ world", "$AP_1", true, false},
+               {"echo \\~/note", "$RP_1", false, true}};
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    result = parse_command(paths[i].input);
+    shell_abstract_element_t *path =
+        result ? shell_abstract_command_find_element(result, paths[i].key)
+               : NULL;
+    valid = path && result->has_abs_paths == paths[i].absolute &&
+            result->has_rel_paths == paths[i].relative;
+    TEST(paths[i].input, valid);
+    shell_abstract_command_free(result);
+  }
 }
 
 static void test_invalid_and_null_inputs(void) {

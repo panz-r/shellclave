@@ -160,16 +160,19 @@ static SHELL_NONNULL(1, 3) bool abstract_parse_variable(
 /* Full-token variable tokens can retain double-quoted literal surroundings.
  * Keep their established whole-token abstraction while extracting metadata
  * from the expansion itself. Compound unquoted words reach this helper with
- * the variable span already isolated. */
-static SHELL_NONNULL(1, 3, 4) bool abstract_variable_info_from_token(
+ * the variable span already isolated. The expansion occupies
+ * text[*variable_start, *variable_after). */
+static SHELL_NONNULL(1, 3, 4, 5) bool abstract_variable_info_span(
     const char *text, size_t length, shell_abstract_variable_info_t *out,
-    size_t *variable_start) {
+    size_t *variable_start, size_t *variable_after) {
   *variable_start = 0;
+  *variable_after = length;
   if (abstract_parse_variable(text, length, out))
     return true;
   if (length >= 2 && text[0] == '"' && text[length - 1] == '"' &&
       abstract_parse_variable(text + 1, length - 2, out)) {
     *variable_start = 1;
+    *variable_after = length - 1;
     return true;
   }
 
@@ -181,7 +184,40 @@ static SHELL_NONNULL(1, 3, 4) bool abstract_variable_info_from_token(
       !abstract_parse_variable(text + start, after - start, out))
     return false;
   *variable_start = start;
+  *variable_after = after;
   return true;
+}
+
+static SHELL_NONNULL(1, 3, 4) bool abstract_variable_info_from_token(
+    const char *text, size_t length, shell_abstract_variable_info_t *out,
+    size_t *variable_start) {
+  size_t variable_after;
+  return abstract_variable_info_span(text, length, out, variable_start,
+                                     &variable_after);
+}
+
+/* A plain reference is `$name` or `${name}`: the expansion selects the named
+ * parameter's value and applies no operator. Length (`${#name}`), indirection
+ * (`${!name}`), subscripts, defaults, alternates, substrings and pattern edits
+ * all change the result, so a plain environment lookup cannot represent them.
+ */
+static SHELL_NONNULL(1) bool abstract_variable_is_plain(const char *text,
+                                                        size_t length) {
+  shell_abstract_variable_info_t info = {0};
+  size_t start, after;
+  if (!abstract_variable_info_span(text, length, &info, &start, &after))
+    return false;
+  if (!info.is_braced)
+    return true;
+  const char *expansion = text + start;
+  size_t expansion_length = after - start;
+  size_t brace = shell_source_logical_following(expansion, expansion_length, 0);
+  size_t first =
+      shell_source_logical_following(expansion, expansion_length, brace);
+  size_t name_end = info.name_start + info.name_length;
+  return first == info.name_start &&
+         shell_source_skip_escaped_line_endings(
+             expansion, expansion_length - 1, name_end) == expansion_length - 1;
 }
 
 static SHELL_NONNULL(1, 3) bool abstract_variable_info(
@@ -235,21 +271,58 @@ static SHELL_NONNULL(1) char *abstract_variable_name_copy(
   return copy;
 }
 
-/**
- * Check if string is an absolute path
- */
-static bool is_absolute_path(const char *s, size_t len) {
-  if (len == 0)
-    return false;
-  return s[0] == '/';
+/* Pathname classification follows the word's decoded static value, not its
+ * source spelling: `\/etc/passwd` and `""/etc/passwd` both name /etc/passwd.
+ * Only the leading bytes and the presence of a slash are classified, so the
+ * visitor streams a bounded prefix rather than materializing the word. A word
+ * that cannot be decoded keeps its source spelling. */
+typedef struct {
+  size_t length;
+  char prefix[3];
+  bool has_slash;
+} abstract_path_shape_t;
+
+static bool abstract_path_shape_byte(unsigned char byte, size_t position,
+                                     void *context) {
+  abstract_path_shape_t *shape = context;
+  if (position < sizeof(shape->prefix))
+    shape->prefix[position] = (char)byte;
+  shape->has_slash |= byte == '/';
+  shape->length = position + 1;
+  return true;
+}
+
+static SHELL_NONNULL(1) abstract_path_shape_t
+    abstract_path_shape(const char *text, size_t len) {
+  abstract_path_shape_t shape = {0};
+  size_t decoded = 0;
+  if (shell_process_visit_word_value(text, len, abstract_path_shape_byte,
+                                     &shape, &decoded) == SHELL_PROCESS_OK)
+    return shape;
+  shape = (abstract_path_shape_t){0};
+  for (size_t i = 0; i < len; i++)
+    abstract_path_shape_byte((unsigned char)text[i], i, &shape);
+  return shape;
 }
 
 /**
- * Check if string is a relative path
+ * Check if the decoded word is an absolute path
  */
-static bool is_relative_path(const char *s, size_t len) {
-  if (len == 0)
+static bool is_absolute_path(const abstract_path_shape_t *shape) {
+  return shape->length != 0 && shape->prefix[0] == '/';
+}
+
+/**
+ * Check if the decoded word is a relative path. An active tilde prefix is a
+ * source property: an escaped or quoted `~` decodes to the same byte but is a
+ * literal relative component, so `source` supplies the leading spelling.
+ */
+static bool is_relative_path(const abstract_path_shape_t *shape,
+                             const char *source) {
+  if (shape->length == 0)
     return false;
+  const char *s = shape->prefix;
+  size_t len = shape->length;
 
   // ./ or ../
   if (len >= 2 && s[0] == '.' && s[1] == '/')
@@ -261,13 +334,8 @@ static bool is_relative_path(const char *s, size_t len) {
   if (len == 1 && s[0] == '.')
     return true;
 
-  // Contains / but not absolute and not starting with ~
-  // Use memchr instead of strchr to respect length
-  if (memchr(s, '/', len) != NULL) {
-    return s[0] != '~';
-  }
-
-  return false;
+  // Contains / but not absolute and not starting with an active tilde.
+  return shape->has_slash && source[0] != '~';
 }
 
 /**
@@ -353,13 +421,14 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
   }
 
   // Paths (before checking options since - could be a path component)
-  if (is_absolute_path(text, len)) {
+  abstract_path_shape_t shape = abstract_path_shape(text, len);
+  if (is_absolute_path(&shape)) {
     return SHELL_TOKEN_ARGUMENT; // Will be classified as path in abstraction
   }
   if (is_home_path(text, len)) {
     return SHELL_TOKEN_ARGUMENT;
   }
-  if (is_relative_path(text, len)) {
+  if (is_relative_path(&shape, text)) {
     return SHELL_TOKEN_ARGUMENT;
   }
 
@@ -441,18 +510,51 @@ static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
     if (shell_source_word_has_glob(text, len)) {
       return SHELL_ABSTRACT_GB;
     }
-    if (is_absolute_path(text, len)) {
+    abstract_path_shape_t shape = abstract_path_shape(text, len);
+    if (is_absolute_path(&shape)) {
       return SHELL_ABSTRACT_AP;
     }
     if (is_home_path(text, len)) {
       return SHELL_ABSTRACT_HP;
     }
-    if (is_relative_path(text, len)) {
+    if (is_relative_path(&shape, text)) {
       return SHELL_ABSTRACT_RP;
     }
   }
 
   return -1; // Not abstractable
+}
+
+/* Store the decoded static value of a path word; `original` keeps the exact
+ * spelling. A word that cannot be decoded retains its source spelling. */
+static SHELL_NONNULL(1, 2) bool abstract_fill_path(
+    shell_abstract_element_t *element, const char *text, size_t length) {
+  size_t decoded_length = 0;
+  char *path = NULL;
+  if (shell_process_measure_word_value(text, length, &decoded_length) ==
+      SHELL_PROCESS_OK) {
+    path = malloc(decoded_length + 1);
+    size_t written = 0;
+    if (path &&
+        shell_process_write_word_value(text, length, path, decoded_length,
+                                       &written) == SHELL_PROCESS_OK) {
+      path[written] = '\0';
+      decoded_length = written;
+    } else {
+      free(path);
+      return false;
+    }
+  } else {
+    path = strndup(text, length);
+    decoded_length = length;
+    if (!path)
+      return false;
+  }
+  element->data.path.path = path;
+  element->data.path.is_absolute = decoded_length != 0 && path[0] == '/';
+  element->data.path.ends_with_slash =
+      decoded_length != 0 && path[decoded_length - 1] == '/';
+  return true;
 }
 
 /* --- BUILD ABSTRACTED COMMAND --- */
@@ -763,10 +865,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 9) bool compound_abstract_append(
       return false;
     }
   } else {
-    element->data.path.path = strndup(text, length);
-    element->data.path.is_absolute = text[0] == '/';
-    element->data.path.ends_with_slash = length != 0 && text[length - 1] == '/';
-    if (!element->data.path.path) {
+    if (!abstract_fill_path(element, text, length)) {
       free_abstract_element(element);
       return false;
     }
@@ -1279,10 +1378,8 @@ abstract_command_parse_impl(const char *command, size_t command_length,
       case SHELL_ABSTRACT_AP:
       case SHELL_ABSTRACT_RP:
       case SHELL_ABSTRACT_HP:
-        elem->data.path.path = strndup(tok->start, tok->length);
-        elem->data.path.is_absolute = (tok->start[0] == '/');
-        elem->data.path.ends_with_slash =
-            (tok->length > 0 && tok->start[tok->length - 1] == '/');
+        if (!abstract_fill_path(elem, tok->start, tok->length))
+          elem->data.path.path = NULL;
         break;
 
       case SHELL_ABSTRACT_GB:
@@ -1536,7 +1633,8 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
   case SHELL_ABSTRACT_EV:
   case SHELL_ABSTRACT_PV:
   case SHELL_ABSTRACT_SV: {
-    if (!elem->data.var.name)
+    if (!elem->data.var.name ||
+        !abstract_variable_is_plain(elem->original, strlen(elem->original)))
       return NULL;
 
     // Look up in environment
@@ -1595,19 +1693,36 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
   }
 }
 
+/* Variable and path elements are the only kinds with a runtime value. */
+static bool abstract_element_is_expandable(shell_abstract_type_t type) {
+  switch (type) {
+  case SHELL_ABSTRACT_EV:
+  case SHELL_ABSTRACT_PV:
+  case SHELL_ABSTRACT_SV:
+  case SHELL_ABSTRACT_AP:
+  case SHELL_ABSTRACT_RP:
+  case SHELL_ABSTRACT_HP:
+    return true;
+  default:
+    return false;
+  }
+}
+
 bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
                                    const shell_runtime_context_t *ctx) {
+  bool complete = true;
   for (size_t i = 0; i < cmd->element_count; i++) {
-    if (cmd->elements[i]->expanded) {
-      free(cmd->elements[i]->expanded);
-      cmd->elements[i]->expanded = NULL;
-    }
+    free(cmd->elements[i]->expanded);
+    cmd->elements[i]->expanded = NULL;
+    if (!abstract_element_is_expandable(cmd->elements[i]->type))
+      continue;
 
     cmd->elements[i]->expanded =
         shell_abstract_element_expand(cmd->elements[i], ctx);
+    complete &= cmd->elements[i]->expanded != NULL;
   }
 
-  return true;
+  return complete;
 }
 
 /* --- UTILITY FUNCTIONS --- */

@@ -82,7 +82,10 @@ typedef struct {
     } var;
 
     struct {
-      char *path; // "/etc", "./foo"
+      /* Decoded static word value, such as "/etc" or "./foo": quotes and
+       * escapes are removed, while `original` retains the exact spelling.
+       * is_absolute and ends_with_slash describe this value. */
+      char *path;
       bool is_absolute;
       bool ends_with_slash;
     } path;
@@ -221,16 +224,36 @@ typedef struct {
 } shell_runtime_context_t;
 
 /**
- * Expand a single element using runtime context
- * Returns expanded string (caller must free) or NULL on failure
+ * Expand a single element using runtime context.
+ *
+ * Only variable (EV, PV, SV) and path (AP, RP, HP) elements have a runtime
+ * value; every other kind returns NULL. A variable resolves only for a plain
+ * reference, `$name` or `${name}`: a parameter operator (`${name:-word}`,
+ * `${name:+word}`, `${#name}`, `${!name}`, substrings, pattern edits) or a
+ * subscript changes the result in ways an environment lookup cannot model, so
+ * it returns NULL rather than the unmodified value. Path elements hold the
+ * decoded word value, so escapes and quotes in the source are already removed.
+ *
+ * Returns the expanded string (caller must free), or NULL when the element
+ * cannot be resolved by this context or allocation fails.
  */
 char *shell_abstract_element_expand(shell_abstract_element_t *elem,
                                     const shell_runtime_context_t *ctx)
     SHELL_NONNULL(1, 2);
 
 /**
- * Expand all elements in an abstracted command
- */
+ * Expand every element that supports runtime expansion, storing each result
+ * in the element's `expanded` field. Results from an earlier call are
+ * replaced; an element that does not resolve ends with `expanded` NULL.
+ *
+ * Returns true when every expandable element (variable and path elements)
+ * resolved. Elements of other kinds (globs, strings, substitutions,
+ * arithmetic, redirects, conditionals) are never expandable: they keep a NULL
+ * `expanded` and do not affect the result, so a command with none returns
+ * true. Returns false when any expandable element did not resolve, for
+ * example an unset variable, a parameter operator, a missing HOME or an
+ * allocation failure. All elements are still processed, so resolved elements
+ * keep their values after a false result. */
 bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
                                    const shell_runtime_context_t *ctx)
     SHELL_NONNULL(1, 2);
