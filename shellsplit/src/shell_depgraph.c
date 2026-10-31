@@ -27516,10 +27516,14 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
   for (uint32_t i = 0; i < g->node_count; i++) {
     const shell_dep_node_t *n = &g->nodes[i];
     if (n->type == SHELL_NODE_CMD) {
-      fprintf(fp, "  [%u] CMD cwd=\"%s\"", i,
-              n->cmd.cwd_offset < g->cwd_buf.len
-                  ? g->cwd_buf.data + n->cmd.cwd_offset
-                  : "?");
+      /* The CWD is caller-supplied filesystem context and may contain line
+       * ends or quotes, so it is escaped like every other dumped string. */
+      const char *cwd = n->cmd.cwd_offset < g->cwd_buf.len
+                            ? g->cwd_buf.data + n->cmd.cwd_offset
+                            : "?";
+      fprintf(fp, "  [%u] CMD cwd=\"", i);
+      dep_dump_escaped_span(fp, cwd, (uint32_t)strlen(cwd));
+      fputc('"', fp);
       if (n->cmd.pipeline_negation_count != 0)
         fprintf(fp, " negation-count=%u%s", n->cmd.pipeline_negation_count,
                 n->cmd.pipeline_negated ? " negated" : "");

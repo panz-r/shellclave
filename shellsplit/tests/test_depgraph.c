@@ -4528,6 +4528,38 @@ TEST(file_path_requires_directory) {
   pass_count++;
 }
 
+/* Caller-supplied filesystem context is data, not dump structure: a hostile
+ * initial CWD must not forge records or inject raw control bytes. */
+TEST(dump_escapes_working_directory) {
+  static const char cwd[] = "/tmp/dir\nEdges:\n  [999] FORGED \"q\" \\b\r\t";
+  shell_dep_graph_t graph;
+  ASSERT(parse_cwd("echo hi", cwd, &graph) == SHELL_DEP_OK);
+  FILE *output = tmpfile();
+  ASSERT(output != NULL);
+  shell_dep_graph_dump(&graph, output);
+  ASSERT(fseek(output, 0, SEEK_SET) == 0);
+  char text[4096];
+  size_t length = fread(text, 1, sizeof(text) - 1, output);
+  fclose(output);
+  text[length] = '\0';
+  ASSERT(length != 0 && strstr(text, "[999]") != NULL);
+  ASSERT(strstr(text, "cwd=\"/tmp/dir\\nEdges:\\n  [999] FORGED "
+                      "\\\"q\\\" \\\\b\\r\\x09\"") != NULL);
+  /* One command node record, and no raw control byte beyond line ends. */
+  unsigned commands = 0;
+  for (const char *line = text; line && *line;) {
+    if (strncmp(line, "  [0] CMD", 9) == 0)
+      commands++;
+    const char *next = strchr(line, '\n');
+    line = next ? next + 1 : NULL;
+  }
+  ASSERT(commands == 1);
+  for (size_t i = 0; i < length; i++)
+    ASSERT(text[i] == '\n' || (unsigned char)text[i] >= 0x20);
+  ASSERT(strstr(text, "\nEdges:\n  [999]") == NULL);
+  pass_count++;
+}
+
 TEST(wrapper_cwd_semantics) {
   static const char *const dynamic_command_cases[] = {
       "command \"$target\"; pwd",
@@ -18725,6 +18757,7 @@ int main(int argc, char **argv) {
   RUN(cd_graph_visible_effects);
   RUN(cd_redirect_operand_ownership);
   RUN(file_path_requires_directory);
+  RUN(dump_escapes_working_directory);
   RUN(wrapper_cwd_semantics);
   RUN(continued_process_substitution_topology);
   RUN(continued_terminal_redirect_topology);
