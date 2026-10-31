@@ -160,6 +160,7 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len)
  * `out` owns a command released with
  * shell_abstract_command_free(). On failure, `out` is NULL and the status
  * identifies invalid input, shell syntax, allocation failure, or overflow.
+ * Blank source returns SHELL_ABSTRACT_BLANK with `out` NULL.
  */
 typedef enum {
   SHELL_ABSTRACT_OK = 0,
@@ -167,6 +168,10 @@ typedef enum {
   SHELL_ABSTRACT_EPARSE,
   SHELL_ABSTRACT_ENOMEM,
   SHELL_ABSTRACT_EOVERFLOW,
+  /* The source is valid but blank: whitespace, comments and escaped line
+   * endings only. There is no command to abstract, which is not a parse
+   * error. `out` is NULL. */
+  SHELL_ABSTRACT_BLANK,
 } shell_abstract_status_t;
 
 /* Shellsplit abstracts modeled simple-command lists, pipelines, and

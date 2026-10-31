@@ -532,10 +532,10 @@ TEST(public_failure_and_limit_contracts) {
   shell_transformed_command_t **transformed =
       (shell_transformed_command_t **)(uintptr_t)1;
   size_t transformed_count = SIZE_MAX;
-  bool valid =
-      shell_transform_command_line("", 0, NULL, &transformed,
-                                   &transformed_count) == SHELL_TRANSFORM_OK &&
-      transformed == NULL && transformed_count == 0;
+  bool valid = shell_transform_command_line("", 0, NULL, &transformed,
+                                            &transformed_count) ==
+                   SHELL_TRANSFORM_BLANK &&
+               transformed == NULL && transformed_count == 0;
 
   transformed = (shell_transformed_command_t **)(uintptr_t)1;
   transformed_count = SIZE_MAX;

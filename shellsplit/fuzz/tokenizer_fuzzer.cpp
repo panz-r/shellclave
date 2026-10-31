@@ -1509,8 +1509,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
 
   /* Comment/continuation-only input has no visible diagnostic tokens. The
-   * command tokenizer may reject such non-command source rather than return
-   * empty records; ordinary words must never use this empty-stream escape. */
+   * command tokenizer reports it as BLANK rather than returning empty records;
+   * ordinary words must never use this empty-stream escape. */
   static const char *const empty_visible_sources[] = {
       "#hile do7",
       "# time ! echo hidden",
@@ -5689,15 +5689,17 @@ static int test_tokenizer_state(const char *input, size_t length) {
     /* Malformed input has no complete command stream to reconcile. A valid
      * source with visible tokens may only take this escape for the documented
      * output-capacity limit. Comment/continuation-only source has no command
-     * to return and may be rejected with EParse. All other valid grammar,
-     * including unsupported semantics, must yield diagnostic records. Deferred
+     * to return and is reported as BLANK, which is valid only when no
+     * diagnostic token is visible. All other valid grammar, including
+     * unsupported semantics, must yield diagnostic records. Deferred
      * control-flow classification checks framing rather than complete body
      * grammar, so its true result cannot override a local tokenizer rejection.
      */
-    return outputs_cleared && (!syntax_valid ||
+    bool blank = full_status == SHELL_TOKENIZE_BLANK && syntax_valid &&
+                 !unsupported && iterated.empty();
+    return outputs_cleared && (!syntax_valid || blank ||
                                (full_status == SHELL_TOKENIZE_EPARSE &&
-                                (!lexical_complete || iterated.empty() ||
-                                 control_framing)) ||
+                                (!lexical_complete || control_framing)) ||
                                full_status == SHELL_TOKENIZE_EOVERFLOW)
                ? 0
                : 1;
@@ -5706,9 +5708,10 @@ static int test_tokenizer_state(const char *input, size_t length) {
     shell_commands_free(commands, command_count);
     return 1;
   }
+  /* OK guarantees at least one command; command-free source reports BLANK. */
   if (command_count == 0) {
     shell_commands_free(commands, command_count);
-    return unsupported || !iterated.empty() ? 1 : 0;
+    return 1;
   }
   /* Unsupported semantics do not excuse a disappearing diagnostic token.
    * Reconcile both streams with the same source-proven structural omissions. */
@@ -5908,8 +5911,11 @@ static int test_transformer(const char *input, size_t input_length) {
 
   // Clean up on failure
   if (!success) {
+    /* Blank source has no command and returns no output. */
+    bool blank_leaked = status == SHELL_TRANSFORM_BLANK &&
+                        (transformed_cmds != NULL || transformed_count != 0);
     shell_transformed_command_list_free(transformed_cmds, transformed_count);
-    return 0;
+    return blank_leaked;
   }
 
   if ((transformed_cmds == NULL) != (transformed_count == 0)) {
@@ -6040,15 +6046,17 @@ static int test_processor(const char *input, size_t input_length) {
       &has_shell_features);
   bool extracted = extracted_status == SHELL_PROCESS_OK;
 
-  /* The flat processor preserves an empty lexical result for diagnostics,
-   * whereas a canonical netargv sequence requires source that contains a
-   * command. This is an intentional semantic boundary, not a differential
-   * parser failure. */
-  if (success && command_count == 0 && !extracted &&
-      extracted_status == SHELL_PROCESS_EINPUT && sequence.data == NULL &&
-      sequence_count == 0 && !has_shell_features) {
+  /* Blank source has no command. The flat processor and the canonical
+   * sequence builder both report BLANK, except that the builder treats
+   * zero-length input as invalid input. Neither returns any output. */
+  if (status == SHELL_PROCESS_BLANK) {
+    bool consistent =
+        command_count == 0 && infos == NULL && !extracted &&
+        (extracted_status == SHELL_PROCESS_BLANK ||
+         (input_length == 0 && extracted_status == SHELL_PROCESS_EINPUT)) &&
+        sequence.data == NULL && sequence_count == 0 && !has_shell_features;
     shell_command_infos_free(infos, command_count);
-    return 0;
+    return consistent ? 0 : 1;
   }
 
   /* The legacy flat processor preserves lexically useful but semantically
@@ -6187,14 +6195,13 @@ static int test_processor(const char *input, size_t input_length) {
     }
   }
 
-  /* shell_process_command permits a syntactically valid comment-only input
-   * with no command records; the descriptor-bearing API deliberately treats
-   * that as no command line. Its result contract is exercised for every
-   * material command below. */
+  /* OK guarantees at least one record; command-free source reports BLANK
+   * above. Its result contract is exercised for every material command
+   * below. */
   if (command_count == 0) {
     shell_command_infos_free(infos, command_count);
     shell_netstring_buffer_free(&sequence);
-    return expected_features != has_shell_features;
+    return 1;
   }
 
   shell_parse_result_t fast = {};
@@ -6261,6 +6268,7 @@ static int test_output_limits(const char *input, size_t input_length) {
   shell_process_status_t process_status = shell_process_command(
       input, input_length, &process_limits, &infos, &info_count);
   if (process_status != SHELL_PROCESS_OK &&
+      process_status != SHELL_PROCESS_BLANK &&
       process_status != SHELL_PROCESS_EINPUT &&
       process_status != SHELL_PROCESS_EPARSE &&
       process_status != SHELL_PROCESS_ENOMEM &&
@@ -6276,6 +6284,7 @@ static int test_output_limits(const char *input, size_t input_length) {
   shell_transform_status_t transform_status = shell_transform_command_line(
       input, input_length, &transform_limits, &transformed, &transformed_count);
   if (transform_status != SHELL_TRANSFORM_OK &&
+      transform_status != SHELL_TRANSFORM_BLANK &&
       transform_status != SHELL_TRANSFORM_EINPUT &&
       transform_status != SHELL_TRANSFORM_EPARSE &&
       transform_status != SHELL_TRANSFORM_ENOMEM &&

@@ -9,6 +9,11 @@
 extern "C" {
 #endif
 
+/* Every builder below returns SHELL_PROCESS_BLANK for valid source that has no
+ * command: whitespace, comments and escaped line endings only. That is not a
+ * parse error, and the outputs are empty exactly as for a failure. Zero-length
+ * input remains SHELL_PROCESS_EINPUT. */
+
 /* Build one outer netstring per isolated supported subcommand, containing its
  * canonical netargv. The outer sequence and every nested record are
  * length-delimited; payloads may contain NUL. Bash `time` prefixes are

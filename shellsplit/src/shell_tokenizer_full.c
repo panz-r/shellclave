@@ -3224,37 +3224,10 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
   if (expect_command && pipeline_prefix.time_mode != SHELL_PIPE_TIME_NONE)
     count++;
 
-  if (count == 0 && input_length != 0) {
-    bool has_non_whitespace = false;
-    size_t input_len = input_length;
-    for (size_t i = 0; i < input_len; i++) {
-      char c = input[i];
-      if (shell_source_space((unsigned char)c))
-        continue;
-
-      if (c == '&' && i + 1 < input_len &&
-          (input[i + 1] == '>' || input[i + 1] == '<')) {
-        i++; // skip the next char
-        continue;
-      }
-      if (c == '<' || c == '>') {
-        if (i + 1 < input_len && (input[i + 1] == '<' || input[i + 1] == '>')) {
-          i++; // skip the next char
-        }
-        continue;
-      }
-
-      has_non_whitespace = true;
-      break;
-    }
-    if (has_non_whitespace) {
-      return SHELL_TOKENIZE_EPARSE;
-    }
-  }
-
-  if (count == 0) {
-    return SHELL_TOKENIZE_OK;
-  }
+  /* Syntax was validated before tokenization, so a command-free source is
+   * empty rather than malformed. */
+  if (count == 0)
+    return SHELL_TOKENIZE_BLANK;
 
   if (count > SIZE_MAX / sizeof(shell_command_t))
     return SHELL_TOKENIZE_EOVERFLOW;

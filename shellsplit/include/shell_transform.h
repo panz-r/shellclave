@@ -65,7 +65,11 @@ typedef enum {
   SHELL_TRANSFORM_EPARSE,
   SHELL_TRANSFORM_ENOMEM,
   SHELL_TRANSFORM_EOVERFLOW,
-  SHELL_TRANSFORM_EOUTPUT_LIMIT
+  SHELL_TRANSFORM_EOUTPUT_LIMIT,
+  /* The source is valid but blank: empty, or only whitespace, comments and
+   * escaped line endings. There is no command to transform, which is not a
+   * parse error. Outputs are NULL and zero. */
+  SHELL_TRANSFORM_BLANK
 } shell_transform_status_t;
 
 /* Limits apply to each returned string and to the aggregate output of one
@@ -109,7 +113,8 @@ shell_transform_status_t shell_transform_command(
  * `[[ … ]]` predicates, dynamic/mutating arithmetic commands, `$"…"`, and `;&`
  * / `;;&` forms return SHELL_TRANSFORM_EPARSE.
  *
- * On failure, writable outputs are reset to NULL and zero.
+ * Blank source returns SHELL_TRANSFORM_BLANK. On failure or blank source,
+ * writable outputs are reset to NULL and zero.
  */
 shell_transform_status_t
 shell_transform_command_line(const char *command_line, size_t command_length,

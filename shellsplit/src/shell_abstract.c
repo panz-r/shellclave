@@ -997,6 +997,8 @@ abstract_command_parse_impl(const char *command, size_t command_length,
     return SHELL_ABSTRACT_ENOMEM;
   case SHELL_TOKENIZE_EOVERFLOW:
     return SHELL_ABSTRACT_EOVERFLOW;
+  case SHELL_TOKENIZE_BLANK:
+    return SHELL_ABSTRACT_BLANK;
   case SHELL_TOKENIZE_EPARSE:
   default:
     return SHELL_ABSTRACT_EPARSE;
@@ -1438,6 +1440,8 @@ abstract_command_parse(const char *command, size_t command_length,
   *out = NULL;
   shell_process_status_t validation =
       shell_process_validate_supported_source(command, command_length, NULL);
+  if (validation == SHELL_PROCESS_BLANK)
+    return SHELL_ABSTRACT_BLANK;
   if (validation == SHELL_PROCESS_EINPUT)
     return SHELL_ABSTRACT_EINPUT;
   if (validation == SHELL_PROCESS_EOUTPUT_LIMIT)

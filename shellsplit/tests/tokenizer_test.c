@@ -3954,9 +3954,10 @@ static void run_tokenizer_cases(const tokenizer_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool parsed = (shell_tokenize_commands(
-                       cases[i].input, strlen(cases[i].input), &commands,
-                       &command_count) == SHELL_TOKENIZE_OK);
+    bool parsed =
+        (shell_tokenize_commands(cases[i].input, strlen(cases[i].input),
+                                 &commands, &command_count) ==
+         (cases[i].command_count ? SHELL_TOKENIZE_OK : SHELL_TOKENIZE_BLANK));
     test(cases[i].name,
          parsed && command_count == cases[i].command_count &&
              tokens_are_consistent(cases[i].input, commands, command_count));
@@ -4015,10 +4016,11 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool parsed =
-        (shell_tokenize_commands(cases[i].tokenizer.input,
-                                 strlen(cases[i].tokenizer.input), &commands,
-                                 &command_count) == SHELL_TOKENIZE_OK);
+    bool parsed = (shell_tokenize_commands(cases[i].tokenizer.input,
+                                           strlen(cases[i].tokenizer.input),
+                                           &commands, &command_count) ==
+                   (cases[i].tokenizer.command_count ? SHELL_TOKENIZE_OK
+                                                     : SHELL_TOKENIZE_BLANK));
     unsigned features = 0;
     for (size_t j = 0; j < command_count; j++) {
       unsigned command_features =
@@ -4128,7 +4130,9 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
     shell_process_status_t process_status = shell_process_command(
         cases[i].input, strlen(cases[i].input), NULL, &infos, &command_count);
     bool has_shell_features = false;
-    bool processed = process_status == SHELL_PROCESS_OK;
+    bool processed =
+        process_status ==
+        (cases[i].command_count ? SHELL_PROCESS_OK : SHELL_PROCESS_BLANK);
     bool valid = processed && command_count == cases[i].command_count &&
                  (command_count == 0 || infos);
     for (size_t j = 0; infos && j < cases[i].command_count && j < command_count;
@@ -4188,9 +4192,10 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
   for (size_t i = 0; i < count; i++) {
     shell_transformed_command_t **commands = NULL;
     size_t command_count = 0;
-    bool transformed = shell_transform_command_line(
-                           cases[i].input, strlen(cases[i].input), NULL,
-                           &commands, &command_count) == SHELL_TRANSFORM_OK;
+    bool transformed =
+        shell_transform_command_line(cases[i].input, strlen(cases[i].input),
+                                     NULL, &commands, &command_count) ==
+        (cases[i].command_count ? SHELL_TRANSFORM_OK : SHELL_TRANSFORM_BLANK);
     bool valid = transformed && command_count == cases[i].command_count &&
                  (command_count == 0 || commands != NULL);
     for (size_t j = 0; valid && j < command_count; j++) {
@@ -5088,6 +5093,85 @@ static void test_processed_commands_preserve_comment_free_ranges(void) {
   test("Processed commands preserve comment-free fast ranges", valid);
 }
 
+static void test_tokenizer_empty_source_is_not_a_parse_error(void) {
+  static const char *const empty[] = {
+      "",
+      " \t\n",
+      "# just a comment",
+      "# <(printf data)\n",
+      "\\\n",
+      "\\\n # continued empty source\n \\\n",
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(empty) / sizeof(empty[0]); i++) {
+    shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
+    size_t count = SIZE_MAX;
+    valid = shell_tokenize_commands(empty[i], strlen(empty[i]), &commands,
+                                    &count) == SHELL_TOKENIZE_BLANK &&
+            commands == NULL && count == 0;
+  }
+  static const char invalid[] = "echo one |";
+  shell_command_t *commands = NULL;
+  size_t count = 0;
+  valid = valid && shell_tokenize_commands(invalid, strlen(invalid), &commands,
+                                           &count) == SHELL_TOKENIZE_EPARSE;
+  test("Valid source without commands is empty, not a parse error", valid);
+}
+
+/* Blank source is valid but has no command: every command-line API reports
+ * BLANK rather than success with nothing, or a parse error. Zero-length input
+ * stays invalid input where the strict parser defines it so. */
+static void test_blank_source_convention(void) {
+  static const char *const blank[] = {
+      " \t\n",
+      "# comment",
+      "# <(printf data)\n",
+      "\\\n",
+      "\\\n # continued empty source\n \\\n",
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(blank) / sizeof(blank[0]); i++) {
+    const char *source = blank[i];
+    size_t length = strlen(source);
+
+    shell_transformed_command_t **transformed =
+        (shell_transformed_command_t **)(uintptr_t)1;
+    size_t transformed_count = SIZE_MAX;
+    valid = shell_transform_command_line(source, length, NULL, &transformed,
+                                         &transformed_count) ==
+                SHELL_TRANSFORM_BLANK &&
+            transformed == NULL && transformed_count == 0;
+
+    shell_abstract_command_t *abstract =
+        (shell_abstract_command_t *)(uintptr_t)1;
+    valid = valid &&
+            shell_abstract_command_parse(source, length, &abstract) ==
+                SHELL_ABSTRACT_BLANK &&
+            abstract == NULL;
+
+    shell_netstring_buffer_t argv = {0}, command = {0}, type = {0},
+                             anomaly_command = {0}, anomaly_type = {0};
+    size_t count = SIZE_MAX;
+    bool features = true;
+    valid =
+        valid &&
+        shell_build_netargv_sequence_buffer(source, length, NULL, &argv, &count,
+                                            &features) == SHELL_PROCESS_BLANK &&
+        argv.data == NULL && argv.length == 0 && count == 0 && !features &&
+        shell_build_command_netseq_buffer(source, length, NULL, &command,
+                                          &count) == SHELL_PROCESS_BLANK &&
+        command.data == NULL && command.length == 0 && count == 0 &&
+        shell_build_type_netseq_buffer(source, length, NULL, &type, &count) ==
+            SHELL_PROCESS_BLANK &&
+        type.data == NULL && type.length == 0 && count == 0 &&
+        shell_build_anomaly_netseqs_buffer(source, length, NULL,
+                                           &anomaly_command, &anomaly_type,
+                                           &count) == SHELL_PROCESS_BLANK &&
+        anomaly_command.data == NULL && anomaly_type.data == NULL && count == 0;
+  }
+  test("Blank source is reported as BLANK by every command-line API", valid);
+}
+
 static void test_processed_comment_only_source_is_empty(void) {
   static const char *const cases[] = {
       "# comment-only source",
@@ -5104,13 +5188,14 @@ static void test_processed_comment_only_source_is_empty(void) {
         shell_parse_fast(cases[i], strlen(cases[i]), NULL, &fast) == SHELL_OK &&
         fast.count == 0 && fast.status == SHELL_STATUS_OK &&
         shell_process_commands(cases[i], strlen(cases[i]), NULL, &processed) ==
-            SHELL_PROCESS_EPARSE &&
+            SHELL_PROCESS_BLANK &&
         processed.commands == NULL && processed.command_count == 0 &&
         processed.groups == NULL && processed.group_count == 0 &&
         processed.group_io_ops == NULL && processed.group_io_op_count == 0;
     shell_processed_commands_free(&processed);
   }
-  test("Structured processing rejects trivia-only source without records",
+  test("Structured processing reports trivia-only source as blank without "
+       "records",
        valid);
   /* Backslash-CR retains a command word, unlike a backslash-LF continuation. */
   static const char nonblank[] = " \\\n \\\r\n \t";
@@ -9334,6 +9419,8 @@ int main(void) {
   test_structured_processor_requires_complete_syntax();
   test_tolerant_unfinished_group_omits_empty_command();
   test_processed_commands_preserve_comment_free_ranges();
+  test_tokenizer_empty_source_is_not_a_parse_error();
+  test_blank_source_convention();
   test_processed_comment_only_source_is_empty();
   test_posix_brace_group_sequence();
   test_posix_brace_group_forms();
@@ -10118,8 +10205,8 @@ int main(void) {
       const char *source;
       shell_transform_status_t status;
     } cases[] = {
-        {"", SHELL_TRANSFORM_OK},
-        {" \t", SHELL_TRANSFORM_OK},
+        {"", SHELL_TRANSFORM_BLANK},
+        {" \t", SHELL_TRANSFORM_BLANK},
         {"\x01"
          "cmd",
          SHELL_TRANSFORM_EINPUT},
@@ -10499,8 +10586,22 @@ int main(void) {
     shell_process_status_t process_result =
         shell_process_command("", 0, NULL, &infos, &count);
     bool process_valid =
-        process_result == SHELL_PROCESS_OK && infos == NULL && count == 0;
-    test("Processor: empty input produces no lexical records", process_valid);
+        process_result == SHELL_PROCESS_BLANK && infos == NULL && count == 0;
+    test("Processor: empty input is blank and produces no lexical records",
+         process_valid);
+
+    static const char *const blank[] = {" \t\n", "# comment", "\\\n"};
+    bool blank_valid = true;
+    for (size_t i = 0; i < sizeof(blank) / sizeof(blank[0]); i++) {
+      infos = (shell_command_info_t *)(uintptr_t)1;
+      count = SIZE_MAX;
+      blank_valid =
+          blank_valid &&
+          shell_process_command(blank[i], strlen(blank[i]), NULL, &infos,
+                                &count) == SHELL_PROCESS_BLANK &&
+          infos == NULL && count == 0;
+    }
+    test("Processor: trivia-only source is blank in the flat API", blank_valid);
 
     infos = (shell_command_info_t *)(uintptr_t)1;
     count = SIZE_MAX;

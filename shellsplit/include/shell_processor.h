@@ -190,7 +190,11 @@ typedef enum {
   SHELL_PROCESS_EPARSE,
   SHELL_PROCESS_ENOMEM,
   SHELL_PROCESS_EOVERFLOW,
-  SHELL_PROCESS_EOUTPUT_LIMIT
+  SHELL_PROCESS_EOUTPUT_LIMIT,
+  /* The source is valid but blank: empty, or only whitespace, comments and
+   * escaped line endings. It has no command record to return, which is not a
+   * parse error. Outputs are cleared exactly as for a failure. */
+  SHELL_PROCESS_BLANK
 } shell_process_status_t;
 
 /* Limits apply to each returned string, aggregate output, and compound-group
@@ -244,7 +248,8 @@ typedef struct {
  * fall-through `;&` / `;;&`) also return SHELL_PROCESS_EPARSE. Supported
  * compound groups contain simple-command lists, pipelines, and nested
  * brace/subshell groups; callers must not infer support for control compounds
- * from group support. On failure, writable outputs are set to NULL and zero.
+ * from group support. Blank source returns SHELL_PROCESS_BLANK. On failure or
+ * blank source, writable outputs are set to NULL and zero.
  */
 shell_process_status_t
 shell_process_command(const char *command_line, size_t command_length,
@@ -261,7 +266,9 @@ shell_process_command(const char *command_line, size_t command_length,
  * Redirect-only simple
  * operations are omitted from `result->commands` as documented on
  * shell_processed_commands_t. Control compounds return SHELL_PROCESS_EPARSE.
- * The result owns all returned storage and is cleared on failure. */
+ * Valid blank source (empty, whitespace, comments, escaped line endings) has no
+ * command record and returns SHELL_PROCESS_BLANK, not a parse error.
+ * The result owns all returned storage and is cleared on failure or blank. */
 shell_process_status_t
 shell_process_commands(const char *command_line, size_t command_length,
                        const shell_process_limits_t *limits,

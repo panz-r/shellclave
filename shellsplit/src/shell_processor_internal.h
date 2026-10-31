@@ -105,9 +105,11 @@ void shell_anomaly_stages_free(shell_anomaly_stages_t *stages);
 
 /* Validate that complete source is representable by Shellsplit's semantic
  * command model. `parsed` is optional; when supplied it receives the strict
- * fast-parser result used for validation. The flat API uses this model for
- * complete compound groups, then retains its intentionally tolerant lexical
- * fallback for incomplete parenthesized input. */
+ * fast-parser result used for validation. Valid source with no command range
+ * (whitespace, comments, escaped line endings) returns SHELL_PROCESS_BLANK, so
+ * SHELL_PROCESS_OK guarantees at least one range. The flat API uses this model
+ * for complete compound groups, then retains its intentionally tolerant
+ * lexical fallback for incomplete parenthesized input. */
 shell_process_status_t shell_process_validate_supported_source(
     const char *command_line, size_t command_length,
     shell_parse_result_t *parsed) SHELL_NONNULL(1);

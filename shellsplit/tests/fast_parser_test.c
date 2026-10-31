@@ -3787,7 +3787,7 @@ static void test_transform_contract_boundaries(void) {
   size_t count = SIZE_MAX;
   valid = valid &&
           shell_transform_command_line("", 0, NULL, &commands, &count) ==
-              SHELL_TRANSFORM_OK &&
+              SHELL_TRANSFORM_BLANK &&
           commands == NULL && count == 0;
   test("Transform contracts retain expansion and output boundaries", valid);
 }

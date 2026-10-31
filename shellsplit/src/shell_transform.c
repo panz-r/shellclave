@@ -435,6 +435,8 @@ static SHELL_NONNULL(1, 4, 5) shell_transform_status_t
                                             true, &cmds, &cmd_count)) {
   case SHELL_TOKENIZE_OK:
     break;
+  case SHELL_TOKENIZE_BLANK:
+    return SHELL_TRANSFORM_BLANK;
   case SHELL_TOKENIZE_ENOMEM:
     return SHELL_TRANSFORM_ENOMEM;
   case SHELL_TOKENIZE_EOVERFLOW:
@@ -444,10 +446,6 @@ static SHELL_NONNULL(1, 4, 5) shell_transform_status_t
   case SHELL_TOKENIZE_EPARSE:
   default:
     return SHELL_TRANSFORM_EPARSE;
-  }
-
-  if (cmd_count == 0) {
-    return SHELL_TRANSFORM_OK;
   }
 
   if (cmd_count > SIZE_MAX / sizeof(shell_transformed_command_t *)) {

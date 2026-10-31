@@ -500,7 +500,7 @@ static SHELL_NONNULL(1) shell_process_status_t
   if (shell_tokenizer_has_unsupported_semantics(command_line, command_length))
     return SHELL_PROCESS_EPARSE;
   if (error == SHELL_OK)
-    return SHELL_PROCESS_OK;
+    return target->count == 0 ? SHELL_PROCESS_BLANK : SHELL_PROCESS_OK;
   return error == SHELL_ETRUNC ? SHELL_PROCESS_EOUTPUT_LIMIT
                                : SHELL_PROCESS_EPARSE;
 }
@@ -541,6 +541,7 @@ static SHELL_NONNULL(1, 4, 5) shell_process_status_t
                                               commands, count);
   switch (tokenized) {
   case SHELL_TOKENIZE_OK:
+  case SHELL_TOKENIZE_BLANK:
     break;
   case SHELL_TOKENIZE_ENOMEM:
     return SHELL_PROCESS_ENOMEM;
@@ -1286,7 +1287,7 @@ static SHELL_NONNULL(1, 5, 6) shell_process_status_t
 
   if (basic_count == 0) {
     shell_commands_free(basic_commands, basic_count);
-    return SHELL_PROCESS_OK;
+    return SHELL_PROCESS_BLANK;
   }
 
   if (basic_count > SIZE_MAX / sizeof(shell_command_info_t)) {
@@ -1932,13 +1933,9 @@ static SHELL_NONNULL(1, 4, 6) shell_process_status_t
                                       const shell_parse_result_t *parsed,
                                       bool retain_empty,
                                       shell_processed_commands_t *result) {
-  /* This structured result describes executable simple-command records. A
-   * syntactically valid comment-only source has no such record and therefore
-   * is not a successful structured-processing result. Keep this distinct
-   * from shell_process_validate_supported_source(), whose narrower contract
-   * is grammar validation rather than result production. */
-  if (parsed->count == 0)
-    return SHELL_PROCESS_EPARSE;
+  /* `parsed` came from a source accepted by
+   * shell_process_validate_supported_source(), which reports blank source as
+   * BLANK, so it describes at least one range. */
   /* Project every source-range boundary into the retained command array.
    * Prefix counts also preserve the insertion position of empty groups;
    * group remapping never rescans ranges or reconstructs source membership. */

@@ -215,6 +215,10 @@ typedef enum {
   SHELL_TOKENIZE_EPARSE,
   SHELL_TOKENIZE_ENOMEM,
   SHELL_TOKENIZE_EOVERFLOW,
+  /* The source is valid but contains no command: it is empty or consists only
+   * of whitespace, comments and escaped line endings. This is not a parse
+   * error. Outputs are NULL and 0. */
+  SHELL_TOKENIZE_BLANK,
 } shell_tokenize_status_t;
 
 /**
@@ -228,6 +232,7 @@ typedef enum {
  * final body record; delimiters and empty structural slots do not become
  * separate records. A separately written redirect-only command still has
  * tokens and its own record, even though it has no argv words.
+ * Valid source without any command returns SHELL_TOKENIZE_BLANK.
  * On failure, writable outputs are NULL and 0.
  * Bounded syntax-analysis exhaustion returns SHELL_TOKENIZE_EOVERFLOW,
  * including limits reached inside executable substitutions or heredocs.
