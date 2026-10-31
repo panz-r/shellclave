@@ -384,7 +384,10 @@ typedef struct {
  * ranges are not a guarantee that the source can be modeled semantically.
  * SHELL_EPARSE is a coarse failure code, including unsupported byte domains;
  * it does not prove a Bash syntax error. Use shell_parse_draft() from
- * shell_source.h for typed syntax/unsupported/input/resource classification.
+ * shell_source.h for typed syntax/unsupported/input/resource classification;
+ * on a rejection it also locates an unfinished construct (incomplete_at) or
+ * the offending token (invalid_at). Strict parsing keeps no bookkeeping for
+ * that, so accepted input pays nothing: explain a rejection only after it.
  */
 shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                                const shell_limits_t *limits,

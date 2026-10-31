@@ -17,6 +17,9 @@ typedef struct {
   uint32_t last_redirect[SHELL_SOURCE_MAX_HEADERS];
   shell_redirect_word_t redirect_word;
   shell_source_status_t failure;
+  /* Root-relative position of the first token that proved a grammar error. */
+  uint32_t invalid_at;
+  bool invalid_located;
 } source_collector_t;
 
 /* One lexical body's recovery facts. Record spans remain root-relative;
@@ -35,6 +38,15 @@ static SHELL_NONNULL(1) void need(source_body_t *body, shell_source_need_t kind,
   if (body->grammar.need == SHELL_SOURCE_NEEDS_NONE) {
     body->grammar.need = kind;
     body->grammar.incomplete_at = (uint32_t)(at - body->base);
+  }
+}
+
+/* Record the innermost located error: a child body reports first. at is
+ * root-relative. */
+static SHELL_NONNULL(1) void invalid(source_collector_t *collector, size_t at) {
+  if (!collector->invalid_located) {
+    collector->invalid_at = (uint32_t)at;
+    collector->invalid_located = true;
   }
 }
 
@@ -138,6 +150,8 @@ static SHELL_NONNULL(1, 2) bool collect_expansions(
                                             : SHELL_SOURCE_END_PARENTHESIZED);
     if (status != SHELL_SOURCE_COMPLETE) {
       collector->failure = status;
+      if (status == SHELL_SOURCE_INVALID && child.grammar.invalid_located)
+        invalid(collector, child.base + child.grammar.invalid_at);
       return false;
     }
   }
@@ -169,6 +183,8 @@ static SHELL_NONNULL(1, 2) bool collect_expansions(
         collector, &child, received, depth + 1, SHELL_SOURCE_END_OPEN_CHILD);
     if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE) {
       collector->failure = status;
+      if (status == SHELL_SOURCE_INVALID && child.grammar.invalid_located)
+        invalid(collector, child.base + child.grammar.invalid_at);
       return false;
     }
   }
@@ -246,6 +262,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       header_finish(collector, current, base + start);
       if (!group_count) {
         collector->failure = SHELL_SOURCE_INVALID;
+        invalid(collector, base + start);
         return false;
       }
       current = groups[--group_count];
@@ -343,6 +360,8 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
         collector->failure = condition.frame == SHELL_CONDITIONAL_INVALID
                                  ? SHELL_SOURCE_INVALID
                                  : SHELL_SOURCE_UNSUPPORTED;
+        if (condition.frame == SHELL_CONDITIONAL_INVALID)
+          invalid(collector, base + start);
         return false;
       }
       shell_source_header_t *header = &out->headers[current];
@@ -480,11 +499,12 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
           shell_source_probe_heredoc_delimiter(source, length, &after_operator,
                                                &partial);
       if (delimiter_status != SHELL_HEREDOC_WORD_INCOMPLETE) {
-        if (delimiter_status == SHELL_HEREDOC_WORD_MISSING)
+        if (delimiter_status == SHELL_HEREDOC_WORD_MISSING) {
           collector->failure = SHELL_SOURCE_INVALID;
-        else if (delimiter_status == SHELL_HEREDOC_WORD_COMPLETE &&
-                 lexer.heredoc_error &&
-                 lexer.pending_heredoc_count == SHELL_MAX_SUBCOMMANDS)
+          invalid(collector, base + start);
+        } else if (delimiter_status == SHELL_HEREDOC_WORD_COMPLETE &&
+                   lexer.heredoc_error &&
+                   lexer.pending_heredoc_count == SHELL_MAX_SUBCOMMANDS)
           collector->failure = SHELL_SOURCE_TRUNCATED;
         return false;
       }
@@ -593,6 +613,7 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
                                         const shell_limits_t *limits,
                                         shell_source_result_t *out) {
   memset(out, 0, sizeof(*out));
+  out->invalid_at = UINT32_MAX;
   if (length > UINT32_MAX)
     return SHELL_SOURCE_TRUNCATED;
   shell_source_operation_begin(source, length);
@@ -609,6 +630,12 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
   out->prefix_length = root.grammar.prefix_length;
   out->incomplete_at = root.grammar.incomplete_at;
   out->need = root.grammar.need;
+  if (status == SHELL_SOURCE_INVALID) {
+    if (collector.invalid_located)
+      out->invalid_at = collector.invalid_at;
+    else if (root.grammar.invalid_located)
+      out->invalid_at = root.grammar.invalid_at;
+  }
   if (status == SHELL_SOURCE_COMPLETE)
     out->prefix_length = (uint32_t)length;
   if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE)
@@ -637,6 +664,8 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
 done:
   if (shell_source_scratch_exhausted())
     status = SHELL_SOURCE_TRUNCATED;
+  if (status != SHELL_SOURCE_INVALID)
+    out->invalid_at = UINT32_MAX;
   if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE) {
     memset(&out->prefix, 0, sizeof(out->prefix));
     out->prefix_length = out->tail_start = 0;

@@ -5814,12 +5814,79 @@ static void cwd(void) {
   }
 }
 
+/* Strict parsing reports only EPARSE and keeps no bookkeeping for why. The
+ * draft classifier explains a rejection on demand: INCOMPLETE names the
+ * missing construct, INVALID locates the offending token. Each invalid
+ * position is the token the pinned Bash names in its "syntax error near
+ * unexpected token" message, and each incomplete source is its "unexpected
+ * EOF" error. */
+static void strict_rejections_are_explained(void) {
+  static const struct {
+    const char *source;
+    shell_source_status_t status;
+    shell_source_need_t need; /* INCOMPLETE only */
+    uint32_t at;              /* incomplete_at, or invalid_at for INVALID */
+    char token;               /* the offending byte, INVALID only */
+  } cases[] = {
+      {"}", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 0, '}'},
+      {"echo a; }", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 8, '}'},
+      {"echo )", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 5, ')'},
+      {"echo a ; ; echo", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 9,
+       ';'},
+      {"echo a && && echo", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 10,
+       '&'},
+      {"echo a | | b", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 9, '|'},
+      {"( echo a ) }", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 11, '}'},
+      {"{ echo a; )", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 10, ')'},
+      /* Inside a substitution the position is still root-relative. */
+      {"echo $( } )", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 8, '}'},
+      {"echo $(echo ) )", SHELL_SOURCE_INVALID, SHELL_SOURCE_NEEDS_NONE, 14,
+       ')'},
+      {"'abc", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_QUOTE, 0, 0},
+      {"echo \"a b", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_QUOTE, 5, 0},
+      {"echo $(date", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_SUBSTITUTION,
+       5, 0},
+      {"{ echo a;", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_GROUP, 0, 0},
+      {"echo a |", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_COMMAND, 7, 0},
+      {"echo >", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_REDIRECT, 5, 0},
+  };
+  shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+  strict.strict_mode = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    size_t length = strlen(cases[i].source);
+    shell_parse_result_t parsed;
+    CHECK(shell_parse_fast(cases[i].source, length, &strict, &parsed) ==
+          SHELL_EPARSE);
+    CHECK(shell_parse_draft(cases[i].source, length, NULL, &draft) ==
+          cases[i].status);
+    if (cases[i].status == SHELL_SOURCE_INVALID) {
+      CHECK(draft.invalid_at == cases[i].at &&
+            cases[i].source[draft.invalid_at] == cases[i].token);
+      CHECK(draft.need == SHELL_SOURCE_NEEDS_NONE);
+    } else {
+      CHECK(draft.need == cases[i].need && draft.incomplete_at == cases[i].at);
+      CHECK(draft.invalid_at == UINT32_MAX);
+    }
+  }
+  /* Accepted and unclassified sources carry no location. */
+  CHECK(shell_parse_draft("echo ok", 7, NULL, &draft) ==
+            SHELL_SOURCE_COMPLETE &&
+        draft.invalid_at == UINT32_MAX);
+  /* A word the decoder rejects is explained by the same call. */
+  size_t decoded_length = 0;
+  CHECK(shell_measure_decoded_word("'abc", 4, &decoded_length) ==
+        SHELL_PROCESS_EPARSE);
+  CHECK(shell_parse_draft("'abc", 4, NULL, &draft) == SHELL_SOURCE_INCOMPLETE &&
+        draft.need == SHELL_SOURCE_NEEDS_QUOTE && draft.incomplete_at == 0);
+}
+
 int main(void) {
   shellsplit_graph_fixture_t fixture;
   CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 8192,
                                       0, false, 0));
   limits = fixture.limits;
   heredocs();
+  strict_rejections_are_explained();
   byte_domains();
   word_byte_source();
   ansi_byte_source();

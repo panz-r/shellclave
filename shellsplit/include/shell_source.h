@@ -191,10 +191,23 @@ typedef struct {
  * reserved time is misplaced pipeline syntax and the draft is INVALID.
  * INVALID_INPUT rejects embedded NUL. These outcomes and TRUNCATED clear
  * prefix qualification and every header's completeness.
+ *
+ * Explaining a strict rejection: strict parsing reports only EPARSE, and keeps
+ * no per-token bookkeeping to say why, so valid input pays nothing for
+ * diagnostics. To explain a rejected source, run shell_parse_draft() on it
+ * afterward. INCOMPLETE names the missing construct (need) and where it began
+ * (incomplete_at), as for an unterminated quote or group; INVALID may locate
+ * the offending token (invalid_at). Both are best-effort hints, not a Bash
+ * message, and the same call explains a word rejected by the word decoder.
  */
 typedef struct shell_source_result {
   shell_parse_result_t prefix;
   uint32_t prefix_length, tail_start, incomplete_at;
+  /* For INVALID, the start of the token that proved the grammar invalid when
+   * the classifier located one (a misplaced closer or operator, say), else
+   * UINT32_MAX. It is UINT32_MAX for every other status. Unlike incomplete_at
+   * it does not describe missing grammar: appending cannot repair it. */
+  uint32_t invalid_at;
   shell_source_need_t need;
   shell_source_header_t headers[SHELL_SOURCE_MAX_HEADERS];
   shell_source_redirect_t redirects[SHELL_SOURCE_MAX_REDIRECTS];

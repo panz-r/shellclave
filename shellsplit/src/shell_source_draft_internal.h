@@ -10,6 +10,11 @@ typedef struct {
   /* A complete delimiter is awaiting implicit document termination at this
    * body's EOF. This is distinct from an absent or unfinished delimiter. */
   bool heredoc_eof;
+  /* Position of the token that proved the grammar invalid, relative to this
+   * body's source, when the classifier located one. Recorded only on the
+   * failure path, so correct syntax pays nothing for it. */
+  uint32_t invalid_at;
+  bool invalid_located;
 } shell_source_draft_state_t;
 
 typedef enum {

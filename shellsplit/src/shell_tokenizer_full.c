@@ -2044,6 +2044,18 @@ static void shell_list_draft_checkpoint(shell_source_draft_state_t *draft,
     draft->prefix_length = (uint32_t)position;
 }
 
+/* Reject with a grammar error and, for a draft, remember which token proved
+ * it. This runs only on the failure path, so accepted input never pays for the
+ * hint. The position is relative to this body's source. */
+static shell_error_t list_invalid_at(shell_source_draft_state_t *draft,
+                                     size_t position) {
+  if (draft && !draft->invalid_located) {
+    draft->invalid_at = (uint32_t)position;
+    draft->invalid_located = true;
+  }
+  return SHELL_EPARSE;
+}
+
 static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     const char *input, size_t input_length,
     shell_list_end_context_t end_context, size_t recursion_depth,
@@ -2124,7 +2136,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
       if (draft)
         draft->failure = SHELL_SOURCE_UNSUPPORTED;
       if (draft)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
     }
     bool redirect_word = state.redirect_operand;
 
@@ -2133,7 +2145,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
      * command-position role nevertheless proves an unmatched close. */
     if (!literal_token && state.needs_stage &&
         token_is_plain_word(input, input_length, &token, "}"))
-      return SHELL_EPARSE;
+      return list_invalid_at(draft, token.position);
 
     /* Case terminators are not separators in an ordinary command list.
      * Actual control constructs took their diagnostic path above. Reject a
@@ -2147,13 +2159,13 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
                              word_end == input_length;
       if (!pending_keyword) {
         draft->failure = SHELL_SOURCE_UNSUPPORTED;
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       }
     }
     if (!literal_token && (token.type == SHELL_TOKEN_CASE_TERMINATE ||
                            token.type == SHELL_TOKEN_CASE_FALLTHROUGH ||
                            token.type == SHELL_TOKEN_CASE_TEST_NEXT))
-      return SHELL_EPARSE;
+      return list_invalid_at(draft, token.position);
 
     /* The iterator retains source spans, so a bare escaped line ending can
      * appear as an argument token. It is grammar rather than a command word
@@ -2195,12 +2207,12 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
        * never supplies a redirect word. Escaped line endings were consumed
        * above and therefore remain valid continuations. */
       if (shell_list_token_is_newline(&token))
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       if (token.position != state.redirect_operator_end &&
           shell_source_skip_inline_continuations(input, token.position,
                                                  state.redirect_operator_end) !=
               token.position)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       /* Operators are complete longest-match tokens. An adjacent operator
        * cannot replace this operator's missing shell-word operand. */
       if (!literal_token &&
@@ -2214,7 +2226,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
            token.type == SHELL_TOKEN_BACKGROUND ||
            token.type == SHELL_TOKEN_GROUP_START ||
            token.type == SHELL_TOKEN_SUBSHELL_START))
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       state.redirect_operand = false;
       state.redirect_operator_end = 0;
     }
@@ -2252,7 +2264,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
              token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
              token.type == SHELL_TOKEN_SEMICOLON ||
              token.type == SHELL_TOKEN_BACKGROUND))
-          return SHELL_EPARSE;
+          return list_invalid_at(draft, token.position);
         state.group_redirect_operand = false;
         state.group_redirect_word_open = true;
         state.group_redirect_word_end = token.position + token.length;
@@ -2286,13 +2298,13 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
            token.type != SHELL_TOKEN_AND && token.type != SHELL_TOKEN_OR &&
            token.type != SHELL_TOKEN_SEMICOLON &&
            token.type != SHELL_TOKEN_BACKGROUND))
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       /* A containing-group closer is handled below.  Separators clear this
        * state through their ordinary transition. */
     }
     if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       if (!state.needs_stage || state.redirect_operand)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       shell_conditional_t condition =
           shell_conditional_parse(input, input_length, token.position);
       if (condition.frame == SHELL_CONDITIONAL_LIMIT) {
@@ -2303,10 +2315,10 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
       if (condition.frame == SHELL_CONDITIONAL_UNSUPPORTED) {
         if (draft)
           draft->failure = SHELL_SOURCE_UNSUPPORTED;
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       }
       if (condition.frame == SHELL_CONDITIONAL_INVALID)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       if (condition.frame == SHELL_CONDITIONAL_INCOMPLETE) {
         if (!draft)
           return !require_complete ? SHELL_OK : SHELL_EPARSE;
@@ -2332,7 +2344,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     }
     if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       if (!state.needs_stage || state.redirect_operand)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       if (tokenizer.in_arithmetic) {
         /* Diagnostics tolerate the unfinished expression, but it consumes
          * the rest of the source, so an open brace group cannot close. */
@@ -2366,7 +2378,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
        * substitutions are opaque word tokens. A raw preceding '$' does not
        * prove substitution: it may have been escaped. */
       if (!state.needs_stage)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       if (group_count == SHELL_MAX_GROUPS) {
         if (draft)
           draft->failure = SHELL_SOURCE_TRUNCATED;
@@ -2384,11 +2396,11 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     if (!literal_token && (token.type == SHELL_TOKEN_GROUP_END ||
                            token.type == SHELL_TOKEN_SUBSHELL_END)) {
       if (group_count == 0)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       shell_list_group_state_t group = groups[--group_count];
       if ((input[group.opening_position] == '(' && token.start[0] != ')') ||
           (input[group.opening_position] == '{' && token.start[0] != '}'))
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       /* `name()` is a function declaration marker, not an empty subshell.
        * Preserve its lexical classification while control-flow/function
        * semantics remain outside the canonical model. */
@@ -2397,7 +2409,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
           group.opening_position + 1 == token.position &&
           !group.parent.needs_stage;
       if (state.needs_stage && !state.may_end && !empty_function_marker)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       state = group.parent;
       state.needs_stage = false;
       state.pipeline_start = false;
@@ -2422,7 +2434,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     if (!literal_token && token.type == SHELL_TOKEN_PIPE_NEGATE &&
         state.needs_stage) {
       if (!state.pipeline_start)
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       if (shell_pipeline_prefix_step(&state.prefix,
                                      SHELL_PIPE_PREFIX_WORD_NEGATE) ==
           SHELL_PIPE_PREFIX_OVERFLOW)
@@ -2439,7 +2451,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     if (!literal_token && state.needs_stage && !state.pipeline_start &&
         tokenizer.lexical_command_position &&
         token_is_plain_word(input, input_length, &token, "time"))
-      return SHELL_EPARSE;
+      return list_invalid_at(draft, token.position);
 
     if (!literal_token && state.needs_stage && state.pipeline_start) {
       shell_pipeline_prefix_step_t step = shell_pipeline_prefix_step(
@@ -2461,7 +2473,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
           state.prefix.time_mode == SHELL_PIPE_TIME_NONE) {
         if (draft)
           draft->failure = SHELL_SOURCE_UNSUPPORTED;
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       }
       if (state.prefix.time_mode != SHELL_PIPE_TIME_NONE) {
         state = shell_list_state_initial();
@@ -2487,7 +2499,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
             (token.type == SHELL_TOKEN_SEMICOLON ||
              token.type == SHELL_TOKEN_BACKGROUND))
           draft->failure = SHELL_SOURCE_UNSUPPORTED;
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       }
       state.needs_stage = true;
       state.pipeline_start =
@@ -2518,7 +2530,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
                                &word_end)) {
         if (word_end != input_length || !can_append) {
           draft->failure = SHELL_SOURCE_UNSUPPORTED;
-          return SHELL_EPARSE;
+          return list_invalid_at(draft, token.position);
         }
         draft->need = SHELL_SOURCE_NEEDS_COMMAND;
         draft->incomplete_at = (uint32_t)token.position;
@@ -2527,7 +2539,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
       if (control_token_starts_function_definition(&token, input,
                                                    input_length)) {
         draft->failure = SHELL_SOURCE_UNSUPPORTED;
-        return SHELL_EPARSE;
+        return list_invalid_at(draft, token.position);
       }
     }
     if (!shell_token_type_is_redirection(token.type) &&
