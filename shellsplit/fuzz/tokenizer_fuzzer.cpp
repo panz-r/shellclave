@@ -48,9 +48,11 @@
 extern "C" {
 #include "../src/shell_depgraph_internal.h"
 #include "../src/shell_semantics_internal.h"
-#include "../src/shell_source_internal.h"
+#include "../src/shell_source_lexical_internal.h"
+#include "../src/shell_source_runtime_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 #include "shell_source.h"
+#include "source_word_probe.h"
 
 static const size_t MAX_INPUT_SIZE = 8192;
 static int g_verbose = 0;
@@ -8866,7 +8868,7 @@ static void run_fixed_oracles() {
     char source[256];
     int length = snprintf(source, sizeof(source), "echo %s", fixture.word);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(source) ||
-        shell_source_word_has_glob(fixture.word, strlen(fixture.word)) !=
+        fuzz_source_word_has_glob(fixture.word, strlen(fixture.word)) !=
             fixture.glob ||
         (shell_classify_raw_token(fixture.word, strlen(fixture.word)) ==
          SHELL_TOKEN_GLOB) != fixture.glob ||
@@ -8973,7 +8975,7 @@ static void run_fixed_oracles() {
   for (const auto &fixture : shellsplit_test_parameter_words) {
     const char *name = nullptr;
     size_t length = 0;
-    bool matched = shell_source_word_parameter_name(
+    bool matched = fuzz_source_word_parameter_name(
         fixture.word, strlen(fixture.word), &name, &length);
     if (matched != (fixture.name != nullptr) ||
         (matched && (length != strlen(fixture.name) ||

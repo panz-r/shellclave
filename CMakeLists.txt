@@ -907,7 +907,9 @@ if(SHELLCLAVE_BUILD_FUZZERS)
     shellclave_stage_smoke_seeds("${fuzzer_name}")
   endforeach()
 
-  add_executable(fuzz_shellsplit shellsplit/fuzz/tokenizer_fuzzer.cpp)
+  add_executable(fuzz_shellsplit shellsplit/fuzz/tokenizer_fuzzer.cpp
+    shellsplit/fuzz/source_word_probe.c)
+  shellclave_project_target(fuzz_shellsplit)
   target_compile_features(fuzz_shellsplit PRIVATE cxx_std_11)
   target_include_directories(fuzz_shellsplit PRIVATE shellsplit/tests)
   target_compile_options(fuzz_shellsplit PRIVATE -fsanitize=fuzzer,address,undefined)
