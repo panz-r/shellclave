@@ -6173,9 +6173,12 @@ static int test_processor(const char *input, size_t input_length) {
     return 0;
   }
 
+  /* The flat view keeps a simple record with no command words, such as a
+   * bare `time`; the canonical sequence has no entry for it. */
   size_t policy_count = 0;
   for (size_t i = 0; i < command_count; ++i)
-    policy_count += infos[i].kind == SHELL_COMMAND_SIMPLE;
+    policy_count += infos[i].kind == SHELL_COMMAND_SIMPLE &&
+                    infos[i].command_token_count != 0;
   if ((infos == NULL) != (command_count == 0) || (sequence.data == NULL) ||
       sequence_count != policy_count) {
     if (g_verbose)
