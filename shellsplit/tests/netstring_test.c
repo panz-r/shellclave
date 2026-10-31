@@ -161,6 +161,38 @@ static void test_stream_reader(void) {
   fclose(stream);
 }
 
+static void test_stream_reader_bounds_prefix_digits(void) {
+  FILE *stream = tmpfile();
+  unsigned char *record = NULL;
+  size_t length = 0;
+  TEST("open prefix stream", stream != NULL);
+  if (!stream)
+    return;
+  for (int i = 0; i < 4096; i++)
+    fputc('0', stream);
+  fputs(":,", stream);
+  rewind(stream);
+  TEST("stream rejects leading zeros at the second digit",
+       shell_netstring_read_stream(stream, 0, &record, &length) ==
+               SHELL_NETSTRING_EFORMAT &&
+           record == NULL && length == 0 && ftell(stream) == 2);
+  fclose(stream);
+
+  stream = tmpfile();
+  TEST("open overflow prefix stream", stream != NULL);
+  if (!stream)
+    return;
+  for (int i = 0; i < 4096; i++)
+    fputc('9', stream);
+  fputs(":,", stream);
+  rewind(stream);
+  TEST("stream stops reading an overflowing prefix",
+       shell_netstring_read_stream(stream, 0, &record, &length) ==
+               SHELL_NETSTRING_EOVERFLOW &&
+           ftell(stream) < 32);
+  fclose(stream);
+}
+
 static void test_stream_reader_allocation_failures(void) {
   FILE *stream = tmpfile();
   unsigned char *record = NULL;
@@ -266,6 +298,7 @@ int main(void) {
   test_encoding();
   test_malformed_record();
   test_stream_reader();
+  test_stream_reader_bounds_prefix_digits();
   test_stream_reader_allocation_failures();
   test_stream_reader_rejects_unallocatable_record();
   test_stream_reader_format_failures();

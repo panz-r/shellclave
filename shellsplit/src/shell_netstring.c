@@ -172,16 +172,20 @@ shell_netstring_status_t shell_netstring_read_stream(FILE *stream,
     return ferror(stream) ? SHELL_NETSTRING_EIO : SHELL_NETSTRING_DONE;
   if (ch < '0' || ch > '9')
     return SHELL_NETSTRING_EFORMAT;
+  /* Reject a non-canonical prefix at its second digit, and overflow at the
+   * digit that causes it, so a hostile stream cannot make us consume an
+   * unbounded run of digits. */
   bool leading_zero = ch == '0';
-  size_t payload_length = 0, digits = 0;
+  size_t payload_length = 0;
   do {
     if (payload_length > (SIZE_MAX - (unsigned)(ch - '0')) / 10)
       return SHELL_NETSTRING_EOVERFLOW;
     payload_length = payload_length * 10 + (unsigned)(ch - '0');
-    digits++;
     ch = fgetc(stream);
+    if (leading_zero && ch >= '0' && ch <= '9')
+      return SHELL_NETSTRING_EFORMAT;
   } while (ch >= '0' && ch <= '9');
-  if (ch != ':' || (leading_zero && digits != 1))
+  if (ch != ':')
     return ch == EOF && ferror(stream) ? SHELL_NETSTRING_EIO
                                        : SHELL_NETSTRING_EFORMAT;
   size_t total = 0;
