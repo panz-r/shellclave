@@ -14930,11 +14930,25 @@ TEST(redirect_setup_outcome_substitutions) {
     const char *prefix;
     bool executes;
   } cases[] = {
-      {"false >setup &&", false},           {"{ false; } >setup &&", false},
-      {"{ exit 0; } >setup &&", false},     {"! { false; } >setup ||", true},
-      {"{ { false; }; } >setup &&", false}, {"(exit 0) >setup ||", true},
-      {"{ true; } >setup ||", true},        {"! { exit 0; } >setup &&", false},
-      {"! { true; } >setup &&", false},     {"! (exit 0) >setup &&", false},
+      {"false >setup &&", false},
+      {"{ false; } >setup &&", false},
+      {"{ exit 0; } >setup &&", false},
+      {"! { false; } >setup ||", true},
+      {"{ { false; }; } >setup &&", false},
+      {"(exit 0) >setup ||", true},
+      {"{ true; } >setup ||", true},
+      {"! { exit 0; } >setup &&", false},
+      {"! { true; } >setup &&", false},
+      {"! (exit 0) >setup &&", false},
+      /* A statically failing setup returns before a compound's `!` applies,
+       * but a simple command's returning failure is negated. */
+      {"! true >\"\" ||", false},
+      {"! false >\"\" &&", true},
+      {"! { :; } >\"\" ||", true},
+      {"! ((1)) >\"\" ||", true},
+      {"! ((0)) >\"\" &&", false},
+      {"! [[ a ]] >\"\" ||", true},
+      {"! [[ -z a ]] >\"\" &&", false},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     char source[256];

@@ -9170,6 +9170,15 @@ static uint8_t dep_status_negate(uint8_t status) {
          ((status & DEP_STATUS_MAY_FAIL) ? DEP_STATUS_MAY_SUCCEED : 0);
 }
 
+/* Whether a command's own redirect setup failure is inverted by its `!`. Bash
+ * returns a compound command's setup failure before applying the inversion,
+ * whereas a simple command's returning failure is negated with its other
+ * outcomes. */
+static bool dep_setup_failure_negated(shell_command_kind_t kind,
+                                      uint32_t negation_count) {
+  return kind == SHELL_COMMAND_SIMPLE && (negation_count & UINT32_C(1));
+}
+
 /* The resolved static builtin has Bash's fixed status even with operands or
  * command/builtin wrappers. Query wrappers and external paths are not builtin
  * targets. Redirect setup and expansion termination are composed separately;
@@ -10391,9 +10400,10 @@ static SHELL_NONNULL(1) void dep_cwd_finish_command(
       context->execution->pipeline
           .local_process[context->execution->owner[event - SHELL_MAX_GROUPS]])
     candidate = stopped;
-  bool negated =
-      context->fast->cmds[event - SHELL_MAX_GROUPS].pipeline_negation_count &
-      1u;
+  const shell_range_t *cmd = &context->fast->cmds[event - SHELL_MAX_GROUPS];
+  bool negated = cmd->pipeline_negation_count & 1u;
+  bool setup_negated =
+      dep_setup_failure_negated(cmd->kind, cmd->pipeline_negation_count);
   for (unsigned i = 0; i < 5; i++)
     executed.state[i] = i < 2 && (!changes_directory || i == (unsigned)negated)
                             ? candidate
@@ -10405,7 +10415,7 @@ static SHELL_NONNULL(1) void dep_cwd_finish_command(
     executed.state[failure] = dep_cwd_join(stopped, candidate);
   }
   if (!changes_directory && setup_may_fail) {
-    unsigned failure = negated ? 0 : 1;
+    unsigned failure = setup_negated ? 0 : 1;
     executed.state[failure] = dep_cwd_join(executed.state[failure], stopped);
   }
   dep_cwd_finish(context, event, &executed);
@@ -20223,8 +20233,14 @@ static SHELL_NONNULL(
         outcomes.mask &= (uint8_t)~(1u << i);
     }
   }
-  if (failures.mask && !dep_fd_add(&outcomes, negated ? 0 : 1,
-                                   failures.state[1], journal, baseline))
+  if (failures.mask &&
+      !dep_fd_add(&outcomes,
+                  dep_setup_failure_negated(
+                      context->fast->cmds[range].kind,
+                      context->fast->cmds[range].pipeline_negation_count)
+                      ? 0
+                      : 1,
+                  failures.state[1], journal, baseline))
     return false;
   if (nullable_readonly && !private) {
     /* Only the empty-argv alternative commits these prefixes. Its readonly
@@ -26863,15 +26879,16 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         out, streams, &parse_context, cmd_node_idx, &setup_may_fail);
     if (setup_error != SHELL_DEP_OK)
       return dep_stop_graph_construction(out, setup_error);
+    uint8_t setup_failure =
+        dep_setup_failure_negated(node->cmd.kind,
+                                  node->cmd.pipeline_negation_count)
+            ? DEP_STATUS_MAY_SUCCEED
+            : DEP_STATUS_MAY_FAIL;
     if (!cwd_isolated && setup_may_fail)
-      event_static_status[source_event] |= node->cmd.pipeline_negated
-                                               ? DEP_STATUS_MAY_SUCCEED
-                                               : DEP_STATUS_MAY_FAIL;
+      event_static_status[source_event] |= setup_failure;
     if (!cwd_isolated && owner_setup_stop[cmd_node_idx] != UINT32_MAX) {
-      uint8_t failure = node->cmd.pipeline_negated ? DEP_STATUS_MAY_SUCCEED
-                                                   : DEP_STATUS_MAY_FAIL;
       event_static_status[source_event] =
-          failure | (event_static_status[source_event] & DEP_STATUS_STOP);
+          setup_failure | (event_static_status[source_event] & DEP_STATUS_STOP);
     }
 
     int32_t member_group = dep_range_group(&execution.pipeline, si);
