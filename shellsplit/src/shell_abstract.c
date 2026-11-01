@@ -13,7 +13,6 @@
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
 #include "shell_word_internal.h"
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
