@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
 
 /*
  * normalize.c - Command normalisation with typed wildcard lattice.

@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
 
 /*
  * policy_ctx.c - Shared policy context: stable string chunks and string pool.

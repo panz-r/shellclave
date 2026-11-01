@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
 
 /*
  * filter_hash.c - FNV-1a 64-bit hash implementation.
