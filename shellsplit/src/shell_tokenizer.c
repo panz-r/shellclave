@@ -1861,9 +1861,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       pos = (uint32_t)after;
       continue;
     }
-    // Also handle plain (( )) - arithmetic in bash. Physical continuations
-    // are removed before syntax recognition, so use the same logical
-    // punctuation matcher as the full lexer.
+    // Physical continuations are removed before syntax recognition, so use
+    // the same logical punctuation matcher as the full lexer.
     size_t arithmetic_command_after = 0;
     /* An opening `((` is arithmetic only when its balanced interior is
      * followed immediately by `))`. Otherwise Bash opens two subshells, as in
