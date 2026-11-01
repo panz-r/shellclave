@@ -1538,12 +1538,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         result->count = subcmd_idx;
         return SHELL_EPARSE;
       }
-      /* Retain the fast parser's historical eager attribution: once a list
-       * connector has closed a preceding range, its following process
-       * substitution is recorded on that emitted range. The final range is
-       * still classified as a substitution below when it starts a command. */
-      if (subcmd_idx > 0 && subcmd_idx < max_cmds)
-        result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PROCESS_SUB;
       if (current_type == SHELL_TYPE_SIMPLE)
         current_type = SHELL_TYPE_SUBSTITUTION;
       pos = (uint32_t)after;
@@ -2577,11 +2571,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             return SHELL_EPARSE;
           }
           pos = (uint32_t)after;
-          // Mark that we have process substitution (if we have at least one
-          // subcommand)
-          if (subcmd_idx > 0 && subcmd_idx < max_cmds) {
-            result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PROCESS_SUB;
-          }
           if (current_type == SHELL_TYPE_SIMPLE) {
             current_type = SHELL_TYPE_SUBSTITUTION;
           }
