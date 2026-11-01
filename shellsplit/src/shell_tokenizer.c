@@ -498,6 +498,7 @@ static SHELL_NONNULL(1,
   const char *p = cmd + start;
   shell_source_scope_t previous = shell_source_scope_begin(p, len);
   uint32_t i = 0;
+  size_t bracket_examined = 0;
   bool in_single_quotes = false;
   bool in_double_quotes = false;
   /* Nested command bodies are shell source with deferred documents, not a
@@ -869,10 +870,18 @@ static SHELL_NONNULL(1,
       }
       break;
     case '[':
-      // Globs do NOT expand in double quotes, and not in heredoc context
+      // Globs do NOT expand in double quotes, and not in heredoc context. A
+      // bracket is a pattern only with a closing bracket in the same word, so
+      // `echo [` and the `[` test command are not globs. A failed probe has
+      // examined its word, so no opener inside that span repeats it.
       if (!in_double_quotes && context != FAST_FEATURE_CONDITIONAL_WORD &&
-          !(i > 0 && p[i - 1] == '<')) {
-        *features |= SHELL_FEAT_GLOBS;
+          !(i > 0 && p[i - 1] == '<') && i >= bracket_examined) {
+        shell_source_glob_probe_t probe =
+            shell_source_probe_glob_bracket(p, len, i);
+        if (probe.complete)
+          *features |= SHELL_FEAT_GLOBS;
+        else
+          bracket_examined = probe.after;
       }
       break;
     default:

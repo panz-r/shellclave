@@ -677,7 +677,7 @@ static const struct {
     {"a[${v:-${w:-]}} + (2)]=x", true, false},
     {"a[${v:-$(printf ])} + (2)]=x", true, false},
     {"a[<(printf ]) + (2)]=x", true, false},
-    {"a[>(printf [) + (2)]=x", true, true},
+    {"a[>(printf [) + (2)]=x", true, false},
     {"a[${indices[0]:-]} + (2)]=x", true, false},
     {"a\\\n[$\\\n{v:-]} + (2)]\\\n=\\\nx", true, false},
     {"! a[0]=b", true, false},
