@@ -5849,6 +5849,30 @@ static void strict_rejections_are_explained(void) {
       {"{ echo a;", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_GROUP, 0, 0},
       {"echo a |", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_COMMAND, 7, 0},
       {"echo >", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_REDIRECT, 5, 0},
+      /* Bash ends such a document at EOF with a warning. Received source can
+       * still be appended to, so it stays unfinished rather than complete. */
+      {"cat <<2", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_HEREDOC_HEADER, 4,
+       0},
+      {"cat <<EOF", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_HEREDOC_HEADER,
+       4, 0},
+      {"cat <<'EOF'", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_HEADER, 4, 0},
+      {"cat <<-EOF", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_HEREDOC_HEADER,
+       4, 0},
+      {"cat <<EOF | wc", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_HEADER, 4, 0},
+      {"(cat <<EOF)", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_HEADER, 5, 0},
+      {"echo a; cat <<EOF", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_HEADER, 12, 0},
+      {"cat <<EOF\n", SHELL_SOURCE_INCOMPLETE, SHELL_SOURCE_NEEDS_HEREDOC_BODY,
+       4, 0},
+      {"cat <<EOF\nbody", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_BODY, 4, 0},
+      {"echo a; cat <<EOF\nbody\nmore", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_BODY, 12, 0},
+      {"cat <<EOF &&\nx", SHELL_SOURCE_INCOMPLETE,
+       SHELL_SOURCE_NEEDS_HEREDOC_BODY, 4, 0},
   };
   shell_limits_t strict = SHELL_LIMITS_DEFAULT;
   strict.strict_mode = true;
@@ -5867,6 +5891,20 @@ static void strict_rejections_are_explained(void) {
       CHECK(draft.need == cases[i].need && draft.incomplete_at == cases[i].at);
       CHECK(draft.invalid_at == UINT32_MAX);
     }
+  }
+  /* Supplying the delimiter completes the same documents. */
+  static const char *const terminated[] = {
+      "cat <<2\nbody\n2\n",          "cat <<EOF\nEOF",
+      "cat <<'EOF'\nbody\nEOF\n",    "cat <<-EOF\n\tbody\n\tEOF\n",
+      "cat <<EOF | wc\nbody\nEOF\n", "(cat <<EOF\nbody\nEOF\n)",
+      "echo a; cat <<EOF\nbody\nEOF"};
+  for (size_t i = 0; i < sizeof(terminated) / sizeof(terminated[0]); i++) {
+    size_t length = strlen(terminated[i]);
+    shell_parse_result_t parsed;
+    CHECK(shell_parse_fast(terminated[i], length, &strict, &parsed) ==
+          SHELL_OK);
+    CHECK(shell_parse_draft(terminated[i], length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
   }
   /* Accepted and unclassified sources carry no location. */
   CHECK(shell_parse_draft("echo ok", 7, NULL, &draft) ==
