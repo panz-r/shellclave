@@ -14949,6 +14949,22 @@ TEST(redirect_setup_outcome_substitutions) {
       {"! ((0)) >\"\" &&", false},
       {"! [[ a ]] >\"\" ||", true},
       {"! [[ -z a ]] >\"\" &&", false},
+      /* A pipeline stage runs in a child, so its failed setup is that stage's
+       * exit status, which is the pipeline status for the last stage. The
+       * child's status is inverted by `!` for every command kind. */
+      {"true | : >\"\" ||", true},
+      {"true | : >\"\" &&", false},
+      {"true | : <\"\" ||", true},
+      {"true | : 2>&bogus ||", true},
+      {"true | true >\"\" ||", true},
+      {"true | ((1)) >\"\" ||", true},
+      {"true | { :; } >\"\" ||", true},
+      {"! true | : >\"\" &&", true},
+      {"! true | : >\"\" ||", false},
+      {"! true | ((0)) >\"\" &&", true},
+      {"! true | [[ a ]] >\"\" ||", false},
+      {"true | : >\"\" | true ||", false},
+      {": >\"\" | cat >\"\" ||", true},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     char source[256];
@@ -14962,6 +14978,9 @@ TEST(redirect_setup_outcome_substitutions) {
     int file = find_file_doc(&graph, "out");
     ASSERT(writer >= 0 && file >= 0 &&
            find_cmd_tokens(&graph, "printf", "marker") >= 0);
+    if (has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer, (uint32_t)file,
+                     1, SHELL_DEP_FD_NONE) != cases[i].executes)
+      printf("    setup outcome: %s\n", source);
     ASSERT(has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
                         (uint32_t)file, 1,
                         SHELL_DEP_FD_NONE) == cases[i].executes);

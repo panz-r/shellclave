@@ -9170,13 +9170,15 @@ static uint8_t dep_status_negate(uint8_t status) {
          ((status & DEP_STATUS_MAY_FAIL) ? DEP_STATUS_MAY_SUCCEED : 0);
 }
 
-/* Whether a command's own redirect setup failure is inverted by its `!`. Bash
- * returns a compound command's setup failure before applying the inversion,
- * whereas a simple command's returning failure is negated with its other
- * outcomes. */
+/* Whether a command's own redirect setup failure is inverted by its `!`. A
+ * simple command's returning failure is negated with its other outcomes, and
+ * so is any command that runs as a pipeline or asynchronous child, whose
+ * failed setup is that child's exit status. In the current shell, Bash
+ * returns a compound command's setup failure before applying the inversion. */
 static bool dep_setup_failure_negated(shell_command_kind_t kind,
-                                      uint32_t negation_count) {
-  return kind == SHELL_COMMAND_SIMPLE && (negation_count & UINT32_C(1));
+                                      uint32_t negation_count, bool child) {
+  return (kind == SHELL_COMMAND_SIMPLE || child) &&
+         (negation_count & UINT32_C(1));
 }
 
 /* The resolved static builtin has Bash's fixed status even with operands or
@@ -10402,8 +10404,10 @@ static SHELL_NONNULL(1) void dep_cwd_finish_command(
     candidate = stopped;
   const shell_range_t *cmd = &context->fast->cmds[event - SHELL_MAX_GROUPS];
   bool negated = cmd->pipeline_negation_count & 1u;
-  bool setup_negated =
-      dep_setup_failure_negated(cmd->kind, cmd->pipeline_negation_count);
+  bool setup_negated = dep_setup_failure_negated(
+      cmd->kind, cmd->pipeline_negation_count,
+      context->execution->pipeline
+          .local_process[context->execution->owner[event - SHELL_MAX_GROUPS]]);
   for (unsigned i = 0; i < 5; i++)
     executed.state[i] = i < 2 && (!changes_directory || i == (unsigned)negated)
                             ? candidate
@@ -20258,7 +20262,8 @@ static SHELL_NONNULL(
       !dep_fd_add(&outcomes,
                   dep_setup_failure_negated(
                       context->fast->cmds[range].kind,
-                      context->fast->cmds[range].pipeline_negation_count)
+                      context->fast->cmds[range].pipeline_negation_count,
+                      private)
                       ? 0
                       : 1,
                   failures.state[1], journal, baseline))
@@ -26901,13 +26906,13 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     if (setup_error != SHELL_DEP_OK)
       return dep_stop_graph_construction(out, setup_error);
     uint8_t setup_failure =
-        dep_setup_failure_negated(node->cmd.kind,
-                                  node->cmd.pipeline_negation_count)
+        dep_setup_failure_negated(
+            node->cmd.kind, node->cmd.pipeline_negation_count, cwd_isolated)
             ? DEP_STATUS_MAY_SUCCEED
             : DEP_STATUS_MAY_FAIL;
-    if (!cwd_isolated && setup_may_fail)
+    if (setup_may_fail)
       event_static_status[source_event] |= setup_failure;
-    if (!cwd_isolated && owner_setup_stop[cmd_node_idx] != UINT32_MAX) {
+    if (owner_setup_stop[cmd_node_idx] != UINT32_MAX) {
       event_static_status[source_event] =
           setup_failure | (event_static_status[source_event] & DEP_STATUS_STOP);
     }
