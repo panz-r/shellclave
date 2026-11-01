@@ -1410,6 +1410,9 @@ typedef struct {
   bool isolated;
   bool backgrounded;
   bool inherited_background;
+  /* A stage of a multi-stage pipeline, whose failed setup is the child's exit
+   * status and is therefore inverted by the pipeline's `!`. */
+  bool pipeline_member;
   /* Prepared with the compound's redirect operations. Numeric self-dup is
    * a Bash no-op, including on a closed descriptor, and cannot fail setup. */
   bool setup_can_fail;
@@ -1436,6 +1439,7 @@ static void dep_prepare_group_execution(const char *command,
     groups[i].isolated = group->kind == SHELL_GROUP_SUBSHELL ||
                          context.pipeline_member || context.backgrounded;
     groups[i].backgrounded = context.backgrounded;
+    groups[i].pipeline_member = context.pipeline_member;
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_SCOPE_LOOKUP);
     int32_t parent =
         group->parent == UINT16_MAX ? -1 : groups[group->parent].isolated_scope;
@@ -9361,14 +9365,16 @@ static SHELL_NONNULL(1) dep_group_completion_t
                (DEP_STATUS_TERMINAL_FAILURE | DEP_STATUS_ABORT_FAILURE))
         outcome = DEP_STATUS_MAY_FAIL;
     }
-    /* Setup runs outside this compound's negation. A child shell converts
-     * setup termination to a return, but negation only inverts body returns.
-     * An enclosing compound may still negate that returned setup failure. */
+    /* In the current shell, setup runs outside this compound's negation and
+     * negation only inverts body returns. A pipeline stage runs in a child
+     * whose failed setup is its exit status, so the pipeline's `!` inverts
+     * it. An enclosing compound may still negate a returned setup failure. */
+    bool negated = group_is_pipeline_negated(descriptor);
+    uint8_t returned = negated ? dep_status_negate(outcome) : outcome;
     if (added & (1u << i))
-      result.added |= outcome;
-    if (group_is_pipeline_negated(descriptor))
-      outcome = dep_status_negate(outcome);
-    result.outcome[i] = outcome;
+      result.added |=
+          context->group_exec[group].pipeline_member ? returned : outcome;
+    result.outcome[i] = returned;
   }
   if (dep_group_setup_stopped(context, group))
     memset(result.outcome, 0, sizeof(result.outcome));

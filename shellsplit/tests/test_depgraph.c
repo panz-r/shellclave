@@ -14965,6 +14965,17 @@ TEST(redirect_setup_outcome_substitutions) {
       {"! true | [[ a ]] >\"\" ||", false},
       {"true | : >\"\" | true ||", false},
       {": >\"\" | cat >\"\" ||", true},
+      /* The same holds for a group stage, but a group in the current shell
+       * returns its setup failure before its own `!` applies. */
+      {"true | (:) >\"\" ||", true},
+      {"true | { :; } >\"\" &&", false},
+      {"! true | (:) >\"\" &&", true},
+      {"! true | (:) >\"\" ||", false},
+      {"! true | { :; } >\"\" &&", true},
+      {"(:) >\"\" | true ||", false},
+      {"! (:) >\"\" | true &&", false},
+      {"! (:) >\"\" ||", true},
+      {"! (:) >\"\" &&", false},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     char source[256];
