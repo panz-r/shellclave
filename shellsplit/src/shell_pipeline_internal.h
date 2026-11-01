@@ -142,6 +142,9 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
       else if (last_range != UINT32_MAX)
         index->range_successor[last_range] = next;
       closed = UINT16_MAX;
+      /* This separator ends the unit it follows. A later separator, such as
+       * the newline in `a | (b);` plus newline, must not reassign it. */
+      last_range = UINT32_MAX;
       connector = next;
       connector_start = (uint32_t)token.position;
       connector_end = (uint32_t)(token.position + token.length);

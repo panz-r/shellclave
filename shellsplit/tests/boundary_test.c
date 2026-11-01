@@ -239,6 +239,34 @@ static void background_newlines(shell_dep_limits_t *limits,
     CHECK(index.range_input_unit[0] == 0 &&
           index.range_input_unit[1] == connectors[item].input_unit);
   }
+  /* A separator after a closed group must not reassign the pipeline head's
+   * successor. Newline-separated lists match their one-line spelling. */
+  static const struct {
+    const char *lines;
+    const char *inline_source;
+  } after_group[] = {
+      {"cd /tmp | (:);\ncat", "cd /tmp | (:); cat"},
+      {"cd /tmp | { :; };\ncat", "cd /tmp | { :; }; cat"},
+      {"cd /tmp | (:);\n\ncat", "cd /tmp | (:); cat"},
+      {"cd /tmp | (:)\n\ncat", "cd /tmp | (:); cat"},
+  };
+  for (size_t item = 0; item < sizeof(after_group) / sizeof(after_group[0]);
+       item++) {
+    shell_parse_result_t fast;
+    shell_pipeline_index_t index;
+    const char *source = after_group[item].lines;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    shell_pipeline_index_connectors(source, strlen(source), &fast, &index);
+    CHECK(index.range_successor[0] == SHELL_TYPE_PIPELINE &&
+          index.group_connector[0] == SHELL_TYPE_PIPELINE);
+    parse(source, limits, graph);
+    uint32_t cat = command(graph, "cat");
+    CHECK(cat != UINT32_MAX && graph->nodes[cat].cmd.cwd_known &&
+          !strcmp(graph->cwd_buf.data + graph->nodes[cat].cmd.cwd_offset, "/"));
+    parse(after_group[item].inline_source, limits, other);
+    CHECK(graph->node_count == other->node_count &&
+          graph->edge_count == other->edge_count);
+  }
   static const char group_source[] = "wc & # note\n\n{ wait; }";
   shell_parse_result_t fast;
   shell_pipeline_index_t index;
