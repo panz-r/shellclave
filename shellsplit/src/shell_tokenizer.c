@@ -833,6 +833,10 @@ static SHELL_NONNULL(1,
                      next == '?' || next == '$' || next == '!' || next == '@' ||
                      next == '*' || next == '-') {
             *features |= SHELL_FEAT_VARS;
+            /* A special parameter owns its name byte. Resume after it so `?`
+             * and `*` are not read again as pathname patterns. */
+            i = (uint32_t)next_position + 1;
+            continue;
           } else if (shell_ascii_alpha((unsigned char)next) || next == '_') {
             *features |= SHELL_FEAT_VARS;
           }
