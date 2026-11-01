@@ -368,6 +368,13 @@ static bool is_long_option(const char *s, size_t len) {
   return s[0] == '-' && s[1] == '-' && s[2] != '-';
 }
 
+/* Bare `>&` overloads its operand: Bash treats a pathname as a target for
+ * stdout and stderr, and a descriptor or `-` as duplication or close. An
+ * explicit descriptor prefix always selects duplication. */
+static bool redirection_is_legacy_output(const shell_token_t *token) {
+  return token->length == 2 && token->start[0] == '>' && token->start[1] == '&';
+}
+
 static bool redirection_consumes_operand(const shell_token_t *token) {
   if (token->type == SHELL_TOKEN_HERESTRING ||
       token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
@@ -1196,6 +1203,7 @@ abstract_command_parse_impl(const char *command, size_t command_length,
   for (size_t c = 0; c < cmd_count; c++) {
     shell_command_t *cmd = &cmds[c];
     bool redirect_operand = false;
+    bool legacy_output_operand = false;
     for (size_t i = 0; i < cmd->token_count; i++) {
       shell_token_t *tok = &cmd->tokens[i];
       shell_token_t redirect_word;
@@ -1203,7 +1211,21 @@ abstract_command_parse_impl(const char *command, size_t command_length,
       if (shell_token_type_is_redirection(tok->type)) {
         abst->has_redirects = true;
         redirect_operand = redirection_consumes_operand(tok);
+        legacy_output_operand = redirection_is_legacy_output(tok);
         continue;
+      }
+
+      if (legacy_output_operand) {
+        /* A static pathname after `>&` is a redirection target; descriptors
+         * and unresolved words keep their ordinary classification. */
+        legacy_output_operand = false;
+        size_t operand_after = 0;
+        if (shell_source_skip_shell_word(command, command_length, tok->position,
+                                         &operand_after) &&
+            shell_process_classify_legacy_output_target(
+                command + tok->position, operand_after - tok->position) ==
+                SHELL_PROCESS_LEGACY_REDIRECT_PATH)
+          redirect_operand = true;
       }
 
       if (redirect_operand) {
