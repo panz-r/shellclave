@@ -2589,7 +2589,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           }
           continue;
         }
-        // Check for multi-char redirects: >>, <<, >&, &>, <&, &<, etc.
+        /* Recognize redirect operators beginning with '<' or '>': <<, >>, <>,
+         * >|, <& and >&. Combined &> and &>> redirects are handled
+         * separately. */
         bool is_double_redirect = false;
         bool is_extended_redirect = false;
         bool is_fd_redirect = false; // >& or <& (file descriptor redirect)
@@ -2646,8 +2648,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           return SHELL_EPARSE;
         }
 
-        // Check for valid redirect operators: &>, &>>, <&, &<, etc.
-        // These are valid bash redirects (e.g., >&1, 2>&1, &>file)
+        // The operand follows the operator, including the descriptor forms
+        // above (>&1, 2>&1). The checks below reject an operand that begins
+        // with an operator, comment or newline.
         char next_ch = cmd[pos];
         /* A process substitution may be the target of an ordinary redirect:
          * `2> >(consumer)` and `0< <(producer)`. Leave its opener for the
