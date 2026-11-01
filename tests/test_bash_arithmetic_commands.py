@@ -13,7 +13,7 @@ class ArithmeticCommands(unittest.TestCase):
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
-    def status(self, expression, syntax_only=False):
+    def run_bash(self, expression, syntax_only=False):
         environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C")
         for name in ("BASHOPTS", "SHELLOPTS", "POSIXLY_CORRECT", "BASH_COMPAT"):
             environment.pop(name, None)
@@ -21,7 +21,10 @@ class ArithmeticCommands(unittest.TestCase):
         return subprocess.run(
             [self.bash, "--noprofile", "--norc", "-p", *options, "-c",
              "((" + expression + "))"], capture_output=True,
-            env=environment, timeout=10).returncode
+            env=environment, timeout=10)
+
+    def status(self, expression, syntax_only=False):
+        return self.run_bash(expression, syntax_only).returncode
 
     def test_safe_proofs_match_bash(self):
         for expression in (
@@ -75,6 +78,27 @@ class ArithmeticCommands(unittest.TestCase):
                            "9223372036854775808", "2 ** 1000000000",
                            "1 << 64", "-1 >> 1", "2 ** -1"):
             with self.subTest(expression=expression):
+                self.assertEqual(self.truth(expression), 0)
+
+    def test_negative_exponent_follows_evaluation(self):
+        # The pinned Bash reports "exponent less than 0" only when the
+        # exponentiation is evaluated. A skipped operand is never evaluated,
+        # unlike a syntax error, so its enclosing truth stays provable.
+        for expression in ("1 || 2**-1", "1 ? 1 : 2**-1", "0 && 2**-1",
+                           "0 && 0**-1", "1 || 2**(1-3)", "0 ? 2**-1 : 1",
+                           "(1 || 2**-1) + 1"):
+            with self.subTest(expression=expression, evaluated=False):
+                result = self.run_bash(expression)
+                self.assertNotIn(b"exponent less than 0", result.stderr)
+                truth = self.truth(expression)
+                self.assertIn(truth, (1, 2))
+                self.assertEqual(result.returncode, 1 if truth == 1 else 0)
+        for expression in ("2**-1", "1, 2**-1", "0 || 2**-1", "1 && 2**-1",
+                           "1 ? 2**-1 : 0", "0 ? 1 : 2**-1"):
+            with self.subTest(expression=expression, evaluated=True):
+                result = self.run_bash(expression)
+                self.assertIn(b"exponent less than 0", result.stderr)
+                self.assertEqual(result.returncode, 1)
                 self.assertEqual(self.truth(expression), 0)
 
     def test_binary_operator_proofs(self):
