@@ -14983,6 +14983,47 @@ TEST(redirect_setup_outcome_substitutions) {
   pass_count++;
 }
 
+TEST(failed_setup_keeps_assignment_only_commit) {
+  /* Bash commits an assignment-only command's values before expanding its
+   * redirects, so a failed setup leaves them set. Assignments that merely
+   * prefix a command stay temporary, and a subshell keeps its own copy. */
+  static const struct {
+    const char *prefix;
+    bool reachable;
+  } cases[] = {
+      {"unset x; x=2 >\"\";", true},
+      {"unset x; x=2 >>\"\";", true},
+      {"unset x; x=2 2>\"\";", true},
+      {"unset x; x=2 3>\"\";", true},
+      {"unset x; x=2 2>&bad;", true},
+      {"unset x; x=2 >/dev/null >\"\";", true},
+      {"unset x; x=2 <\"\";", true},
+      {"unset x; { x=2 >\"\"; };", true},
+      {"unset x; x=2 >/dev/null;", true},
+      {"unset x; x=2 true >\"\";", false},
+      {"unset x; export x=2 >\"\";", false},
+      {"unset x; (x=2 >\"\");", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char source[256];
+    int length = snprintf(source, sizeof(source),
+                          "%s [[ -v x ]] && cat <secret", cases[i].prefix);
+    ASSERT(length > 0 && (size_t)length < sizeof(source));
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(source, &graph) == SHELL_DEP_OK);
+    int reader = find_cmd_tokens(&graph, "cat", NULL);
+    int file = find_file_doc(&graph, "secret");
+    ASSERT(reader >= 0 && file >= 0);
+    if (has_edge(&graph, SHELL_EDGE_READ, (uint32_t)file, (uint32_t)reader) !=
+        cases[i].reachable)
+      printf("    assignment commit: %s\n", source);
+    ASSERT(has_edge(&graph, SHELL_EDGE_READ, (uint32_t)file,
+                    (uint32_t)reader) == cases[i].reachable);
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
 TEST(expansion_phases_survive_failed_setup) {
   for (size_t i = 0; i < sizeof(shellsplit_test_expansion_setup) /
                              sizeof(shellsplit_test_expansion_setup[0]);
@@ -18730,6 +18771,7 @@ int main(int argc, char **argv) {
   RUN(descriptor_presence_and_setup_reports);
   RUN(unreachable_stage_effects_and_syntax);
   RUN(redirect_setup_outcome_substitutions);
+  RUN(failed_setup_keeps_assignment_only_commit);
   RUN(expansion_phases_survive_failed_setup);
   RUN(expansion_control_effects_require_reachable_setup);
   RUN(assignment_value_descriptor_snapshots);

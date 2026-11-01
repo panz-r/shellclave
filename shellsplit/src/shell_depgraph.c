@@ -20094,6 +20094,19 @@ static SHELL_NONNULL(
                          ops, op_count, mutations))
       return false;
   }
+  /* Assignment-only commands commit their values before any redirect operand
+   * is expanded, so a statically failed setup still leaves them in place.
+   * Descriptor effects are not published: the redirects did not take effect. */
+  if (!setup_survived && current_setup && (!private || report_state) &&
+      mutations->before_redirect) {
+    dep_owner_routes_t persistent;
+    dep_copy_routes(&persistent, incoming);
+    if (!dep_apply_persistent_owner_routes(&persistent, executed, ops, 0, false,
+                                           false, mutations, NULL) ||
+        !dep_fd_bindings(&continued, journal, baseline, incoming, &persistent,
+                         ops, 0, mutations))
+      return false;
+  }
   if (child_setup)
     continued = child_continued;
   dep_fd_flow_t failures;
