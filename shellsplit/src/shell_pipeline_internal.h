@@ -90,7 +90,6 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
   shell_token_t token;
   uint32_t range = 0, group = 0;
   uint16_t stack[SHELL_MAX_GROUPS];
-  uint32_t parent_range[SHELL_MAX_GROUPS];
   uint32_t last_range = UINT32_MAX;
   uint32_t depth = 0;
   uint16_t closed = UINT16_MAX;
@@ -158,7 +157,6 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
         index->group_input_unit[group] = input_unit;
         index->group_connector_start[group] = connector_start;
         index->group_connector_end[group] = connector_end;
-        parent_range[depth] = last_range;
         stack[depth++] = (uint16_t)group++;
       }
       last_range = UINT32_MAX;
@@ -171,7 +169,6 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
       size_t end = token.position + token.length;
       if (depth != 0 && parsed->groups[stack[depth - 1]].end == end) {
         closed = stack[--depth];
-        last_range = parent_range[depth];
       }
       connector = SHELL_TYPE_SIMPLE;
       command_position = false;
