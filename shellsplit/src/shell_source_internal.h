@@ -3999,9 +3999,13 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
                                      shell_source_substitution_scan_t *scan,
                                      size_t *start, size_t *after,
                                      shell_source_substitution_kind_t *kind) {
+  /* The event is published only with FOUND. Keeping it local makes that
+   * contract visible, so callers' outputs are written exactly when read. */
+  size_t event_start = 0, event_after = 0;
+  shell_source_substitution_kind_t event_kind = SHELL_SOURCE_SUBST_COMMAND;
   for (;;) {
     shell_source_scan_status_t status = shell_source_next_word_expansion_body(
-        input, length, scan, start, after, kind);
+        input, length, scan, &event_start, &event_after, &event_kind);
     if ((status == SHELL_SOURCE_SCAN_INCOMPLETE ||
          status == SHELL_SOURCE_SCAN_MALFORMED) &&
         !scan->exhausted && shell_source_clipped_ansi(scan)) {
@@ -4012,6 +4016,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     size_t end =
         status == SHELL_SOURCE_SCAN_INCOMPLETE ? length : scan->position;
     shell_source_report_word_code(input, scan, end);
+    if (status == SHELL_SOURCE_SCAN_FOUND) {
+      *start = event_start;
+      *after = event_after;
+      *kind = event_kind;
+    }
     return status;
   }
 }
