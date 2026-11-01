@@ -416,6 +416,49 @@ int main(int argc, char **argv) {
         draft->headers[0].kind == SHELL_COMMAND_ARITHMETIC);
   parse("((printf ok); printf tail)");
   parse("( (printf ok) )");
+  /* Without a closing `))` after the first balanced interior, `((` opens two
+   * subshells. The fast parser frames it exactly as the spaced spelling. */
+  static const struct {
+    const char *nested, *spaced;
+    const char *executable;
+  } subshells[] = {
+      {"((printf ok); printf tail)", "( (printf ok); printf tail )", "printf"},
+      {"((cat secret.txt) 3>&1)", "( (cat secret.txt) 3>&1 )", "cat"},
+      {"((true) >\"\") && printf x", "( (true) >\"\" ) && printf x", "true"},
+      {"x; ((cat) ); y", "x; ( (cat) ); y", "cat"},
+  };
+  for (size_t i = 0; i < sizeof(subshells) / sizeof(subshells[0]); i++) {
+    shell_parse_result_t nested, spaced;
+    shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+    strict.strict_mode = true;
+    current = subshells[i].nested;
+    CHECK(shell_parse_fast(subshells[i].nested, strlen(subshells[i].nested),
+                           &strict, &nested) == SHELL_OK);
+    CHECK(shell_parse_fast(subshells[i].spaced, strlen(subshells[i].spaced),
+                           &strict, &spaced) == SHELL_OK);
+    CHECK(nested.group_count == 2 && nested.group_count == spaced.group_count &&
+          nested.count == spaced.count);
+    for (size_t command = 0; command < nested.count; command++)
+      CHECK(nested.cmds[command].kind == SHELL_COMMAND_SIMPLE);
+    parse(subshells[i].nested);
+    uint32_t nested_nodes = graph->node_count, nested_edges = graph->edge_count;
+    bool found = false;
+    for (uint32_t node = 0; node < nested_nodes; node++)
+      found |=
+          graph->nodes[node].type == SHELL_NODE_CMD &&
+          graph->nodes[node].cmd.token_count &&
+          graph->nodes[node].cmd.token_lens[0] ==
+              strlen(subshells[i].executable) &&
+          !memcmp(graph->nodes[node].cmd.tokens[0], subshells[i].executable,
+                  strlen(subshells[i].executable));
+    CHECK(found);
+    parse(subshells[i].spaced);
+    CHECK(graph->node_count == nested_nodes &&
+          graph->edge_count == nested_edges);
+  }
+  /* A closing `))` still frames arithmetic, including with nested parens. */
+  parse("((1)) && ((0))");
+  parse("(( (1) + (2) ))");
   parse("{ ((1)); } | cat");
   parse("printf %s \"$( ((1<<2)); printf ok)\"");
   parse("cat <<EOF\n$( ((1<<2)); printf ok)\nEOF\n");

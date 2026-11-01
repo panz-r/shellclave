@@ -1865,8 +1865,18 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     // are removed before syntax recognition, so use the same logical
     // punctuation matcher as the full lexer.
     size_t arithmetic_command_after = 0;
-    if (c == '(' && shell_source_match_logical_punctuation(
-                        cmd, cmd_len, pos, "((", &arithmetic_command_after)) {
+    /* An opening `((` is arithmetic only when its balanced interior is
+     * followed immediately by `))`. Otherwise Bash opens two subshells, as in
+     * `((cat file) 3>&1)`. The full lexer decides with the same framing
+     * helper. Inside arithmetic, each parenthesis is counted on its own. */
+    size_t arithmetic_content, arithmetic_content_end, arithmetic_framed_after;
+    if (c == '(' &&
+        shell_source_match_logical_punctuation(cmd, cmd_len, pos, "((",
+                                               &arithmetic_command_after) &&
+        (arith_depth > 0 ||
+         shell_source_arithmetic_command(
+             cmd, cmd_len, pos, &arithmetic_content, &arithmetic_content_end,
+             &arithmetic_framed_after) != SHELL_ARITHMETIC_FRAME_NONE)) {
       /* `(( ... ))` is a shell arithmetic command only at a command
        * boundary. In argument position it is invalid shell syntax, not a
        * simple command containing literal parentheses. */
