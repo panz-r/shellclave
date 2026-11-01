@@ -18,6 +18,14 @@ typedef struct {
 bool sg_test_eval_workspace_layout(size_t length, sg_test_eval_layout_t *out)
     SHELL_NONNULL(2);
 
+/* Exercise the output writer in isolation. buf has size writable bytes, of
+ * which used are already consumed (used <= size). Returns the copied string
+ * or NULL, and reports the consumed count and overflow flag afterward. */
+const char *sg_test_writer_copy(char *buf, size_t size, size_t used,
+                                const char *src, size_t src_len,
+                                size_t *used_after, bool *overflow)
+    SHELL_NONNULL(1, 4, 6, 7);
+
 void sg_test_anomaly_op_fail_at(size_t operation_index);
 void sg_test_anomaly_op_reset(void);
 size_t sg_test_anomaly_op_count(void);

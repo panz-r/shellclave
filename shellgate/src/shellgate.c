@@ -137,7 +137,9 @@ static const char *bw_copy(buf_writer_t *w, const char *src, size_t src_len) {
   }
   size_t avail = w->size - w->used;
   size_t copy = src_len < avail ? src_len : avail - 1;
-  if (copy == 0 && avail <= 1) {
+  /* The last byte can hold only the terminator. An empty string fits exactly;
+   * a nonempty one would be cut to nothing, which the caller must not see. */
+  if (src_len != 0 && copy == 0) {
     w->overflow = true;
     return NULL;
   }
@@ -2552,6 +2554,20 @@ static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
 }
 
 #ifdef SHELLGATE_TEST_ALLOCATOR
+/* Drive the diagnostic writer directly: copy src into buf (size bytes, used
+ * already consumed) and report the writer's state afterward. */
+const char *sg_test_writer_copy(char *buf, size_t size, size_t used,
+                                const char *src, size_t src_len,
+                                size_t *used_after, bool *overflow) {
+  buf_writer_t writer;
+  bw_init(&writer, buf, size);
+  writer.used = used;
+  const char *result = bw_copy(&writer, src, src_len);
+  *used_after = writer.used;
+  *overflow = writer.overflow;
+  return result;
+}
+
 bool sg_test_eval_workspace_layout(size_t length, sg_test_eval_layout_t *out) {
   sg_eval_workspace_layout_t layout;
   if (!sg_eval_workspace_plan(length, &layout))

@@ -7161,6 +7161,42 @@ TEST(policy_persistence_matrix) {
 
 /* --- BUFFER MANAGEMENT --- */
 
+TEST(output_writer_exact_fit_boundaries) {
+  char buffer[8];
+  size_t used;
+  bool overflow;
+
+  /* One byte left holds only the terminator, which an empty string needs. */
+  memset(buffer, 'x', sizeof(buffer));
+  const char *copy = sg_test_writer_copy(buffer, 4, 3, "", 0, &used, &overflow);
+  ASSERT(copy == buffer + 3 && copy[0] == '\0');
+  ASSERT(used == 4 && !overflow);
+
+  /* A full buffer has no room even for that terminator. */
+  ASSERT(sg_test_writer_copy(buffer, 4, 4, "", 0, &used, &overflow) == NULL);
+  ASSERT(overflow);
+
+  /* A nonempty string cannot be cut to nothing in the last byte. */
+  overflow = false;
+  ASSERT(sg_test_writer_copy(buffer, 4, 3, "a", 1, &used, &overflow) == NULL);
+  ASSERT(overflow);
+
+  /* An empty string fits at the start of any nonempty buffer. */
+  overflow = true;
+  copy = sg_test_writer_copy(buffer, 1, 0, "", 0, &used, &overflow);
+  ASSERT(copy == buffer && copy[0] == '\0' && used == 1 && !overflow);
+
+  /* Nonempty strings keep their fit, truncation and overflow behavior. */
+  overflow = true;
+  copy = sg_test_writer_copy(buffer, 4, 0, "abc", 3, &used, &overflow);
+  ASSERT(copy != NULL && strcmp(copy, "abc") == 0 && used == 4);
+  copy = sg_test_writer_copy(buffer, 4, 0, "abcd", 4, &used, &overflow);
+  ASSERT(copy != NULL && strcmp(copy, "abc") == 0 && used == 4 && overflow);
+  overflow = false;
+  copy = sg_test_writer_copy(buffer, 4, 1, "ab", 2, &used, &overflow);
+  ASSERT(copy != NULL && strcmp(copy, "ab") == 0 && used == 4 && !overflow);
+}
+
 TEST(eval_workspace_prefix_boundaries) {
   static const size_t lengths[] = {11, 64, 4096};
   sg_gate_t *gate = sg_gate_new();
@@ -16182,6 +16218,7 @@ int main(int argc, char **argv) {
 
   printf("\nBuffer management:\n");
   RUN(eval_workspace_prefix_boundaries);
+  RUN(output_writer_exact_fit_boundaries);
   RUN(buffer_contract_matrix);
   RUN(graph_result_fields_stay_out_of_workspace);
   RUN(final_diagnostic_truncation_fails_closed);
