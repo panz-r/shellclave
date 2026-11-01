@@ -2601,16 +2601,28 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           }
         }
         pos = (uint32_t)redirect_after;
-        // Skip file descriptor number if present (but not after >>, and not for
-        // fd redirects) For 2>file, skip the 2. For 2>&1, don't skip the 1
-        // (it's the target).
+        /* Digits right after the operator are its target file name: `>2` and
+         * `>22` are valid. Digits that touch another redirect operator are
+         * instead that operator's IO number, which leaves this one without a
+         * target: Bash rejects `>2>x` and `>2<x`. `>2>(cmd)` is a process
+         * substitution word, so it stays a valid target. */
         if (!is_double_redirect && !is_fd_redirect && !is_extended_redirect) {
           size_t target_after = 0;
           uint32_t descriptor = 0;
           if (shell_source_parse_io_number(cmd, pos, cmd_len, &target_after,
                                            &descriptor) ==
-              SHELL_SOURCE_IO_NUMBER_VALID)
-            pos = (uint32_t)target_after;
+              SHELL_SOURCE_IO_NUMBER_VALID) {
+            size_t touching = shell_source_skip_escaped_line_endings(
+                cmd, cmd_len, target_after);
+            if (touching < cmd_len &&
+                (cmd[touching] == '<' || cmd[touching] == '>') &&
+                !shell_source_process_substitution_open(cmd, cmd_len, touching,
+                                                        NULL)) {
+              result->status = SHELL_STATUS_ERROR;
+              result->count = subcmd_idx;
+              return SHELL_EPARSE;
+            }
+          }
         }
         pos =
             (uint32_t)shell_source_skip_inline_continuations(cmd, cmd_len, pos);

@@ -433,11 +433,28 @@ static void test_list_syntax_contract(void) {
        valid_syntax);
 
   static const char *const modeled[] = {
-      "echo one;\n",         "echo one |\n cat",
-      "echo one |&\n cat",   "echo one &&\n cat",
-      "echo one ||\r\n cat", "{ echo one; } |& { cat; }",
-      "{\\\n echo one; }",   "! ! printf command |& cat",
-      "((1))2>out",          "((1)){fd}>out",
+      "echo one;\n",
+      "echo one |\n cat",
+      "echo one |&\n cat",
+      "echo one &&\n cat",
+      "echo one ||\r\n cat",
+      "{ echo one; } |& { cat; }",
+      "{\\\n echo one; }",
+      "! ! printf command |& cat",
+      "((1))2>out",
+      "((1)){fd}>out",
+      /* Digits after an operator are a file name unless they touch another
+       * redirect operator. */
+      "echo >2",
+      "echo x >2",
+      "echo >22",
+      "echo 2>2",
+      "echo <2",
+      "{ echo; } >2",
+      ": >12",
+      "echo >2;",
+      "echo >2&",
+      "echo >2>(:)",
   };
   bool public_contract = true;
   for (size_t i = 0; i < sizeof(modeled) / sizeof(modeled[0]); i++) {
@@ -467,6 +484,23 @@ static void test_list_syntax_contract(void) {
     }
   }
   test("List grammar agrees across public parsing surfaces", public_contract);
+
+  /* Digits touching a second operator are its IO number, leaving the first
+   * operator without a target: Bash rejects each of these. */
+  static const char *const no_target[] = {"echo >2>x", "echo >2<x",
+                                          "echo >2>>x", "echo >2>&1"};
+  bool targets_required = true;
+  for (size_t i = 0; i < sizeof(no_target) / sizeof(no_target[0]); i++) {
+    shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+    strict.strict_mode = true;
+    shell_parse_result_t parsed = {0};
+    if (shell_parse_fast(no_target[i], strlen(no_target[i]), &strict,
+                         &parsed) != SHELL_EPARSE) {
+      printf("    redirect without a target accepted: %s\n", no_target[i]);
+      targets_required = false;
+    }
+  }
+  test("A redirect touching another operator has no target", targets_required);
 }
 
 static void test_source_scanner_boundaries(void) {
