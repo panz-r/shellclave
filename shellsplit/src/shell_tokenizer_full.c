@@ -1220,7 +1220,13 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
       token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
     state->lexical_command_position = false;
     state->lexical_redirect_operand = false;
-    state->lexical_operand_end = token->position + token->length;
+    /* `))` ends the arithmetic command, so a descriptor redirect, `{name}`
+     * redirect or comment may follow it directly. `]]` instead must be
+     * followed by a delimiter: Bash rejects `[[ a ]]2>out` and `[[ a ]]#c`,
+     * so a conditional keeps its word boundary. */
+    state->lexical_operand_end = token->type == SHELL_TOKEN_ARITHMETIC_COMMAND
+                                     ? 0
+                                     : token->position + token->length;
     state->lexical_prefix = 0;
     return true;
   }
