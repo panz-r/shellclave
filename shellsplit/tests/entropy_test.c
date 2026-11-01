@@ -144,6 +144,25 @@ static int test_posterior_regression_matrix(void) {
   return 1;
 }
 
+static int test_longest_prefix_suffix_entropy(void) {
+  /* The longest overlapping prefix owns the suffix: AIzaSy, not AIza. */
+  double entropy = -1.0;
+  ASSERT(
+      shell_env_screener_check_secret_prefix("AIzaSyAAAAAAAAAAAA", &entropy));
+  ASSERT(entropy == 0.0);
+  ASSERT(shell_env_screener_check_secret_prefix("AIzaXXXXXXX", &entropy));
+  ASSERT(entropy == 0.0);
+  entropy = -1.0;
+  ASSERT(shell_env_screener_check_secret_prefix("AIzaSyAbCdEf", &entropy));
+  ASSERT(near(entropy, shell_env_screener_calculate_entropy("AbCdEf"), 1e-12));
+  /* A value with nothing after the longer prefix falls back to the shorter. */
+  ASSERT(shell_env_screener_check_secret_prefix("AIzaSy", &entropy));
+  ASSERT(near(entropy, shell_env_screener_calculate_entropy("Sy"), 1e-12));
+  ASSERT(shell_env_screener_check_secret_prefix("sk-abc", NULL));
+  ASSERT(!shell_env_screener_check_secret_prefix("sk-", NULL));
+  return 1;
+}
+
 static int test_detector_matrices(void) {
   static const struct {
     const char *value;
@@ -294,6 +313,7 @@ int main(void) {
   TEST(test_permutation_boundaries_and_ranges);
   TEST(test_permutation_allocation_failures);
   TEST(test_posterior_regression_matrix);
+  TEST(test_longest_prefix_suffix_entropy);
   TEST(test_detector_matrices);
   TEST(test_environment_scan_contract);
   printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,

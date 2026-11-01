@@ -115,7 +115,7 @@ bool shell_env_screener_looks_like_base64(const char *value) SHELL_NONNULL(1);
  * Check if value has a known secret prefix
  * @param value            The value to check
  * @param out_suffix_entropy  If not NULL, receives entropy of suffix (after
- * prefix)
+ * the longest matching prefix)
  * @return                 true if known prefix detected
  */
 bool shell_env_screener_check_secret_prefix(const char *value,

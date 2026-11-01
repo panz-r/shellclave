@@ -106,7 +106,7 @@ bool shell_env_screener_is_whitelisted(const char *name) {
  * Check if value has a known secret prefix and return combined score
  * @param value  The value to check
  * @param out_suffix_entropy  If not NULL, receives entropy of suffix (after
- * prefix)
+ * the longest matching prefix)
  * @return       true if known prefix detected
  */
 bool shell_env_screener_check_secret_prefix(const char *value,
@@ -115,21 +115,21 @@ bool shell_env_screener_check_secret_prefix(const char *value,
     return false;
 
   size_t value_len = strlen(value);
+  size_t longest = 0;
 
+  /* Prefixes overlap (AIza, AIzaSy), so the first match is not the best one. */
   for (int i = 0; secret_prefixes[i]; i++) {
     size_t prefix_len = strlen(secret_prefixes[i]);
-    if (value_len > prefix_len &&
-        strncmp(value, secret_prefixes[i], prefix_len) == 0) {
-      /* Found prefix - calculate entropy of suffix */
-      if (out_suffix_entropy) {
-        *out_suffix_entropy =
-            shell_env_screener_calculate_entropy(value + prefix_len);
-      }
-      return true;
-    }
+    if (prefix_len > longest && value_len > prefix_len &&
+        strncmp(value, secret_prefixes[i], prefix_len) == 0)
+      longest = prefix_len;
   }
+  if (!longest)
+    return false;
 
-  return false;
+  if (out_suffix_entropy)
+    *out_suffix_entropy = shell_env_screener_calculate_entropy(value + longest);
+  return true;
 }
 
 /**
