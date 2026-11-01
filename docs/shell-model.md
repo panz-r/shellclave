@@ -1108,6 +1108,14 @@ implicit document termination also cannot satisfy a missing redirect operand
 or command after a connector. Open drafts retain their existing INCOMPLETE
 recovery, and explicitly terminated documents retain exact framing.
 
+A heredoc whose delimiter line has not arrived is INCOMPLETE, at top level as
+in a group or pipeline. NEEDS_HEREDOC_HEADER reports a missing body start and
+NEEDS_HEREDOC_BODY a missing delimiter line. Bash would end the document at EOF
+with a warning, as in `cat <<EOF`, but received source can still be appended
+to, and a later command would then become body text. Strict parsing and graph
+construction reject the source, and the library is deliberately stricter than
+Bash here. Supplying the delimiter line completes the same document.
+
 An unfinished heredoc's raw content includes the received body prefix.
 `confirmed_length` excludes a tentative final line that could still become its
 delimiter. Apply the content helpers to a copy of `content` with that raw byte
