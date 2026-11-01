@@ -103,7 +103,7 @@ bool shell_env_screener_is_whitelisted(const char *name) {
 }
 
 /**
- * Check if value has a known secret prefix and return combined score
+ * Check if value has a known secret prefix and measure the suffix entropy
  * @param value  The value to check
  * @param out_suffix_entropy  If not NULL, receives entropy of suffix (after
  * the longest matching prefix)
@@ -172,12 +172,10 @@ bool shell_env_screener_looks_like_base64(const char *value) {
   size_t padding = 0;
   if (value[len - 1] == '=') {
     padding = 1;
-    if (len > 1 && value[len - 2] == '=')
+    if (value[len - 2] == '=')
       padding = 2;
   }
   size_t data_len = len - padding;
-  if (data_len == 0)
-    return false;
 
   /* Padding is permitted only in the final two positions. */
   for (size_t i = 0; i < data_len; i++) {
@@ -302,8 +300,6 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
  * For secrets: ratios cluster around 1.0 (Gaussian-like)
  * For non-secrets: ratios deviate from 1.0 (bimodal)
  */
-
-#include <math.h>
 
 /* Gaussian-like centered at 1.0 with std dev 0.15, scaled to 0-1 */
 static double lh_ratio_secret(double ratio) {
