@@ -176,7 +176,9 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
 
 typedef struct {
   shell_test_program_t *program;
-  uint16_t close[SHELL_DEP_MAX_TOKENS];
+  /* For a "(" at i: the first ")" at or after i + 2 that Bash's 1..4-argument
+   * dispatch scan would stop at, or UINT16_MAX. */
+  uint16_t boundary[SHELL_DEP_MAX_TOKENS];
   uint16_t unknown[SHELL_DEP_MAX_TOKENS + 1];
   size_t total_count;
   bool uncertain, failed;
@@ -212,14 +214,14 @@ static SHELL_NONNULL(1, 2) uint16_t
     return node(p, TEST_NOT, child, 0);
   }
   if (is_word(p, i, "(")) {
-    size_t close = parser->close[i];
-    size_t inspected_end = close < end ? close : end;
+    size_t boundary = parser->boundary[i];
+    size_t inspected_end = boundary < end ? boundary : end;
     if (i + 2 < inspected_end &&
         parser->unknown[inspected_end] != parser->unknown[i + 2])
       parser->uncertain = true;
     uint16_t child;
-    if (close < end && close - i - 1 <= 4) {
-      child = counted(parser, position, close, end);
+    if (boundary < end && boundary - i - 1 <= 4) {
+      child = counted(parser, position, boundary, end);
     } else {
       child = expression(parser, position, end);
     }
@@ -376,30 +378,31 @@ bool shell_test_refresh(shell_test_program_t *program) {
   }
   parser_t parser = {.program = program, .total_count = count};
   uint16_t stack[SHELL_DEP_MAX_TOKENS];
+  uint16_t pair[SHELL_DEP_MAX_TOKENS];
   size_t depth = 0;
   for (size_t i = 0; i < count; ++i) {
-    parser.close[i] = UINT16_MAX;
+    pair[i] = UINT16_MAX;
     if (is_word(program, i, "("))
       stack[depth++] = (uint16_t)i;
     else if (depth && is_word(program, i, ")"))
-      parser.close[stack[--depth]] = (uint16_t)i;
+      pair[stack[--depth]] = (uint16_t)i;
   }
   /* Bash 5.3 scans from the second word inside a group when selecting
-   * its 1..4-argument dispatch. Precompute that exact boundary in linear work;
-   * general expressions still consume their closing token through grammar. */
+   * its 1..4-argument dispatch. Precompute that exact boundary in linear work
+   * from the structural pairing; general expressions still consume their
+   * closing token through grammar. */
   uint16_t next[SHELL_DEP_MAX_TOKENS + 1];
   next[count] = UINT16_MAX;
   for (size_t i = count; i-- > 0;) {
     if (is_word(program, i, ")"))
       next[i] = (uint16_t)i;
     else if (is_word(program, i, "("))
-      next[i] = parser.close[i] == UINT16_MAX ? UINT16_MAX
-                                              : next[parser.close[i] + 1];
+      next[i] = pair[i] == UINT16_MAX ? UINT16_MAX : next[pair[i] + 1];
     else
       next[i] = next[i + 1];
   }
   for (size_t i = 0; i < count; ++i) {
-    parser.close[i] = i + 2 <= count ? next[i + 2] : UINT16_MAX;
+    parser.boundary[i] = i + 2 <= count ? next[i + 2] : UINT16_MAX;
     parser.unknown[i + 1] = parser.unknown[i] + !words[i].known;
   }
   size_t position = 0;
