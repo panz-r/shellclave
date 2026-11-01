@@ -1080,7 +1080,12 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
       goto ordinary_word;
     if (check_pos < state->length) {
       char after_digit = state->input[check_pos];
-      if (after_digit == '>' || after_digit == '<') {
+      /* `2>(cmd)` is a word holding a process substitution, as in Bash
+       * (`echo 2>(:)` prints `2/dev/fd/63`), not a descriptor redirect. */
+      size_t substitution_open;
+      if ((after_digit == '>' || after_digit == '<') &&
+          !shell_source_process_substitution_open(
+              state->input, state->length, check_pos, &substitution_open)) {
         return full_redirect_token(state, token, state->position, check_pos,
                                    true);
       }
