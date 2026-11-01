@@ -311,12 +311,29 @@ static bool is_absolute_path(const abstract_path_shape_t *shape) {
 }
 
 /**
- * Check if the decoded word is a relative path. An active tilde prefix is a
- * source property: an escaped or quoted `~` decodes to the same byte but is a
- * literal relative component, so `source` supplies the leading spelling.
+ * Whether the word starts with a tilde prefix that Bash expands: unquoted and
+ * uncancelled through its delimiter, and naming the home directory (`~`), the
+ * working directories (`~+`, `~-`) or a login name. Quoting is a source
+ * property, so the shared source scanner decides it. A prefix with any other
+ * body, such as `~1`, stays literal.
+ */
+static bool has_expanding_tilde_prefix(const char *source, size_t len) {
+  if (len == 0 || source[0] != '~' ||
+      !shell_source_conditional_has_tilde_expansion(source, len))
+    return false;
+  if (len == 1 || source[1] == '/')
+    return true;
+  if ((source[1] == '+' || source[1] == '-') && (len == 2 || source[2] == '/'))
+    return true;
+  return shell_ascii_alpha((unsigned char)source[1]);
+}
+
+/**
+ * Check if the decoded word is a relative path. A literal `~` decodes to the
+ * same byte as an active tilde prefix, so `source` supplies the quoting.
  */
 static bool is_relative_path(const abstract_path_shape_t *shape,
-                             const char *source) {
+                             const char *source, size_t source_len) {
   if (shape->length == 0)
     return false;
   const char *s = shape->prefix;
@@ -332,21 +349,15 @@ static bool is_relative_path(const abstract_path_shape_t *shape,
   if (len == 1 && s[0] == '.')
     return true;
 
-  // Contains / but not absolute and not starting with an active tilde.
-  return shape->has_slash && source[0] != '~';
+  // Contains / but not absolute and not starting with an expanding tilde.
+  return shape->has_slash && !has_expanding_tilde_prefix(source, source_len);
 }
 
 /**
- * Check if string is a home path (~ or ~user)
+ * Check if string is a tilde path (~, ~+, ~- or ~user) that Bash expands
  */
 static bool is_home_path(const char *s, size_t len) {
-  if (len == 0)
-    return false;
-  if (s[0] == '~') {
-    return len == 1 || s[1] == '/' ||
-           (len >= 2 && shell_ascii_alpha((unsigned char)s[1]));
-  }
-  return false;
+  return has_expanding_tilde_prefix(s, len);
 }
 
 /**
@@ -433,7 +444,7 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
   if (is_home_path(text, len)) {
     return SHELL_TOKEN_ARGUMENT;
   }
-  if (is_relative_path(&shape, text)) {
+  if (is_relative_path(&shape, text, len)) {
     return SHELL_TOKEN_ARGUMENT;
   }
 
@@ -532,7 +543,7 @@ static SHELL_NONNULL(2, 4) bool try_abstract_type(shell_token_type_t tok_type,
     if (is_home_path(text, len)) {
       return abstract_type_found(type, SHELL_ABSTRACT_HP);
     }
-    if (is_relative_path(&shape, text)) {
+    if (is_relative_path(&shape, text, len)) {
       return abstract_type_found(type, SHELL_ABSTRACT_RP);
     }
   }

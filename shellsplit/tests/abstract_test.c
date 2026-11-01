@@ -638,6 +638,22 @@ static void test_abstraction_matrix(void) {
        "echo ok 2>&out", 0, FLAG_REDIRECTS},
       {"dynamic duplication operand", "echo ok >& $FD", "echo ok >& $EV_1", 1,
        FLAG_REDIRECTS | FLAG_VARIABLES},
+      /* An active tilde prefix is a home or working-directory path. Quoting
+       * or an invalid prefix body leaves a literal relative path. */
+      {"tilde plus path", "cat ~+/child", "cat $HP_1", 1,
+       FLAG_PATHS | FLAG_HOME_PATHS},
+      {"tilde minus path", "cat ~-/child", "cat $HP_1", 1,
+       FLAG_PATHS | FLAG_HOME_PATHS},
+      {"user home path", "cat ~root/child", "cat $HP_1", 1,
+       FLAG_PATHS | FLAG_HOME_PATHS},
+      {"quote-cancelled tilde is relative", "cat ~''/child", "cat $RP_1", 1,
+       FLAG_PATHS | FLAG_REL_PATHS},
+      {"quote-cancelled user is relative", "cat ~root''/child", "cat $RP_1", 1,
+       FLAG_PATHS | FLAG_REL_PATHS},
+      {"numeric tilde body is relative", "cat ~1/x", "cat $RP_1", 1,
+       FLAG_PATHS | FLAG_REL_PATHS},
+      {"tilde plus suffix is relative", "cat ~+x/y", "cat $RP_1", 1,
+       FLAG_PATHS | FLAG_REL_PATHS},
       {"heredoc is redirection", "cat <<EOF\npayload\nEOF",
        "cat <<EOF\npayload\nEOF", 0, FLAG_REDIRECTS},
   };
