@@ -351,7 +351,18 @@ static SHELL_NONNULL(1, 2) uint16_t counted(parser_t *parser, size_t *position,
     return expression(parser, position, expression_end);
   }
   *position = end;
+  /* Every shell_test_dispatch_kind_t enumerator either assigns result or
+   * returns above, and a switch without default keeps -Wswitch checking new
+   * kinds. GCC cannot rule out an out-of-range enum value, so it reports
+   * result as possibly uninitialized; the warning is too conservative here. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
   return dispatch.negated ? node(p, TEST_NOT, result, 0) : result;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 #include "shell_test_projection_impl.h"
