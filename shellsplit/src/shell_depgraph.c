@@ -20064,6 +20064,7 @@ static SHELL_NONNULL(
   bool current_setup = mode == DEP_UNDO_COMMAND;
   bool child_setup = mode == DEP_UNDO_CHILD;
   dep_route_state_t continued = selected;
+  dep_route_state_t failed_setup = selected;
   dep_route_state_t child_continued = selected;
   if (child_setup) {
     dep_named_mutations_t unchanged = {0};
@@ -20086,6 +20087,7 @@ static SHELL_NONNULL(
         dep_route_state_publish(&continued, journal, executed_state, baseline,
                                 ops, op_count, descriptor_exec, &collection);
     journal->diagnostic_cleanup = false;
+    failed_setup = continued;
     if (!restored ||
         !dep_apply_persistent_owner_routes(&persistent, executed, ops, op_count,
                                            descriptor_exec, named_binding,
@@ -20094,23 +20096,29 @@ static SHELL_NONNULL(
                          ops, op_count, mutations))
       return false;
   }
-  /* Assignment-only commands commit their values before any redirect operand
-   * is expanded, so a statically failed setup still leaves them in place.
-   * Descriptor effects are not published: the redirects did not take effect. */
-  if (!setup_survived && current_setup && (!private || report_state) &&
-      mutations->before_redirect) {
+  /* A failed setup stops before the command runs, so its continuation keeps
+   * the published descriptor state but none of the command's own variable
+   * effects. Assignment-only commands instead commit their values before any
+   * redirect operand is expanded, so those survive the failure. */
+  if (child_setup) {
+    continued = child_continued;
+    failed_setup = continued;
+  } else if (current_setup && mutations->before_redirect &&
+             (!private || report_state)) {
     dep_owner_routes_t persistent;
     dep_copy_routes(&persistent, incoming);
     if (!dep_apply_persistent_owner_routes(&persistent, executed, ops, 0, false,
                                            false, mutations, NULL) ||
-        !dep_fd_bindings(&continued, journal, baseline, incoming, &persistent,
-                         ops, 0, mutations))
+        !dep_fd_bindings(&failed_setup, journal, baseline, incoming,
+                         &persistent, ops, 0, mutations))
       return false;
   }
-  if (child_setup)
-    continued = child_continued;
+  /* Only setup the model treats as failing (see setup_may_fail) diverges from
+   * the completed command. Here-documents and here-strings do not. */
+  bool failure_modeled = source->setup_may_fail || stop != UINT32_MAX;
   dep_fd_flow_t failures;
-  if (!dep_fd_setup_failures(&selected, journal, baseline, &continued, ops,
+  if (!dep_fd_setup_failures(&selected, journal, baseline,
+                             failure_modeled ? &failed_setup : &continued, ops,
                              all_op_count, descriptor_exec, named_binding,
                              mutations, &failures, setup_entry, context,
                              &collection))

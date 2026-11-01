@@ -15024,6 +15024,44 @@ TEST(failed_setup_keeps_assignment_only_commit) {
   pass_count++;
 }
 
+TEST(possible_setup_failure_discards_builtin_variable_effects) {
+  /* A builtin that never runs because its redirect setup failed cannot have
+   * changed a variable, so a possible failure keeps both outcomes. Setup the
+   * model treats as infallible (here-strings, duplicating an open descriptor)
+   * still proves the builtin's effect. */
+  static const struct {
+    const char *source;
+    bool reachable;
+  } cases[] = {
+      {"x=1; unset x >$n; [[ -v x ]] && cat <secret", true},
+      {"x=1; unset x >/nonexistent/f; [[ -v x ]] && cat <secret", true},
+      {"x=1; unset x 2>/nonexistent/f; [[ -v x ]] && cat <secret", true},
+      {"x=1; unset -v x <input; [[ -v x ]] && cat <secret", true},
+      {"x=1; unset x >\"\"; [[ -v x ]] && cat <secret", true},
+      {"x=1; unset x >&2; [[ -v x ]] && cat <secret", false},
+      {"x=1; unset x <<<p; [[ -v x ]] && cat <secret", false},
+      {"unset x; export x=1 >/nonexistent/f; [[ -v x ]] || cat <secret", true},
+      {"unset x; read x >$n </dev/null; [[ -v x ]] || cat <secret", true},
+      {"unset x; export x=1 >\"\"; [[ -v x ]] || cat <secret", true},
+      {"unset x; export x=1 <<<p; [[ -v x ]] || cat <secret", false},
+      {"unset x; export x=1 >&2; [[ -v x ]] || cat <secret", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i].source, &graph) == SHELL_DEP_OK);
+    int reader = find_cmd_tokens(&graph, "cat", NULL);
+    int file = find_file_doc(&graph, "secret");
+    ASSERT(reader >= 0 && file >= 0);
+    bool reachable =
+        has_edge(&graph, SHELL_EDGE_READ, (uint32_t)file, (uint32_t)reader);
+    if (reachable != cases[i].reachable)
+      printf("    builtin effect: %s\n", cases[i].source);
+    ASSERT(reachable == cases[i].reachable);
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
 TEST(expansion_phases_survive_failed_setup) {
   for (size_t i = 0; i < sizeof(shellsplit_test_expansion_setup) /
                              sizeof(shellsplit_test_expansion_setup[0]);
@@ -18772,6 +18810,7 @@ int main(int argc, char **argv) {
   RUN(unreachable_stage_effects_and_syntax);
   RUN(redirect_setup_outcome_substitutions);
   RUN(failed_setup_keeps_assignment_only_commit);
+  RUN(possible_setup_failure_discards_builtin_variable_effects);
   RUN(expansion_phases_survive_failed_setup);
   RUN(expansion_control_effects_require_reachable_setup);
   RUN(assignment_value_descriptor_snapshots);
