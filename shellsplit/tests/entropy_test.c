@@ -163,6 +163,24 @@ static int test_longest_prefix_suffix_entropy(void) {
   return 1;
 }
 
+static int test_zero_entropy_suffix_score(void) {
+  /* A zero-entropy suffix is a valid result, not a missing one: the score
+   * must not fall back to the entropy of the whole value. */
+  static const struct {
+    const char *value;
+    double expected;
+  } cases[] = {
+      {"sk-AAAAAAAAAAAA", 0.001305},
+      {"AIzaXXXXXXX", 0.079024},
+      {"AIzaSyAAAAAAAAAAAA", 0.026508},
+      {"sk-abcdef123456", 0.883451},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    ASSERT(near(shell_env_screener_combined_score_name(NULL, cases[i].value),
+                cases[i].expected, fmax(1e-6, cases[i].expected * 0.01)));
+  return 1;
+}
+
 static int test_detector_matrices(void) {
   static const struct {
     const char *value;
@@ -314,6 +332,7 @@ int main(void) {
   TEST(test_permutation_allocation_failures);
   TEST(test_posterior_regression_matrix);
   TEST(test_longest_prefix_suffix_entropy);
+  TEST(test_zero_entropy_suffix_score);
   TEST(test_detector_matrices);
   TEST(test_environment_scan_contract);
   printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,

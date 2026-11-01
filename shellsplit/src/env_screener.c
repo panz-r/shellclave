@@ -404,7 +404,7 @@ double shell_env_screener_combined_score_name(const char *name,
       shell_env_screener_check_secret_prefix(value, &suffix_entropy);
 
   double shannon;
-  if (has_prefix && suffix_entropy > 0) {
+  if (has_prefix) {
     shannon = suffix_entropy;
   } else {
     shannon = shell_env_screener_calculate_entropy(value);
