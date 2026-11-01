@@ -23,11 +23,7 @@ typedef enum {
   SHELL_TRANSFORM_NONE,     // Diagnostic spelling is retained
   SHELL_TRANSFORM_VARIABLE, // Variable/arithmetic diagnostic placeholder
   SHELL_TRANSFORM_GLOB,     // Glob diagnostic placeholder
-  SHELL_TRANSFORM_SUBSHELL, // Command/process-substitution placeholder
-  /* Reserved legacy values. Operators are marked with is_shell_construct but
-   * are not rewritten and therefore never receive these transform types. */
-  SHELL_TRANSFORM_PIPE,
-  SHELL_TRANSFORM_REDIRECTION
+  SHELL_TRANSFORM_SUBSHELL  // Command/process-substitution placeholder
 } shell_transform_type_t;
 
 /**

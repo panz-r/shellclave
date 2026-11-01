@@ -10047,8 +10047,8 @@ int main(void) {
       for (size_t token = 0; token < commands[command]->token_count; token++) {
         const shell_transformed_token_t *item =
             &commands[command]->tokens[token];
-        valid = item->type != SHELL_TRANSFORM_PIPE &&
-                item->type != SHELL_TRANSFORM_REDIRECTION;
+        valid = item->type >= SHELL_TRANSFORM_NONE &&
+                item->type <= SHELL_TRANSFORM_SUBSHELL;
         if (strcmp(item->original, "|&") == 0)
           saw_pipe =
               item->type == SHELL_TRANSFORM_NONE && item->is_shell_construct;

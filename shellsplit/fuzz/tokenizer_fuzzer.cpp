@@ -5969,7 +5969,7 @@ static int test_transformer(const char *input, size_t input_length) {
         const shell_transformed_token_t *tok = &tcmd->tokens[j];
         bool transformed = tok->type != SHELL_TRANSFORM_NONE;
         if (tok->type < SHELL_TRANSFORM_NONE ||
-            tok->type > SHELL_TRANSFORM_REDIRECTION || !tok->original ||
+            tok->type > SHELL_TRANSFORM_SUBSHELL || !tok->original ||
             !tok->transformed ||
             (!transformed && tok->transformed != tok->original) ||
             (transformed && tok->transformed == tok->original) ||
