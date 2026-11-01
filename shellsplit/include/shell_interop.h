@@ -97,7 +97,9 @@ char *shell_interop_subcommand_dup(const shell_interop_handle_t *handle,
                                    size_t index) SHELL_NONNULL(1);
 
 /* Format recognized feature flags into caller-owned storage. `written` gets
- * the byte count excluding NUL. The output is cleared on failure. */
+ * the byte count excluding NUL, or zero on failure. For a nonzero output_size
+ * the output is cleared on failure. A zero output_size returns SHELL_EINPUT
+ * without writing to output. */
 shell_error_t shell_interop_format_features(uint32_t features, char *output,
                                             size_t output_size, size_t *written)
     SHELL_NONNULL(2, 4);
