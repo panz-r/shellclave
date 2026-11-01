@@ -15,7 +15,6 @@
 #include "shell_word_decode_internal.h"
 #include <limits.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
