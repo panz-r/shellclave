@@ -30,30 +30,21 @@ static const char *secret_prefixes[] = {
     "ya29.",       /* Google OAuth token */
     "github_pat_", /* GitHub fine-grained token */
     NULL};
-static const char *whitelisted_vars[] = {
-    /* X11/Wayland */
-    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
-    "XDG_SESSION_ID", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_VTNR",
-    "XDG_SEAT",
-    /* GNOME/KDE */
-    "GNOME_DESKTOP_SESSION_ID", "GNOME_TERMINAL_SCREEN",
-    "GNOME_TERMINAL_SERVICE", "GNOME_TERMINAL_VERSION", "KDE_FULL_SESSION",
-    "KDE_SESSION_VERSION", "KDE_MULTIHEAD", "QT_QPA_PLATFORM",
-    "QT_STYLE_OVERRIDE",
-    /* Terminal */
-    "TMUX", "TMUX_PANE", "TERM", "TERM_PROGRAM", "COLORTERM", "LS_COLORS",
-    "LESSCLOSE", "LESSOPEN",
-    /* Shell/Env */
-    "SHELL", "PWD", "HOME", "USER", "LOGNAME", "PATH", "LANG", "LANGUAGE",
-    "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "HOSTNAME", "HOST", "MACHTYPE", "ARCH",
-    /* SSH/Auth */
-    "SSH_AUTH_SOCK", "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY",
-    /* Other common */
-    "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND", "HISTCONTROL", "HISTFILESIZE",
-    "HISTSIZE", "HISTTIMEFORMAT", "GLOBIGNORE", "BASHOPTS", "BASH_VERSION",
-    "BASH_VERSINFO", "GROUPS", "UID", "EUID", "GID", "EGID",
-    "MEMORY_PRESSURE_WATCH", "INVOCATION_ID", "JOURNAL_STREAM",
-    "WAYLAND_DISLOCK", NULL};
+/* Names that are never secrets, comma separated: the one copy of the list. */
+static const char whitelist_doc[] =
+    "DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, XDG_SESSION_ID, "
+    "XDG_CURRENT_DESKTOP, XDG_SESSION_TYPE, XDG_VTNR, XDG_SEAT, "
+    "GNOME_DESKTOP_SESSION_ID, GNOME_TERMINAL_SCREEN, "
+    "GNOME_TERMINAL_SERVICE, GNOME_TERMINAL_VERSION, KDE_FULL_SESSION, "
+    "KDE_SESSION_VERSION, KDE_MULTIHEAD, QT_QPA_PLATFORM, "
+    "QT_STYLE_OVERRIDE, TMUX, TMUX_PANE, TERM, TERM_PROGRAM, COLORTERM, "
+    "LS_COLORS, LESSCLOSE, LESSOPEN, SHELL, PWD, HOME, USER, LOGNAME, PATH, "
+    "LANG, LANGUAGE, LC_ALL, LC_CTYPE, LC_MESSAGES, HOSTNAME, HOST, "
+    "MACHTYPE, ARCH, SSH_AUTH_SOCK, SSH_CLIENT, SSH_CONNECTION, SSH_TTY, "
+    "PS1, PS2, PS3, PS4, PROMPT_COMMAND, HISTCONTROL, HISTFILESIZE, "
+    "HISTSIZE, HISTTIMEFORMAT, GLOBIGNORE, BASHOPTS, BASH_VERSION, "
+    "BASH_VERSINFO, GROUPS, UID, EUID, GID, EGID, MEMORY_PRESSURE_WATCH, "
+    "INVOCATION_ID, JOURNAL_STREAM, WAYLAND_DISLOCK";
 
 /**
  * Secret patterns in variable names
@@ -94,10 +85,14 @@ bool shell_env_screener_is_secret_pattern(const char *name) {
 }
 
 bool shell_env_screener_is_whitelisted(const char *name) {
-  for (int i = 0; whitelisted_vars[i]; i++) {
-    if (strcmp(name, whitelisted_vars[i]) == 0) {
+  size_t length = strlen(name);
+  for (const char *entry = whitelist_doc; *entry;) {
+    size_t end = strcspn(entry, ",");
+    if (end == length && memcmp(entry, name, length) == 0)
       return true;
-    }
+    entry += end;
+    if (*entry)
+      entry += 2; /* skip ", " */
   }
   return false;
 }
@@ -425,17 +420,4 @@ double shell_env_screener_combined_score_name(const char *name,
   return posterior;
 }
 
-const char *shell_env_screener_get_whitelist_doc(void) {
-  static char doc[2048] = {0};
-  if (doc[0])
-    return doc;
-
-  size_t pos = 0;
-  for (int i = 0; whitelisted_vars[i] && pos < sizeof(doc) - 20; i++) {
-    if (i > 0) {
-      pos += snprintf(doc + pos, sizeof(doc) - pos, ", ");
-    }
-    pos += snprintf(doc + pos, sizeof(doc) - pos, "%s", whitelisted_vars[i]);
-  }
-  return doc;
-}
+const char *shell_env_screener_get_whitelist_doc(void) { return whitelist_doc; }

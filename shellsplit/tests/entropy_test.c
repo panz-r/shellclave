@@ -249,6 +249,12 @@ static int test_detector_matrices(void) {
   ASSERT(whitelist && strstr(whitelist, "DISPLAY") &&
          strstr(whitelist, "PATH"));
   ASSERT(shell_env_screener_get_whitelist_doc() == whitelist);
+  ASSERT(shell_env_screener_is_whitelisted("DISPLAY"));
+  ASSERT(shell_env_screener_is_whitelisted("WAYLAND_DISLOCK"));
+  ASSERT(!shell_env_screener_is_whitelisted("DISPLA"));
+  ASSERT(!shell_env_screener_is_whitelisted("PATHX"));
+  ASSERT(!shell_env_screener_is_whitelisted("PS"));
+  ASSERT(!shell_env_screener_is_whitelisted(""));
   return 1;
 }
 
