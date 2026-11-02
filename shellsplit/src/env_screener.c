@@ -210,11 +210,18 @@ static const char *secret_pattern_in_span(const char *name, size_t name_len) {
   return NULL;
 }
 
-static bool score_environment_entry(const char *entry, size_t min_length,
-                                    double *out_score) {
+typedef enum {
+  ENTRY_SKIPPED, /* not eligible: malformed, short or whitelisted */
+  ENTRY_SCORED,
+  ENTRY_FAILED /* eligible, but the score could not be measured */
+} entry_status_t;
+
+static entry_status_t score_environment_entry(const char *entry,
+                                              size_t min_length,
+                                              double *out_score) {
   const char *eq = strchr(entry, '=');
   if (!eq || eq == entry || !eq[1] || strlen(eq + 1) < min_length)
-    return false;
+    return ENTRY_SKIPPED;
 
   size_t name_len = (size_t)(eq - entry);
   char name[256];
@@ -223,7 +230,7 @@ static bool score_environment_entry(const char *entry, size_t min_length,
     memcpy(name, entry, name_len);
     name[name_len] = '\0';
     if (shell_env_screener_is_whitelisted(name))
-      return false;
+      return ENTRY_SKIPPED;
     score_name = name;
   } else {
     /* Long names cannot match the finite whitelist, but must not bypass the
@@ -232,7 +239,8 @@ static bool score_environment_entry(const char *entry, size_t min_length,
   }
 
   *out_score = shell_env_screener_combined_score_name(score_name, eq + 1);
-  return true;
+  /* NaN is a measurement that could not be made, not a low suspicion. */
+  return isnan(*out_score) ? ENTRY_FAILED : ENTRY_SCORED;
 }
 
 shell_env_screener_status_t
@@ -254,8 +262,11 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
   /* First pass: count how many would be flagged */
   for (size_t i = 0; environ[i]; i++) {
     double score;
-    if (score_environment_entry(environ[i], min_length, &score) &&
-        score > posterior_threshold)
+    entry_status_t status =
+        score_environment_entry(environ[i], min_length, &score);
+    if (status == ENTRY_FAILED)
+      return SHELL_ENV_SCREENER_ERROR;
+    if (status == ENTRY_SCORED && score > posterior_threshold)
       flagged++;
   }
 
@@ -269,8 +280,13 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
   size_t out_idx = 0;
   for (size_t i = 0; environ[i] && out_idx < capacity; i++) {
     double score;
-    if (score_environment_entry(environ[i], min_length, &score) &&
-        score > posterior_threshold)
+    entry_status_t status =
+        score_environment_entry(environ[i], min_length, &score);
+    if (status == ENTRY_FAILED) {
+      *out_count = 0;
+      return SHELL_ENV_SCREENER_ERROR;
+    }
+    if (status == ENTRY_SCORED && score > posterior_threshold)
       out_indices[out_idx++] = i;
   }
 

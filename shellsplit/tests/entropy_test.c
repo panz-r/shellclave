@@ -258,6 +258,34 @@ static int test_detector_matrices(void) {
   return 1;
 }
 
+static int test_allocation_failure_is_not_a_non_detection(void) {
+  extern char **environ;
+  char **saved_environ = environ;
+  char *controlled_environ[] = {
+      "API_KEY=9fA3kLmP2qRsT7vWxY1zB4cD6eF8gH0j",
+      NULL,
+  };
+  size_t indices[2] = {SIZE_MAX, SIZE_MAX};
+  size_t count = SIZE_MAX;
+
+  environ = controlled_environ;
+  /* An entry takes four allocations to score, and the counting and filling
+   * passes each score it: failing any of the eight must be an error. */
+  for (size_t fail_at = 1; fail_at <= 8; fail_at++) {
+    shellsplit_test_alloc_fail_at(fail_at);
+    shell_env_screener_status_t status =
+        shell_env_screener_scan(indices, 2, &count, 0.5, 8);
+    shellsplit_test_alloc_reset();
+    ASSERT(status == SHELL_ENV_SCREENER_ERROR);
+    ASSERT(count == 0);
+  }
+  ASSERT(shell_env_screener_scan(indices, 2, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_OK);
+  ASSERT(count == 1 && indices[0] == 0);
+  environ = saved_environ;
+  return 1;
+}
+
 static int test_environment_scan_contract(void) {
   extern char **environ;
   char **saved_environ = environ;
@@ -341,6 +369,7 @@ int main(void) {
   TEST(test_zero_entropy_suffix_score);
   TEST(test_detector_matrices);
   TEST(test_environment_scan_contract);
+  TEST(test_allocation_failure_is_not_a_non_detection);
   printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,
          tests_failed);
   return tests_failed > 0 ? 1 : 0;

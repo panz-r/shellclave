@@ -73,7 +73,9 @@ bool shell_env_screener_is_whitelisted(const char *name) SHELL_NONNULL(1);
  * @param min_length             read: minimum value length to consider
  * @return                       SHELL_ENV_SCREENER_OK on success,
  * SHELL_ENV_SCREENER_BUFFER_TOO_SMALL if capacity too small (out_count has
- * minimum needed), SHELL_ENV_SCREENER_ERROR on error
+ * minimum needed), SHELL_ENV_SCREENER_ERROR on error, including an eligible
+ * entry whose score could not be measured (allocation failure); a failed
+ * measurement is never reported as a non-detection
  */
 shell_env_screener_status_t
 shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
