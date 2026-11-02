@@ -922,14 +922,21 @@ sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size) {
 
 /* --- BAYESIAN CDF HELPERS --- */
 
+/* Histogram bucket of a finite, non-negative score. Scores at or above
+ * CDF_MAX_SCORE saturate into the last bucket; the saturation happens before
+ * the conversion, which is undefined for a value size_t cannot represent. */
+static size_t cdf_bucket(double score) {
+  if (score >= CDF_MAX_SCORE)
+    return CDF_NUM_BUCKETS - 1;
+  return (size_t)(score / CDF_MAX_SCORE * CDF_NUM_BUCKETS);
+}
+
 static void cdf_record(size_t *hist, size_t *total, double score) {
   if (!hist)
     return;
   if (!isfinite(score) || score < 0.0)
     return;
-  size_t bucket = (size_t)(score / CDF_MAX_SCORE * CDF_NUM_BUCKETS);
-  if (bucket >= CDF_NUM_BUCKETS)
-    bucket = CDF_NUM_BUCKETS - 1;
+  size_t bucket = cdf_bucket(score);
   hist[bucket]++;
   (*total)++;
 }
@@ -940,9 +947,7 @@ static double cdf_log_odds(const size_t *hist, size_t total, double score) {
   if (!isfinite(score) || score < 0.0)
     return 0.0;
 
-  size_t bucket = (size_t)(score / CDF_MAX_SCORE * CDF_NUM_BUCKETS);
-  if (bucket >= CDF_NUM_BUCKETS)
-    bucket = CDF_NUM_BUCKETS - 1;
+  size_t bucket = cdf_bucket(score);
 
   /* Use a smoothed mid-rank empirical CDF. Counting half of the current
    * bucket prevents a common tied normal score from landing at F(x)=1. */
@@ -2573,6 +2578,9 @@ static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
 }
 
 #ifdef SHELLGATE_TEST_ALLOCATOR
+/* Expose the histogram bucket mapping for a finite, non-negative score. */
+size_t sg_test_cdf_bucket(double score) { return cdf_bucket(score); }
+
 /* Drive the diagnostic writer directly: copy src into buf (size bytes, used
  * already consumed) and report the writer's state afterward. */
 const char *sg_test_writer_copy(char *buf, size_t size, size_t used,

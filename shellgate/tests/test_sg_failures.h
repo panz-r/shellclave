@@ -18,6 +18,10 @@ typedef struct {
 bool sg_test_eval_workspace_layout(size_t length, sg_test_eval_layout_t *out)
     SHELL_NONNULL(2);
 
+/* Histogram bucket for a finite, non-negative anomaly score; scores at or
+ * above the histogram range saturate into the last bucket. */
+size_t sg_test_cdf_bucket(double score);
+
 /* Exercise the output writer in isolation. buf has size writable bytes, of
  * which used are already consumed (used <= size). Returns the copied string
  * or NULL, and reports the consumed count and overflow flag afterward. */

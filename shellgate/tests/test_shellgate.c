@@ -5989,6 +5989,19 @@ TEST(suggestion_rendering_failure_is_not_silent) {
   sg_gate_free(gate);
 }
 
+/* The conversion to a bucket index is undefined for a double that size_t
+ * cannot represent, so a large finite score must saturate before it. */
+TEST(cdf_bucket_saturates_before_conversion) {
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(0.0), 0);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(0.1), 0);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(25.0), 64);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(49.99), 127);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(50.0), 127);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(1e9), 127);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(1e300), 127);
+  ASSERT_EQ_UINT(sg_test_cdf_bucket(DBL_MAX), 127);
+}
+
 /* --- EDGE CASES --- */
 
 TEST(eval_input_contract_matrix) {
@@ -16226,6 +16239,7 @@ int main(int argc, char **argv) {
   RUN(match_only_path_avoids_suggestion_allocations);
   RUN(complete_and_oversized_suggestions);
   RUN(suggestion_rendering_failure_is_not_silent);
+  RUN(cdf_bucket_saturates_before_conversion);
   RUN(contextual_policy_mutations_preserve_verdicts);
 
   printf("\nEdge cases:\n");
