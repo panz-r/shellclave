@@ -126,7 +126,6 @@ Weights must be non-negative and sum to approximately 1.0.
 ### Hyperparameters
 
 - **alpha** (0.1): Fallback smoothing parameter (used when KN data is sparse).
-- **unk_prior** (-10.0): Fallback log-probability for unseen stages in bits.
 - **kn_discount** (0.5): Kneser-Ney absolute discount parameter.
 
 ### Per-Model Scores
@@ -214,12 +213,11 @@ Sequences with < 3 stages are not scored for anomaly detection (score = 0, detec
 - Save/load both models atomically with `sg_gate_save_anomaly_model()` /
   `sg_gate_load_anomaly_model()`.
 - Gate persistence uses the checksummed v2 bundle containing raw and type
-  models. Standalone writers use v7. Legacy v6 models remain loadable when
-  every n-gram item is non-empty; a v6 file containing the v7 empty
-  redirect-only-stage sentinel is rejected atomically. Version 5 and older
-  files, plus the former `_type` sidecar layout, are rejected because their
-  NUL-delimited n-gram keys cannot represent the current opaque byte-item
-  semantics.
+  models. Standalone writers use v8. Version 7 and older files, plus the
+  former `_type` sidecar layout, are rejected: v8 drops the stored
+  unknown-stage prior, which never affected scores, and versions before v6
+  use NUL-delimited n-gram keys that cannot represent the current opaque
+  byte-item semantics.
 
 ## Long-Running Model Maintenance
 

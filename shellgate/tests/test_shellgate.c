@@ -14393,17 +14393,14 @@ TEST(anomaly_configuration_validation) {
   static const struct {
     double threshold;
     double alpha;
-    double unknown_log_prior;
   } invalid_enable[] = {
-      {NAN, 0.1, -10.0},  {INFINITY, 0.1, -10.0}, {5.0, 0.0, -10.0},
-      {5.0, -0.1, -10.0}, {5.0, NAN, -10.0},      {5.0, INFINITY, -10.0},
-      {5.0, 0.1, NAN},    {5.0, 0.1, -INFINITY},
+      {NAN, 0.1},  {INFINITY, 0.1}, {5.0, 0.0},
+      {5.0, -0.1}, {5.0, NAN},      {5.0, INFINITY},
   };
   for (size_t i = 0; i < sizeof(invalid_enable) / sizeof(invalid_enable[0]);
        i++) {
     sg_anomaly_config_t config = {
         .alpha = invalid_enable[i].alpha,
-        .unknown_log_prior = invalid_enable[i].unknown_log_prior,
     };
     ASSERT(sg_gate_enable_anomaly(g, invalid_enable[i].threshold, &config) ==
            SG_ERR_INVALID);
@@ -14416,14 +14413,12 @@ TEST(anomaly_configuration_validation) {
   ASSERT(preserved_vocab == 3);
   sg_anomaly_config_t invalid_config = {
       .alpha = 0.0,
-      .unknown_log_prior = -10.0,
   };
   ASSERT(sg_gate_enable_anomaly(g, 5.0, &invalid_config) == SG_ERR_INVALID);
   ASSERT_EQ_UINT(test_anomaly_vocabulary(g), preserved_vocab);
 
   sg_anomaly_config_t custom_config = {
       .alpha = 0.25,
-      .unknown_log_prior = -7.0,
   };
   ASSERT_SG_OK(sg_gate_enable_anomaly(g, 5.0, &custom_config));
 

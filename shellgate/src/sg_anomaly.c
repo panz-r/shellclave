@@ -14,8 +14,8 @@
  *   D = absolute discount (default 0.5)
  *
  * Serialisation uses a binary format with length-prefixed keys:
- *   Header (text):  # anomaly-model-v7\n
- *                   # alpha unk_prior D total_uni total_bi total_tri total_quad
+ *   Header (text):  # anomaly-model-v8\n
+ *                   # alpha D total_uni total_bi total_tri total_quad
  * vocab_size unk_count\n Entry (binary): uint8_t type; uint32_t key_len;
  * uint8_t key[key_len]; uint64_t count; uint8_t nl; type values: 1='U', 2='B',
  * 3='T', 4='Q'
@@ -231,7 +231,6 @@ struct sg_anomaly_model {
   size_t total_tri;
   size_t total_quad;
   double alpha;       /* Dirichlet smoothing (used when KN data insufficient) */
-  double unk_prior;   /* fallback log-prob for unseen commands */
   double kn_discount; /* Kneser-Ney absolute discount (default 0.5) */
   size_t vocab_size;  /* number of unique unigrams */
   bool oom;           /* sticky record of an allocation failure, not poison */
@@ -302,15 +301,13 @@ static SHELL_NONNULL(1) sg_anomaly_status_t
 
 void sg_anomaly_config_default(sg_anomaly_config_t *config) {
   config->alpha = 0.1;
-  config->unknown_log_prior = -10.0;
 }
 
-static sg_anomaly_model_t *anomaly_model_new(double alpha, double unk_prior) {
+static sg_anomaly_model_t *anomaly_model_new(double alpha) {
   sg_anomaly_model_t *m = calloc(1, sizeof(*m));
   if (!m)
     return NULL;
   m->alpha = alpha;
-  m->unk_prior = unk_prior;
   m->kn_discount = 0.5;
   m->vocab_size = 0;
   m->oom = false;
@@ -343,10 +340,9 @@ sg_anomaly_model_new_with_config(const sg_anomaly_config_t *config) {
     sg_anomaly_config_default(&defaults);
     config = &defaults;
   }
-  if (!isfinite(config->alpha) || config->alpha <= 0.0 ||
-      !isfinite(config->unknown_log_prior))
+  if (!isfinite(config->alpha) || config->alpha <= 0.0)
     return NULL;
-  return anomaly_model_new(config->alpha, config->unknown_log_prior);
+  return anomaly_model_new(config->alpha);
 }
 
 sg_anomaly_model_t *sg_anomaly_model_new(void) {
@@ -401,8 +397,6 @@ static double unk_logprob(const sg_anomaly_model_t *m) {
       log_add_positive(log_count(m->total_uni), log_count(m->unk_count));
   denominator = log_add_positive(denominator,
                                  log_alpha + log((double)m->vocab_size + 1.0));
-  if (!isfinite(denominator))
-    return m->unk_prior;
   return (numerator - denominator) / M_LN2;
 }
 
@@ -997,11 +991,10 @@ sg_anomaly_status_t sg_anomaly_write_stream(const sg_anomaly_model_t *model,
   if (status != SG_ANOMALY_OK)
     return status;
   errno = 0;
-  if (sg_io_printf(f, "# anomaly-model-v7\n") < 0 ||
-      sg_io_printf(f, "# %.17g %.17g %.17g %zu %zu %zu %zu %zu %zu\n",
-                   model->alpha, model->unk_prior, model->kn_discount,
-                   model->total_uni, model->total_bi, model->total_tri,
-                   model->total_quad, model->vocab_size,
+  if (sg_io_printf(f, "# anomaly-model-v8\n") < 0 ||
+      sg_io_printf(f, "# %.17g %.17g %zu %zu %zu %zu %zu %zu\n", model->alpha,
+                   model->kn_discount, model->total_uni, model->total_bi,
+                   model->total_tri, model->total_quad, model->vocab_size,
                    model->unk_count) < 0 ||
       save_table(f, model->uni, BINARY_TYPE_UNI) < 0 ||
       save_table(f, model->bi, BINARY_TYPE_BI) < 0 ||
@@ -1029,14 +1022,13 @@ sg_anomaly_status_t sg_anomaly_model_save(const sg_anomaly_model_t *model,
 }
 
 static bool serialized_key_valid(const char *key, size_t length,
-                                 size_t components, bool allow_empty_items) {
+                                 size_t components) {
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, key, length) != SHELL_NETSTRING_OK)
     return false;
   shell_netstring_view_t view;
   for (size_t i = 0; i < components; i++) {
     if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
-        (!allow_empty_items && view.payload_length == 0) ||
         view.payload_length > SG_ANOMALY_MAX_STAGE_LENGTH)
       return false;
   }
@@ -1150,8 +1142,8 @@ static SHELL_NONNULL(1, 2) sg_anomaly_status_t
   return SG_ANOMALY_OK;
 }
 
-static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) sg_anomaly_status_t
-    serialized_header_parse(const char *line, double *alpha, double *unk_prior,
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7, 8, 9) sg_anomaly_status_t
+    serialized_header_parse(const char *line, double *alpha,
                             double *kn_discount, size_t *expected_uni,
                             size_t *expected_bi, size_t *expected_tri,
                             size_t *expected_quad, size_t *expected_vocab,
@@ -1161,8 +1153,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) sg_anomaly_status_t
     errno = EPROTO;
     return SG_ANOMALY_ERR_FORMAT;
   }
-  double *doubles[] = {alpha, unk_prior, kn_discount};
-  for (size_t i = 0; i < 3; i++) {
+  double *doubles[] = {alpha, kn_discount};
+  for (size_t i = 0; i < 2; i++) {
     sg_anomaly_status_t status = serialized_header_double(&cursor, doubles[i]);
     if (status != SG_ANOMALY_OK)
       return status;
@@ -1226,11 +1218,8 @@ static sg_anomaly_status_t load_anomaly_stream(sg_anomaly_model_t *model,
       anomaly_read_header_line(f, line, sizeof(line));
   if (line_status != SG_ANOMALY_OK)
     return line_status;
-  bool allow_empty_items = strcmp(line, "# anomaly-model-v7\n") == 0 ||
-                           strcmp(line, "# anomaly-model-v7\r\n") == 0;
-  bool legacy_v6 = strcmp(line, "# anomaly-model-v6\n") == 0 ||
-                   strcmp(line, "# anomaly-model-v6\r\n") == 0;
-  if (!allow_empty_items && !legacy_v6) {
+  if (strcmp(line, "# anomaly-model-v8\n") != 0 &&
+      strcmp(line, "# anomaly-model-v8\r\n") != 0) {
     errno = EPROTO;
     return SG_ANOMALY_ERR_FORMAT;
   }
@@ -1238,16 +1227,15 @@ static sg_anomaly_status_t load_anomaly_stream(sg_anomaly_model_t *model,
   if (line_status != SG_ANOMALY_OK)
     return line_status;
 
-  double alpha = 0.0, unk_prior = 0.0, kn_discount = 0.0;
+  double alpha = 0.0, kn_discount = 0.0;
   size_t expected_uni = 0, expected_bi = 0, expected_tri = 0;
   size_t expected_quad = 0, expected_vocab = 0, unk_count = 0;
   sg_anomaly_status_t header_status = serialized_header_parse(
-      line, &alpha, &unk_prior, &kn_discount, &expected_uni, &expected_bi,
-      &expected_tri, &expected_quad, &expected_vocab, &unk_count);
+      line, &alpha, &kn_discount, &expected_uni, &expected_bi, &expected_tri,
+      &expected_quad, &expected_vocab, &unk_count);
   if (header_status != SG_ANOMALY_OK)
     return header_status;
   model->alpha = alpha;
-  model->unk_prior = unk_prior;
   model->kn_discount = kn_discount;
   model->unk_count = unk_count;
 
@@ -1281,7 +1269,7 @@ static sg_anomaly_status_t load_anomaly_stream(sg_anomaly_model_t *model,
       return status;
     if (count == 0 || count > INT64_MAX || count > SIZE_MAX ||
         newline != '\n' || type < 1 || type > 4 ||
-        !serialized_key_valid(key, key_len, type, allow_empty_items)) {
+        !serialized_key_valid(key, key_len, type)) {
       errno = EPROTO;
       return SG_ANOMALY_ERR_FORMAT;
     }
@@ -1578,8 +1566,7 @@ static void anomaly_replace_model(sg_anomaly_model_t *model,
 }
 
 sg_anomaly_status_t sg_anomaly_model_reset(sg_anomaly_model_t *model) {
-  sg_anomaly_model_t *staged =
-      anomaly_model_new(model->alpha, model->unk_prior);
+  sg_anomaly_model_t *staged = anomaly_model_new(model->alpha);
   if (!staged) {
     model->oom = true;
     return SG_ANOMALY_ERR_MEMORY;

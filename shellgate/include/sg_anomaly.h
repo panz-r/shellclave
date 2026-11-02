@@ -74,8 +74,6 @@ void sg_anomaly_model_clear_error(sg_anomaly_model_t *model) SHELL_NONNULL(1);
 typedef struct {
   /* Dirichlet smoothing parameter; must be finite and positive. */
   double alpha;
-  /* Fallback log-probability; must be finite. */
-  double unknown_log_prior;
 } sg_anomaly_config_t;
 
 /* Initialize a configuration with the default hyperparameters. */

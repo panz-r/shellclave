@@ -19,11 +19,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static sg_anomaly_model_t *test_model_with_config(double alpha,
-                                                  double unknown_log_prior) {
+static sg_anomaly_model_t *test_model_with_config(double alpha) {
   sg_anomaly_config_t config = {
       .alpha = alpha,
-      .unknown_log_prior = unknown_log_prior,
   };
   return sg_anomaly_model_new_with_config(&config);
 }
@@ -331,10 +329,8 @@ TEST(config_contract) {
   sg_anomaly_config_t config;
   sg_anomaly_config_default(&config);
   ASSERT_EQ_DBL(config.alpha, 0.1, 0.0);
-  ASSERT_EQ_DBL(config.unknown_log_prior, -10.0, 0.0);
 
   config.alpha = 0.25;
-  config.unknown_log_prior = -7.0;
   sg_anomaly_model_t *model = sg_anomaly_model_new_with_config(&config);
   ASSERT(model != NULL);
   sg_anomaly_model_free(model);
@@ -346,9 +342,48 @@ TEST(config_contract) {
   ASSERT(sg_anomaly_model_new_with_config(&config) == NULL);
   config.alpha = NAN;
   ASSERT(sg_anomaly_model_new_with_config(&config) == NULL);
-  config.alpha = 0.1;
-  config.unknown_log_prior = INFINITY;
+  config.alpha = INFINITY;
   ASSERT(sg_anomaly_model_new_with_config(&config) == NULL);
+}
+
+/* An unseen stage is scored from the learned counts and the smoothing
+ * parameter alone; there is no separate fallback probability to configure.
+ * Both inputs change the score of a sequence of unseen stages. */
+TEST(unseen_stage_score_follows_smoothing_and_counts) {
+  static const char learned[] = "1:a,1:b,1:c,";
+  static const char unseen[] = "1:x,1:y,1:z,";
+  static const double alphas[] = {0.01, 0.1, 1.0};
+  double by_alpha[3] = {0};
+  for (size_t i = 0; i < 3; i++) {
+    sg_anomaly_model_t *model = test_model_with_config(alphas[i]);
+    ASSERT(model != NULL);
+    for (int repeat = 0; repeat < 2; repeat++)
+      ASSERT_EQ_INT(
+          sg_anomaly_model_update_netseq(model, learned, sizeof(learned) - 1),
+          SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(
+                      model, unseen, sizeof(unseen) - 1, &by_alpha[i]),
+                  SG_ANOMALY_OK);
+    ASSERT(isfinite(by_alpha[i]));
+    sg_anomaly_model_free(model);
+  }
+  ASSERT(by_alpha[0] < by_alpha[1] && by_alpha[1] < by_alpha[2]);
+
+  double by_count[3] = {0};
+  static const int repeats[] = {1, 5, 50};
+  for (size_t i = 0; i < 3; i++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    ASSERT(model != NULL);
+    for (int repeat = 0; repeat < repeats[i]; repeat++)
+      ASSERT_EQ_INT(
+          sg_anomaly_model_update_netseq(model, learned, sizeof(learned) - 1),
+          SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(
+                      model, unseen, sizeof(unseen) - 1, &by_count[i]),
+                  SG_ANOMALY_OK);
+    sg_anomaly_model_free(model);
+  }
+  ASSERT(by_count[0] < by_count[1] && by_count[1] < by_count[2]);
 }
 
 TEST(extreme_alpha_scores_are_finite) {
@@ -358,7 +393,6 @@ TEST(extreme_alpha_scores_are_finite) {
   for (size_t i = 0; i < sizeof(alphas) / sizeof(alphas[0]); i++) {
     sg_anomaly_config_t config = {
         .alpha = alphas[i],
-        .unknown_log_prior = -10.0,
     };
     sg_anomaly_model_t *model = sg_anomaly_model_new_with_config(&config);
     ASSERT(model != NULL);
@@ -480,7 +514,7 @@ TEST(update_count_matrix) {
 
 TEST(score_discrimination_matrix) {
   for (size_t length = 3; length <= 5; length++) {
-    sg_anomaly_model_t *model = test_model_with_config(0.1, -10.0);
+    sg_anomaly_model_t *model = test_model_with_config(0.1);
     ASSERT(model != NULL);
     sg_anomaly_update(model, commands, length);
     double initial_score = sg_anomaly_score(model, commands, length);
@@ -503,8 +537,8 @@ TEST(score_discrimination_matrix) {
 
 TEST(backoff_levels_are_usable) {
   const char *sequence[] = {"ls", "cd", "pwd"};
-  sg_anomaly_model_t *unigram_model = test_model_with_config(0.1, -10.0);
-  sg_anomaly_model_t *bigram_model = test_model_with_config(0.1, -10.0);
+  sg_anomaly_model_t *unigram_model = test_model_with_config(0.1);
+  sg_anomaly_model_t *bigram_model = test_model_with_config(0.1);
   ASSERT(unigram_model && bigram_model);
 
   for (size_t i = 0; i < 3; i++)
@@ -549,7 +583,7 @@ TEST(save_load_roundtrip) {
   snprintf(anomaly_temp_path, sizeof(anomaly_temp_path), "%s", path);
   close(fd);
 
-  sg_anomaly_model_t *source = test_model_with_config(0.5, -8.0);
+  sg_anomaly_model_t *source = test_model_with_config(0.5);
   sg_anomaly_model_t *loaded = sg_anomaly_model_new();
   ASSERT(source && loaded);
   update_repeated(source, commands, 5, 5);
@@ -706,7 +740,7 @@ TEST(save_load_roundtrip) {
   /* Version 5 used NUL-delimited model keys and is deliberately not
    * compatible with binary-safe version 6. Loading remains atomic. */
   ASSERT(fprintf(fixture, "# anomaly-model-v5\n") > 0);
-  ASSERT(fprintf(fixture, "# 0.1 -10 0.5 0 0 0 0 0 0\n") > 0);
+  ASSERT(fprintf(fixture, "# 0.1 0.5 0 0 0 0 0 0\n") > 0);
   ASSERT(fclose(fixture) == 0);
   errno = 0;
   ASSERT_EQ_INT(sg_anomaly_model_load(loaded, path), SG_ANOMALY_ERR_FORMAT);
@@ -715,8 +749,8 @@ TEST(save_load_roundtrip) {
 
   fixture = fopen(path, "wb");
   ASSERT(fixture != NULL);
-  ASSERT(fprintf(fixture, "# anomaly-model-v6\n") > 0);
-  ASSERT(fprintf(fixture, "# 0.1 -10 0.5 0 0 0 0 0 0\n") > 0);
+  ASSERT(fprintf(fixture, "# anomaly-model-v8\n") > 0);
+  ASSERT(fprintf(fixture, "# 0.1 0.5 0 0 0 0 0 0\n") > 0);
   for (unsigned char key = 'a'; key <= 'c'; key++) {
     const uint8_t type = 1;
     const uint32_t key_length = 4;
@@ -1560,7 +1594,7 @@ TEST(binary_netseq_persistence) {
   ASSERT(unlink(path) == 0);
 }
 
-TEST(empty_stage_persistence_and_legacy_loading) {
+TEST(empty_stage_persistence_and_older_version_rejection) {
   static const char sentinel_sequence[] = "4:echo,0:,4:sort,";
   static const char ordinary_sequence[] = "4:echo,4:sort,4:done,";
   sg_anomaly_model_t *source = sg_anomaly_model_new();
@@ -1579,7 +1613,7 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   char header[32] = {0};
   ASSERT(fgets(header, sizeof(header), stream) != NULL);
-  ASSERT(strcmp(header, "# anomaly-model-v7\n") == 0);
+  ASSERT(strcmp(header, "# anomaly-model-v8\n") == 0);
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream), 0);
   ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
@@ -1594,9 +1628,7 @@ TEST(empty_stage_persistence_and_legacy_loading) {
                                                sizeof(ordinary_sequence) - 1),
                 SG_ANOMALY_OK);
   ASSERT_EQ_INT(sg_anomaly_write_stream(loaded, stream), 0);
-  /* v6 uses canonical binary netstring keys but predates the empty
-   * redirect-only-stage item, so relabeling this v7 sentinel model must fail
-   * atomically. */
+  /* A relabeled older version is rejected atomically. */
   ASSERT(fseek(stream, (sizeof("# anomaly-model-v") - 1), SEEK_SET) == 0);
   ASSERT(fputc('6', stream) == '6' && fflush(stream) == 0);
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
@@ -1612,19 +1644,29 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   ASSERT_EQ_INT(sg_anomaly_model_update_netseq(legacy_source, ordinary_sequence,
                                                sizeof(ordinary_sequence) - 1),
                 SG_ANOMALY_OK);
-  stream = tmpfile();
-  ASSERT(stream != NULL);
-  ASSERT_EQ_INT(sg_anomaly_write_stream(legacy_source, stream), 0);
-  ASSERT(fseek(stream, (sizeof("# anomaly-model-v") - 1), SEEK_SET) == 0);
-  ASSERT(fputc('6', stream) == '6' && fflush(stream) == 0);
-  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
-  /* A non-empty legacy v6 model remains supported. */
-  ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
-                    loaded, (sg_anomaly_item_view_t){"", (sizeof("") - 1)}),
-                0);
-  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), 3);
-  ASSERT(fclose(stream) == 0);
+  /* Older versions are rejected, whatever the model holds, and a failed load
+   * leaves the target unchanged. */
+  static const char older_versions[] = "67";
+  for (size_t v = 0; v < sizeof(older_versions) - 1; v++) {
+    ASSERT_EQ_INT(sg_anomaly_model_update_netseq(legacy_source,
+                                                 ordinary_sequence,
+                                                 sizeof(ordinary_sequence) - 1),
+                  SG_ANOMALY_OK);
+    stream = tmpfile();
+    ASSERT(stream != NULL);
+    ASSERT_EQ_INT(sg_anomaly_write_stream(legacy_source, stream), 0);
+    ASSERT(fseek(stream, (sizeof("# anomaly-model-v") - 1), SEEK_SET) == 0);
+    ASSERT(fputc(older_versions[v], stream) == older_versions[v] &&
+           fflush(stream) == 0);
+    ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+    size_t before = sg_anomaly_model_total_unigrams(loaded);
+    errno = 0;
+    ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream),
+                  SG_ANOMALY_ERR_FORMAT);
+    ASSERT_EQ_INT(errno, EPROTO);
+    ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), before);
+    ASSERT(fclose(stream) == 0);
+  }
   sg_anomaly_model_free(legacy_source);
   sg_anomaly_model_free(loaded);
   sg_anomaly_model_free(source);
@@ -1694,8 +1736,8 @@ TEST(owned_file_close_and_error_precedence) {
   ASSERT(fd >= 0);
   ASSERT(close(fd) == 0);
   snprintf(anomaly_temp_path, sizeof(anomaly_temp_path), "%s", path);
-  sg_anomaly_model_t *source = test_model_with_config(0.5, -8.0);
-  sg_anomaly_model_t *target = test_model_with_config(0.25, -12.0);
+  sg_anomaly_model_t *source = test_model_with_config(0.5);
+  sg_anomaly_model_t *target = test_model_with_config(0.25);
   ASSERT(source && target);
   update_repeated(source, commands, 5, 3);
   update_repeated(target, commands, 5, 1);
@@ -1775,18 +1817,18 @@ TEST(persisted_header_validation) {
     sg_anomaly_status_t status;
     int error_number;
   } cases[] = {
-      {"# 0.1 -10 0.5 0 0 0 0 0 -1\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
-      {"# 0.1 -10 0.5 0 0 0 0 0 +1\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
-      {"# 0.1 -10 0.5 999999999999999999999999999999999999 0 0 0 0 "
+      {"# 0.1 0.5 0 0 0 0 0 -1\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 0.5 0 0 0 0 0 +1\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 0.5 999999999999999999999999999999999999 0 0 0 0 "
        "0\n",
        SG_ANOMALY_ERR_LIMIT, EOVERFLOW},
-      {"# 0.1 -10 0.5 0 0 0 0 0 "
+      {"# 0.1 0.5 0 0 0 0 0 "
        "999999999999999999999999999999999999\n",
        SG_ANOMALY_ERR_LIMIT, EOVERFLOW},
-      {"# 0.1 -10 0 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
-      {"# 0.1 -10 1.00001 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
-      {"# 0.1 -10 0.5 0 0 0 0 0 0 trailing\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
-      {"# 0.1 -10 0.5 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 0 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 1.00001 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 0.5 0 0 0 0 0 0 trailing\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 0.5 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
       {"# nan -10 0.5 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
   };
 
@@ -1797,7 +1839,7 @@ TEST(persisted_header_validation) {
     anomaly_snapshot_t before = snapshot_model(target);
     FILE *stream = tmpfile();
     ASSERT(stream != NULL);
-    ASSERT(fputs("# anomaly-model-v7\n", stream) >= 0);
+    ASSERT(fputs("# anomaly-model-v8\n", stream) >= 0);
     ASSERT(fputs(cases[i].header, stream) >= 0);
     ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
     errno = 0;
@@ -1811,7 +1853,7 @@ TEST(persisted_header_validation) {
   /* The inclusive upper discount bound remains a valid empty model. */
   FILE *stream = tmpfile();
   ASSERT(stream != NULL);
-  ASSERT(fputs("# anomaly-model-v7\n# 0.1 -10 1 0 0 0 0 0 0\n", stream) >= 0);
+  ASSERT(fputs("# anomaly-model-v8\n# 0.1 1 0 0 0 0 0 0\n", stream) >= 0);
   ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
   sg_anomaly_model_t *loaded = NULL;
   ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &loaded), SG_ANOMALY_OK);
@@ -1823,14 +1865,14 @@ TEST(persisted_header_validation) {
 
 TEST(persisted_header_framing) {
   static const char nul_header[] =
-      "# anomaly-model-v7\n# 0.1 -10 0.5 0 0 0 0 0 0\0 hidden bytes\n";
+      "# anomaly-model-v8\n# 0.1 0.5 0 0 0 0 0 0\0 hidden bytes\n";
   static const char nul_version[] =
-      "# anomaly-model-v7\0 hidden bytes\n# 0.1 -10 0.5 0 0 0 0 0 0\n";
-  static const char incomplete_version[] = "# anomaly-model-v7";
+      "# anomaly-model-v8\0 hidden bytes\n# 0.1 0.5 0 0 0 0 0 0\n";
+  static const char incomplete_version[] = "# anomaly-model-v8";
   static const char incomplete_header[] =
-      "# anomaly-model-v7\n# 0.1 -10 0.5 0 0 0 0 0 0";
+      "# anomaly-model-v8\n# 0.1 0.5 0 0 0 0 0 0";
   static const char incomplete_crlf[] =
-      "# anomaly-model-v7\n# 0.1 -10 0.5 0 0 0 0 0 0\r";
+      "# anomaly-model-v8\n# 0.1 0.5 0 0 0 0 0 0\r";
   static const struct {
     const char *data;
     size_t length;
@@ -1864,7 +1906,7 @@ TEST(persisted_header_framing) {
 
   /* At the physical buffer boundary a final newline is mandatory, but a
    * complete line filling all available byte positions is still valid. */
-  static const char fields[] = "0.1 -10 0.5 0 0 0 0 0 0\n";
+  static const char fields[] = "0.1 0.5 0 0 0 0 0 0\n";
   for (size_t length = 254; length <= 256; length++) {
     char line[256];
     memset(line, ' ', length);
@@ -1872,7 +1914,7 @@ TEST(persisted_header_framing) {
     memcpy(line + length - (sizeof(fields) - 1), fields, sizeof(fields) - 1);
     FILE *stream = tmpfile();
     ASSERT(stream != NULL);
-    ASSERT(fputs("# anomaly-model-v7\n", stream) >= 0);
+    ASSERT(fputs("# anomaly-model-v8\n", stream) >= 0);
     ASSERT(fwrite(line, 1, length, stream) == length);
     ASSERT(fseek(stream, 0, SEEK_SET) == 0);
     sg_anomaly_model_t *loaded = NULL;
@@ -1884,8 +1926,7 @@ TEST(persisted_header_framing) {
   }
   FILE *stream = tmpfile();
   ASSERT(stream != NULL);
-  ASSERT(fputs("# anomaly-model-v6\r\n# 0.1 -10 0.5 0 0 0 0 0 0\r\n", stream) >=
-         0);
+  ASSERT(fputs("# anomaly-model-v8\r\n# 0.1 0.5 0 0 0 0 0 0\r\n", stream) >= 0);
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   sg_anomaly_model_t *loaded = NULL;
   ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &loaded), SG_ANOMALY_OK);
@@ -1898,7 +1939,7 @@ static bool locale_roundtrip_case(locale_t numeric, locale_t other,
                                   double alpha) {
   bool ok = false;
   FILE *stream = NULL;
-  sg_anomaly_model_t *source = test_model_with_config(alpha, -10.0);
+  sg_anomaly_model_t *source = test_model_with_config(alpha);
   sg_anomaly_model_t *loaded = NULL;
   locale_t previous = uselocale(numeric);
   if (!source)
@@ -2046,8 +2087,8 @@ TEST(path_save_failure_atomicity) {
   strcpy(anomaly_save_directory, directory);
   char path[272];
   snprintf(path, sizeof(path), "%s/model", anomaly_save_directory);
-  sg_anomaly_model_t *previous = test_model_with_config(0.25, -12.0);
-  sg_anomaly_model_t *replacement = test_model_with_config(0.5, -8.0);
+  sg_anomaly_model_t *previous = test_model_with_config(0.25);
+  sg_anomaly_model_t *replacement = test_model_with_config(0.5);
   sg_anomaly_model_t *loaded = sg_anomaly_model_new();
   ASSERT(previous && replacement && loaded);
   update_repeated(previous, commands, 5, 1);
@@ -2306,12 +2347,11 @@ TEST(persisted_counter_accumulation_is_exact) {
       FILE *stream = tmpfile();
       ASSERT(stream != NULL);
       size_t total = (size_t)INT64_MAX + 1u;
-      ASSERT(
-          fprintf(stream,
-                  "# anomaly-model-v7\n# 0.1 -10 0.5 %zu %zu %zu %zu %zu 0\n",
-                  order == 1 ? total : 0, order == 2 ? total : 0,
-                  order == 3 ? total : 0, order == 4 ? total : 0,
-                  (size_t)(order == 1 ? 1u : 0u)) > 0);
+      ASSERT(fprintf(stream,
+                     "# anomaly-model-v8\n# 0.1 0.5 %zu %zu %zu %zu %zu 0\n",
+                     order == 1 ? total : 0, order == 2 ? total : 0,
+                     order == 3 ? total : 0, order == 4 ? total : 0,
+                     (size_t)(order == 1 ? 1u : 0u)) > 0);
       static const char *keys[] = {"1:a,", "1:a,1:b,", "1:a,1:b,1:c,",
                                    "1:a,1:b,1:c,1:d,"};
       static const char *siblings[] = {"1:a,", "1:a,1:x,", "1:a,1:b,1:x,",
@@ -2331,7 +2371,7 @@ TEST(persisted_counter_accumulation_is_exact) {
    * record when reserialized, rather than being silently saturated. */
   FILE *stream = tmpfile();
   ASSERT(stream != NULL);
-  ASSERT(fprintf(stream, "# anomaly-model-v7\n# 0.1 -10 0.5 %zu 0 0 0 1 0\n",
+  ASSERT(fprintf(stream, "# anomaly-model-v8\n# 0.1 0.5 %zu 0 0 0 1 0\n",
                  (size_t)INT64_MAX) > 0);
   ASSERT(write_count_record(stream, 1, "1:a,", INT64_MAX - 1));
   ASSERT(write_count_record(stream, 1, "1:a,", 1));
@@ -2366,10 +2406,10 @@ static sg_anomaly_model_t *model_with_large_counts(uint64_t count,
   if (!stream)
     return NULL;
   sg_anomaly_model_t *model = NULL;
-  bool ok = fprintf(stream,
-                    "# anomaly-model-v7\n# 0.1 -10 0.5 %zu %zu %zu %zu 1 %zu\n",
-                    (size_t)count, (size_t)count, (size_t)count, (size_t)count,
-                    unknown) > 0;
+  bool ok =
+      fprintf(stream, "# anomaly-model-v8\n# 0.1 0.5 %zu %zu %zu %zu 1 %zu\n",
+              (size_t)count, (size_t)count, (size_t)count, (size_t)count,
+              unknown) > 0;
   for (uint8_t order = 1; order <= 4 && ok; order++)
     ok = write_count_record(stream, order, keys[order - 1], count);
   if (ok && fseek(stream, 0, SEEK_SET) == 0)
@@ -2738,6 +2778,7 @@ int main(void) {
   RUN(lifecycle_and_null_safety);
   RUN(config_contract);
   RUN(extreme_alpha_scores_are_finite);
+  RUN(unseen_stage_score_follows_smoothing_and_counts);
   RUN(update_count_matrix);
   RUN(count_views_preserve_exact_binary_spans);
   RUN(score_discrimination_matrix);
@@ -2757,7 +2798,7 @@ int main(void) {
   RUN(one_pass_score_and_count);
   RUN(canonical_netseq_contract);
   RUN(binary_netseq_persistence);
-  RUN(empty_stage_persistence_and_legacy_loading);
+  RUN(empty_stage_persistence_and_older_version_rejection);
   RUN(typed_stream_io_failure_atomicity);
   RUN(owned_file_close_and_error_precedence);
   RUN(persisted_header_validation);

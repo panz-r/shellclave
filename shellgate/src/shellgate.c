@@ -708,8 +708,7 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
                                   const sg_anomaly_config_t *config) {
   if (!isfinite(threshold))
     return SG_ERR_INVALID;
-  if (config && (!isfinite(config->alpha) || config->alpha <= 0.0 ||
-                 !isfinite(config->unknown_log_prior)))
+  if (config && (!isfinite(config->alpha) || config->alpha <= 0.0))
     return SG_ERR_INVALID;
   sg_anomaly_model_t *new_raw = sg_anomaly_model_new_with_config(config);
   if (!new_raw)
