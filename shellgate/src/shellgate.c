@@ -209,14 +209,34 @@ static SHELL_NONNULL(1, 2) const
   return result;
 }
 
-static const char *bw_copy_policy_cpl(buf_writer_t *w,
-                                      st_netpattern_view_t netpattern) {
-  char *cpl = NULL;
-  if (st_netpattern_to_cpl_view(netpattern, &cpl) != ST_OK)
-    return NULL;
-  const char *copy = bw_copy(w, cpl, strlen(cpl));
-  free(cpl);
-  return copy;
+/* Render up to two suggestions into slots, starting after those already held.
+ * Returns SG_ERR_TRUNC when the result buffer is exhausted, SG_ERR_MEMORY when
+ * rendering cannot allocate, and SG_ERR_PARSE for a pattern that is not
+ * canonical. A suggestion too long to render is simply unavailable, like one
+ * the policy could not offer: it ends the list without an error. */
+static sg_error_t bw_add_policy_suggestions(buf_writer_t *w,
+                                            const st_expand_suggestion_t *found,
+                                            size_t available,
+                                            const char **slots,
+                                            uint32_t *count) {
+  while (*count < 2 && *count < available) {
+    st_netpattern_view_t pattern = {
+        .data = found[*count].pattern,
+        .length = found[*count].pattern_length,
+    };
+    char *cpl = NULL;
+    st_error_t rendered = st_netpattern_to_cpl_view(pattern, &cpl);
+    if (rendered == ST_ERR_LIMIT)
+      return SG_OK;
+    if (rendered != ST_OK)
+      return rendered == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
+    slots[*count] = bw_copy(w, cpl, strlen(cpl));
+    free(cpl);
+    if (!slots[*count])
+      return SG_ERR_TRUNC;
+    ++*count;
+  }
+  return SG_OK;
 }
 
 static const char *bw_printf(buf_writer_t *w, const char *fmt, ...) {
@@ -4585,73 +4605,36 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         sr->verdict = SG_VERDICT_UNDETERMINED;
 
         if (gate->suggestions) {
-          if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
-            out->suggestions[0] = bw_copy_policy_cpl(
-                &bw, (st_netpattern_view_t){
-                         .data = eval.suggestions[0].pattern,
-                         .length = eval.suggestions[0].pattern_length});
-            if (out->suggestions[0])
-              out->suggestion_count++;
-            else if (bw.overflow) {
-              out->truncated = true;
-              out->verdict = SG_VERDICT_UNDETERMINED;
-              free(owned_cmd_seq);
-              free(owned_type_seq);
-              return SG_ERR_TRUNC;
-            }
+          sg_error_t added = bw_add_policy_suggestions(
+              &bw, eval.suggestions, eval.suggestion_count, out->suggestions,
+              &out->suggestion_count);
+          if (added == SG_ERR_TRUNC) {
+            out->truncated = true;
+            out->verdict = SG_VERDICT_UNDETERMINED;
+            free(owned_cmd_seq);
+            free(owned_type_seq);
+            return SG_ERR_TRUNC;
           }
-          if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
-            out->suggestions[1] = bw_copy_policy_cpl(
-                &bw, (st_netpattern_view_t){
-                         .data = eval.suggestions[1].pattern,
-                         .length = eval.suggestions[1].pattern_length});
-            if (out->suggestions[1])
-              out->suggestion_count++;
-            else if (bw.overflow) {
-              out->truncated = true;
-              out->verdict = SG_VERDICT_UNDETERMINED;
-              free(owned_cmd_seq);
-              free(owned_type_seq);
-              return SG_ERR_TRUNC;
-            }
-          }
+          if (added != SG_OK && evaluation_error == SG_OK)
+            evaluation_error = added;
         }
       }
 
       if (gate->suggestions) {
         /* Generate deny suggestions from deny policy */
         if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
-          if (deny_eval.suggestion_count > 0) {
-            out->deny_suggestions[0] = bw_copy_policy_cpl(
-                &bw, (st_netpattern_view_t){
-                         .data = deny_eval.suggestions[0].pattern,
-                         .length = deny_eval.suggestions[0].pattern_length});
-            if (out->deny_suggestions[0])
-              out->deny_suggestion_count++;
-            else if (bw.overflow) {
-              out->truncated = true;
-              out->verdict = SG_VERDICT_UNDETERMINED;
-              free(owned_cmd_seq);
-              free(owned_type_seq);
-              return SG_ERR_TRUNC;
-            }
+          sg_error_t added = bw_add_policy_suggestions(
+              &bw, deny_eval.suggestions, deny_eval.suggestion_count,
+              out->deny_suggestions, &out->deny_suggestion_count);
+          if (added == SG_ERR_TRUNC) {
+            out->truncated = true;
+            out->verdict = SG_VERDICT_UNDETERMINED;
+            free(owned_cmd_seq);
+            free(owned_type_seq);
+            return SG_ERR_TRUNC;
           }
-          if (deny_eval.suggestion_count > 1 &&
-              out->deny_suggestion_count == 1) {
-            out->deny_suggestions[1] = bw_copy_policy_cpl(
-                &bw, (st_netpattern_view_t){
-                         .data = deny_eval.suggestions[1].pattern,
-                         .length = deny_eval.suggestions[1].pattern_length});
-            if (out->deny_suggestions[1])
-              out->deny_suggestion_count++;
-            else if (bw.overflow) {
-              out->truncated = true;
-              out->verdict = SG_VERDICT_UNDETERMINED;
-              free(owned_cmd_seq);
-              free(owned_type_seq);
-              return SG_ERR_TRUNC;
-            }
-          }
+          if (added != SG_OK && evaluation_error == SG_OK)
+            evaluation_error = added;
         }
       }
     }

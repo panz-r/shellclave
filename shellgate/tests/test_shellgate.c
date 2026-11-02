@@ -5942,6 +5942,53 @@ TEST(complete_and_oversized_suggestions) {
   sg_gate_free(gate);
 }
 
+/* A suggestion is rendered with an allocation of its own. Failing it must not
+ * return success with the suggestion missing: every injected failure either
+ * reports the memory error or leaves the suggestions identical to a run
+ * without faults. */
+TEST(suggestion_rendering_failure_is_not_silent) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"tool #size.MiB done"}, 1);
+  ASSERT(gate != NULL);
+  ASSERT_ST_OK(
+      test_policy_replace_cpl(gate, true, "tool #size.MiB done", false));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, true));
+  static const char command[] = "tool 10GB 'a b'";
+  sg_result_t baseline;
+  st_test_alloc_reset();
+  ASSERT_SG_OK(eval_cmd(gate, command, &baseline));
+  size_t allocations = st_test_alloc_count();
+  st_test_alloc_reset();
+  ASSERT(baseline.suggestion_count == 2 && baseline.deny_suggestion_count == 2);
+  ASSERT(allocations > 0);
+  char expected[4][128];
+  for (size_t i = 0; i < 2; i++) {
+    ASSERT(strlen(baseline.suggestions[i]) < sizeof(expected[0]));
+    ASSERT(strlen(baseline.deny_suggestions[i]) < sizeof(expected[0]));
+    strcpy(expected[i], baseline.suggestions[i]);
+    strcpy(expected[2 + i], baseline.deny_suggestions[i]);
+  }
+  size_t memory_failures = 0;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    sg_result_t result;
+    st_test_alloc_fail_at(fail_at);
+    sg_error_t error = eval_cmd(gate, command, &result);
+    st_test_alloc_reset();
+    if (error == SG_ERR_MEMORY) {
+      memory_failures++;
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+      continue;
+    }
+    ASSERT_SG_OK(error);
+    ASSERT(result.suggestion_count == 2 && result.deny_suggestion_count == 2);
+    for (size_t i = 0; i < 2; i++) {
+      ASSERT(strcmp(result.suggestions[i], expected[i]) == 0);
+      ASSERT(strcmp(result.deny_suggestions[i], expected[2 + i]) == 0);
+    }
+  }
+  ASSERT(memory_failures > 0);
+  sg_gate_free(gate);
+}
+
 /* --- EDGE CASES --- */
 
 TEST(eval_input_contract_matrix) {
@@ -16178,6 +16225,7 @@ int main(int argc, char **argv) {
   RUN(suggestion_matrix);
   RUN(match_only_path_avoids_suggestion_allocations);
   RUN(complete_and_oversized_suggestions);
+  RUN(suggestion_rendering_failure_is_not_silent);
   RUN(contextual_policy_mutations_preserve_verdicts);
 
   printf("\nEdge cases:\n");
