@@ -56,8 +56,6 @@ static SHELL_NONNULL(1) uint32_t
   return start;
 }
 
-/* An io_number is contiguous with its redirect and starts at a shell-word
- * boundary. Values above INT_MAX remain ordinary argument text. */
 /* `{` and `}` are reserved words only when they form a complete word. Keep
  * this separate from parameter-expansion handling: an unquoted `}` in
  * `echo foo}` is ordinary argument text, whereas `foo; }` is an invalid

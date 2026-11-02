@@ -14,7 +14,9 @@ extern "C" {
 
 /**
  * Scores environment-variable names and values with built-in patterns and
- * entropy metrics. It does not modify the environment or allocate memory.
+ * entropy metrics. It does not modify the environment. Scoring allocates
+ * temporary memory; when that fails the score is NaN and a scan returns
+ * SHELL_ENV_SCREENER_ERROR.
  */
 
 /* --- CONFIGURATION --- */
@@ -93,7 +95,8 @@ const char *shell_env_screener_get_whitelist_doc(void);
  * Includes boosts for known secret prefixes and variable name patterns
  * @param name   Variable name (e.g., "API_KEY", "MY_SECRET") or NULL
  * @param value  Variable value
- * @return      Combined score in [0, 1]
+ * @return      Combined score in [0, 1], or NaN when scoring could not
+ *              allocate
  */
 double shell_env_screener_combined_score_name(const char *name,
                                               const char *value)

@@ -154,15 +154,15 @@ bool shell_env_screener_looks_like_path(const char *value) {
 }
 
 /**
- * Check if value looks like base64 encoded (positive indicator for secrets)
+ * Recognize Base64-like text with a lightweight heuristic. The combined
+ * score does not use this helper.
  * @param value  The value to check
  * @return      true if value appears to be base64 encoded
  */
 bool shell_env_screener_looks_like_base64(const char *value) {
-  if (strlen(value) < 4)
-    return false;
-
   size_t len = strlen(value);
+  if (len < 4)
+    return false;
 
   size_t padding = 0;
   if (value[len - 1] == '=') {
@@ -180,9 +180,6 @@ bool shell_env_screener_looks_like_base64(const char *value) {
       return false;
     }
   }
-  for (size_t i = data_len; i < len; i++)
-    if (value[i] != '=')
-      return false;
 
   /* Valid base64: length should be divisible by 4 (with optional padding) */
   /* And should have some padding or at least be long enough */
@@ -300,7 +297,11 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
  * P(secret | evidence) = P(evidence | secret) * P(secret) / P(evidence)
  *
  * We combine evidence conditionally independently:
- * P(E|secret) = P(entropy|secret) * P(prefix|secret) * P(name|secret)
+ * P(E|secret) = P(entropy|secret) * P(prefix|secret) * P(name|secret) *
+ *               P(path|secret)
+ *
+ * Independence is an approximation, so the result is a heuristic score and
+ * not a calibrated probability.
  */
 
 #define PRIOR_SECRET 0.10
