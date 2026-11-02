@@ -1299,6 +1299,35 @@ static void test_executable_substitution_scanner_contract(void) {
        valid);
 }
 
+/* `&&` inside a substitution is one logical operator, also when an escaped
+ * line ending separates its bytes; only a lone `&` is background execution. */
+static void test_substitution_and_list_is_not_background(void) {
+  static const struct {
+    const char *source;
+    bool background;
+  } cases[] = {
+      {"echo \"$(printf x && printf y)\"", false},
+      {"echo \"$(printf x &\\\n& printf y)\"", false},
+      {"echo $(printf x && printf y)", false},
+      {"echo \"`printf x && printf y`\"", false},
+      {"echo \"$(echo x 2>&1 && true)\"", false},
+      {"echo \"$(printf x & printf y)\"", true},
+      {"echo \"$(sleep 1 &)\"", true},
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    uint32_t features = 0;
+    valid = valid && shell_parse_fast(cases[i].source, strlen(cases[i].source),
+                                      NULL, &parsed) == SHELL_OK;
+    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
+      features |= parsed.cmds[cmd].features;
+    valid = valid && (features & SHELL_FEAT_SUBSHELL) != 0 &&
+            ((features & SHELL_FEAT_BACKGROUND) != 0) == cases[i].background;
+  }
+  test("&& in a substitution is not background execution", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9547,6 +9576,7 @@ int main(void) {
   test_list_syntax_contract();
   test_source_scanner_boundaries();
   test_executable_substitution_scanner_contract();
+  test_substitution_and_list_is_not_background();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();

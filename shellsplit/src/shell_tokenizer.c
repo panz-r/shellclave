@@ -858,9 +858,17 @@ static SHELL_NONNULL(1,
       }
       break;
     case '&':
-      if (!in_double_quotes && !(i + 1 < len && p[i + 1] == '&') &&
-          !(i > 0 && (p[i - 1] == '<' || p[i - 1] == '>')))
-        *features |= SHELL_FEAT_BACKGROUND;
+      if (!in_double_quotes) {
+        // `&&` is one operator, including across escaped line endings, so
+        // neither of its bytes is a background operator.
+        size_t after = 0;
+        if (shell_source_match_logical_punctuation(p, len, i, "&&", &after)) {
+          i = (uint32_t)after;
+          continue;
+        }
+        if (!(i > 0 && (p[i - 1] == '<' || p[i - 1] == '>')))
+          *features |= SHELL_FEAT_BACKGROUND;
+      }
       break;
     case '*':
     case '?':
