@@ -360,25 +360,6 @@ static bool is_home_path(const char *s, size_t len) {
   return has_expanding_tilde_prefix(s, len);
 }
 
-/**
- * Check if string is a short option
- */
-static bool is_short_option(const char *s, size_t len) {
-  if (len == 0)
-    return false;
-  return len >= 2 && s[0] == '-' && s[1] != '-' &&
-         !shell_ascii_digit((unsigned char)s[1]);
-}
-
-/**
- * Check if string is a long option
- */
-static bool is_long_option(const char *s, size_t len) {
-  if (len < 3)
-    return false;
-  return s[0] == '-' && s[1] == '-' && s[2] != '-';
-}
-
 /* Bare `>&` overloads its operand: Bash treats a pathname as a target for
  * stdout and stderr, and a descriptor or `-` as duplication or close. An
  * explicit descriptor prefix always selects duplication. */
@@ -436,7 +417,7 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
     return SHELL_TOKEN_ARGUMENT;
   }
 
-  // Paths (before checking options since - could be a path component)
+  // Paths take precedence over the glob classification below
   abstract_path_shape_t shape = abstract_path_shape(text, len);
   if (is_absolute_path(&shape)) {
     return SHELL_TOKEN_ARGUMENT; // Will be classified as path in abstraction
@@ -450,14 +431,6 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
 
   if (has_glob)
     return SHELL_TOKEN_GLOB;
-
-  // Options
-  if (is_long_option(text, len)) {
-    return SHELL_TOKEN_ARGUMENT;
-  }
-  if (is_short_option(text, len)) {
-    return SHELL_TOKEN_ARGUMENT;
-  }
 
   return SHELL_TOKEN_ARGUMENT;
 }
