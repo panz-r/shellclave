@@ -1814,6 +1814,142 @@ static int test_cpl_allocation_failures(void) {
   return 1;
 }
 
+/* Independent of the library: decode one scalar value, rejecting overlong
+ * forms, surrogates, values above U+10FFFF and truncation. Returns the
+ * sequence length, or zero. */
+static size_t test_utf8_scalar(const unsigned char *s, size_t n, uint32_t *cp) {
+  if (n == 0)
+    return 0;
+  if (s[0] < 0x80) {
+    *cp = s[0];
+    return 1;
+  }
+  size_t size = (s[0] & 0xe0) == 0xc0   ? 2
+                : (s[0] & 0xf0) == 0xe0 ? 3
+                : (s[0] & 0xf8) == 0xf0 ? 4
+                                        : 0;
+  if (size == 0 || n < size)
+    return 0;
+  uint32_t value = s[0] & (0xff >> (size + 1));
+  for (size_t i = 1; i < size; i++) {
+    if ((s[i] & 0xc0) != 0x80)
+      return 0;
+    value = (value << 6) | (s[i] & 0x3f);
+  }
+  static const uint32_t minimum[5] = {0, 0, 0x80, 0x800, 0x10000};
+  if (value < minimum[size] || value > 0x10ffff ||
+      (value >= 0xd800 && value <= 0xdfff))
+    return 0;
+  *cp = value;
+  return size;
+}
+
+/* CPL is printable text: valid UTF-8 and no control characters, including the
+ * C1 controls, so it is safe to display, log or transport as text. */
+static bool test_cpl_is_printable_text(const char *cpl) {
+  const unsigned char *s = (const unsigned char *)cpl;
+  size_t n = strlen(cpl);
+  for (size_t i = 0; i < n;) {
+    uint32_t cp = 0;
+    size_t size = test_utf8_scalar(s + i, n - i, &cp);
+    if (size == 0 || cp < 0x20 || (cp >= 0x7f && cp <= 0x9f))
+      return false;
+    i += size;
+  }
+  return true;
+}
+
+static int test_cpl_escapes_bytes_that_are_not_text(void) {
+  static const struct {
+    const char *bytes;
+    size_t length;
+    const char *cpl;
+  } cases[] = {
+      {"\xff", 1, "\"\\xff\""},
+      {"\x80", 1, "\"\\x80\""},
+      {"a\xff"
+       "b\x80"
+       "c",
+       5, "\"a\\xffb\\x80c\""},
+      {"a\0b", 3, "\"a\\x00b\""},
+      {"\x7f", 1, "\"\\x7f\""},
+      /* Not well-formed UTF-8: overlong, surrogate, past U+10FFFF, truncated.
+       */
+      {"\xc0\xaf", 2, "\"\\xc0\\xaf\""},
+      {"\xe0\x80\x80", 3, "\"\\xe0\\x80\\x80\""},
+      {"\xed\xa0\x80", 3, "\"\\xed\\xa0\\x80\""},
+      {"\xf4\x90\x80\x80", 4, "\"\\xf4\\x90\\x80\\x80\""},
+      {"caf\xc3", 4, "\"caf\\xc3\""},
+      /* C1 controls are valid UTF-8 but not printable. */
+      {"\xc2\x85", 2, "\"\\xc2\\x85\""},
+      {"\xc2\x9f", 2, "\"\\xc2\\x9f\""},
+      /* Well-formed printable UTF-8 stays readable, also beside bad bytes. */
+      {"caf\xc3\xa9", 5, "caf\xc3\xa9"},
+      {"\xe6\x97\xa5\xe6\x9c\xac", 6, "\xe6\x97\xa5\xe6\x9c\xac"},
+      {"\xf0\x9f\x98\x80", 4, "\xf0\x9f\x98\x80"},
+      {"\xc2\xa0", 2, "\xc2\xa0"},
+      {"\xf4\x8f\xbf\xbf", 4, "\xf4\x8f\xbf\xbf"},
+      {"\xc3\xa9\xff", 3, "\"\xc3\xa9\\xff\""},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    st_token_t tokens[2] = {
+        {.text = "cmd", .text_length = 3, .type = ST_TYPE_LITERAL},
+        {.text = cases[i].bytes,
+         .text_length = cases[i].length,
+         .type = ST_TYPE_LITERAL},
+    };
+    st_netpattern_t canonical = {0};
+    ASSERT(st_netpattern_encode_owned(tokens, 2, &canonical) == ST_OK);
+    char *rendered = NULL;
+    ASSERT(st_netpattern_to_cpl_view(
+               (st_netpattern_view_t){canonical.data, canonical.length},
+               &rendered) == ST_OK);
+    char expected[64];
+    ASSERT(snprintf(expected, sizeof(expected), "cmd %s", cases[i].cpl) <
+           (int)sizeof(expected));
+    ASSERT(strcmp(rendered, expected) == 0);
+    ASSERT(test_cpl_is_printable_text(rendered));
+    st_netpattern_t again = {0};
+    ASSERT(st_netpattern_from_cpl_owned(rendered, &again) == ST_OK);
+    ASSERT(again.length == canonical.length &&
+           memcmp(again.data, canonical.data, canonical.length) == 0);
+    st_netpattern_free(&again);
+    free(rendered);
+    st_netpattern_free(&canonical);
+  }
+
+  /* The literal parts of a compound follow the same rule. */
+  st_token_t compound = {
+      .text = "pre\xff{#path}\xc0\xaf",
+      .text_length = 4 + 7 + 2,
+      .type = ST_TYPE_LITERAL,
+      .compound = true,
+      .capture_type = ST_TYPE_PATH,
+      .prefix = "pre\xff",
+      .prefix_length = 4,
+      .capture = "#path",
+      .capture_length = 5,
+      .suffix = "\xc0\xaf",
+      .suffix_length = 2,
+  };
+  st_netpattern_t canonical = {0};
+  ASSERT(st_netpattern_encode_owned(&compound, 1, &canonical) == ST_OK);
+  char *rendered = NULL;
+  ASSERT(st_netpattern_to_cpl_view(
+             (st_netpattern_view_t){canonical.data, canonical.length},
+             &rendered) == ST_OK);
+  ASSERT(strcmp(rendered, "\"pre\\xff\"{#path}\"\\xc0\\xaf\"") == 0);
+  ASSERT(test_cpl_is_printable_text(rendered));
+  st_netpattern_t again = {0};
+  ASSERT(st_netpattern_from_cpl_owned(rendered, &again) == ST_OK);
+  ASSERT(again.length == canonical.length &&
+         memcmp(again.data, canonical.data, canonical.length) == 0);
+  st_netpattern_free(&again);
+  free(rendered);
+  st_netpattern_free(&canonical);
+  return 1;
+}
+
 static int test_netpattern_cpl_contract(void) {
   st_netpattern_t roundtrip = {0};
   char *roundtrip_cpl = NULL;
@@ -2752,6 +2888,7 @@ int main(void) {
   TEST(test_netargv_visit_is_borrowed_and_allocation_free);
   TEST(test_netargv_visit_accepts_binary_payloads);
   TEST(test_netpattern_cpl_contract);
+  TEST(test_cpl_escapes_bytes_that_are_not_text);
   TEST(test_cpl_parse_work_is_linear);
   TEST(test_cpl_decoded_token_limits);
   TEST(test_cpl_allocation_failures);

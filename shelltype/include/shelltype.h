@@ -510,7 +510,11 @@ void st_policy_free(st_policy_t *policy);
  * than ST_MAX_TOKEN_LEN decoded bytes. Structural braces do not count toward
  * those limits; a complete compound spelling may exceed one literal's limit.
  * Canonical inputs and outputs carry explicit lengths and preserve every byte.
- * CPL itself is printable text; arbitrary literal bytes use escaped notation.
+ * CPL itself is printable text: well-formed UTF-8 (RFC 3629) is written as is,
+ * while every other byte, and the C1 controls U+0080-U+009F, is written \xHH
+ * inside a quoted literal. Rendering is therefore always valid UTF-8 and
+ * parsing it reproduces the canonical bytes exactly. Parsing also accepts
+ * unescaped input that rendering would escape.
  */
 
 /* Owned-output forms require `out_netpattern` to be empty (initialized to {0}

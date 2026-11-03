@@ -630,16 +630,77 @@ cpl_done:
   return error;
 }
 
+/* How a literal is spelled in CPL, which is printable text. Well-formed UTF-8
+ * (RFC 3629) stays readable as written; every other byte, and the C1 controls
+ * that are not printable, is written \xHH so the rendering is valid text and
+ * arbitrary bytes survive a round trip. The three renderers below share this
+ * one rule through cpl_unit(). */
+typedef enum {
+  CPL_BYTE_PLAIN,   /* as written: ASCII or a whole printable UTF-8 sequence */
+  CPL_BYTE_ESCAPED, /* backslash and the byte: " and \ */
+  CPL_BYTE_NAMED,   /* \b \f \n \r \t */
+  CPL_BYTE_HEX      /* \xHH: controls, DEL and bytes that are not UTF-8 */
+} cpl_byte_class_t;
+
+typedef struct {
+  cpl_byte_class_t kind;
+  size_t length; /* source bytes covered: 1, or 2-4 for a UTF-8 sequence */
+} cpl_unit_t;
+
+/* Length of the well-formed printable UTF-8 sequence at text[at], or zero. The
+ * second byte's range excludes overlong forms, surrogates and values beyond
+ * U+10FFFF; U+0080-U+009F are controls, not printable text. */
+static size_t cpl_utf8_sequence(const char *text, size_t length, size_t at) {
+  unsigned char lead = (unsigned char)text[at];
+  size_t size = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+  if (lead < 0xc2 || lead > 0xf4 || length - at < size)
+    return 0;
+  unsigned char low = 0x80, high = 0xbf;
+  if (lead == 0xe0)
+    low = 0xa0;
+  else if (lead == 0xed)
+    high = 0x9f;
+  else if (lead == 0xf0)
+    low = 0x90;
+  else if (lead == 0xf4)
+    high = 0x8f;
+  else if (lead == 0xc2)
+    low = 0xa0;
+  unsigned char second = (unsigned char)text[at + 1];
+  if (second < low || second > high)
+    return 0;
+  for (size_t i = 2; i < size; i++)
+    if (((unsigned char)text[at + i] & 0xc0) != 0x80)
+      return 0;
+  return size;
+}
+
+static cpl_unit_t cpl_unit(const char *text, size_t length, size_t at) {
+  unsigned char c = (unsigned char)text[at];
+  size_t sequence = c >= 0x80 ? cpl_utf8_sequence(text, length, at) : 0;
+  if (sequence)
+    return (cpl_unit_t){CPL_BYTE_PLAIN, sequence};
+  if (c == '"' || c == '\\')
+    return (cpl_unit_t){CPL_BYTE_ESCAPED, 1};
+  if (c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t')
+    return (cpl_unit_t){CPL_BYTE_NAMED, 1};
+  if (c < 0x20 || c > 0x7e)
+    return (cpl_unit_t){CPL_BYTE_HEX, 1};
+  return (cpl_unit_t){CPL_BYTE_PLAIN, 1};
+}
+
 static bool literal_needs_quotes(const char *text, size_t length) {
   if (length == 0)
     return true;
   if (text[0] == '#' || (length == 1 && text[0] == '*'))
     return true;
-  for (size_t i = 0; i < length; i++) {
+  for (size_t i = 0; i < length;) {
+    cpl_unit_t unit = cpl_unit(text, length, i);
     unsigned char c = (unsigned char)text[i];
-    if (shell_ascii_space(c) || c < 0x20 || c == 0x7f || c == '"' ||
-        c == '\\' || c == '{' || c == '}')
+    if (unit.kind != CPL_BYTE_PLAIN || shell_ascii_space(c) || c == '{' ||
+        c == '}')
       return true;
+    i += unit.length;
   }
   return false;
 }
@@ -648,49 +709,64 @@ static size_t cpl_literal_length(const char *text, size_t length, bool quote) {
   if (!quote)
     return length;
   size_t result = 2;
-  for (size_t i = 0; i < length; i++) {
-    unsigned char c = (unsigned char)text[i];
-    if (c == '"' || c == '\\' || c == '\b' || c == '\f' || c == '\n' ||
-        c == '\r' || c == '\t')
+  for (size_t i = 0; i < length;) {
+    cpl_unit_t unit = cpl_unit(text, length, i);
+    switch (unit.kind) {
+    case CPL_BYTE_ESCAPED:
+    case CPL_BYTE_NAMED:
       result += 2;
-    else if (c < 0x20 || c == 0x7f)
+      break;
+    case CPL_BYTE_HEX:
       result += 4;
-    else
-      result++;
+      break;
+    case CPL_BYTE_PLAIN:
+      result += unit.length;
+      break;
+    }
+    i += unit.length;
   }
   return result;
 }
 
 static void append_cpl_literal(char *output, size_t *used, const char *text,
                                size_t length, bool quote) {
-  if (quote)
-    output[(*used)++] = '"';
+  if (!quote) {
+    memcpy(output + *used, text, length);
+    *used += length;
+    return;
+  }
+  output[(*used)++] = '"';
   static const char hex[] = "0123456789abcdef";
-  for (size_t i = 0; i < length; i++) {
+  for (size_t i = 0; i < length;) {
+    cpl_unit_t unit = cpl_unit(text, length, i);
     unsigned char c = (unsigned char)text[i];
-    if (!quote) {
-      output[(*used)++] = (char)c;
-    } else if (c == '"' || c == '\\') {
+    switch (unit.kind) {
+    case CPL_BYTE_PLAIN:
+      memcpy(output + *used, text + i, unit.length);
+      *used += unit.length;
+      break;
+    case CPL_BYTE_ESCAPED:
       output[(*used)++] = '\\';
       output[(*used)++] = (char)c;
-    } else if (c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t') {
+      break;
+    case CPL_BYTE_NAMED:
       output[(*used)++] = '\\';
       output[(*used)++] = c == '\b'   ? 'b'
                           : c == '\f' ? 'f'
                           : c == '\n' ? 'n'
                           : c == '\r' ? 'r'
                                       : 't';
-    } else if (c < 0x20 || c == 0x7f) {
+      break;
+    case CPL_BYTE_HEX:
       output[(*used)++] = '\\';
       output[(*used)++] = 'x';
       output[(*used)++] = hex[c >> 4];
       output[(*used)++] = hex[c & 15];
-    } else {
-      output[(*used)++] = (char)c;
+      break;
     }
+    i += unit.length;
   }
-  if (quote)
-    output[(*used)++] = '"';
+  output[(*used)++] = '"';
 }
 
 st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
