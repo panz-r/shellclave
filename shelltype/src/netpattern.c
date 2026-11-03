@@ -593,9 +593,6 @@ st_error_t st_netpattern_from_cpl_owned(const char *cpl,
         error = ST_ERR_INVALID;
         goto cpl_done;
       }
-      tokens[i].text = words[i].text;
-      tokens[i].text_length = words[i].length;
-      tokens[i].type = ST_TYPE_LITERAL;
       tokens[i].compound = true;
       tokens[i].prefix = bytes_dup(words[i].text, prefix_length);
       tokens[i].prefix_length = prefix_length;

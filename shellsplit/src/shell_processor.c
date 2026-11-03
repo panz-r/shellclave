@@ -684,14 +684,14 @@ void shell_anomaly_stages_free(shell_anomaly_stages_t *stages) {
   *stages = (shell_anomaly_stages_t){0};
 }
 
+/* The stage limit bounds the array, so its byte size always fits size_t. */
+_Static_assert(SHELL_MAX_SUBCOMMANDS <= SIZE_MAX / sizeof(shell_command_t),
+               "anomaly stage array size must fit size_t");
+
 static SHELL_NONNULL(1, 2) bool anomaly_append_stage(
     shell_anomaly_stage_collect_t *collect, shell_command_t *command) {
   if (collect->stages->count >= SHELL_MAX_SUBCOMMANDS) {
     collect->status = SHELL_PROCESS_EOUTPUT_LIMIT;
-    return false;
-  }
-  if (collect->stages->count == SIZE_MAX / sizeof(*collect->stages->commands)) {
-    collect->status = SHELL_PROCESS_EOVERFLOW;
     return false;
   }
   shell_command_t *grown = realloc(

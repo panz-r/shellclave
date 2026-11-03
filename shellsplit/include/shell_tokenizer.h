@@ -202,7 +202,11 @@ typedef enum {
  */
 typedef struct {
   uint32_t max_subcommands; // Max subcommands to return
-  bool strict_mode;         // Reject incomplete or malformed syntax
+  /* Strict mode rejects unterminated quotes, substitutions, parentheses,
+   * top-level heredocs, and invalid parameter expansions. A single trailing
+   * semicolon is accepted as a command-list terminator; trailing pipes and
+   * logical operators are not. */
+  bool strict_mode;
   /* Optional borrowed source scratch. NULL/zero selects bounded private
    * storage; a larger supplied buffer extends that capacity. A buffer of
    * shell_source_workspace_size() supplies a sufficient capacity bound.
@@ -230,13 +234,6 @@ typedef struct {
  * exhaustion through the consuming API. */
 bool shell_source_workspace_size(size_t source_length, size_t *workspace_size)
     SHELL_NONNULL(2);
-
-/**
- * Strict mode rejects unterminated quotes, substitutions, parentheses,
- * top-level heredocs, and invalid parameter expansions. A single trailing
- * semicolon is accepted as a command-list terminator; trailing pipes and
- * logical operators are not.
- */
 
 /**
  * Default limits
