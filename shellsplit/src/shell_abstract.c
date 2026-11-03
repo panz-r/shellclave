@@ -1384,9 +1384,8 @@ abstract_command_parse_impl(const char *command, size_t command_length,
           elem = NULL;
           break;
         }
-        bool has_static_name = false;
-        elem->data.var.name = abstract_variable_name_copy(
-            tok->start, tok->length, &has_static_name);
+        elem->data.var.name =
+            abstract_variable_name_copy(tok->start, tok->length, NULL);
         elem->data.var.is_braced = variable.is_braced;
         elem->data.var.is_quoted = tok->is_quoted;
         break;
