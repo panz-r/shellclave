@@ -59,14 +59,16 @@ static SHELL_NONNULL(1) uint32_t
 /* `{` and `}` are reserved words only when they form a complete word. Keep
  * this separate from parameter-expansion handling: an unquoted `}` in
  * `echo foo}` is ordinary argument text, whereas `foo; }` is an invalid
- * command-position closer. */
+ * command-position closer. The word ends at the next logical byte: an escaped
+ * line ending is removed before parsing, so `}\<newline>;` closes the word
+ * and `}\<newline>x` extends it. */
 static bool group_word_ends_here(const char *cmd, uint32_t pos,
                                  uint32_t cmd_len) {
-  if (pos + 1 == cmd_len)
+  size_t next = shell_source_logical_following(cmd, cmd_len, pos);
+  if (next >= cmd_len)
     return true;
-  char next = cmd[pos + 1];
-  return shell_source_space((unsigned char)next) || is_separator(next) ||
-         next == ')';
+  return shell_source_space((unsigned char)cmd[next]) ||
+         is_separator(cmd[next]) || cmd[next] == ')';
 }
 
 /* Advance across one shell word without splitting a quoted here-string
@@ -1621,10 +1623,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         c == '}' && brace_depth == 0 && brace_group_depth > 0 &&
         (pos == 0 || shell_source_space((unsigned char)cmd[pos - 1]) ||
          cmd[pos - 1] == ';' || cmd[pos - 1] == '\n' || cmd[pos - 1] == ')') &&
-        (pos + 1 == cmd_len ||
-         shell_source_space((unsigned char)cmd[pos + 1]) ||
-         is_separator(cmd[pos + 1]) || cmd[pos + 1] == ')' ||
-         brace_close_redirect);
+        (group_word_ends_here(cmd, pos, cmd_len) || brace_close_redirect);
     /* One forward token stream supplies trivia and prefix facts. Neither a
      * literal brace nor a continuation may restart at the stage's source
      * origin: many literal braces after one long gap would be quadratic. */

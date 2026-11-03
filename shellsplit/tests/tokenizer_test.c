@@ -1328,6 +1328,82 @@ static void test_substitution_and_list_is_not_background(void) {
   test("&& in a substitution is not background execution", valid);
 }
 
+/* A closing brace is a complete word when the next logical byte ends it. An
+ * escaped line ending is removed before parsing, so it may separate `}` from
+ * what follows: the group must close in the same place, with the same command
+ * spans, as without it. */
+static void test_brace_close_across_line_continuation(void) {
+  static const struct {
+    const char *source;
+    uint32_t group_end;
+    uint32_t second_start;
+    uint32_t second_length;
+  } accepted[] = {
+      {"{ printf ok; } ; printf done", 14, 17, 11},
+      {"{ printf ok; }\\\n ; printf done", 14, 19, 11},
+      {"{ printf ok; }\\\n; printf done", 14, 18, 11},
+      {"{ printf ok; }\\\n&& printf done", 14, 19, 11},
+      {"{ printf ok; }\\\n\\\n ; printf done", 14, 21, 11},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = shell_parse_fast(accepted[i].source, strlen(accepted[i].source),
+                             NULL, &parsed) == SHELL_OK &&
+            parsed.count == 2 && parsed.group_count == 1 &&
+            parsed.groups[0].kind == SHELL_GROUP_BRACE &&
+            parsed.groups[0].start == 0 &&
+            parsed.groups[0].end == accepted[i].group_end &&
+            parsed.groups[0].first_command == 0 &&
+            parsed.groups[0].command_count == 1 &&
+            parsed.groups[0].parent == UINT16_MAX &&
+            parsed.cmds[0].start == 2 && parsed.cmds[0].len == 9 &&
+            parsed.cmds[1].start == accepted[i].second_start &&
+            parsed.cmds[1].len == accepted[i].second_length;
+  }
+  test("Brace group closes across an escaped line ending", valid);
+
+  static const char nested[] = "{ { printf a; }\\\n ; printf b; }";
+  shell_parse_result_t parsed = {0};
+  valid =
+      shell_parse_fast(nested, sizeof(nested) - 1, NULL, &parsed) == SHELL_OK &&
+      parsed.count == 2 && parsed.group_count == 2 &&
+      parsed.groups[0].start == 0 && parsed.groups[0].end == 31 &&
+      parsed.groups[0].parent == UINT16_MAX && parsed.groups[1].start == 2 &&
+      parsed.groups[1].end == 15 && parsed.groups[1].parent == 0;
+  test("Nested brace groups close across an escaped line ending", valid);
+
+  /* Trailing, redirect and pipe forms parse; a continued word does not close
+   * the group, and a brace that is only a word stays one. */
+  static const char *const parsed_ok[] = {
+      "{ printf ok; }\\\n",       "{ printf ok; }\\\n > /dev/null",
+      "{ printf ok; }\\\n | cat", "( { printf a; }\\\n )",
+      "{ echo }\\\n; }",          "printf ok; }x",
+      "printf ok; }\\\nx",
+  };
+  valid = true;
+  for (size_t i = 0; valid && i < sizeof(parsed_ok) / sizeof(parsed_ok[0]);
+       i++) {
+    parsed = (shell_parse_result_t){0};
+    valid = shell_parse_fast(parsed_ok[i], strlen(parsed_ok[i]), NULL,
+                             &parsed) == SHELL_OK;
+  }
+  test("Continued and literal braces match Bash acceptance", valid);
+
+  static const char *const rejected[] = {
+      "{ printf ok; }\\\nfoo",
+      "printf ok; }\\\n ; printf x",
+      "printf ok; } ; printf x",
+  };
+  valid = true;
+  for (size_t i = 0; valid && i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    parsed = (shell_parse_result_t){0};
+    valid = shell_parse_fast(rejected[i], strlen(rejected[i]), NULL, &parsed) ==
+            SHELL_EPARSE;
+  }
+  test("Continued braces that Bash rejects stay rejected", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9577,6 +9653,7 @@ int main(void) {
   test_source_scanner_boundaries();
   test_executable_substitution_scanner_contract();
   test_substitution_and_list_is_not_background();
+  test_brace_close_across_line_continuation();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();
