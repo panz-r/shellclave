@@ -11,6 +11,13 @@ sg_anomaly_score_netseq_count(const sg_anomaly_model_t *model,
                               const char *netseq, size_t length, double *score,
                               size_t *count) SHELL_NONNULL(1, 2, 4, 5);
 
+/* Log2 probability of one stage under the unigram base distribution that every
+ * higher order backs off to. A stage the model has not learned selects the
+ * aggregate unknown-stage bucket. The probabilities of the learned stages and
+ * that bucket form one distribution. Model and item are required. */
+double sg_anomaly_unigram_logprob(const sg_anomaly_model_t *model,
+                                  sg_anomaly_item_view_t item) SHELL_NONNULL(1);
+
 /* Internal stream form used to embed the v7 single-model format in
  * Shellgate's atomic v2 hybrid bundle. The caller owns the stream; read is
  * failure-atomic. Typed results distinguish format, limit, memory and I/O

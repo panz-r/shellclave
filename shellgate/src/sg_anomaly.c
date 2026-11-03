@@ -388,16 +388,33 @@ static double log_count(size_t count) {
   return count == 0 ? -INFINITY : log((double)count);
 }
 
-/* Compute log probability of unknown command in bits. */
-static double unk_logprob(const sg_anomaly_model_t *m) {
-  /* P_unk = (unk_count + alpha) / (total_uni + unk_count + alpha * (V + 1)) */
-  double log_alpha = log(m->alpha);
-  double numerator = log_add_positive(log_count(m->unk_count), log_alpha);
+/* The unigram base distribution has one category per learned stage plus one
+ * for the aggregate of stages never learned, with unk_count (the number of
+ * first sightings, the escape count of PPM method C) as that category's own
+ * count. One shared denominator makes them a single distribution:
+ *   D = total_uni + unk_count + alpha * (V + 1)
+ *   P(stage) = (count + alpha) / D
+ *   P(unknown) = (unk_count + alpha) / D
+ */
+static double unigram_log_denominator(const sg_anomaly_model_t *m) {
   double denominator =
       log_add_positive(log_count(m->total_uni), log_count(m->unk_count));
-  denominator = log_add_positive(denominator,
-                                 log_alpha + log((double)m->vocab_size + 1.0));
-  return (numerator - denominator) / M_LN2;
+  return log_add_positive(denominator,
+                          log(m->alpha) + log((double)m->vocab_size + 1.0));
+}
+
+/* Log probability in bits of a stage seen uni_count times; zero selects the
+ * aggregate unknown-stage bucket. */
+static double unigram_logprob(const sg_anomaly_model_t *m, size_t uni_count) {
+  size_t count = uni_count == 0 ? m->unk_count : uni_count;
+  double numerator = log_add_positive(log_count(count), log(m->alpha));
+  return (numerator - unigram_log_denominator(m)) / M_LN2;
+}
+
+double sg_anomaly_unigram_logprob(const sg_anomaly_model_t *model,
+                                  sg_anomaly_item_view_t item) {
+  return unigram_logprob(model,
+                         sg_anomaly_model_unigram_count_view(model, item));
 }
 
 /*
@@ -428,7 +445,7 @@ static double kn_level_logprob(const sg_anomaly_model_t *m, size_t n_count,
 
   double p_total = p_observed + p_lower;
   if (p_total <= 0)
-    return unk_logprob(m);
+    return unigram_logprob(m, 0);
   if (p_total > 1.0)
     p_total = 1.0;
   return log(p_total) / M_LN2;
@@ -444,16 +461,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const anomaly_bytes_t *p3,
   /* --- Level 1: Unigram (base) --- */
   key_len = build_key(key, sizeof(key), curr, 1);
   size_t uni_count = key_len > 0 ? count_get(m->uni, key, key_len) : 0;
-  double unigram_lp;
-  if (uni_count > 0) {
-    double log_alpha = log(m->alpha);
-    double numerator = log_add_positive(log_count(uni_count), log_alpha);
-    double denominator = log_add_positive(
-        log_count(m->total_uni), log_alpha + log((double)m->vocab_size));
-    unigram_lp = (numerator - denominator) / M_LN2;
-  } else {
-    unigram_lp = unk_logprob(m);
-  }
+  double unigram_lp = unigram_logprob(m, uni_count);
 
   /* --- Level 2: Bigram --- */
   const anomaly_bytes_t bigram[] = {*p1, *curr};

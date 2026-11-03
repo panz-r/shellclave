@@ -386,6 +386,55 @@ TEST(unseen_stage_score_follows_smoothing_and_counts) {
   ASSERT(by_count[0] < by_count[1] && by_count[1] < by_count[2]);
 }
 
+/* The unigram distribution every higher order backs off to must be one
+ * distribution: the learned stages together with the aggregate bucket for
+ * stages never learned carry probability 1, whatever the model has been
+ * through. */
+static double unigram_distribution_mass(const sg_anomaly_model_t *model) {
+  static const char *const stages[] = {"a", "b", "c", "d", "e", "f"};
+  double mass = 0.0;
+  for (size_t i = 0; i < sizeof(stages) / sizeof(stages[0]); i++) {
+    sg_anomaly_item_view_t item = {stages[i], strlen(stages[i])};
+    if (sg_anomaly_model_unigram_count_view(model, item) > 0)
+      mass += exp2(sg_anomaly_unigram_logprob(model, item));
+  }
+  sg_anomaly_item_view_t never = {"never-learned", sizeof("never-learned") - 1};
+  ASSERT(sg_anomaly_model_unigram_count_view(model, never) == 0);
+  return mass + exp2(sg_anomaly_unigram_logprob(model, never));
+}
+
+TEST(unigram_distribution_is_normalized) {
+  static const double alphas[] = {0.001, 0.1, 1.0, 50.0};
+  for (size_t a = 0; a < sizeof(alphas) / sizeof(alphas[0]); a++) {
+    sg_anomaly_model_t *model = test_model_with_config(alphas[a]);
+    ASSERT(model != NULL);
+    /* One stage learned once. */
+    ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, "1:a,", 4),
+                  SG_ANOMALY_OK);
+    ASSERT_EQ_DBL(unigram_distribution_mass(model), 1.0, 1e-9);
+    /* Several stages with unequal counts. */
+    static const char sequences[] = "1:a,1:b,1:c,1:a,1:b,1:a,1:d,1:e,1:a,";
+    for (int repeat = 0; repeat < 3; repeat++)
+      ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, sequences,
+                                                   sizeof(sequences) - 1),
+                    SG_ANOMALY_OK);
+    ASSERT_EQ_DBL(unigram_distribution_mass(model), 1.0, 1e-9);
+
+    sg_anomaly_model_t *loaded = roundtrip_model(model);
+    ASSERT(loaded != NULL);
+    ASSERT_EQ_DBL(unigram_distribution_mass(loaded), 1.0, 1e-9);
+    sg_anomaly_model_free(loaded);
+
+    ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_OK);
+    ASSERT_EQ_DBL(unigram_distribution_mass(model), 1.0, 1e-9);
+    size_t removed = 0;
+    ASSERT_EQ_INT(sg_anomaly_model_prune(model, 3, &removed), SG_ANOMALY_OK);
+    ASSERT(removed > 0);
+    ASSERT_EQ_DBL(unigram_distribution_mass(model), 1.0, 1e-9);
+    sg_anomaly_model_free(model);
+  }
+}
+
 TEST(extreme_alpha_scores_are_finite) {
   static const double alphas[] = {DBL_TRUE_MIN, DBL_MIN, 0.1, DBL_MAX};
   static const char learned[] = "1:a,1:b,1:c,";
@@ -1042,17 +1091,14 @@ reference_stage_probability(const sg_anomaly_model_t *model,
                             size_t vocabulary_count) {
   const double alpha = 0.1;
   size_t count = reference_ngram_count(model, window + order - 1, 1);
-  double probability;
-  if (count) {
-    probability = ((double)count + alpha) /
-                  ((double)sg_anomaly_model_total_unigrams(model) +
-                   alpha * (double)sg_anomaly_model_vocab_size(model));
-  } else {
-    double unknown = (double)sg_anomaly_model_unknown_count(model);
-    probability = (unknown + alpha) /
-                  ((double)sg_anomaly_model_total_unigrams(model) + unknown +
-                   alpha * ((double)sg_anomaly_model_vocab_size(model) + 1.0));
-  }
+  /* Learned stages and the unknown bucket share one denominator, so together
+   * they are a single distribution. */
+  double unknown = (double)sg_anomaly_model_unknown_count(model);
+  double denominator =
+      (double)sg_anomaly_model_total_unigrams(model) + unknown +
+      alpha * ((double)sg_anomaly_model_vocab_size(model) + 1.0);
+  double probability =
+      ((count ? (double)count : unknown) + alpha) / denominator;
   double discount = sg_anomaly_model_kneser_ney_discount(model);
   for (size_t level = 2; level <= order; level++) {
     const sg_anomaly_item_view_t *items = window + order - level;
@@ -2820,6 +2866,7 @@ int main(void) {
   printf("sg_anomaly unit tests\n");
   RUN(lifecycle_and_null_safety);
   RUN(config_contract);
+  RUN(unigram_distribution_is_normalized);
   RUN(extreme_alpha_scores_are_finite);
   RUN(unseen_stage_score_follows_smoothing_and_counts);
   RUN(update_count_matrix);
