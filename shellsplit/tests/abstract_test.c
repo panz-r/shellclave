@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 #include "shell_abstract.h"
 #include "shell_sequence.h"
@@ -6,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int passed;
 static int failed;
@@ -1074,6 +1077,100 @@ static void test_path_and_name_matrices(void) {
   TEST("all path category names", valid);
 }
 
+/* Tilde expansion substitutes HOME for the `~` and keeps the rest of the word
+ * as written, as the shell does: an empty HOME makes `~/child` the absolute
+ * `/child`, and a HOME ending in a slash keeps that slash. */
+static void test_home_expansion_substitutes_the_prefix(void) {
+  printf("\n=== Home Expansion Prefix ===\n");
+  static const struct {
+    const char *home;
+    const char *word;
+    const char *expected;
+  } cases[] = {
+      {"", "~/child", "/child"},
+      {"", "~/child/grand", "/child/grand"},
+      {"", "~", ""},
+      {"", "~/", "/"},
+      {"", "~//x", "//x"},
+      {"/", "~/child", "//child"},
+      {"/", "~", "/"},
+      {"/", "~/", "//"},
+      {"/home/user", "~/child", "/home/user/child"},
+      {"/home/user", "~/child/grand", "/home/user/child/grand"},
+      {"/home/user", "~", "/home/user"},
+      {"/home/user", "~/", "/home/user/"},
+      {"/home/user", "~//x", "/home/user//x"},
+      {"/home/user/", "~/child", "/home/user//child"},
+      {"/home/user/", "~", "/home/user/"},
+      {"/home/user/", "~/", "/home/user//"},
+      {"/a//", "~/.cfg", "/a///.cfg"},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char home[128];
+    snprintf(home, sizeof(home), "HOME=%s", cases[i].home);
+    const char *environment[] = {home, NULL};
+    shell_runtime_context_t context = {
+        .env = environment, .cwd = "/work", .resolve_symlinks = false};
+    char command[64];
+    snprintf(command, sizeof(command), "ls %s", cases[i].word);
+    shell_abstract_command_t *result = parse_command(command);
+    shell_abstract_element_t *element =
+        result ? shell_abstract_command_find_element(result, "$HP_1") : NULL;
+    char *expanded =
+        element ? shell_abstract_element_expand(element, &context) : NULL;
+    valid = expanded && strcmp(expanded, cases[i].expected) == 0;
+    if (!valid)
+      fprintf(stderr, "HOME=[%s] %s -> [%s], expected [%s]\n", cases[i].home,
+              cases[i].word, expanded ? expanded : "(null)", cases[i].expected);
+    free(expanded);
+    shell_abstract_command_free(result);
+  }
+  TEST("home expansion keeps HOME and the original suffix", valid);
+
+  /* Symlink resolution runs on the substituted path. An empty HOME must still
+   * give an absolute path: /tmp resolves, a relative `tmp` would not. */
+  char directory[] = "/tmp/shellsplit-home-XXXXXX";
+  valid = mkdtemp(directory) != NULL;
+  char child[160], home[192], trailing[192];
+  snprintf(child, sizeof(child), "%s/sub", directory);
+  valid = valid && mkdir(child, 0700) == 0;
+  snprintf(home, sizeof(home), "HOME=%s", directory);
+  snprintf(trailing, sizeof(trailing), "HOME=%s/", directory);
+  char *resolved_directory = valid ? realpath(child, NULL) : NULL;
+  valid = valid && resolved_directory;
+  static const char *const words[] = {"~/sub", "~/sub", "~/missing", "~/tmp"};
+  const char *homes[] = {home, trailing, home, "HOME="};
+  for (size_t i = 0; valid && i < 4; i++) {
+    const char *environment[] = {homes[i], NULL};
+    shell_runtime_context_t context = {
+        .env = environment, .cwd = "/work", .resolve_symlinks = true};
+    char command[64];
+    snprintf(command, sizeof(command), "ls %s", words[i]);
+    shell_abstract_command_t *result = parse_command(command);
+    shell_abstract_element_t *element =
+        result ? shell_abstract_command_find_element(result, "$HP_1") : NULL;
+    char *expanded =
+        element ? shell_abstract_element_expand(element, &context) : NULL;
+    if (i < 2)
+      valid = expanded && strcmp(expanded, resolved_directory) == 0;
+    else if (i == 2)
+      valid = expanded == NULL;
+    else
+      valid = expanded && strcmp(expanded, "/tmp") == 0;
+    if (!valid)
+      fprintf(stderr, "resolve case %zu -> [%s]\n", i,
+              expanded ? expanded : "(null)");
+    free(expanded);
+    shell_abstract_command_free(result);
+  }
+  if (resolved_directory)
+    rmdir(child);
+  rmdir(directory);
+  free(resolved_directory);
+  TEST("symlink resolution applies to the substituted home path", valid);
+}
+
 static void test_runtime_expansion(void) {
   printf("\n=== Runtime Expansion Matrix ===\n");
 
@@ -1514,6 +1611,7 @@ int main(void) {
   test_classification_matrix();
   test_path_and_name_matrices();
   test_runtime_expansion();
+  test_home_expansion_substitutes_the_prefix();
   test_parameters_are_not_environment();
   test_word_features_independent_of_abstraction();
   test_invalid_and_null_inputs();

@@ -1644,6 +1644,23 @@ static char *join_path(const char *base, const char *path) {
   return result;
 }
 
+/* Tilde expansion replaces only the `~`: HOME followed by the rest of the word
+ * exactly as written, so an empty HOME leaves `~/child` as the absolute
+ * `/child` and a trailing slash in HOME is kept. tail is empty or begins with
+ * `/`. */
+static char *expand_home_prefix(const char *home, const char *tail) {
+  size_t home_len = strlen(home);
+  size_t tail_len = strlen(tail);
+  if (home_len > SIZE_MAX - tail_len - 1)
+    return NULL;
+  char *result = malloc(home_len + tail_len + 1);
+  if (!result)
+    return NULL;
+  memcpy(result, home, home_len);
+  memcpy(result + home_len, tail, tail_len + 1);
+  return result;
+}
+
 /* A positional or special parameter is shell state the caller may know, not an
  * environment entry. Copy the callback's value, which need not outlive it. */
 static SHELL_NONNULL(1, 2) char *abstract_expand_parameter(
@@ -1706,10 +1723,7 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
       if (!home)
         return NULL;
 
-      if (path[1] == '\0') {
-        return finish_expanded_path(strdup(home), ctx);
-      }
-      return finish_expanded_path(join_path(home, path + 2), ctx);
+      return finish_expanded_path(expand_home_prefix(home, path + 1), ctx);
     }
     /* `~name` names another user's home. The context carries no account
      * database, and the analyzing host need not be the executing host, so
