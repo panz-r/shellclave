@@ -742,6 +742,15 @@ static SHELL_NONNULL(1,
         continue;
       }
     }
+    /* `<&` and `>&` duplicate or close a descriptor. Their `&` belongs to the
+     * operator, across an escaped line ending too, and an `&` met later is
+     * background execution even after an escaped `>`. */
+    size_t duplication = 0;
+    if (!in_double_quotes && (c == '<' || c == '>') &&
+        shell_source_logical_next_is(p, len, i, '&', &duplication)) {
+      i = (uint32_t)duplication + 1;
+      continue;
+    }
     size_t combined_redirect = 0;
     if (!in_double_quotes && c == '&' &&
         shell_source_logical_next_is(p, len, i, '>', &combined_redirect)) {
@@ -888,8 +897,7 @@ static SHELL_NONNULL(1,
           i = (uint32_t)after;
           continue;
         }
-        if (!(i > 0 && (p[i - 1] == '<' || p[i - 1] == '>')))
-          *features |= SHELL_FEAT_BACKGROUND;
+        *features |= SHELL_FEAT_BACKGROUND;
       }
       break;
     case '*':

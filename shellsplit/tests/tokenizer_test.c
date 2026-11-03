@@ -1526,6 +1526,64 @@ static void test_nested_brace_group_is_a_feature(void) {
   test("A nested brace group sets the group feature", valid);
 }
 
+/* `>&` and `<&` duplicate or close a descriptor: their `&` belongs to the
+ * operator, also when an escaped line ending separates the two bytes, and is
+ * never background execution. Conversely an `&` after an escaped `>` is a real
+ * background operator. */
+static void test_descriptor_duplication_is_not_background(void) {
+  static const struct {
+    const char *source;
+    bool background;
+  } cases[] = {
+      {"echo 2>&1", false},
+      {"echo 2>\\\n&1", false},
+      {"echo >\\\n&2", false},
+      {"echo <\\\n&0", false},
+      {"echo >\\\n&-", false},
+      {"echo 2<\\\n&-", false},
+      {"echo {fd}>\\\n&1", false},
+      {"echo {fd}<\\\n&0", false},
+      {"echo a >\\\n\\\n&1", false},
+      {"echo $(echo 2>&1)", false},
+      {"echo $(echo 2>\\\n&1)", false},
+      {"echo $(echo >\\\n&2)", false},
+      {"echo $(echo <\\\n&0)", false},
+      {"echo $(echo {fd}>\\\n&1)", false},
+      {"echo <(echo 2>\\\n&1)", false},
+      {"echo `echo 2>\\\n&1`", false},
+      {"echo \"$(echo 2>\\\n&1)\"", false},
+      {"echo $(echo a |& cat)", false},
+      {"echo $(echo a &> f)", false},
+      {"echo $(echo a &\\\n& b)", false},
+      /* A real background operator, including after a duplication. */
+      {"echo >&2 &", true},
+      {"echo >\\\n&2 &", true},
+      {"echo $(echo a &)", true},
+      {"echo $(echo a >&2 &)", true},
+      {"echo $(echo a >\\\n&2 &)", true},
+      {"echo $(echo a >&2&)", true},
+      {"echo $(echo \\>& )", true},
+      {"echo $(echo \\<& )", true},
+      {"echo $(echo '>'& )", true},
+      {"echo <(echo a &)", true},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    uint32_t features = 0;
+    valid = shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                             &parsed) == SHELL_OK;
+    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
+      features |= parsed.cmds[cmd].features;
+    valid = valid &&
+            ((features & SHELL_FEAT_BACKGROUND) != 0) == cases[i].background;
+    if (!valid)
+      fprintf(stderr, "wrong background feature (0x%05x): %s\n", features,
+              cases[i].source);
+  }
+  test("Descriptor duplication is not background execution", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9778,6 +9836,7 @@ int main(void) {
   test_brace_close_across_line_continuation();
   test_negator_requires_a_word_start();
   test_nested_brace_group_is_a_feature();
+  test_descriptor_duplication_is_not_background();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();
