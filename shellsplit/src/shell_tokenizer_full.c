@@ -853,8 +853,12 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     }
   }
 
+  /* The physical byte before `!` supplies the operator and whitespace
+   * boundaries; the tracked operand end supplies logical word continuity, so a
+   * negator cannot begin after an escaped line ending that joins it to the
+   * preceding word fragment. */
   if (!state->in_quotes && current_char == '!' &&
-      token_at_word_boundary(state) &&
+      token_at_word_boundary(state) && token_starts_word(state) &&
       shell_source_match_pipeline_negator(state->input, state->length,
                                           state->position, NULL)) {
     token->type = SHELL_TOKEN_PIPE_NEGATE;

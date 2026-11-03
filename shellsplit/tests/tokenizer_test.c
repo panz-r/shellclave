@@ -1404,6 +1404,77 @@ static void test_brace_close_across_line_continuation(void) {
   test("Continued braces that Bash rejects stay rejected", valid);
 }
 
+/* A `!` is a pipeline negator only where a shell word starts. An escaped line
+ * ending is removed before words are recognized, so it joins `!` to a
+ * preceding expansion instead of starting a new word: Bash reads
+ * `echo $x\\<newline>! tail` as the arguments `abc!` and `tail`. */
+static size_t test_negator_positions(const char *source, size_t *positions,
+                                     size_t capacity) {
+  shell_tokenizer_state_t state;
+  shell_token_t token;
+  size_t count = 0;
+  if (!shell_tokenizer_init(&state, source, strlen(source), NULL))
+    return SIZE_MAX;
+  while (shell_tokenizer_next(&state, &token))
+    if (token.type == SHELL_TOKEN_PIPE_NEGATE && count < capacity)
+      positions[count++] = token.position;
+  return count;
+}
+
+static void test_negator_requires_a_word_start(void) {
+  static const char *const joined[] = {
+      "printf '<%s>\\n' $value\\\n! tail",
+      "printf '<%s>\\n' $(printf abc)\\\n! tail",
+      "printf '<%s>\\n' \"$value\"\\\n! tail",
+      "echo $x\\\n! tail",
+      "echo ${x}\\\n! tail",
+      "echo `date`\\\n! tail",
+      "echo \"$(printf x)\"\\\n! tail",
+      "echo $x$y\\\n! tail",
+      "echo <(true)\\\n! tail",
+      "echo $((1 + 2))\\\n! tail",
+      "echo ${x}! tail",
+      "echo $x\\\n\\\n! tail",
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(joined) / sizeof(joined[0]); i++) {
+    size_t positions[4];
+    valid = test_negator_positions(joined[i], positions, 4) == 0;
+    if (!valid)
+      fprintf(stderr, "unexpected negator: %s\n", joined[i]);
+  }
+  test("A line continuation after an expansion does not start a negator",
+       valid);
+
+  static const struct {
+    const char *source;
+    size_t first;
+    size_t count;
+  } negated[] = {
+      {"! true", 0, 1},
+      {"echo a; ! false", 8, 1},
+      {"echo a;\\\n! false", 9, 1},
+      {"echo a &&\\\n! false", 11, 1},
+      {"echo a ||\\\n! false", 11, 1},
+      {"echo a\n! false", 7, 1},
+      {"echo $x ;\\\n! false", 11, 1},
+      {"if ! true; then :; fi", 3, 1},
+      {"case x in a) ! false ;; esac", 13, 1},
+      {"( ! true )", 2, 1},
+      {"{ ! true; }", 2, 1},
+      {"! \\\n! true", 0, 2},
+  };
+  valid = true;
+  for (size_t i = 0; valid && i < sizeof(negated) / sizeof(negated[0]); i++) {
+    size_t positions[4];
+    size_t count = test_negator_positions(negated[i].source, positions, 4);
+    valid = count == negated[i].count && positions[0] == negated[i].first;
+    if (!valid)
+      fprintf(stderr, "negator lost or moved: %s\n", negated[i].source);
+  }
+  test("Pipeline negators at a word start are still recognized", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9654,6 +9725,7 @@ int main(void) {
   test_executable_substitution_scanner_contract();
   test_substitution_and_list_is_not_background();
   test_brace_close_across_line_continuation();
+  test_negator_requires_a_word_start();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();
