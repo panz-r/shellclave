@@ -1440,6 +1440,60 @@ static void test_type_sequence_matrix(void) {
   TEST("nested type sequence checks framed output after parsing", valid);
 }
 
+/* Active glob syntax takes precedence over option spelling in the anomaly type
+ * signature, as in shell_classify_raw_token(): a word is OPT only when it is an
+ * ordinary option-shaped word. Quoted and escaped glob punctuation is literal.
+ */
+static void test_type_sequence_hyphen_globs(void) {
+  printf("\n=== Type Sequence Hyphen Globs ===\n");
+  static const struct {
+    const char *command;
+    const char *expected;
+  } cases[] = {
+      {"ls *.txt", "10:2:ls,2:GB,,"},
+      {"ls -*.txt", "10:2:ls,2:GB,,"},
+      {"ls -[ab].txt", "10:2:ls,2:GB,,"},
+      {"ls --*", "10:2:ls,2:GB,,"},
+      {"ls -?", "10:2:ls,2:GB,,"},
+      {"ls -@(a|b)", "10:2:ls,2:GB,,"},
+      {"ls -!(a)", "10:2:ls,2:GB,,"},
+      {"ls -a*\"b\"", "10:2:ls,2:GB,,"},
+      {"ls -\"a\"*", "10:2:ls,2:GB,,"},
+      {"ls -- -*.c", "16:2:ls,3:OPT,2:GB,,"},
+      {"ls -x", "11:2:ls,3:OPT,,"},
+      {"ls --long", "11:2:ls,3:OPT,,"},
+      {"ls -1", "11:2:ls,3:OPT,,"},
+      {"ls -[a", "11:2:ls,3:OPT,,"},
+      {"ls -\\*.txt", "11:2:ls,3:OPT,,"},
+      {"ls -\\[ab].txt", "11:2:ls,3:OPT,,"},
+      {"ls '-*.txt'", "11:2:ls,3:STR,,"},
+      {"ls \"-*.txt\"", "11:2:ls,3:STR,,"},
+      {"ls -", "11:2:ls,3:STR,,"},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    size_t length = strlen(cases[i].command);
+    size_t expected = strlen(cases[i].expected);
+    size_t count = 0, anomaly_count = 0;
+    shell_netstring_buffer_t direct = {0}, command = {0}, type = {0};
+    valid =
+        shell_build_type_netseq_buffer(cases[i].command, length, NULL, &direct,
+                                       &count) == SHELL_PROCESS_OK &&
+        shell_build_anomaly_netseqs_buffer(cases[i].command, length, NULL,
+                                           &command, &type, &anomaly_count) ==
+            SHELL_PROCESS_OK &&
+        direct.length == expected && type.length == expected &&
+        memcmp(direct.data, cases[i].expected, expected) == 0 &&
+        memcmp(type.data, cases[i].expected, expected) == 0;
+    if (!valid)
+      fprintf(stderr, "type signature mismatch: %s\n", cases[i].command);
+    shell_netstring_buffer_free(&direct);
+    shell_netstring_buffer_free(&command);
+    shell_netstring_buffer_free(&type);
+  }
+  TEST("hyphen-prefixed active globs keep the glob type in signatures", valid);
+}
+
 int main(void) {
   printf("=== Shell Abstraction Tests ===\n");
 
@@ -1464,6 +1518,7 @@ int main(void) {
   test_word_features_independent_of_abstraction();
   test_invalid_and_null_inputs();
   test_type_sequence_matrix();
+  test_type_sequence_hyphen_globs();
 
   printf("\n=== Summary ===\n");
   printf("Passed: %d\nFailed: %d\nTotal:  %d\n", passed, failed,

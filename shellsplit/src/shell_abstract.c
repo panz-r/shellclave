@@ -1862,7 +1862,11 @@ void shell_abstract_command_free(shell_abstract_command_t *cmd) {
 /* --- LIGHTWEIGHT TYPE SEQUENCE GENERATION --- */
 
 static const char *token_abbreviation(const shell_token_t *token) {
-  if (token->length >= 2 && token->start[0] == '-')
+  /* Active glob syntax takes precedence over option spelling, as in
+   * shell_classify_raw_token(): the lexer has already decided which words are
+   * globs, so only an ordinary option-shaped word is an option. */
+  if (token->length >= 2 && token->start[0] == '-' &&
+      token->type != SHELL_TOKEN_GLOB && token->type != SHELL_TOKEN_EXTGLOB)
     return "OPT";
   shell_abstract_type_t type;
   if (!try_abstract_type(token->type, token->start, token->length, &type))
