@@ -34,8 +34,11 @@ typedef struct {
   shell_arithmetic_result_t result;
   bool references;
   bool mutation; /* Proven unsupported mutation; survives source projection. */
-  bool unresolved; /* Source expansion could not be reduced to pure arithmetic.
-                    */
+  /* Source expansion could not be reduced to pure arithmetic. Set only by
+   * shell_conditional_arithmetic_operand(), which sees the undecoded operand;
+   * shell_arithmetic_analyze_scalar() analyzes decoded text and leaves it
+   * false. */
+  bool unresolved;
 } shell_arithmetic_scalar_result_t;
 shell_arithmetic_scalar_result_t
 shell_arithmetic_analyze_scalar(const char *source, size_t length,

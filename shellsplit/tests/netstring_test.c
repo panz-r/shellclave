@@ -73,6 +73,8 @@ static void test_validation_failures(void) {
       {"3:abc,x", SHELL_NETSTRING_EFORMAT},
       {"x:abc,", SHELL_NETSTRING_EFORMAT},
       {"184467440737095516160:x,", SHELL_NETSTRING_EOVERFLOW},
+      {"1:a,3:ab", SHELL_NETSTRING_EFORMAT},
+      {"0:,3:ab,", SHELL_NETSTRING_EFORMAT},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     TEST("malformed framing rejected",
@@ -83,6 +85,17 @@ static void test_validation_failures(void) {
   TEST("empty sequence validates",
        shell_netstring_validate(NULL, 0, &count) == SHELL_NETSTRING_OK &&
            count == 0);
+  static const struct {
+    const char *input;
+    size_t records;
+  } counted[] = {{"0:,", 1}, {"0:,0:,", 2}, {"0:,1:a,0:,", 3}, {"1:a,", 1}};
+  for (size_t i = 0; i < sizeof(counted) / sizeof(counted[0]); i++) {
+    count = 99;
+    TEST("empty and ordinary records are counted exactly",
+         shell_netstring_validate(counted[i].input, strlen(counted[i].input),
+                                  &count) == SHELL_NETSTRING_OK &&
+             count == counted[i].records);
+  }
   TEST("null non-empty input rejected",
        shell_netstring_validate(NULL, 1, NULL) == SHELL_NETSTRING_EINPUT);
 }

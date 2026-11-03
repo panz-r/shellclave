@@ -89,12 +89,11 @@ shell_netstring_status_t shell_netstring_validate(const void *data,
     return status;
   shell_netstring_view_t view;
   size_t count = 0;
+  /* Every record occupies at least the three bytes of `0:,`, so the count is
+   * at most length / 3 and cannot overflow. */
   while ((status = shell_netstring_iter_next(&iter, &view)) ==
-         SHELL_NETSTRING_OK) {
-    if (count == SIZE_MAX)
-      return SHELL_NETSTRING_EOVERFLOW;
+         SHELL_NETSTRING_OK)
     count++;
-  }
   if (status != SHELL_NETSTRING_DONE)
     return status;
   if (record_count)
