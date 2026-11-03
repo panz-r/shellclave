@@ -221,8 +221,10 @@ shell_abstract_command_get_element(shell_abstract_command_t *cmd, size_t index)
  * in `*value` and its byte count in `*value_length`; the bytes may be empty
  * (length zero, `*value` then unused), must not contain NUL, and need only
  * stay valid until the callback's caller returns, since expansion copies
- * them. Return false when the parameter has no known value. `context` is the
- * context's `parameters_context`. The callback must not modify the element.
+ * them. A nonzero count requires `*value` to point to that many readable
+ * bytes; expansion does not validate a result that breaks this. Return false
+ * when the parameter has no known value. `context` is the context's
+ * `parameters_context`. The callback must not modify the element.
  */
 typedef bool (*shell_parameter_resolver_t)(shell_abstract_type_t type,
                                            const char *name, void *context,

@@ -1328,6 +1328,19 @@ static bool fixture_parameter(shell_abstract_type_t type, const char *name,
   return true;
 }
 
+/* A true result with a zero count leaves `*value` unused: the callback need
+ * not set it. */
+static bool unused_value_parameter(shell_abstract_type_t type, const char *name,
+                                   void *context, const char **value,
+                                   size_t *value_length) {
+  (void)type;
+  (void)name;
+  (void)context;
+  (void)value;
+  *value_length = 0;
+  return true;
+}
+
 static char *expand_first(const char *input, const char *key,
                           const shell_runtime_context_t *context) {
   shell_abstract_command_t *result = parse_command(input);
@@ -1393,6 +1406,13 @@ static void test_parameters_are_not_environment(void) {
   TEST("an empty callback value resolves to an empty string",
        empty && empty[0] == '\0');
   free(empty);
+
+  shell_runtime_context_t unused_value = with_callback;
+  unused_value.parameters = unused_value_parameter;
+  char *unset_pointer = expand_first("echo $1", "$PV_1", &unused_value);
+  TEST("a zero count does not read the value pointer",
+       unset_pointer && unset_pointer[0] == '\0');
+  free(unset_pointer);
 
   fixture = (parameter_fixture_t){"2", "other", 0};
   char *unknown = expand_first("echo $1", "$PV_1", &with_callback);
