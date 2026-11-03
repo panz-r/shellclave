@@ -140,6 +140,34 @@ static void test_encoding(void) {
            SHELL_NETSTRING_EOVERFLOW);
 }
 
+/* The output buffer must hold the whole record: an exact fit succeeds at every
+ * digit-count boundary, one byte less fails, and a failure writes nothing. */
+static void test_encoding_capacity_boundaries(void) {
+  static const size_t lengths[] = {0, 1, 9, 10, 99, 100, 1000};
+  unsigned char payload[1000];
+  memset(payload, 'x', sizeof(payload));
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+    size_t needed = 0, written = 99;
+    unsigned char record[1100];
+    valid = shell_netstring_encoded_length(lengths[i], &needed) ==
+                SHELL_NETSTRING_OK &&
+            needed <= sizeof(record);
+    memset(record, 0xa5, sizeof(record));
+    valid = valid &&
+            shell_netstring_write(record, needed - 1, payload, lengths[i],
+                                  &written) == SHELL_NETSTRING_EOVERFLOW &&
+            written == 0 && record[0] == 0xa5 && record[needed - 2] == 0xa5;
+    valid =
+        valid &&
+        shell_netstring_write(record, needed, payload, lengths[i], &written) ==
+            SHELL_NETSTRING_OK &&
+        written == needed && record[needed - 1] == ',' &&
+        shell_netstring_validate(record, needed, NULL) == SHELL_NETSTRING_OK;
+  }
+  TEST("record capacity is exact at every digit-count boundary", valid);
+}
+
 static void test_malformed_record(void) {
   shell_netstring_iter_t iter;
   shell_netstring_view_t view;
@@ -309,6 +337,7 @@ int main(void) {
   test_validation_failures();
   test_count_and_error_position();
   test_encoding();
+  test_encoding_capacity_boundaries();
   test_malformed_record();
   test_stream_reader();
   test_stream_reader_bounds_prefix_digits();

@@ -103,7 +103,9 @@ typedef struct {
     } cmd_subst;
   } data;
 
-  // Runtime-expandable data (set during validation phase)
+  /* Resolved value, owned by the element. Set or cleared only by
+   * shell_abstract_command_expand(); NULL means not yet expanded, unresolved,
+   * or not expandable. */
   char *expanded;
 } shell_abstract_element_t;
 

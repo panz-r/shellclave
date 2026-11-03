@@ -14,10 +14,6 @@ extern "C" {
 #endif
 
 /**
- * Parsed command metadata for downstream consumers.
- */
-
-/**
  * Parsed shell command metadata, including original text and tokenized details.
  */
 typedef struct {

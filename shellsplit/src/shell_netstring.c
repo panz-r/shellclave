@@ -148,9 +148,10 @@ shell_netstring_write(void *record, size_t record_capacity, const void *payload,
     return SHELL_NETSTRING_EOVERFLOW;
   unsigned char *out = record;
   size_t prefix = 0;
-  if (shell_netstring_write_prefix(out, record_capacity, payload_length,
-                                   &prefix) != SHELL_NETSTRING_OK)
-    return SHELL_NETSTRING_EOVERFLOW;
+  /* The capacity covers the whole record, which includes the shorter prefix,
+   * so the prefix cannot fail. */
+  (void)shell_netstring_write_prefix(out, record_capacity, payload_length,
+                                     &prefix);
   if (payload_length)
     memcpy(out + prefix, payload, payload_length);
   out[needed - 1] = ',';
