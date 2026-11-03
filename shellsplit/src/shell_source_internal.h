@@ -1773,12 +1773,18 @@ static inline SHELL_NONNULL(1, 4) bool shell_source_scan_arithmetic_number(
  * escapes, comments, nested substitutions, and deferred heredoc bodies remain
  * opaque while matching parentheses. Returns false for an unterminated or
  * malformed fragment; shell_source_skip_balanced_parentheses() maps that
- * failure to `length` for callers that need a sentinel position. */
+ * failure to `length` for callers that need a sentinel position.
+ *
+ * With `pattern`, the parentheses delimit an extglob body: `#` and `<<` are
+ * literal pattern bytes there, not a comment or a heredoc, and `(` only
+ * nests. Quotes, escapes and every substitution stay active, since Bash
+ * expands them inside a pattern. */
 static inline SHELL_NONNULL(
     1, 4) bool shell_source_find_balanced_parentheses_impl(const char *input,
                                                            size_t length,
                                                            size_t position,
-                                                           size_t *after) {
+                                                           size_t *after,
+                                                           bool pattern) {
   if (input[position] != '(')
     return false;
   size_t depth = 1;
@@ -1822,7 +1828,7 @@ static inline SHELL_NONNULL(
                                                &quoted))
         return false;
       position = quoted - 1;
-    } else if (shell_source_comment_starts(c, starts_word)) {
+    } else if (!pattern && shell_source_comment_starts(c, starts_word)) {
       /* Leave a newline visible for deferred heredoc-body processing. */
       size_t line_end = shell_source_line_end(input, length, position);
       position = line_end == length ? length - 1 : line_end - 1;
@@ -1855,7 +1861,7 @@ static inline SHELL_NONNULL(
         word_boundary = false;
         continue;
       }
-      if (c != '<')
+      if (c != '<' || pattern)
         continue;
       size_t operator_after = 0;
       if (shell_source_match_logical_punctuation(input, length, position, "<<<",
@@ -1881,9 +1887,9 @@ static inline SHELL_NONNULL(
       position = line - 1;
     } else if (c == '(') {
       size_t content, end, arithmetic_after;
-      if (shell_source_arithmetic_command(input, length, position, &content,
-                                          &end, &arithmetic_after) ==
-          SHELL_ARITHMETIC_FRAME_COMPLETE)
+      if (!pattern && shell_source_arithmetic_command(
+                          input, length, position, &content, &end,
+                          &arithmetic_after) == SHELL_ARITHMETIC_FRAME_COMPLETE)
         position = arithmetic_after - 1;
       else
         depth++;
@@ -1897,21 +1903,25 @@ static inline SHELL_NONNULL(
   return true;
 }
 
-static inline bool shell_source_find_balanced_parentheses(const char *input,
-                                                          size_t length,
-                                                          size_t position,
-                                                          size_t *after) {
+static inline bool shell_source_find_parentheses_cached(const char *input,
+                                                        size_t length,
+                                                        size_t position,
+                                                        size_t *after,
+                                                        bool pattern) {
   if (position >= length)
     return false;
+  const unsigned found_kind =
+      pattern ? SHELL_SOURCE_INDEX_EXTGLOB : SHELL_SOURCE_INDEX_PARENS;
+  const unsigned failed_kind = pattern ? SHELL_SOURCE_INDEX_UNCLOSED_EXTGLOB
+                                       : SHELL_SOURCE_INDEX_UNCLOSED_PARENS;
   size_t height;
   size_t failed_end;
-  if (shell_source_index_get(input, length, position,
-                             SHELL_SOURCE_INDEX_UNCLOSED_PARENS, &failed_end,
+  if (shell_source_index_get(input, length, position, failed_kind, &failed_end,
                              &height) &&
       failed_end == length)
     return false;
-  if (shell_source_index_get(input, length, position, SHELL_SOURCE_INDEX_PARENS,
-                             after, &height)) {
+  if (shell_source_index_get(input, length, position, found_kind, after,
+                             &height)) {
     if (height > SHELL_MAX_SUBCOMMANDS - shell_source_scan_depth)
       return false;
     shell_source_scan_child(height);
@@ -1919,19 +1929,26 @@ static inline bool shell_source_find_balanced_parentheses(const char *input,
   }
   if (!shell_source_scan_enter())
     return false;
-  bool complete = shell_source_find_balanced_parentheses_impl(input, length,
-                                                              position, after);
+  bool complete = shell_source_find_balanced_parentheses_impl(
+      input, length, position, after, pattern);
   height = shell_source_scan_leave();
   if (complete)
-    shell_source_index_put(input, length, position, SHELL_SOURCE_INDEX_PARENS,
-                           *after, height);
+    shell_source_index_put(input, length, position, found_kind, *after, height);
   else
     /* Immutable received EOF is part of this negative fact. Do not reuse it
      * for a different span end (for example a separately qualified prefix).
      * Nested draft consumers reuse the failed forward walk, not its suffix. */
-    shell_source_index_put(input, length, position,
-                           SHELL_SOURCE_INDEX_UNCLOSED_PARENS, length, height);
+    shell_source_index_put(input, length, position, failed_kind, length,
+                           height);
   return complete;
+}
+
+static inline bool shell_source_find_balanced_parentheses(const char *input,
+                                                          size_t length,
+                                                          size_t position,
+                                                          size_t *after) {
+  return shell_source_find_parentheses_cached(input, length, position, after,
+                                              false);
 }
 
 static inline size_t shell_source_skip_balanced_parentheses(const char *input,
@@ -2957,7 +2974,7 @@ static inline SHELL_NONNULL(4) bool shell_source_skip_extglob(const char *input,
        input[position] != '!') ||
       !shell_source_logical_next_is(input, length, position, '(', &open))
     return false;
-  return shell_source_find_balanced_parentheses(input, length, open, after);
+  return shell_source_find_parentheses_cached(input, length, open, after, true);
 }
 
 /* A dollar byte is literal unless it begins syntax whose result depends on

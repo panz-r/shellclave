@@ -23,6 +23,10 @@ enum {
   SHELL_SOURCE_INDEX_LITERAL_FRAGMENT,
   SHELL_SOURCE_INDEX_ARITHMETIC_BODY,
   SHELL_SOURCE_INDEX_UNCLOSED_ARITHMETIC_BODY,
+  /* An extglob body is pattern text, not a shell fragment: the same `(` has a
+   * different extent, so its facts never share the parenthesis entries. */
+  SHELL_SOURCE_INDEX_EXTGLOB,
+  SHELL_SOURCE_INDEX_UNCLOSED_EXTGLOB,
 };
 typedef struct {
   uintptr_t begin, end, frontier;

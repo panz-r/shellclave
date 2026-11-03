@@ -443,6 +443,92 @@ static void command_word_subscript(void) {
   }
 }
 
+/* The parentheses of an extglob delimit a pattern, not a shell fragment: `#`
+ * and `<<` are literal pattern bytes there, while quotes, escapes and every
+ * substitution stay active, as Bash expands them inside a pattern. */
+static void extglob_body_is_pattern_text(void) {
+  static const char *const complete[] = {
+      "echo @(a|#b)",
+      "echo @(#b)",
+      "echo !(a|#b)",
+      "echo +(#b)",
+      "echo ?(#b)",
+      "echo *(#b)",
+      "echo @(a|@(b|#c))",
+      "echo a@(#b)c",
+      "echo @(a # c)",
+      "echo @(#)",
+      "echo @(a|# ) x",
+      "echo @(<<)",
+      "echo @(a<<b)",
+      "echo @(a<<<b)",
+      "echo @(a<<-b)",
+      "echo @(a<<EOF)",
+      "echo @(a<<(x))",
+      "echo @(<<(x) # y)",
+      "echo $(echo @(a|#b))",
+      "echo \"x\" @(#b) y",
+      "x=@(#b)",
+      "( echo @(#b) )",
+      "{ echo @(#b); }",
+      "echo @(#b) # trailing",
+      "echo @(#b); echo @(a|#c)",
+      "echo <(echo @(#b))",
+      "echo @(a\n|#b)",
+  };
+  for (size_t c = 0; c < sizeof(complete) / sizeof(complete[0]); c++) {
+    int status =
+        shell_parse_draft(complete[c], strlen(complete[c]), NULL, &draft);
+    if (status != SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected COMPLETE (%d): %s\n", status, complete[c]);
+    CHECK(status == SHELL_SOURCE_COMPLETE);
+    CHECK(shell_dep_graph_parse(complete[c], strlen(complete[c]), "/workspace",
+                                &limits, &graph) == SHELL_DEP_OK);
+  }
+  /* A substitution inside the pattern is still a command the graph sees. */
+  static const struct {
+    const char *source;
+    unsigned commands; /* the outer command plus every nested one */
+  } nested[] = {
+      {"echo @(a|#b)", 1},          {"echo @(a$(echo X)b)", 2},
+      {"echo @(a`echo X`b)", 2},    {"echo @(a<(echo hi)b)", 2},
+      {"echo @(a<<(x))", 2},        {"echo @(#b|$(echo X))", 2},
+      {"echo @(a<<(echo hi)b)", 2},
+  };
+  for (size_t c = 0; c < sizeof(nested) / sizeof(nested[0]); c++) {
+    CHECK(shell_dep_graph_parse(nested[c].source, strlen(nested[c].source),
+                                "/workspace", &limits, &graph) == SHELL_DEP_OK);
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; n++)
+      commands += graph.nodes[n].type == SHELL_NODE_CMD;
+    if (commands != nested[c].commands)
+      fprintf(stderr, "graph: %u command nodes, expected %u: %s\n", commands,
+              nested[c].commands, nested[c].source);
+    CHECK(commands == nested[c].commands);
+  }
+  /* Unterminated and over-closed patterns, and a comment inside a nested
+   * substitution (Bash fails on it when run), are still not complete. */
+  static const char *const rejected[] = {
+      "echo @(a|b",
+      "echo @(a))",
+      "echo @(a|#b",
+      "echo @(a|#b))",
+      "echo @(a<<(x)",
+      "echo @(#b",
+      "echo @(",
+      "echo @(a|# )x)",
+      "echo @($(echo #x))",
+      "echo @(a<<(echo #x)b)",
+  };
+  for (size_t c = 0; c < sizeof(rejected) / sizeof(rejected[0]); c++) {
+    int status =
+        shell_parse_draft(rejected[c], strlen(rejected[c]), NULL, &draft);
+    if (status == SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected not COMPLETE: %s\n", rejected[c]);
+    CHECK(status != SHELL_SOURCE_COMPLETE);
+  }
+}
+
 static void selector_recovery(void) {
   static const char *const selectors[] = {
       "${#value}",       "${!value}",       "${!prefix*}",   "${!prefix@}",
@@ -6188,6 +6274,7 @@ int main(void) {
   special_parameter_extglob_tail();
   conditional_opener_needs_a_word_boundary();
   command_word_subscript();
+  extglob_body_is_pattern_text();
   word_byte_source();
   ansi_byte_source();
   ansi_control_delimiters();
