@@ -510,11 +510,9 @@ static bool command_is_scorable(anomaly_bytes_t command) {
   return command.data != NULL;
 }
 
-/* The length cap bounds the memory a single key can consume, so it constrains
- * what may be learned, not what may be scored. Scoring an over-long name is
- * safe: its n-gram keys never fit the key buffer, so it backs off to the
- * unknown-command probability and reads as highly anomalous. Rejecting it here
- * instead would return INFINITY and suppress detection entirely. */
+/* Count-accessor and observed-stage lookups accept only a name that could have
+ * been learned: present and within the stage length cap. Scoring does not use
+ * this predicate; the cap constrains learning only (see validate_netseq). */
 static bool command_is_valid(anomaly_bytes_t command) {
   return command_is_scorable(command) &&
          command.length <= SG_ANOMALY_MAX_STAGE_LENGTH;
@@ -527,6 +525,13 @@ static sg_anomaly_status_t netstring_status(shell_netstring_status_t status) {
                                              : SG_ANOMALY_ERR_FORMAT;
 }
 
+/* The length cap bounds the memory a single key can consume, so it constrains
+ * what may be learned, not what may be scored: updates enforce it
+ * (enforce_item_limit), while lookups and scoring do not reject an over-long
+ * name on length. Scoring such a name is safe: its n-gram keys never fit the
+ * key buffer, so it backs off to the unknown-command probability and reads as
+ * highly anomalous. Rejecting it in scoring instead would return INFINITY and
+ * suppress detection entirely. */
 static sg_anomaly_status_t validate_netseq(const char *netseq, size_t length,
                                            bool enforce_item_limit,
                                            size_t *count) {

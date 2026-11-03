@@ -18,7 +18,6 @@ typedef struct {
 } arithmetic_value_t;
 
 typedef enum {
-  OP_NONE,
   OP_OR,
   OP_AND,
   OP_BITOR,
@@ -207,8 +206,6 @@ static arithmetic_value_t binary_value(arithmetic_operator_t op,
         return (arithmetic_value_t){0};
     }
     return known(result);
-  default:
-    break;
   }
   return (arithmetic_value_t){0};
 }
