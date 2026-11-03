@@ -878,10 +878,11 @@ static SHELL_NONNULL(1,
       }
       break;
     case '[':
-      // Globs do NOT expand in double quotes, and not in heredoc context. A
-      // bracket is a pattern only with a closing bracket in the same word, so
-      // `echo [` and the `[` test command are not globs. A failed probe has
-      // examined its word, so no opener inside that span repeats it.
+      // Globs do NOT expand in double quotes, nor in a `[[ ]]` operand, where
+      // a pattern is matched rather than expanded. A bracket is a pattern
+      // only with a closing bracket in the same word, so `echo [` and the `[`
+      // test command are not globs. A failed probe has examined its word, so
+      // no opener inside that span repeats it.
       if (!in_double_quotes && context != FAST_FEATURE_CONDITIONAL_WORD &&
           !(i > 0 && p[i - 1] == '<') && i >= bracket_examined) {
         shell_source_glob_probe_t probe =

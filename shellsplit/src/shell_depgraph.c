@@ -112,8 +112,6 @@ bool shell_dep_doc_content_length(const shell_dep_doc_t *doc,
     char c = doc->value[i];
     if (line_start && c == '\t')
       continue;
-    if (total == SIZE_MAX)
-      return false;
     total++;
     line_start = c == '\n';
   }

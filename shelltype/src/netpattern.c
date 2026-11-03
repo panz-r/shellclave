@@ -475,8 +475,6 @@ st_error_t st_netpattern_encode_owned(const st_token_t *tokens, size_t count,
           }
           nested_length += part_lengths[p];
         }
-        if (nested_length == SIZE_MAX)
-          error = ST_ERR_LIMIT;
         char *nested = error == ST_OK ? malloc(nested_length + 1) : NULL;
         if (error == ST_OK && !nested)
           error = ST_ERR_MEMORY;
