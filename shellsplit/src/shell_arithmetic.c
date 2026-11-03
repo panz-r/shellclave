@@ -1,6 +1,5 @@
 #include "shell_arithmetic_internal.h"
 #include "shell_source_internal.h"
-#include <limits.h>
 
 typedef struct {
   const char *source;
