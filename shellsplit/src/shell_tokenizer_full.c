@@ -2071,6 +2071,24 @@ static shell_error_t list_invalid_at(shell_source_draft_state_t *draft,
   return SHELL_EPARSE;
 }
 
+/* The tokenizer reads `$!`, `$?`, `$@` and `$*` as a complete special
+ * parameter, but with extglob Bash reads `$` and then an extglob group that
+ * starts at the same punctuation byte: `$!(foo)` is the parameter followed by
+ * the literal text `(foo)`. `open` is a `(` group-start token; report whether
+ * it begins such a group. The tokenizer splits that word at the `(`, so it is
+ * Bash syntax the lexer cannot model, not a grammar error. */
+static SHELL_NONNULL(1) bool special_parameter_extglob_tail(const char *input,
+                                                            size_t input_length,
+                                                            size_t open) {
+  if (open < 2 || input[open - 2] != '$')
+    return false;
+  char punctuation = input[open - 1];
+  size_t after = 0;
+  return (punctuation == '!' || punctuation == '?' || punctuation == '@' ||
+          punctuation == '*') &&
+         shell_source_skip_extglob(input, input_length, open - 1, &after);
+}
+
 static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     const char *input, size_t input_length,
     shell_list_end_context_t end_context, size_t recursion_depth,
@@ -2128,6 +2146,13 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
           token.position == state.group_redirect_word_end)))
       break;
     bool literal_token = shell_token_is_literal(&token);
+
+    if (!literal_token && token.type == SHELL_TOKEN_GROUP_START &&
+        special_parameter_extglob_tail(input, input_length, token.position)) {
+      if (draft)
+        draft->failure = SHELL_SOURCE_UNSUPPORTED;
+      return list_invalid_at(draft, token.position);
+    }
 
     /* Reuse subscript boundaries only where this lexical role can own an
      * assignment. Ordinary words must not trigger whole-suffix lookahead. */

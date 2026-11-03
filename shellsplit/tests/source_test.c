@@ -191,6 +191,60 @@ static void byte_domains(void) {
   content(&draft.heredocs[1].content, "語\n");
 }
 
+/* With extglob, Bash reads `$` and then `!(...)`: `$!(foo)` is the special
+ * parameter followed by the literal text `(foo)`, and likewise for `$?`, `$@`
+ * and `$*`, whose punctuation is also an extglob operator. The lexer splits
+ * such a word at the `(`, so it cannot model it; that is not a grammar error.
+ * Anything else with a parenthesis after a parameter stays invalid. */
+static void special_parameter_extglob_tail(void) {
+  static const char *const unsupported[] = {
+      "echo $!(foo)",      "echo $?(foo)",         "echo $@(foo)",
+      "echo $*(foo)",      "echo a$!(foo)b",       "echo $!(foo|bar)",
+      "echo $!(foo)/x",    "echo $@(a)$*(b)",      "cat > $!(foo)",
+      "cat < $?(foo)",     "echo > $@(foo)",       "echo >$*(foo)",
+      "echo $!()",         "echo $!( foo )",       "x=$!(foo)",
+      "echo $?(foo) x",    "echo $!(a(b)c)",       "echo $!( ( x ) )",
+      "echo $!(foo)\"x\"", "true && echo $!(foo)", "( echo $!(foo) )",
+      "{ echo $@(x); }",
+  };
+  for (size_t c = 0; c < sizeof(unsupported) / sizeof(unsupported[0]); c++) {
+    int status =
+        shell_parse_draft(unsupported[c], strlen(unsupported[c]), NULL, &draft);
+    if (status != SHELL_SOURCE_UNSUPPORTED)
+      fprintf(stderr, "expected UNSUPPORTED (%d): %s\n", status,
+              unsupported[c]);
+    CHECK(status == SHELL_SOURCE_UNSUPPORTED);
+    CHECK(shell_dep_graph_parse(unsupported[c], strlen(unsupported[c]),
+                                "/workspace", &limits,
+                                &graph) == SHELL_DEP_EPARSE);
+  }
+  static const char *const invalid[] = {
+      "echo $1(foo)",     "echo $x(foo)",   "echo ${x}(foo)", "echo foo(foo)",
+      "echo $-(foo)",     "echo $#(foo)",   "echo $$(foo)",   "echo $0(foo)",
+      "echo $!(foo",      "echo $!(",       "echo $@(foo",    "echo $!(foo))",
+      "echo \"$!\"(foo)", "echo '$!'(foo)", "echo $! (foo)",  "echo ${!x}(foo)",
+  };
+  for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); c++) {
+    int status =
+        shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft);
+    if (status != SHELL_SOURCE_INVALID)
+      fprintf(stderr, "expected INVALID (%d): %s\n", status, invalid[c]);
+    CHECK(status == SHELL_SOURCE_INVALID);
+  }
+  /* These already lex as a literal `$` or a complete extglob token. */
+  static const char *const complete[] = {
+      "echo $+(foo)",  "echo !(foo)",   "echo a@(foo)",  "echo \\$!(foo)",
+      "echo $$!(foo)", "echo $!!(foo)", "echo $!+(foo)", "echo \"$!(foo)\"",
+  };
+  for (size_t c = 0; c < sizeof(complete) / sizeof(complete[0]); c++) {
+    int status =
+        shell_parse_draft(complete[c], strlen(complete[c]), NULL, &draft);
+    if (status != SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected COMPLETE (%d): %s\n", status, complete[c]);
+    CHECK(status == SHELL_SOURCE_COMPLETE);
+  }
+}
+
 static void selector_recovery(void) {
   static const char *const selectors[] = {
       "${#value}",       "${!value}",       "${!prefix*}",   "${!prefix@}",
@@ -5926,6 +5980,7 @@ int main(void) {
   heredocs();
   strict_rejections_are_explained();
   byte_domains();
+  special_parameter_extglob_tail();
   word_byte_source();
   ansi_byte_source();
   ansi_control_delimiters();
