@@ -62,18 +62,6 @@
 #define CDF_MAX_SCORE 50.0
 #define CDF_DEFAULT_MIN_SAMPLES 128
 
-/* --- PORTABLE strlcpy --- */
-
-static size_t sg_strlcpy(char *dst, const char *src, size_t size) {
-  size_t slen = strlen(src);
-  if (size > 0) {
-    size_t copy = slen < size - 1 ? slen : size - 1;
-    memcpy(dst, src, copy);
-    dst[copy] = '\0';
-  }
-  return slen;
-}
-
 /* --- OUTPUT BUFFER WRITER --- */
 
 typedef struct {
@@ -519,7 +507,7 @@ sg_gate_t *sg_gate_new_with_policies_borrowed(const st_policy_t *allow,
   g->policy = allow;
   g->deny_policy = deny;
 
-  sg_strlcpy(g->cwd, ".", sizeof(g->cwd));
+  g->cwd[0] = '.'; /* calloc left the terminator in place */
   g->reject_mask = SG_REJECT_MASK_DEFAULT;
   g->stop_mode = SG_EVAL_ALL;
   g->suggestions = true;
@@ -585,9 +573,10 @@ void sg_gate_free(sg_gate_t *gate) {
 /* --- CONFIGURATION --- */
 
 sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd) {
-  if (strlen(cwd) >= sizeof(gate->cwd))
+  size_t length = strlen(cwd);
+  if (length >= sizeof(gate->cwd))
     return SG_ERR_TRUNC;
-  sg_strlcpy(gate->cwd, cwd, sizeof(gate->cwd));
+  memcpy(gate->cwd, cwd, length + 1);
   return SG_OK;
 }
 

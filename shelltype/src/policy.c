@@ -5,7 +5,7 @@
  * policy.c - Compact Policy Trie (CPT) with arena allocation.
  *
  * Design:
- * - Fixed-size state headers (16 bytes) in a growable array
+ * - Fixed-size state headers in a growable array
  * - All children in a flat arena; each node owns a contiguous region
  * - Children sorted: literals first (binary search), then wildcards (type
  * order)
@@ -52,7 +52,6 @@
 #define MAX_CMD_TOKENS 128
 #define FILTER_POS_LEVELS                                                      \
   8 /* Shell commands rarely exceed 8 tokens before diverging */
-#define FILTER_POS_CAPACITY 1024
 
 /* --- CHILD ENTRY ---
  *
@@ -103,7 +102,7 @@ static char *bytes_dup(const char *data, size_t length) {
   return copy;
 }
 
-/* --- POLICY STATE — 16 bytes, fixed size --- */
+/* --- POLICY STATE — fixed-size record --- */
 
 const char *st_error_string(st_error_t err) {
   switch (err) {
@@ -1008,7 +1007,7 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
 
 /* --- PER-POSITION FILTER REBUILD ---
  *
- * BFS-walk the trie up to depth FILTER_POS_LEVELS (4).
+ * BFS-walk the trie up to depth FILTER_POS_LEVELS.
  * At each depth N, collect all children across all nodes at that depth:
  *   - Literals → insert into pos_filters[N]
  *   - Wildcards → OR into pos_wildcard_mask[N]
