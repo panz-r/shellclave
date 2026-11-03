@@ -17,6 +17,12 @@ enum {
   LEXICAL_PREVIOUS_PIPE = 8,
   LEXICAL_ASSIGNMENT_ALLOWED = 16,
   LEXICAL_DECLARATION_OPERANDS = 32,
+  /* Bash reads a `NAME[...]` command word whole only while no redirect has
+   * followed an assignment word: `>f a[;] x` and `x=1 a[;] x` do, but
+   * `x=1 >f a[;] x` does not. These two bits track that, separately from the
+   * assignment eligibility above, which survives redirects. */
+  LEXICAL_ASSIGNED = 64,
+  LEXICAL_SUBSCRIPT_BLOCKED = 128,
   LEXICAL_TIME_MASK = 15,
 };
 

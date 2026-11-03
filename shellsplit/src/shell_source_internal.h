@@ -2066,6 +2066,52 @@ static inline SHELL_NONNULL(4) bool shell_source_skip_array_subscript(
   return complete;
 }
 
+/* Bash reads an identifier directly followed by a complete `[...]` subscript as
+ * part of one word wherever an assignment is acceptable (a command word, or
+ * after assignment words), whether or not `=` follows: blanks and shell
+ * operators inside the brackets do not end the word, so `a[;] x` is the command
+ * `a[;]` with one argument. Only that first subscript counts; `start` is a word
+ * start. A raw newline inside the brackets ends the command in Bash, so it is
+ * not a subscript here (conservatively, even when nested in an expansion).
+ * On success `open` is the `[` and `after` the byte past its `]`. Both
+ * outputs are required. */
+static inline SHELL_NONNULL(4, 5) bool shell_source_word_subscript(
+    const char *input, size_t length, size_t start, size_t *open,
+    size_t *after) {
+  if (start >= length ||
+      !(shell_ascii_alpha((unsigned char)input[start]) || input[start] == '_'))
+    return false;
+  size_t position = shell_source_logical_following(input, length, start);
+  while (position < length &&
+         (shell_ascii_alnum((unsigned char)input[position]) ||
+          input[position] == '_'))
+    position = shell_source_logical_following(input, length, position);
+  if (position >= length || input[position] != '[' ||
+      !shell_source_skip_array_subscript(input, length, position, after))
+    return false;
+  for (size_t at = position; at < *after; at++) {
+    if (input[at] != '\n')
+      continue;
+    size_t backslashes = 0;
+    while (at - backslashes > position && input[at - backslashes - 1] == '\\')
+      backslashes++;
+    if (backslashes % 2 == 0)
+      return false;
+  }
+  *open = position;
+  return true;
+}
+
+/* Inside a command-word subscript found by shell_source_word_subscript, blanks
+ * and shell operators are bracket members of the word's glob pattern, not word
+ * ends. `open` and `after` are zero when the word has no such subscript. */
+static inline bool shell_source_subscript_member(size_t position, size_t open,
+                                                 size_t after,
+                                                 unsigned char byte) {
+  return position > open && position < after &&
+         (shell_source_space(byte) || (byte != 0 && strchr("|&;<>()", byte)));
+}
+
 /* Identify the array-only form of a braced parameter expansion.  A bracket
  * elsewhere in `${parameter-word}` is normally a pattern, not an array
  * subscript, so callers must not use a raw `[` search for this distinction. */
@@ -4832,6 +4878,13 @@ static SHELL_NONNULL(1) inline bool shell_source_word_has_glob(
     const char *input, size_t length) {
   shell_source_glob_scan_t brackets = {0};
   char quote = 0;
+  /* A word can begin with a command-word subscript, `NAME[...]`, whose blanks
+   * and operators are word bytes (see shell_source_word_subscript). In that
+   * span they are bracket members, not word ends. */
+  size_t member_open = 0, member_after = 0;
+  if (!shell_source_word_subscript(input, length, 0, &member_open,
+                                   &member_after))
+    member_open = member_after = 0;
   for (size_t position = 0; position < length;) {
     SHELL_SOURCE_WORD_SCAN(1);
     unsigned char byte = (unsigned char)input[position];
@@ -4902,7 +4955,9 @@ static SHELL_NONNULL(1) inline bool shell_source_word_has_glob(
          (strchr("+@!", byte) &&
           shell_source_logical_next_is(input, length, position, '(', NULL))))
       return true;
-    if (shell_source_glob_scan_step(&brackets, byte, quote != 0))
+    bool member = shell_source_subscript_member(position, member_open,
+                                                member_after, byte);
+    if (shell_source_glob_scan_step(&brackets, byte, quote != 0 || member))
       return true;
     position++;
   }
@@ -5117,6 +5172,10 @@ shell_source_word_expansion_scan(const char *input, size_t length,
   size_t leading = shell_source_skip_escaped_line_endings(input, length, 0);
   shell_source_brace_scan_t braces = {0};
   shell_source_glob_scan_t glob = {0};
+  size_t member_open = 0, member_after = 0;
+  if (!shell_source_word_subscript(input, length, leading, &member_open,
+                                   &member_after))
+    member_open = member_after = 0;
   for (size_t position = 0; position < length;) {
     SHELL_SOURCE_WORD_SCAN(1);
     char c = input[position];
@@ -5245,7 +5304,10 @@ shell_source_word_expansion_scan(const char *input, size_t length,
           return (shell_source_word_expansion_t){.dynamic = true};
         if (c == '*' || c == '?')
           return (shell_source_word_expansion_t){.dynamic = true};
-        if (shell_source_glob_scan_step(&glob, (unsigned char)c, false))
+        if (shell_source_glob_scan_step(
+                &glob, (unsigned char)c,
+                shell_source_subscript_member(position, member_open,
+                                              member_after, (unsigned char)c)))
           return (shell_source_word_expansion_t){.dynamic = true};
       }
       if (c == '~' && tilde_start) {

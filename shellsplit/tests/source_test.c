@@ -294,6 +294,155 @@ static void conditional_opener_needs_a_word_boundary(void) {
                             &draft) == SHELL_SOURCE_INCOMPLETE);
 }
 
+/* Bash reads `NAME[...]` at a command word as one word piece, even without an
+ * `=`: `a[;] x` is the command `a[;]` with the argument `x`, not `a[`, `;` and
+ * `] x`. Only the subscript right after the identifier counts, a raw newline
+ * ends it, and in an argument the operators inside split as usual. */
+static unsigned graph_command_nodes(void) {
+  unsigned commands = 0;
+  for (uint32_t n = 0; n < graph.node_count; n++)
+    commands += graph.nodes[n].type == SHELL_NODE_CMD;
+  return commands;
+}
+
+static void command_word_subscript(void) {
+  static const struct {
+    const char *source;
+    unsigned commands; /* simple commands the shell runs */
+  } cases[] = {
+      /* One command named by the subscripted word. */
+      {"a[;] x", 1},
+      {"a[&&] x", 1},
+      {"a[||] x", 1},
+      {"a[|] x", 1},
+      {"a[&] x", 1},
+      {"a[ ] x", 1},
+      {"a[ ;] x", 1},
+      {"a[<] x", 1},
+      {"a[>] x", 1},
+      {"a[)] x", 1},
+      {"a[(] x", 1},
+      {"a[;;] x", 1},
+      {"a[b[c;]] x", 1},
+      {"a[\"]\"] x", 1},
+      {"a[;]x y", 1},
+      {"_a1[;] x", 1},
+      {"x=1 a[;] x", 1},
+      {"x=1 y=2 a[&&] x", 1},
+      {"( a[;] x )", 1},
+      {"{ a[;] x; }", 1},
+      {"a[\\\n;] x", 1},
+      /* Several commands, each with its own subscripted word. */
+      {"zz1; a[;] x", 2},
+      {"a[;] x; b[;] y", 2},
+      {"a[;] x | b[;] y", 2},
+      {"a[;] x && b[&] y", 2},
+      /* Argument position: the operators inside split the command. */
+      {"echo a[;] x", 2},
+      {"zz1 a[&] x", 2},
+      /* A redirect before any assignment leaves the position acceptable; one
+       * after an assignment word ends it, as in Bash. */
+      {">f a[;] x", 1},
+      {">f x=1 a[;] x", 1},
+      {"{fd}>f a[;] x", 1},
+      {"x=1 >f a[;] x", 2},
+      {"x=1 >f y=2 a[;] x", 2},
+      {"x=1 2>f a[;] x", 2},
+      /* Only the first subscript, directly after the identifier, is part of
+       * the word; a raw newline ends it; other prefixes are not identifiers. */
+      {"a[x][;] y", 2},
+      {"a[;]b[;] c", 2},
+      {"a[\n] x", 2},
+      {"1a[;] x", 2},
+      {"a-b[;] x", 2},
+      {"\"a\"[;] x", 2},
+      {"a\"b\"[;] x", 2},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    const char *source = cases[c].source;
+    shell_parse_result_t parsed = {0};
+    int status = shell_parse_draft(source, strlen(source), NULL, &draft);
+    if (status != SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected COMPLETE (%d): %s\n", status, source);
+    CHECK(status == SHELL_SOURCE_COMPLETE);
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &parsed) == SHELL_OK);
+    if (parsed.count != cases[c].commands)
+      fprintf(stderr, "fast parser: %u commands, expected %u: %s\n",
+              parsed.count, cases[c].commands, source);
+    CHECK(parsed.count == cases[c].commands);
+    CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
+                                &graph) == SHELL_DEP_OK);
+    if (graph_command_nodes() != cases[c].commands)
+      fprintf(stderr, "graph: %u command nodes, expected %u: %s\n",
+              graph_command_nodes(), cases[c].commands, source);
+    CHECK(graph_command_nodes() == cases[c].commands);
+  }
+
+  /* An operator inside the word is not a background or redirection, and the
+   * bracket is still a glob. */
+  static const struct {
+    const char *source;
+    bool background;
+    bool globs;
+  } features[] = {
+      {"a[&] x", false, true},  {"a[&&] x", false, true},
+      {"a[;] x", false, true},  {"echo a[&] x", true, false},
+      {"a[!] x", false, false},
+  };
+  for (size_t c = 0; c < sizeof(features) / sizeof(features[0]); c++) {
+    shell_parse_result_t parsed = {0};
+    CHECK(shell_parse_fast(features[c].source, strlen(features[c].source), NULL,
+                           &parsed) == SHELL_OK);
+    uint32_t all = 0;
+    for (uint32_t i = 0; i < parsed.count; i++)
+      all |= parsed.cmds[i].features;
+    CHECK(((all & SHELL_FEAT_BACKGROUND) != 0) == features[c].background);
+    CHECK(((all & SHELL_FEAT_GLOBS) != 0) == features[c].globs);
+  }
+
+  /* The bracket is a glob pattern, so the command name is dynamic, as for
+   * `a[x]`; only a bracket that is not a pattern names a fixed command. */
+  static const struct {
+    const char *source;
+    bool known;
+  } names[] = {
+      {"a[x] y", false},  {"a[;] x", false}, {"a[ ] x", false},
+      {"a[&&] x", false}, {"a[!] x", true},  {"a[] x", true},
+      {"ab y", true},
+  };
+  for (size_t c = 0; c < sizeof(names) / sizeof(names[0]); c++) {
+    CHECK(shell_dep_graph_parse(names[c].source, strlen(names[c].source),
+                                "/workspace", &limits, &graph) == SHELL_DEP_OK);
+    bool known = false;
+    for (uint32_t n = 0; n < graph.node_count; n++)
+      if (graph.nodes[n].type == SHELL_NODE_CMD)
+        known = graph.nodes[n].cmd.effective_command_known;
+    if (known != names[c].known)
+      fprintf(stderr, "command name known=%d, expected %d: %s\n", known,
+              names[c].known, names[c].source);
+    CHECK(known == names[c].known);
+  }
+
+  /* Absorbing the subscript must not hide a command it contains: Bash runs
+   * the substitution while expanding the word. */
+  static const struct {
+    const char *source;
+    unsigned nodes; /* the outer command plus every nested one */
+  } nested[] = {
+      {"a[$(echo hi)] x", 2},  {"a[`echo hi`] x", 2},
+      {"a[<(echo hi)] x", 2},  {"a[$(rm -rf q; echo)] x", 3},
+      {"a[;]$(echo hi) x", 2},
+  };
+  for (size_t c = 0; c < sizeof(nested) / sizeof(nested[0]); c++) {
+    CHECK(shell_dep_graph_parse(nested[c].source, strlen(nested[c].source),
+                                "/workspace", &limits, &graph) == SHELL_DEP_OK);
+    if (graph_command_nodes() != nested[c].nodes)
+      fprintf(stderr, "graph: %u command nodes, expected %u: %s\n",
+              graph_command_nodes(), nested[c].nodes, nested[c].source);
+    CHECK(graph_command_nodes() == nested[c].nodes);
+  }
+}
+
 static void selector_recovery(void) {
   static const char *const selectors[] = {
       "${#value}",       "${!value}",       "${!prefix*}",   "${!prefix@}",
@@ -3884,10 +4033,16 @@ static void indexed_prefix_uncertainty(void) {
     CHECK(shell_parse_draft(unfinished[c], strlen(unfinished[c]), NULL,
                             &draft) == SHELL_SOURCE_INCOMPLETE);
   static const char *const invalid[] = {"echo a[1 + (2)]=x",
-                                        "declare a[1 + (2)]=x", "a[1 + (2)] ;"};
+                                        "declare a[1 + (2)]=x"};
   for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); ++c)
     CHECK(shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft) ==
           SHELL_SOURCE_INVALID);
+  /* At a command word Bash reads the whole `a[1 + (2)]` as one word, so these
+   * are commands with that name, not syntax errors. */
+  static const char *const command_words[] = {"a[1 + (2)] ;", "a[1 + (2)] x"};
+  for (size_t c = 0; c < sizeof(command_words) / sizeof(command_words[0]); ++c)
+    CHECK(shell_parse_draft(command_words[c], strlen(command_words[c]), NULL,
+                            &draft) == SHELL_SOURCE_COMPLETE);
 }
 
 static void indexed_expansion_boundaries(void) {
@@ -4071,7 +4226,8 @@ static void indexed_boundary_work(void) {
         size_t tokens = 0;
         while (shell_tokenizer_next(&iterator, &token))
           ++tokens;
-        CHECK(!iterator.heredoc_error && tokens >= count * 2);
+        /* At a command word the balanced brackets are one word. */
+        CHECK(!iterator.heredoc_error && tokens >= 1);
       }
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
       size_t work = shellsplit_test_source_scan_work();
@@ -6031,6 +6187,7 @@ int main(void) {
   byte_domains();
   special_parameter_extglob_tail();
   conditional_opener_needs_a_word_boundary();
+  command_word_subscript();
   word_byte_source();
   ansi_byte_source();
   ansi_control_delimiters();

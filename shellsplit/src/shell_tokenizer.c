@@ -723,6 +723,24 @@ static SHELL_NONNULL(1,
         i = (uint32_t)after;
         continue;
       }
+      /* The same command-word subscript: operators inside it are word bytes.
+       * The lexer types the whole word, so it also says whether the bracket is
+       * a glob. Keep the glob and expansion features. */
+      size_t word_open = 0, word_after = 0;
+      if (have_array_context && fast_lexical_token_at(&array_context, i) &&
+          shell_source_word_subscript(p, len, i, &word_open, &word_after) &&
+          array_context.token.position + array_context.token.length >=
+              word_after) {
+        if (context != FAST_FEATURE_CONDITIONAL_WORD &&
+            array_context.token.type == SHELL_TOKEN_GLOB)
+          *features |= SHELL_FEAT_GLOBS;
+        if (word_after > word_open + 1)
+          detect_expansion_features(p + word_open + 1,
+                                    word_after - word_open - 2, false, false,
+                                    features, false);
+        i = (uint32_t)word_after;
+        continue;
+      }
     }
     size_t combined_redirect = 0;
     if (!in_double_quotes && c == '&' &&
@@ -1460,6 +1478,21 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         fast_array_assignment_at(&documents, pos)) {
       pos = (uint32_t)(documents.token.position + documents.token.length);
       continue;
+    }
+    /* At a command word the lexer reads `NAME[...]` as one word piece, even
+     * without an `=`, so `a[;] x` is the command `a[;]`. Its token extends
+     * past the subscript exactly then; in an argument it stops at the `[` and
+     * the operators inside split as usual. */
+    if (!in_quotes && shell_identifier_start(c) &&
+        fast_lexical_token_at(&documents, pos)) {
+      size_t subscript_open = 0, subscript_after = 0;
+      if (shell_source_word_subscript(cmd, cmd_len, pos, &subscript_open,
+                                      &subscript_after) &&
+          documents.token.position + documents.token.length >=
+              subscript_after) {
+        pos = (uint32_t)subscript_after;
+        continue;
+      }
     }
     /* A nested expansion owns its quotes even inside an outer double-quoted
      * word. Consume its whole span before the outer quote state sees any

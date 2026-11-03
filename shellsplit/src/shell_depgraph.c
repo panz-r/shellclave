@@ -639,8 +639,14 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
   uint32_t pos = range_start;
   uint32_t end = range_start + range_len;
   bool process_sub_target = false;
+  /* Until a command word appears, a `NAME[...]` word keeps its subscript: the
+   * blanks and operators inside it do not split the word. */
+  bool command_word_seen = false;
+  /* Bash stops reading it whole once a redirect follows an assignment word. */
+  bool assignment_seen = false, subscript_blocked = false;
 
   while (pos < end && out->count < SHELL_DEP_MAX_TOKENS) {
+    bool plain_word = false;
     while (pos < end) {
       size_t continued = shell_source_skip_escaped_line_endings(cmd, end, pos);
       if (continued != pos) {
@@ -719,6 +725,7 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
         return true;
       }
     } else if (redirect_end != pos) {
+      subscript_blocked |= assignment_seen;
       pos = redirect_end;
       uint32_t target = pos;
       while (target < end) {
@@ -747,6 +754,12 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
       pos = (uint32_t)after;
     } else {
       process_sub_target = false;
+      plain_word = true;
+      size_t subscript_open = 0, subscript_after = 0;
+      if (!command_word_seen && !subscript_blocked &&
+          shell_source_word_subscript(cmd, end, pos, &subscript_open,
+                                      &subscript_after))
+        pos = (uint32_t)subscript_after;
       if (!scan_word_token(cmd, end, &pos)) {
         out->malformed = true;
         return true;
@@ -773,6 +786,14 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
       out->tokens[out->count].start = cmd + tok_start;
       out->tokens[out->count].len = pos - tok_start;
       out->count++;
+      shell_source_assignment_word_t assignment;
+      if (plain_word) {
+        if (shell_source_parse_scalar_assignment_word(
+                cmd + tok_start, end - tok_start, &assignment))
+          assignment_seen = true;
+        else
+          command_word_seen = true;
+      }
     }
   }
   while (pos < end && shell_source_space((unsigned char)cmd[pos]))

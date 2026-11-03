@@ -647,6 +647,9 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
   char current_char = state->input[start_pos];
   bool is_quoted = state->in_quotes;
   bool word_had_quotes = false;
+  /* Set when the word begins `NAME[...]` where Bash reads that subscript as
+   * part of the word; the scan below steps over it. Zero means none. */
+  size_t word_subscript_open = 0, word_subscript_after = 0;
 
   /* A physical line continuation at a token boundary is grammar, not the
    * prefix of the next lexical operator.  In particular, retaining its old
@@ -930,6 +933,14 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
       state->position = after;
       return shell_token_return_current_group_context(state, token);
     }
+    /* Without an `=`, an assignment-shaped prefix is still one word piece at
+     * a command word: `a[;] x` runs `a[;]`, not `a[` and `] x`. The list
+     * validator keeps classifying unfinished array syntax as it did. */
+    if ((state->lexical_prefix & LEXICAL_ASSIGNMENT_ALLOWED) &&
+        !(state->lexical_prefix & LEXICAL_SUBSCRIPT_BLOCKED))
+      (void)shell_source_word_subscript(state->input, state->length,
+                                        state->position, &word_subscript_open,
+                                        &word_subscript_after);
   }
 
   if (!state->in_quotes && !word_had_quotes && current_char == '{' &&
@@ -1101,6 +1112,11 @@ ordinary_word:
     SHELL_SOURCE_WORD_SCAN(1);
     char c = state->input[state->position];
 
+    if (state->position == word_subscript_open && word_subscript_after != 0) {
+      state->position = word_subscript_after;
+      continue;
+    }
+
     if (state->in_quotes) {
       if (state->quote_char == '"' && (c == '$' || c == '`')) {
         size_t after = 0;
@@ -1245,7 +1261,11 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
     state->lexical_command_position = false;
     state->lexical_redirect_operand = full_redirection_consumes_next(token);
     state->lexical_operand_end = 0;
-    state->lexical_prefix &= LEXICAL_ASSIGNMENT_ALLOWED;
+    bool assigned = (state->lexical_prefix & LEXICAL_ASSIGNED) != 0;
+    state->lexical_prefix &= LEXICAL_ASSIGNMENT_ALLOWED | LEXICAL_ASSIGNED |
+                             LEXICAL_SUBSCRIPT_BLOCKED;
+    if (assigned)
+      state->lexical_prefix |= LEXICAL_SUBSCRIPT_BLOCKED;
     return true;
   }
   if (state->lexical_redirect_operand) {
@@ -1318,9 +1338,10 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
                                      token->position, "readonly", 8, NULL));
   state->lexical_command_position = false;
   state->lexical_prefix =
-      assignment_word ? LEXICAL_ASSIGNMENT_ALLOWED
-      : declaration   ? LEXICAL_DECLARATION_OPERANDS
-                      : state->lexical_prefix & LEXICAL_DECLARATION_OPERANDS;
+      assignment_word ? LEXICAL_ASSIGNMENT_ALLOWED | LEXICAL_ASSIGNED |
+                            (state->lexical_prefix & LEXICAL_SUBSCRIPT_BLOCKED)
+      : declaration ? LEXICAL_DECLARATION_OPERANDS
+                    : state->lexical_prefix & LEXICAL_DECLARATION_OPERANDS;
   return true;
 }
 
