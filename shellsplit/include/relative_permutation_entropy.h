@@ -30,7 +30,9 @@ double shell_rpe_ngram_entropy(const char *s, int n) SHELL_NONNULL(1);
  * @param n_perms Number of permutations to sample
  * @param n       N-gram size
  * @return        Median entropy of permutations, or NAN for invalid input or
- *                allocation failure
+ *                allocation failure. Unigram entropy (n == 1) does not depend
+ *                on character order, so it is the ordinary entropy and needs
+ *                no allocation.
  */
 double shell_rpe_permutation_entropy(const char *s, int n_perms, int n)
     SHELL_NONNULL(1);

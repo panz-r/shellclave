@@ -168,11 +168,12 @@ void fixed_permute_string(char *s, int perm_index) {
 double shell_rpe_permutation_entropy(const char *s, int n_perms, int n) {
   if ((n_perms <= 0) || ((n != 1) && (n != 2)))
     return NAN;
-  if (strlen(s) < 12) {
-    return shell_rpe_ngram_entropy(s, n);
-  }
-
   size_t length = strlen(s);
+  /* Unigram entropy depends only on character frequencies, which every
+   * permutation preserves: all permuted entropies equal the original. */
+  if (n == 1 || length < 12)
+    return shell_rpe_ngram_entropy(s, n);
+
   if ((size_t)n_perms > SIZE_MAX / sizeof(double))
     return NAN;
   double *entropies = malloc((size_t)n_perms * sizeof(*entropies));

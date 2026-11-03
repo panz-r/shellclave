@@ -93,6 +93,43 @@ static int test_permutation_boundaries_and_ranges(void) {
   return 1;
 }
 
+/* Unigram entropy depends only on character frequencies, which a permutation
+ * keeps, so its permutation entropy is the ordinary entropy exactly, however
+ * many permutations are requested, and needs no working memory to compute. */
+static int test_unigram_permutation_entropy_ignores_order(void) {
+  static const char *const inputs[] = {
+      "",
+      "a",
+      "aabbcc",
+      "abcabc",
+      "ccbbaa",
+      "abcdefghijk",
+      "aaaaaaaaaaaaaaaaaaaaaaaa",
+      "abcdefghijklmnopqrstuvwxyz0123456789",
+      "aabbccddeeffgghhiijjkkllmmnnooppqqrrssttuuvvwwxxyyzz",
+      "\xff\x80\xff\x80 mixed bytes \x01\x02\x01",
+  };
+  static const int permutations[] = {1, 2, 17, 100};
+  for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+    double expected = shell_rpe_ngram_entropy(inputs[i], 1);
+    for (size_t p = 0; p < sizeof(permutations) / sizeof(permutations[0]);
+         p++) {
+      ASSERT(shell_rpe_permutation_entropy(inputs[i], permutations[p], 1) ==
+             expected);
+      /* An allocation failure cannot make a computable entropy unavailable. */
+      shellsplit_test_alloc_fail_at(1);
+      double without_memory =
+          shell_rpe_permutation_entropy(inputs[i], permutations[p], 1);
+      size_t allocations = shellsplit_test_alloc_count();
+      shellsplit_test_alloc_reset();
+      ASSERT(without_memory == expected && allocations == 0);
+    }
+  }
+  ASSERT(shell_rpe_relative_entropy_ratio("abcabcabcabc", 17, 1) == 1.0);
+  ASSERT(shell_rpe_relative_entropy_ratio("aaaaaaaaaaaaaaaa", 17, 1) == 2.0);
+  return 1;
+}
+
 static int test_permutation_allocation_failures(void) {
   static const char input[] = "abcdefghijklmnopqrstuvwxyz0123456789";
   for (size_t fail_at = 1; fail_at <= 2; fail_at++) {
@@ -364,6 +401,7 @@ int main(void) {
   TEST(test_known_entropy_values);
   TEST(test_permutation_boundaries_and_ranges);
   TEST(test_permutation_allocation_failures);
+  TEST(test_unigram_permutation_entropy_ignores_order);
   TEST(test_posterior_regression_matrix);
   TEST(test_longest_prefix_suffix_entropy);
   TEST(test_zero_entropy_suffix_score);
