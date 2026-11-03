@@ -66,7 +66,13 @@ bool shell_env_screener_is_whitelisted(const char *name) SHELL_NONNULL(1);
  * Caller provides pre-allocated array for results. Module fills it with
  * indices into 'environ' that point to flagged variables.
  *
- * @param out_indices           write: caller-allocated array of flagged indices
+ * A call with capacity 0 is a sizing query: nothing is written, and
+ * BUFFER_TOO_SMALL reports the capacity needed in out_count. out_indices may
+ * be NULL only then, as an empty array. A nonzero capacity requires
+ * out_indices to point to that many writable elements; this is not checked.
+ *
+ * @param out_indices           write: caller-allocated array of flagged
+ * indices, or NULL when capacity is 0
  * @param capacity                read: size of out_indices array
  * @param out_count             write: number of flagged variables (or minimum
  * capacity needed)

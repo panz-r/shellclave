@@ -355,6 +355,29 @@ static int test_environment_scan_contract(void) {
          SHELL_ENV_SCREENER_OK);
   ASSERT(count == 3 && indices[0] == 5 && indices[1] == 7 && indices[2] == 8);
 
+  /* A NULL buffer with capacity 0 is a sizing query: the required capacity is
+   * reported and no index is written. The reported size then fits exactly. */
+  count = SIZE_MAX;
+  ASSERT(shell_env_screener_scan(NULL, 0, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_BUFFER_TOO_SMALL);
+  ASSERT(count == 3);
+  size_t required = count;
+  ASSERT(shell_env_screener_scan(indices, required, &count, 0.5, 8) ==
+             SHELL_ENV_SCREENER_OK &&
+         count == required);
+  count = SIZE_MAX;
+  ASSERT(shell_env_screener_scan(NULL, 0, &count, 1.0, 8) ==
+             SHELL_ENV_SCREENER_OK &&
+         count == 0);
+  count = SIZE_MAX;
+  ASSERT(shell_env_screener_scan(NULL, 0, &count, 0.0, 100) ==
+             SHELL_ENV_SCREENER_OK &&
+         count == 0);
+  count = SIZE_MAX;
+  ASSERT(shell_env_screener_scan(NULL, 0, &count, NAN, 8) ==
+             SHELL_ENV_SCREENER_ERROR &&
+         count == 0);
+
   ASSERT(shell_env_screener_scan(indices, 3, &count, 1.0, 8) ==
          SHELL_ENV_SCREENER_OK);
   ASSERT(count == 0);
@@ -377,6 +400,10 @@ static int test_environment_scan_contract(void) {
   ASSERT(shell_env_screener_scan(indices, 3, &count, 0.5, 8) ==
          SHELL_ENV_SCREENER_OK);
   ASSERT(count == 0);
+  count = SIZE_MAX;
+  ASSERT(shell_env_screener_scan(NULL, 0, &count, 0.5, 8) ==
+             SHELL_ENV_SCREENER_OK &&
+         count == 0);
 
   /* Long names bypass the fixed whitelist buffer. A non-secret long name
    * must still be scored safely when no bounded secret pattern is present. */
@@ -390,9 +417,6 @@ static int test_environment_scan_contract(void) {
   ASSERT(count == 0);
 
   environ = saved_environ;
-  ASSERT(shell_env_screener_scan(NULL, 3, &count, 0.5, 8) ==
-         SHELL_ENV_SCREENER_ERROR);
-
   return 1;
 }
 

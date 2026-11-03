@@ -246,8 +246,8 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
   extern char **environ;
 
   *out_count = 0;
-  if (!out_indices || !isfinite(posterior_threshold) ||
-      posterior_threshold < 0.0 || posterior_threshold > 1.0)
+  if (!isfinite(posterior_threshold) || posterior_threshold < 0.0 ||
+      posterior_threshold > 1.0)
     return SHELL_ENV_SCREENER_ERROR;
 
   if (!environ) {
