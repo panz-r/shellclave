@@ -200,6 +200,10 @@ static SHELL_NONNULL(1, 2, 3) st_error_t
         continue;
       }
 
+      /* The capture marker is unquoted. Quoted bytes here would join the
+       * capture text and lose their quoting before it is classified. */
+      if (open_capture)
+        goto invalid;
       saw_quoted = true;
       offset++;
       bool closed = false;

@@ -1950,6 +1950,78 @@ static int test_cpl_escapes_bytes_that_are_not_text(void) {
   return 1;
 }
 
+/* A compound pattern has one unquoted capture marker. Quoted text may sit
+ * beside it as literal prefix or suffix, but quoting inside the braces would
+ * hand quoted bytes to the capture, so it is rejected instead of acquiring
+ * wildcard meaning. */
+static int test_cpl_capture_marker_must_be_unquoted(void) {
+  static const struct {
+    const char *cpl;
+    const char *prefix;
+    size_t prefix_length;
+    const char *suffix;
+    size_t suffix_length;
+    st_token_type_t type;
+  } accepted[] = {
+      {"ls pre{#n}post", "pre", 3, "post", 4, ST_TYPE_NUMBER},
+      {"ls \"pre\"{#n}\"post\"", "pre", 3, "post", 4, ST_TYPE_NUMBER},
+      {"ls pre{#n}", "pre", 3, "", 0, ST_TYPE_NUMBER},
+      {"ls {#n}post", "", 0, "post", 4, ST_TYPE_NUMBER},
+      {"ls a{#path}b", "a", 1, "b", 1, ST_TYPE_PATH},
+      /* Braces inside quoted fragments are literal prefix and suffix bytes. */
+      {"ls \"a\\x00{\"{#n}\"}\\x00z\"", "a\0{", 3, "}\0z", 3, ST_TYPE_NUMBER},
+  };
+  for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+    st_netpattern_t pattern = {0};
+    ASSERT(st_netpattern_from_cpl_owned(accepted[i].cpl, &pattern) == ST_OK);
+    st_token_array_t tokens = {0};
+    ASSERT(st_netpattern_decode_view(
+               (st_netpattern_view_t){pattern.data, pattern.length}, &tokens) ==
+           ST_OK);
+    ASSERT(tokens.count == 2 && tokens.tokens[1].compound &&
+           tokens.tokens[1].capture_type == accepted[i].type &&
+           tokens.tokens[1].prefix_length == accepted[i].prefix_length &&
+           memcmp(tokens.tokens[1].prefix, accepted[i].prefix,
+                  accepted[i].prefix_length) == 0 &&
+           tokens.tokens[1].suffix_length == accepted[i].suffix_length &&
+           memcmp(tokens.tokens[1].suffix, accepted[i].suffix,
+                  accepted[i].suffix_length) == 0);
+    st_token_array_free(&tokens);
+    st_netpattern_free(&pattern);
+  }
+
+  /* Text that only looks like a marker stays one literal word. */
+  static const char *const literals[] = {"ls \"pre#npost\"",
+                                         "ls \"pre{#n}post\"", "ls \"#n\""};
+  for (size_t i = 0; i < sizeof(literals) / sizeof(literals[0]); i++) {
+    st_netpattern_t pattern = {0};
+    ASSERT(st_netpattern_from_cpl_owned(literals[i], &pattern) == ST_OK);
+    st_token_array_t tokens = {0};
+    ASSERT(st_netpattern_decode_view(
+               (st_netpattern_view_t){pattern.data, pattern.length}, &tokens) ==
+           ST_OK);
+    ASSERT(tokens.count == 2 && !tokens.tokens[1].compound &&
+           tokens.tokens[1].type == ST_TYPE_LITERAL);
+    st_token_array_free(&tokens);
+    st_netpattern_free(&pattern);
+  }
+
+  static const char *const rejected[] = {
+      "ls pre{\"#n\"}post", "ls pre{\"#n\"suffix}post",
+      "ls a{\"#path\"}b",   "ls a{#\"n\"}b",
+      "ls a{\"#\"n}b",      "ls a{#n\"x\"}b",
+      "ls a{#n\"}\"}b",     "ls {\"#n\"}",
+      "ls a{\"\"#n}b",      "ls a{#n\"\"}b",
+  };
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    st_netpattern_t pattern = {0};
+    ASSERT(st_netpattern_from_cpl_owned(rejected[i], &pattern) ==
+           ST_ERR_INVALID);
+    ASSERT(pattern.data == NULL && pattern.length == 0);
+  }
+  return 1;
+}
+
 static int test_netpattern_cpl_contract(void) {
   st_netpattern_t roundtrip = {0};
   char *roundtrip_cpl = NULL;
@@ -2888,6 +2960,7 @@ int main(void) {
   TEST(test_netargv_visit_is_borrowed_and_allocation_free);
   TEST(test_netargv_visit_accepts_binary_payloads);
   TEST(test_netpattern_cpl_contract);
+  TEST(test_cpl_capture_marker_must_be_unquoted);
   TEST(test_cpl_escapes_bytes_that_are_not_text);
   TEST(test_cpl_parse_work_is_linear);
   TEST(test_cpl_decoded_token_limits);
