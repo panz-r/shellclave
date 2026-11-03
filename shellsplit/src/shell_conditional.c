@@ -511,6 +511,11 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
   if (p == n ||
       (!shell_source_space((unsigned char)s[p]) && !strchr(";|&()<>", s[p])))
     return r;
+  /* A process substitution continues the word, so `[[<(cmd)` is an ordinary
+   * command word and only a separated `[[ <(cmd)` opens a conditional. */
+  if ((s[p] == '<' || s[p] == '>') &&
+      shell_source_process_substitution_open(s, n, p, NULL))
+    return r;
   r.content = p;
   r.end = r.after = n;
   r.frame = SHELL_CONDITIONAL_COMPLETE;

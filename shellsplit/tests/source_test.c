@@ -245,6 +245,55 @@ static void special_parameter_extglob_tail(void) {
   }
 }
 
+/* `[[` is the reserved word only when it is a word by itself. A process
+ * substitution begun with no separator continues the word, so `[[<(cmd)` is an
+ * ordinary command word, while `[[ <(cmd) ]]` is a conditional expression. */
+static void conditional_opener_needs_a_word_boundary(void) {
+  static const struct {
+    const char *source;
+    bool conditional;
+  } complete[] = {
+      {"[[<(echo hi)", false},      {"[[>(echo hi)", false},
+      {"[[<(echo hi) x ]]", false}, {"[[>(echo hi) x ]]", false},
+      {"[[<(echo hi)x", false},     {"[[<(echo hi) ]]", false},
+      {"[[<(a)<(b)", false},        {"[[<(true)>f", false},
+      {"echo [[<(echo hi)", false}, {"x=1 [[<(echo hi)", false},
+      {"[[ <(echo hi) ]]", true},   {"[[ -f <(echo) ]]", true},
+      {"[[ x ]]; echo a", true},    {"[[x]]", false},
+  };
+  for (size_t c = 0; c < sizeof(complete) / sizeof(complete[0]); c++) {
+    const char *source = complete[c].source;
+    shell_parse_result_t parsed = {0};
+    int status = shell_parse_draft(source, strlen(source), NULL, &draft);
+    if (status != SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected COMPLETE (%d): %s\n", status, source);
+    CHECK(status == SHELL_SOURCE_COMPLETE);
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &parsed) == SHELL_OK);
+    bool conditional = false;
+    for (uint32_t i = 0; i < parsed.count; i++)
+      conditional |= (parsed.cmds[i].features & SHELL_FEAT_CONDITIONALS) != 0;
+    if (conditional != complete[c].conditional)
+      fprintf(stderr, "wrong role (conditional=%d): %s\n", conditional, source);
+    CHECK(conditional == complete[c].conditional);
+    CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
+                                &graph) == SHELL_DEP_OK);
+  }
+  static const char *const invalid[] = {
+      "[[<", "[[>", "[[<f", "[[ <f ]]", "[[ x ]]<(y)", "[[ ]]",
+  };
+  for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); c++) {
+    int status =
+        shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft);
+    if (status != SHELL_SOURCE_INVALID)
+      fprintf(stderr, "expected INVALID (%d): %s\n", status, invalid[c]);
+    CHECK(status == SHELL_SOURCE_INVALID);
+  }
+  static const char *const incomplete[] = {"[[", "[[ x"};
+  for (size_t c = 0; c < sizeof(incomplete) / sizeof(incomplete[0]); c++)
+    CHECK(shell_parse_draft(incomplete[c], strlen(incomplete[c]), NULL,
+                            &draft) == SHELL_SOURCE_INCOMPLETE);
+}
+
 static void selector_recovery(void) {
   static const char *const selectors[] = {
       "${#value}",       "${!value}",       "${!prefix*}",   "${!prefix@}",
@@ -5981,6 +6030,7 @@ int main(void) {
   strict_rejections_are_explained();
   byte_domains();
   special_parameter_extglob_tail();
+  conditional_opener_needs_a_word_boundary();
   word_byte_source();
   ansi_byte_source();
   ansi_control_delimiters();
