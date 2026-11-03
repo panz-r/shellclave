@@ -798,10 +798,6 @@ static SHELL_NONNULL(1,
         if (next_position < len) {
           char next = p[next_position];
           if (next == '(') {
-            if (shell_source_dollar_arithmetic_open(p, len, i, NULL)) {
-              // This is handled by the arithmetic-expansion branch above.
-              continue;
-            }
             *features |= SHELL_FEAT_SUBSHELL;
             size_t after = 0;
             if (shell_source_find_balanced_parentheses(p, len, next_position,

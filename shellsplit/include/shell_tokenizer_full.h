@@ -32,12 +32,12 @@ extern "C" {
  */
 typedef enum {
   // Basic types
-  SHELL_TOKEN_COMMAND,         // Command name or path
-  SHELL_TOKEN_ARGUMENT,        // Command argument
-  SHELL_TOKEN_PIPE,            // stdout pipe operator
-  SHELL_TOKEN_REDIRECT_IN,     // Input redirection
-  SHELL_TOKEN_REDIRECT_OUT,    // Output redirection
-  SHELL_TOKEN_REDIRECT_ERR,    // Error redirection
+  SHELL_TOKEN_COMMAND,      // Ordinary lexical word; not necessarily argv[0]
+  SHELL_TOKEN_ARGUMENT,     // Quoted word or word fragment; role is contextual
+  SHELL_TOKEN_PIPE,         // stdout pipe operator
+  SHELL_TOKEN_REDIRECT_IN,  // Input redirection
+  SHELL_TOKEN_REDIRECT_OUT, // Output redirection
+  SHELL_TOKEN_REDIRECT_ERR, // Error redirection
   SHELL_TOKEN_REDIRECT_APPEND, // Append redirection
   SHELL_TOKEN_SEMICOLON,       // Command separator
   SHELL_TOKEN_AND,             // Logical AND
