@@ -65,6 +65,11 @@ typedef struct {
   /* Local simple-stage isolation, independent of an enclosing compound's
    * pipeline/background modifiers. Filled by the execution-stage sweep. */
   bool local_process[SHELL_MAX_SUBCOMMANDS];
+  /* A lone `&` follows this range's own execution stage. This is the
+   * command-local fact; SHELL_FEAT_BACKGROUND also reports `&` found inside
+   * a substitution, which does not make the enclosing command asynchronous.
+   * Filled by the same sweep, for a stage and for each range it owns. */
+  bool local_background[SHELL_MAX_SUBCOMMANDS];
 } shell_pipeline_index_t;
 
 /* Recover local list relationships in one lexical stream, not by restarting
@@ -206,6 +211,7 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_build(
     index->containing_group[range] = UINT16_MAX;
     index->trailing_group[range] = UINT16_MAX;
     index->local_process[range] = false;
+    index->local_background[range] = false;
     innermost_start[range] = UINT16_MAX;
   }
   for (uint32_t group = 0; group < parsed->group_count; group++) {
@@ -517,11 +523,13 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_execution_map_build(
     map->pipeline.local_process[i] =
         map->pipeline.range_connector[i] == SHELL_TYPE_PIPELINE ||
         tail.has_pipeline || background;
+    map->pipeline.local_background[i] = background;
     map->end[i] = end;
     for (uint32_t member = i + 1;
          member < limit && parsed->cmds[member].start < end; member++) {
       SHELL_PIPELINE_WORK();
       map->owner[member] = i;
+      map->pipeline.local_background[member] = background;
     }
   }
   /* The final lexical fragment owns the stage's outgoing list connector.

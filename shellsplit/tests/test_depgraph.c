@@ -4599,6 +4599,47 @@ TEST(wrapper_cwd_semantics) {
   pass_count++;
 }
 
+/* cmd.backgrounded says this command runs asynchronously. A background list
+ * operator inside a substitution makes the outer range contain background
+ * syntax (its lexical feature) but does not background the outer command. */
+TEST(background_is_command_local) {
+  static const struct {
+    const char *command;
+    uint32_t commands;
+    /* Expected backgrounded state of each command, in graph order. */
+    bool background[4];
+  } cases[] = {
+      {"echo $(echo hi &)", 2, {false, true}},
+      {"echo <(echo hi &)", 2, {false, true}},
+      {"echo >(echo hi &)", 2, {false, true}},
+      {"echo \"$(echo hi &)\"", 2, {false, true}},
+      {"echo `echo hi &`", 2, {false, true}},
+      {"echo ${x:-$(echo hi &)}", 2, {false, true}},
+      {"echo $(echo hi &); echo b", 3, {false, true, false}},
+      {"echo $(echo a & echo b)", 3, {false, true, false}},
+      {"echo a $(echo hi &) | cat", 3, {false, true, false}},
+      {"echo $(echo hi &) &", 2, {true, true}},
+      {"echo $(echo hi) &", 2, {true, false}},
+      {"echo hi &", 1, {true}},
+      {"echo one & echo two", 2, {true, false}},
+      {"{ echo $(echo hi &); }", 2, {false, true}},
+      {"{ echo $(echo hi &); } &", 2, {true, true}},
+      {"( echo $(echo hi &) ) &", 2, {true, true}},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t g;
+    ASSERT(parse(cases[i].command, &g) == SHELL_DEP_OK);
+    ASSERT(count_type(&g, SHELL_NODE_CMD) == cases[i].commands);
+    for (uint32_t c = 0; c < cases[i].commands; c++) {
+      bool actual = g.nodes[find_nth_cmd(&g, c)].cmd.backgrounded;
+      if (actual != cases[i].background[c])
+        printf("    %s: command %u backgrounded=%d, expected %d\n",
+               cases[i].command, c, actual, cases[i].background[c]);
+      ASSERT(actual == cases[i].background[c]);
+    }
+  }
+}
+
 TEST(composition_metadata_matrix) {
   static const struct {
     const char *command;
@@ -18903,6 +18944,7 @@ int main(int argc, char **argv) {
   RUN(wrapper_cwd_semantics);
   RUN(continued_process_substitution_topology);
   RUN(continued_terminal_redirect_topology);
+  RUN(background_is_command_local);
   RUN(composition_metadata_matrix);
   RUN(posix_brace_group_pipeline);
   RUN(pipeline_negation_metadata);

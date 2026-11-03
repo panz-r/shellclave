@@ -1470,11 +1470,13 @@ static void dep_prepare_group_execution(const char *command,
   }
 }
 
-static bool dep_range_is_backgrounded(const shell_parse_result_t *result,
-                                      const shell_pipeline_index_t *index,
+/* Whether one range runs asynchronously: its own execution stage is followed
+ * by a lone `&`, or an enclosing group is. Background syntax inside a
+ * substitution belongs to the commands there, not to this one. */
+static bool dep_range_is_backgrounded(const shell_pipeline_index_t *index,
                                       const dep_group_exec_t *groups,
                                       uint32_t range_index) {
-  if (result->cmds[range_index].features & SHELL_FEAT_BACKGROUND)
+  if (index->local_background[range_index])
     return true;
   int32_t group = dep_range_group(index, range_index);
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_SCOPE_LOOKUP);
@@ -26041,8 +26043,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       range_cwd_known = &group_exec[cwd_group].cwd_known;
       range_cwd_absolute = &group_exec[cwd_group].cwd_absolute;
     }
-    bool range_backgrounded = dep_range_is_backgrounded(
-        &fast_result, &execution.pipeline, group_exec, si);
+    bool range_backgrounded =
+        dep_range_is_backgrounded(&execution.pipeline, group_exec, si);
 
     /* The fast parser may end this range at the backslash of an escaped
      * physical line ending, with the following redirect range beginning after
