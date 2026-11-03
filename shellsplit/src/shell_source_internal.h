@@ -2895,18 +2895,24 @@ static SHELL_NONNULL(1) inline shell_source_glob_probe_t
          input[cursor + 1] == '=')) {
       char delimiter = input[cursor + 1];
       cursor += 2;
-      while (cursor + 1 < length &&
-             !(input[cursor] == delimiter && input[cursor + 1] == ']')) {
+      for (;;) {
         SHELL_SOURCE_WORD_SCAN(1);
+        if (cursor >= length)
+          return (shell_source_glob_probe_t){length, false};
+        /* An escaped line ending is removed before the delimiter and `]` are
+         * matched, so `:\<newline>]` closes the class like `:]`. */
+        size_t close = 0;
+        if (input[cursor] == delimiter &&
+            shell_source_logical_next_is(input, length, cursor, ']', &close)) {
+          cursor = close + 1;
+          break;
+        }
         if (input[cursor] == '\\' && cursor + 1 < length)
           cursor++;
         else if (strchr("|&;<>()", input[cursor]))
           return (shell_source_glob_probe_t){cursor, false};
         cursor++;
       }
-      if (cursor + 1 >= length)
-        return (shell_source_glob_probe_t){length, false};
-      cursor += 2;
       continue;
     }
     if (c == ']')

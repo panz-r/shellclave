@@ -1584,6 +1584,66 @@ static void test_descriptor_duplication_is_not_background(void) {
   test("Descriptor duplication is not background execution", valid);
 }
 
+/* An escaped line ending is removed before pattern syntax is read, so it may
+ * sit anywhere in a bracket expression, including between the delimiter and
+ * the `]` that closes a POSIX class: `[[:alpha:\<newline>]]` is `[[:alpha:]]`.
+ * An unterminated bracket stays a literal word. */
+static void test_glob_class_continuation_keeps_the_feature(void) {
+  static const struct {
+    const char *source;
+    bool globs;
+  } cases[] = {
+      {"echo [[:alpha:]]", true},
+      {"echo [[:alpha:\\\n]]", true},
+      {"echo [[:alp\\\nha:]]", true},
+      {"echo [[\\\n:alpha:]]", true},
+      {"echo [[:alpha\\\n:]]", true},
+      {"echo [\\\n[:alpha:]]", true},
+      {"echo [[:alpha:]\\\n]", true},
+      {"echo [[:digit:\\\n]]", true},
+      {"echo [[:upper:\\\n]]", true},
+      {"echo [[:lower:\\\n]]", true},
+      {"echo [[:alnum:\\\n]]", true},
+      {"echo [[.a.\\\n]]", true},
+      {"echo [[=a=\\\n]]", true},
+      {"echo [[:alpha:\\\n\\\n]]", true},
+      {"echo [[:alpha:\\\n]\\\n]", true},
+      {"echo [!\\\n[:alpha:]]", true},
+      {"echo [^[:alpha:\\\n]]", true},
+      {"echo [a[:digit:\\\n]b]", true},
+      {"echo $(echo [[:alpha:\\\n]])", true},
+      {"echo `echo [[:alpha:\\\n]]`", true},
+      /* Unterminated or quoted: not a pattern. */
+      {"echo [[:alpha:]", false},
+      {"echo [[:alpha:]x", false},
+      {"echo [[:alpha:", false},
+      {"echo [[:alpha:\\\n", false},
+      {"echo [[:alpha:\\\n]", false},
+      {"echo [[:alpha\\\n:]", false},
+      {"echo [[:alpha:\\\n]x", false},
+      {"echo [[.a.]", false},
+      {"echo [[=a=\\\n]", false},
+      {"echo [[:alpha:\\\nx", false},
+      {"echo [[:alpha:\\\n\\\n", false},
+      {"echo \"[[:alpha:\\\n]]\"", false},
+      {"echo '[[:alpha:\\\n]]'", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    uint32_t features = 0;
+    valid = shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                             &parsed) == SHELL_OK;
+    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
+      features |= parsed.cmds[cmd].features;
+    valid = valid && ((features & SHELL_FEAT_GLOBS) != 0) == cases[i].globs;
+    if (!valid)
+      fprintf(stderr, "wrong glob feature (0x%04x): %s\n", features,
+              cases[i].source);
+  }
+  test("A continuation inside a glob class keeps the glob feature", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9837,6 +9897,7 @@ int main(void) {
   test_negator_requires_a_word_start();
   test_nested_brace_group_is_a_feature();
   test_descriptor_duplication_is_not_background();
+  test_glob_class_continuation_keeps_the_feature();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();
