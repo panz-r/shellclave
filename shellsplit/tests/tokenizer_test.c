@@ -1475,6 +1475,57 @@ static void test_negator_requires_a_word_start(void) {
   test("Pipeline negators at a word start are still recognized", valid);
 }
 
+/* A brace group inside an executable substitution is a group, as a
+ * parenthesized one is. `{` opens a group only at a command position: in
+ * `echo {a,b}` or `echo {` it is word text. */
+static void test_nested_brace_group_is_a_feature(void) {
+  static const struct {
+    const char *source;
+    uint32_t required; /* feature bits that must be set */
+    bool group;
+  } cases[] = {
+      {"echo $( { :; } )", SHELL_FEAT_SUBSHELL, true},
+      {"echo $( ( : ) )", SHELL_FEAT_SUBSHELL, true},
+      {"echo <( { :; } )", SHELL_FEAT_PROCESS_SUB, true},
+      {"echo >( { :; } )", SHELL_FEAT_PROCESS_SUB, true},
+      {"echo <( ( : ) )", SHELL_FEAT_PROCESS_SUB, true},
+      {"echo `{ :; }`", SHELL_FEAT_SUBSHELL, true},
+      {"echo \"$( { :; } )\"", SHELL_FEAT_SUBSHELL, true},
+      {"echo $( echo a; { :; } )", SHELL_FEAT_SUBSHELL, true},
+      {"echo $( echo a && { :; } )", SHELL_FEAT_SUBSHELL, true},
+      {"echo $( echo $( { :; } ) )", SHELL_FEAT_SUBSHELL, true},
+      {"x=$( { :; } )", SHELL_FEAT_SUBSHELL, true},
+      {"{ :; }", 0, true},
+      {"( : )", 0, true},
+      /* Braces that are words, quoted text, or expansions, not groups. */
+      {"echo {a,b}", 0, false},
+      {"echo {", 0, false},
+      {"echo $( echo {a,b} )", SHELL_FEAT_SUBSHELL, false},
+      {"echo $( echo { )", SHELL_FEAT_SUBSHELL, false},
+      {"echo $( echo a{ )", SHELL_FEAT_SUBSHELL, false},
+      {"echo $( : {x} )", SHELL_FEAT_SUBSHELL, false},
+      {"echo $( echo '{ :; }' )", SHELL_FEAT_SUBSHELL, false},
+      {"echo $( echo \"{ :; }\" )", SHELL_FEAT_SUBSHELL, false},
+      {"echo $( echo ${x} )", SHELL_FEAT_SUBSHELL, false},
+      {"echo <( echo {a,b} )", SHELL_FEAT_PROCESS_SUB, false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    uint32_t features = 0;
+    valid = shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                             &parsed) == SHELL_OK;
+    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
+      features |= parsed.cmds[cmd].features;
+    valid = valid && (features & cases[i].required) == cases[i].required &&
+            ((features & SHELL_FEAT_GROUP) != 0) == cases[i].group;
+    if (!valid)
+      fprintf(stderr, "wrong group feature (0x%04x): %s\n", features,
+              cases[i].source);
+  }
+  test("A nested brace group sets the group feature", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9726,6 +9777,7 @@ int main(void) {
   test_substitution_and_list_is_not_background();
   test_brace_close_across_line_continuation();
   test_negator_requires_a_word_start();
+  test_nested_brace_group_is_a_feature();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();

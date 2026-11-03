@@ -808,6 +808,14 @@ static SHELL_NONNULL(1,
     if (!in_double_quotes && c == '(' && !arithmetic_paren &&
         !(i > 0 && (p[i - 1] == '$' || p[i - 1] == '<' || p[i - 1] == '>')))
       *features |= SHELL_FEAT_GROUP;
+    /* A brace opens a group only at a command position, which the lexer
+     * decides: in `echo {a,b}` it is word text. Group depth in the result
+     * metadata does not see groups nested in executable substitutions, so a
+     * body walk reports them here. */
+    if (!in_double_quotes && c == '{' && context == FAST_FEATURE_COMMAND_BODY &&
+        have_array_context && fast_lexical_token_at(&array_context, i) &&
+        array_context.token.type == SHELL_TOKEN_GROUP_START)
+      *features |= SHELL_FEAT_GROUP;
     switch (c) {
     case '$':
       // Variables expand in double quotes
