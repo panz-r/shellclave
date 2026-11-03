@@ -88,4 +88,8 @@ const unsigned char *sg_test_io_temp_random_bytes(void);
 void sg_test_locale_fail_with_errno(int error_number);
 int sg_test_locale_take_error(void);
 
+/* One-shot failure of activating the created locale for the thread. */
+void sg_test_locale_activate_fail_with_errno(int error_number);
+int sg_test_locale_activate_take_error(void);
+
 #endif

@@ -2048,6 +2048,49 @@ TEST(persistence_locale_failures_are_atomic) {
   ASSERT(ok);
 }
 
+/* A numeric locale that was created but could not be activated never became
+ * the thread's locale: persistence reports the activation error, leaves the
+ * caller's locale and the model alone, and a later attempt succeeds. */
+TEST(persistence_locale_activation_failure_is_reported) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  update_repeated(model, commands, 5, 2);
+  anomaly_snapshot_t before = snapshot_model(model);
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(model, stream), SG_ANOMALY_OK);
+  locale_t current = uselocale((locale_t)0);
+  bool ok = true;
+  const int errors[] = {ENOMEM, EINVAL};
+  for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+    sg_anomaly_status_t expected =
+        errors[i] == ENOMEM ? SG_ANOMALY_ERR_MEMORY : SG_ANOMALY_ERR_IO;
+    sg_test_locale_activate_fail_with_errno(errors[i]);
+    sg_anomaly_status_t status = sg_anomaly_write_stream(model, stream);
+    ok = status == expected && errno == errors[i] &&
+         uselocale((locale_t)0) == current && ok;
+    rewind(stream);
+    sg_test_locale_activate_fail_with_errno(errors[i]);
+    status = sg_anomaly_read_stream(model, stream);
+    ok = status == expected && errno == errors[i] &&
+         uselocale((locale_t)0) == current &&
+         snapshot_equal(before, snapshot_model(model)) && ok;
+    sg_anomaly_model_t *loaded = NULL;
+    sg_test_locale_activate_fail_with_errno(errors[i]);
+    status = sg_anomaly_model_read_new(stream, &loaded);
+    ok = status == expected && errno == errors[i] && loaded == NULL &&
+         uselocale((locale_t)0) == current && ok;
+    sg_anomaly_model_free(loaded);
+  }
+  rewind(stream);
+  ok = sg_anomaly_read_stream(model, stream) == SG_ANOMALY_OK &&
+       uselocale((locale_t)0) == current &&
+       snapshot_equal(before, snapshot_model(model)) && ok;
+  sg_anomaly_model_free(model);
+  ASSERT(fclose(stream) == 0);
+  ASSERT(ok);
+}
+
 /* These owned fixtures fit the supplied buffers; inspect actual physical
  * bytes rather than C strings, since persisted keys may contain NUL. */
 static SHELL_NONNULL(1, 2, 4) bool read_saved_bytes(const char *path,
@@ -2805,6 +2848,7 @@ int main(void) {
   RUN(persisted_header_framing);
   RUN(persistence_is_locale_independent);
   RUN(persistence_locale_failures_are_atomic);
+  RUN(persistence_locale_activation_failure_is_reported);
   RUN(path_save_failure_atomicity);
   RUN(path_save_near_path_max);
   RUN(persisted_counter_accumulation_is_exact);

@@ -21,6 +21,7 @@ static const unsigned char *io_temp_random;
 static sg_test_io_read_observer_t io_read_observer;
 static void *io_read_context;
 static int locale_error;
+static int locale_activate_error;
 
 static bool allocation_fails(void) {
   alloc_count++;
@@ -179,5 +180,15 @@ void sg_test_locale_fail_with_errno(int error_number) {
 int sg_test_locale_take_error(void) {
   int error_number = locale_error;
   locale_error = 0;
+  return error_number;
+}
+
+void sg_test_locale_activate_fail_with_errno(int error_number) {
+  locale_activate_error = error_number;
+}
+
+int sg_test_locale_activate_take_error(void) {
+  int error_number = locale_activate_error;
+  locale_activate_error = 0;
   return error_number;
 }

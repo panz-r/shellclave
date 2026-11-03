@@ -934,7 +934,8 @@ typedef struct {
 } anomaly_locale_t;
 
 /* Persistence owns this operational locale scope, not the process locale.
- * end requires a successfully begun scope; neither helper validates storage. */
+ * end requires a successfully begun scope; neither helper validates storage.
+ * A failed begin leaves the thread locale unchanged and holds no resources. */
 static SHELL_NONNULL(1) sg_anomaly_status_t
     anomaly_locale_begin(anomaly_locale_t *scope) {
 #ifdef SHELLGATE_TEST_IO
@@ -948,6 +949,23 @@ static SHELL_NONNULL(1) sg_anomaly_status_t
   if (!scope->numeric)
     return anomaly_io_failure_status();
   scope->previous = uselocale(scope->numeric);
+#ifdef SHELLGATE_TEST_IO
+  int activation_injected = sg_test_locale_activate_take_error();
+  if (activation_injected) {
+    if (scope->previous)
+      uselocale(scope->previous);
+    scope->previous = (locale_t)0;
+    errno = activation_injected;
+  }
+#endif
+  if (!scope->previous) {
+    /* The scope was never entered: only the locale just created is released,
+     * and the activation error is what the caller reports. */
+    int saved_errno = errno;
+    freelocale(scope->numeric);
+    errno = saved_errno;
+    return anomaly_io_failure_status();
+  }
   return SG_ANOMALY_OK;
 }
 
