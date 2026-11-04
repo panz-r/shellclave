@@ -4698,6 +4698,56 @@ TEST(duplication_operand_does_not_take_the_next_redirect) {
   pass_count++;
 }
 
+/* A complete source may end in a lone backslash, which is the literal word
+ * `\`: `test \` is a one-argument test and true. The semantic traversal that
+ * inventories test programs must read that word like any other, or the graph
+ * looks up a program nothing recorded. The same word after a state-changing
+ * builtin gets the verdict an ordinary operand gets. */
+TEST(final_backslash_is_a_literal_word) {
+  static const struct {
+    const char *source;
+    uint32_t tokens; /* argv words of the first command */
+  } accepted[] = {
+      {"test \\", 2},         {"[ \\", 2},         {"test a \\", 3},
+      {"test ! \\", 3},       {"[ a \\", 3},       {"test -n \\", 3},
+      {"test a = \\", 4},     {"test \\\\ \\", 3}, {"echo \\", 2},
+      {"echo a; test \\", 2},
+  };
+  for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+    shell_dep_graph_t g;
+    if (parse(accepted[i].source, &g) != SHELL_DEP_OK)
+      printf("    not accepted: %s\n", accepted[i].source);
+    ASSERT(parse(accepted[i].source, &g) == SHELL_DEP_OK);
+    uint32_t last = count_type(&g, SHELL_NODE_CMD) - 1;
+    uint32_t tokens = g.nodes[find_nth_cmd(&g, last)].cmd.token_count;
+    if (tokens != accepted[i].tokens)
+      printf("    %s: %u tokens, expected %u\n", accepted[i].source, tokens,
+             accepted[i].tokens);
+    ASSERT(tokens == accepted[i].tokens);
+  }
+  /* The backslash word is an operand like `x`, not a way past the check. */
+  static const char *const operands[][2] = {
+      {"declare -i \\", "declare -i x"},
+      {"readonly \\", "readonly x"},
+      {"set -e \\", "set -e x"},
+      {"shopt -s nullglob \\", "shopt -s nullglob x"},
+      {"eval \\", "eval x"},
+      /* An indexed array assignment is unsupported whatever its value. */
+      {"a[1]=\\", "a[1]=x"},
+      {"a[1]=,\\", "a[1]=,x"},
+  };
+  for (size_t i = 0; i < sizeof(operands) / sizeof(operands[0]); i++) {
+    shell_dep_graph_t with_backslash, with_word;
+    shell_dep_error_t a = parse(operands[i][0], &with_backslash);
+    shell_dep_error_t b = parse(operands[i][1], &with_word);
+    if (a != b)
+      printf("    %s -> %d but %s -> %d\n", operands[i][0], a, operands[i][1],
+             b);
+    ASSERT(a == b);
+  }
+  pass_count++;
+}
+
 TEST(composition_metadata_matrix) {
   static const struct {
     const char *command;
@@ -19004,6 +19054,7 @@ int main(int argc, char **argv) {
   RUN(continued_terminal_redirect_topology);
   RUN(background_is_command_local);
   RUN(duplication_operand_does_not_take_the_next_redirect);
+  RUN(final_backslash_is_a_literal_word);
   RUN(composition_metadata_matrix);
   RUN(posix_brace_group_pipeline);
   RUN(pipeline_negation_metadata);
