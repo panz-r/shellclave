@@ -4748,6 +4748,63 @@ TEST(final_backslash_is_a_literal_word) {
   pass_count++;
 }
 
+/* `N<(cmd)` and `N>(cmd)` are one word holding a process substitution, as in
+ * `echo 2>(:)` printing `2/dev/fd/63`; they are not a descriptor redirect
+ * whose operand is `(cmd)`. Reading them as a redirect hid the substitution's
+ * command from the graph even though Bash runs it. */
+TEST(digit_prefixed_process_substitution_is_a_word) {
+  static const struct {
+    const char *source;
+    uint32_t commands;      /* command nodes, nested ones included */
+    uint32_t first_tokens;  /* argv words of the first command */
+    uint32_t second_tokens; /* argv words of the substitution's command */
+  } words[] = {
+      {"echo 1<(touch y)z", 2, 2, 2},
+      {"echo 2>(touch y)z", 2, 2, 2},
+      {"echo 1<(touch y)", 2, 2, 2},
+      {"echo 1>(touch y)", 2, 2, 2},
+      {"echo 12>(touch y)x", 2, 2, 2},
+      {"cat 1<(touch y)", 2, 2, 2},
+      {"echo a 1<(touch y) b", 2, 4, 2},
+      {"command 1<(:)test", 2, 2, 1},
+      {"echo x 2>(touch y)z 3>(touch w)", 3, 4, 2},
+      {"echo $(echo 1<(touch y))", 3, 2, 2},
+  };
+  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+    shell_dep_graph_t g;
+    shell_dep_error_t status = parse(words[i].source, &g);
+    if (status != SHELL_DEP_OK)
+      printf("    not accepted: %s\n", words[i].source);
+    ASSERT(status == SHELL_DEP_OK);
+    uint32_t commands = count_type(&g, SHELL_NODE_CMD);
+    if (commands != words[i].commands)
+      printf("    %s: %u commands, expected %u\n", words[i].source, commands,
+             words[i].commands);
+    ASSERT(commands == words[i].commands);
+    ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.token_count ==
+           words[i].first_tokens);
+    if (words[i].second_tokens)
+      ASSERT(g.nodes[find_nth_cmd(&g, 1)].cmd.token_count ==
+             words[i].second_tokens);
+  }
+  /* A digit run before a redirect that is not a process substitution is
+   * still a descriptor redirect, not an argument. */
+  static const struct {
+    const char *source;
+    uint32_t tokens;
+  } redirects[] = {
+      {"cat 1<f", 1},    {"echo 2>f", 1},  {"echo 12>f", 1}, {"echo 2>&1", 1},
+      {"echo 1<<<x", 1}, {"echo 2>>f", 1}, {"echo 1<>f", 1}, {"echo 1<&0", 1},
+  };
+  for (size_t i = 0; i < sizeof(redirects) / sizeof(redirects[0]); i++) {
+    shell_dep_graph_t g;
+    ASSERT(parse(redirects[i].source, &g) == SHELL_DEP_OK);
+    ASSERT(count_type(&g, SHELL_NODE_CMD) == 1);
+    ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.token_count == redirects[i].tokens);
+  }
+  pass_count++;
+}
+
 TEST(composition_metadata_matrix) {
   static const struct {
     const char *command;
@@ -19055,6 +19112,7 @@ int main(int argc, char **argv) {
   RUN(background_is_command_local);
   RUN(duplication_operand_does_not_take_the_next_redirect);
   RUN(final_backslash_is_a_literal_word);
+  RUN(digit_prefixed_process_substitution_is_a_word);
   RUN(composition_metadata_matrix);
   RUN(posix_brace_group_pipeline);
   RUN(pipeline_negation_metadata);

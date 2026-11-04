@@ -546,6 +546,10 @@ static uint32_t scan_redirect_token(const char *cmd, uint32_t pos,
       (uint32_t)shell_source_skip_escaped_line_endings(cmd, end, parsed_after);
   if (cursor >= end || (cmd[cursor] != '<' && cmd[cursor] != '>'))
     return pos;
+  /* `2>(cmd)` is one word holding a process substitution (`echo 2>(:)` prints
+   * `2/dev/fd/63`), not a descriptor redirect whose operand is `(cmd)`. */
+  if (shell_source_process_substitution_open(cmd, end, cursor, NULL))
+    return pos;
 
   char operator_char = cmd[cursor++];
   cursor = (uint32_t)shell_source_skip_escaped_line_endings(cmd, end, cursor);
