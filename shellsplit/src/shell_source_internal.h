@@ -2907,7 +2907,10 @@ typedef struct {
 
 /* Required source at an opening '['. The probe is linear, but a failed probe
  * must not be repeated at another opener before its examined endpoint. Word
- * classifiers use the streaming recognizer above instead. */
+ * classifiers use the streaming recognizer above instead. Quoted and ANSI-C
+ * spans are literal members: their spaces and operators do not end the word,
+ * and a quoted `]` does not close the expression. An unterminated quote has no
+ * complete expression, and its examined endpoint is the end of the input. */
 static SHELL_NONNULL(1) inline shell_source_glob_probe_t
     shell_source_probe_glob_bracket(const char *input, size_t length,
                                     size_t position) {
@@ -2925,6 +2928,23 @@ static SHELL_NONNULL(1) inline shell_source_glob_probe_t
     char c = input[cursor];
     if (c == '\\' && cursor + 1 < length) {
       cursor += 2;
+      continue;
+    }
+    if (c == '\'' || c == '"') {
+      size_t quoted = 0;
+      if (!shell_source_skip_complete_quoted_text(input, length, cursor, c,
+                                                  &quoted))
+        return (shell_source_glob_probe_t){length, false};
+      cursor = quoted;
+      continue;
+    }
+    if (c == '$' &&
+        shell_source_logical_next_is(input, length, cursor, '\'', NULL)) {
+      size_t quoted = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, cursor,
+                                                   &quoted))
+        return (shell_source_glob_probe_t){length, false};
+      cursor = quoted;
       continue;
     }
     if (shell_source_space((unsigned char)c) || strchr("|&;<>()", c))

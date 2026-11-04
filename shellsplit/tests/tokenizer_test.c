@@ -1709,6 +1709,86 @@ static void test_quoted_prefix_extglob_is_one_word(void) {
   test("A quoted prefix and an extglob stay one word", valid);
 }
 
+/* Quoted and ANSI-C spans inside a bracket expression are literal members: a
+ * quoted space or operator does not end the word, and a quoted `]` does not
+ * close the expression. Bash expands `[a" "b]` but leaves `[a"]"` alone. */
+static void test_glob_bracket_quoted_members_keep_the_feature(void) {
+  static const struct {
+    const char *source;
+    bool globs;
+  } cases[] = {
+      {"echo [a\" \"b]", true},
+      {"echo [a' 'b]", true},
+      {"echo [a\";\"b]", true},
+      {"echo [a\"|\"b]", true},
+      {"echo [a\"&\"b]", true},
+      {"echo [a\"<\"b]", true},
+      {"echo [a\">\"b]", true},
+      {"echo [a\"(\"b]", true},
+      {"echo [a\")\"b]", true},
+      {"echo [!\" \"]", true},
+      {"echo [^\" \"]", true},
+      {"echo [a$' 'b]", true},
+      {"echo [a$']']", true},
+      {"echo [\"a b\"]", true},
+      {"echo [a\"b c\"d]", true},
+      {"echo [\"]\"]", true},
+      {"echo [\"]\"b]", true},
+      {"echo [a']'b]", true},
+      {"echo [a\"]\"b]", true},
+      {"echo $(echo [a\" \"b])", true},
+      {"echo `echo [a' 'b]`", true},
+      {"echo x [a\" \"b] y", true},
+      /* Unquoted space or operator still ends the word. */
+      {"echo [a b]", false},
+      {"echo [a;b]", false},
+      {"echo [a|b]", false},
+      /* A quoted `]` is not a closer, and the word is quoted or unfinished. */
+      {"echo [a\"]\"", false},
+      {"echo [a']'", false},
+      {"echo [\"]\"", false},
+      {"echo [!\"]\"", false},
+      {"echo \"[a b]\"", false},
+      {"echo '[a\" \"b]'", false},
+      {"echo [a\"b\"", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    uint32_t features = 0;
+    valid = shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                             &parsed) == SHELL_OK;
+    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
+      features |= parsed.cmds[cmd].features;
+    valid = valid && ((features & SHELL_FEAT_GLOBS) != 0) == cases[i].globs;
+    if (!valid)
+      fprintf(stderr, "wrong glob feature (0x%04x): %s\n", features,
+              cases[i].source);
+  }
+  test("Quoted bracket members keep the glob feature", valid);
+
+  /* A `>&word` target that is a bracket glob may expand to a descriptor
+   * number, so quoting a member cannot make it a provable pathname. */
+  static const struct {
+    const char *word;
+    shell_process_legacy_redirect_target_t target;
+  } targets[] = {
+      {"[ab]", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"[a\" \"b]", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"[a' 'b]", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"[1\" \"]", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"[a\"]\"", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
+  };
+  valid = true;
+  for (size_t i = 0; valid && i < sizeof(targets) / sizeof(targets[0]); i++) {
+    valid = shell_process_classify_legacy_output_target(
+                targets[i].word, strlen(targets[i].word)) == targets[i].target;
+    if (!valid)
+      fprintf(stderr, "wrong legacy target class: %s\n", targets[i].word);
+  }
+  test("Quoted bracket members do not prove a pathname target", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9964,6 +10044,7 @@ int main(void) {
   test_descriptor_duplication_is_not_background();
   test_glob_class_continuation_keeps_the_feature();
   test_quoted_prefix_extglob_is_one_word();
+  test_glob_bracket_quoted_members_keep_the_feature();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();
