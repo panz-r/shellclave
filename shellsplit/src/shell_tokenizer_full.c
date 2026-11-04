@@ -680,6 +680,13 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     if (state->in_quotes) {
       while (state->position < state->length) {
         SHELL_SOURCE_WORD_SCAN(1);
+        size_t pid_after = 0;
+        if (state->quote_char == '"' &&
+            shell_source_skip_pid_parameter(state->input, state->length,
+                                            state->position, &pid_after)) {
+          state->position = pid_after;
+          continue;
+        }
         if (state->quote_char == '"' &&
             (state->input[state->position] == '$' ||
              state->input[state->position] == '`')) {
@@ -1122,6 +1129,13 @@ ordinary_word:
     }
 
     if (state->in_quotes) {
+      size_t pid_after = 0;
+      if (state->quote_char == '"' &&
+          shell_source_skip_pid_parameter(state->input, state->length,
+                                          state->position, &pid_after)) {
+        state->position = pid_after;
+        continue;
+      }
       if (state->quote_char == '"' && (c == '$' || c == '`')) {
         size_t after = 0;
         bool recognized = false;

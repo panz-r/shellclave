@@ -573,6 +573,11 @@ static bool scan_word_token(const char *cmd, uint32_t end, uint32_t *position) {
   uint32_t pos = *position;
   while (pos < end) {
     char c = cmd[pos];
+    size_t pid_after = 0;
+    if (shell_source_skip_pid_parameter(cmd, end, pos, &pid_after)) {
+      pos = (uint32_t)pid_after;
+      continue;
+    }
     if (c == '$' && shell_source_logical_next_is(cmd, end, pos, '{', NULL)) {
       size_t after = 0;
       if (!shell_source_skip_parameter_expansion(cmd, end, pos, &after))

@@ -1259,6 +1259,8 @@ static SHELL_NONNULL(1, 3, 4, 5, 6) inline shell_source_declaration_status_t
         return SHELL_SOURCE_DECL_MALFORMED;
       continue;
     }
+    if (shell_source_skip_pid_parameter(input, length, position, cursor))
+      continue;
     if (c == '$' &&
         shell_source_logical_next_is(input, length, position, '{', NULL)) {
       if (!shell_source_skip_parameter_expansion(input, length, position,
@@ -1595,6 +1597,10 @@ static inline SHELL_NONNULL(1, 4, 5, 6) shell_arithmetic_frame_t
       continue;
     }
     if (c == '$') {
+      if (shell_source_skip_pid_parameter(input, length, position, &next)) {
+        position = next;
+        continue;
+      }
       size_t open;
       if (shell_source_dollar_parentheses_open(input, length, position,
                                                &open)) {
@@ -1796,7 +1802,7 @@ static inline SHELL_NONNULL(
     char c = input[position];
     bool starts_word = word_boundary;
     word_boundary = shell_source_word_separator(c);
-    size_t extglob_after = 0;
+    size_t extglob_after = 0, pid_after = 0;
     if (c == '\\' && position + 1 < length) {
       size_t continued =
           shell_source_skip_escaped_line_endings(input, length, position);
@@ -1809,6 +1815,9 @@ static inline SHELL_NONNULL(
     } else if (shell_source_skip_extglob(input, length, position,
                                          &extglob_after)) {
       position = extglob_after - 1;
+    } else if (shell_source_skip_pid_parameter(input, length, position,
+                                               &pid_after)) {
+      position = pid_after - 1;
     } else if (c == '$' && shell_source_logical_next_is(input, length, position,
                                                         '\'', NULL)) {
       size_t quoted = 0;
@@ -1987,6 +1996,7 @@ static inline SHELL_NONNULL(1, 4) bool shell_source_skip_array_subscript_impl(
     return false;
   root->parent = NULL;
   shell_source_array_boundary_t *top = root;
+  size_t pid_after = 0;
   for (position++; position < length; position++) {
     SHELL_SOURCE_WORD_SCAN(1);
     char c = input[position];
@@ -2011,6 +2021,9 @@ static inline SHELL_NONNULL(1, 4) bool shell_source_skip_array_subscript_impl(
                                                   &quoted))
         goto unfinished;
       position = quoted - 1;
+    } else if (shell_source_skip_pid_parameter(input, length, position,
+                                               &pid_after)) {
+      position = pid_after - 1;
     } else if (c == '$' && shell_source_logical_next_is(input, length, position,
                                                         '{', NULL)) {
       size_t parameter_after = 0;
@@ -2464,6 +2477,11 @@ static inline SHELL_NONNULL(
       position += 2;
       continue;
     }
+    size_t pid_after = 0;
+    if (shell_source_skip_pid_parameter(input, length, position, &pid_after)) {
+      position = pid_after;
+      continue;
+    }
     size_t next = shell_source_logical_following(input, length, position);
     if (c == '$' && next < length && input[next] == '\'') {
       size_t quoted = position;
@@ -2614,6 +2632,10 @@ static inline SHELL_NONNULL(
     }
     bool recognized = false;
     size_t nested_after = 0;
+    if (shell_source_skip_pid_parameter(input, length, cursor, &nested_after)) {
+      cursor = nested_after;
+      continue;
+    }
     if ((c == '$' || c == '`') &&
         !shell_source_skip_double_quote_expansion(input, length, cursor,
                                                   &recognized, &nested_after))
@@ -3044,6 +3066,11 @@ static inline bool shell_source_word_has_process_substitution(const char *input,
                                                   &after))
         return false;
       position = after;
+      continue;
+    }
+    size_t pid_after = 0;
+    if (shell_source_skip_pid_parameter(input, length, position, &pid_after)) {
+      position = pid_after;
       continue;
     }
     if (c == '$' &&
@@ -4183,6 +4210,11 @@ static inline bool shell_source_skip_shell_word_impl(const char *input,
     return false;
   while (position < length) {
     char c = input[position];
+    size_t pid_after = 0;
+    if (shell_source_skip_pid_parameter(input, length, position, &pid_after)) {
+      position = pid_after;
+      continue;
+    }
     if (c == '$' &&
         shell_source_logical_next_is(input, length, position, '{', NULL)) {
       size_t parameter_after = 0;
@@ -4735,6 +4767,11 @@ static inline size_t shell_source_skip_redirect_word(const char *input,
       continue;
     }
     word_boundary = false;
+    size_t pid_after = 0;
+    if (shell_source_skip_pid_parameter(input, end, position, &pid_after)) {
+      position = pid_after;
+      continue;
+    }
     if (c == '$' &&
         shell_source_logical_next_is(input, end, position, '{', NULL)) {
       size_t parameter_after = 0;

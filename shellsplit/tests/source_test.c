@@ -529,6 +529,87 @@ static void extglob_body_is_pattern_text(void) {
   }
 }
 
+/* `$$` is the process-ID parameter, and the `{` after it is an ordinary byte:
+ * `echo $${x;y}` runs `echo $${x` and then `y}`. Every scanner has to consume
+ * the pair together; one that steps over the first `$` reads the second as the
+ * opener of `${...}` and disagrees with the others about where words and
+ * commands end. */
+static void dollar_pair_does_not_open_a_parameter(void) {
+  static const struct {
+    const char *source;
+    unsigned commands; /* command nodes the graph holds, nested ones included */
+  } complete[] = {
+      {"echo $${", 1},
+      {"echo $${x..y}", 1},
+      {"echo $${x}", 1},
+      {"echo $${}", 1},
+      {"echo $${}}", 1},
+      {"echo $$\\${}", 1},
+      {"echo \\${}", 1},
+      {"echo $${x:-y}", 1},
+      {"echo a$${", 1},
+      {"echo $${ x", 1},
+      {"echo $${#", 1},
+      {"echo $${!", 1},
+      {"x=$${", 1},
+      {": >$${", 1},
+      {": > $${x}", 1},
+      {"cat <<< $${", 1},
+      {"echo \"$${\"", 1},
+      {"echo \"$${x}\"", 1},
+      {"echo $$$${x}", 1},
+      {"echo $$$${", 1},
+      {"echo $$ ${x}", 1},
+      {"echo $$\\${", 1},
+      {"( echo $${ )", 1},
+      {"echo $(echo $${)", 2},
+      {"echo $${x;touch y}", 2},
+      {"echo $${x|touch y}", 2},
+      {"echo $${x&touch y}", 2},
+      {"echo $$$${x;touch y}", 2},
+      {"echo $${x:-a;b}", 2},
+      {"echo $${x>f}", 1},
+      {"echo $${x:-$(echo y)}", 2},
+      {"echo $${x;b} | cat", 3},
+      {"echo $${x:-a;b} | cat", 3},
+      {"echo $$$${x:-a;b} | cat", 3},
+      {": $${x;b} | cat", 3},
+      {"echo $${x:-a;b} && echo z", 3},
+      {"echo $${x:-a;b} & echo z", 3},
+      /* An odd number of dollars ends in a real `${`. */
+      {"echo $$${x}", 1},
+      {"echo $$${x:-a;b} | cat", 2},
+  };
+  for (size_t c = 0; c < sizeof(complete) / sizeof(complete[0]); c++) {
+    const char *source = complete[c].source;
+    int status = shell_parse_draft(source, strlen(source), NULL, &draft);
+    if (status != SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected COMPLETE (%d): %s\n", status, source);
+    CHECK(status == SHELL_SOURCE_COMPLETE);
+    CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
+                                &graph) == SHELL_DEP_OK);
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; n++)
+      commands += graph.nodes[n].type == SHELL_NODE_CMD;
+    if (commands != complete[c].commands)
+      fprintf(stderr, "graph: %u command nodes, expected %u: %s\n", commands,
+              complete[c].commands, source);
+    CHECK(commands == complete[c].commands);
+  }
+  /* The dollars are a parameter and then real syntax, which Bash rejects. */
+  static const char *const rejected[] = {
+      "echo $$${",    "echo $$(",          "echo $$(echo x)",
+      "echo $$((1))", "echo $$$$(echo x)", "echo \\${(touch y)}",
+  };
+  for (size_t c = 0; c < sizeof(rejected) / sizeof(rejected[0]); c++) {
+    int status =
+        shell_parse_draft(rejected[c], strlen(rejected[c]), NULL, &draft);
+    if (status == SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "expected not COMPLETE: %s\n", rejected[c]);
+    CHECK(status != SHELL_SOURCE_COMPLETE);
+  }
+}
+
 static void selector_recovery(void) {
   static const char *const selectors[] = {
       "${#value}",       "${!value}",       "${!prefix*}",   "${!prefix@}",
@@ -6275,6 +6356,7 @@ int main(void) {
   conditional_opener_needs_a_word_boundary();
   command_word_subscript();
   extglob_body_is_pattern_text();
+  dollar_pair_does_not_open_a_parameter();
   word_byte_source();
   ansi_byte_source();
   ansi_control_delimiters();

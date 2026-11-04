@@ -1454,8 +1454,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
   uint32_t comment_start = UINT32_MAX;
   bool in_quotes = false;
   char quote_char = 0;
-  int brace_depth = 0;
-  int brace_start_pos = -1;
   uint32_t last_closed_group_end = UINT32_MAX;
   uint32_t function_paren_close = UINT32_MAX;
   uint32_t heredoc_prefix_start = UINT32_MAX;
@@ -1509,6 +1507,13 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         pos = (uint32_t)subscript_after;
         continue;
       }
+    }
+    /* `$$` owns both bytes, so the second `$` cannot open `${` or `$(`. */
+    size_t pid_after = 0;
+    if (!(in_quotes && quote_char == '\'') &&
+        shell_source_skip_pid_parameter(cmd, cmd_len, pos, &pid_after)) {
+      pos = (uint32_t)pid_after;
+      continue;
     }
     /* A nested expansion owns its quotes even inside an outer double-quoted
      * word. Consume its whole span before the outer quote state sees any
@@ -1644,14 +1649,12 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                         substitution_paren_depth == 0 && group_paren_depth > 0;
     bool closes_arithmetic = c == ')' && arith_depth > 0;
     bool closes_function_paren = c == ')' && pos == function_paren_close;
-    bool inside_parameter_expansion = brace_depth > 0;
 
     /* POSIX brace groups use reserved words, not ordinary argv words. The
      * delimiters must be separated from their list by shell whitespace or an
      * operator. Parameter expansion braces remain handled below. */
     bool brace_open = c == '{' && !in_quotes && arith_depth == 0 &&
                       substitution_paren_depth == 0 &&
-                      !inside_parameter_expansion &&
                       fast_lexical_token_at(&documents, pos) &&
                       documents.token.type == SHELL_TOKEN_GROUP_START;
     bool brace_close_redirect = false;
@@ -1666,7 +1669,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                              (cmd[redirect] == '<' || cmd[redirect] == '>');
     }
     bool brace_close =
-        c == '}' && brace_depth == 0 && brace_group_depth > 0 &&
+        c == '}' && brace_group_depth > 0 &&
         (pos == 0 || shell_source_space((unsigned char)cmd[pos - 1]) ||
          cmd[pos - 1] == ';' || cmd[pos - 1] == '\n' || cmd[pos - 1] == ')') &&
         (group_word_ends_here(cmd, pos, cmd_len) || brace_close_redirect);
@@ -1724,7 +1727,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       return SHELL_EPARSE;
     }
     if (!in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
-        !inside_parameter_expansion && brace_open && command_boundary) {
+        brace_open && command_boundary) {
       if (brace_group_stack_depth == SHELL_MAX_SUBCOMMANDS) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
@@ -1754,8 +1757,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       continue;
     }
     if (!in_quotes && limits->strict_mode && arith_depth == 0 &&
-        substitution_paren_depth == 0 && !inside_parameter_expansion &&
-        command_boundary && c == '{' &&
+        substitution_paren_depth == 0 && command_boundary && c == '{' &&
         group_word_ends_here(cmd, pos, cmd_len)) {
       /* A standalone opening brace needs an argument-list separator after it.
        * Otherwise it is neither a group delimiter nor an ordinary word. */
@@ -1792,8 +1794,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       continue;
     }
     if (!in_quotes && limits->strict_mode && arith_depth == 0 &&
-        substitution_paren_depth == 0 && !inside_parameter_expansion &&
-        command_boundary && c == '}' &&
+        substitution_paren_depth == 0 && command_boundary && c == '}' &&
         (group_word_ends_here(cmd, pos, cmd_len) || brace_close_redirect)) {
       result->status = SHELL_STATUS_ERROR;
       result->count = subcmd_idx;
@@ -1868,43 +1869,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       continue;
     }
 
-    // Track brace depth only for ${var...}. Literal braces are ordinary word
-    // bytes unless they were already recognized above as brace-group syntax;
-    // treating every `{` as a parameter expansion makes strict callers reject
-    // valid arguments such as `echo {`.
-    if (c == '{') {
-      if (brace_depth == 0 && pos > 0 && cmd[pos - 1] == '$') {
-        // This is ${ - start of variable expansion, remember position
-        // Content starts AFTER this brace
-        brace_start_pos = pos + 1;
-        brace_depth = 1;
-      } else if (brace_depth > 0) {
-        brace_depth++;
-      }
-    } else if (c == '}' && brace_depth > 0) {
-      // Check for empty ${} - no variable name between braces
-      if (brace_start_pos > 0 && brace_depth == 1) {
-        // We're closing the ${...} - check if there's any content
-        // Content starts at brace_start_pos (after ${) and ends at pos (before
-        // })
-        bool has_content = false;
-        for (uint32_t i = (uint32_t)brace_start_pos; i < pos; i++) {
-          if (!shell_source_space((unsigned char)cmd[i])) {
-            has_content = true;
-            break;
-          }
-        }
-        if (!has_content) {
-          // Empty ${} - malformed
-          result->status = SHELL_STATUS_ERROR;
-          result->count = subcmd_idx;
-          return SHELL_EPARSE;
-        }
-        brace_start_pos = -1; // Reset
-      }
-      brace_depth--;
-    }
-
     // Track arithmetic expansion $(( ... )) and (( ... ))
     // Note: $(( opens TWO parens - handle specially to avoid double counting
     if (c == '$' &&
@@ -1937,8 +1901,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       /* `(( ... ))` is a shell arithmetic command only at a command
        * boundary. In argument position it is invalid shell syntax, not a
        * simple command containing literal parentheses. */
-      if (limits->strict_mode && arith_depth == 0 &&
-          !inside_parameter_expansion && !command_boundary) {
+      if (limits->strict_mode && arith_depth == 0 && !command_boundary) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
         return SHELL_EPARSE;
@@ -1987,8 +1950,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         }
         /* A parenthesized group is a command, not a word expansion. `$(` and
          * `<(`/`>(` were consumed above by their dedicated scanners. */
-        if (limits->strict_mode && !inside_parameter_expansion &&
-            !command_boundary) {
+        if (limits->strict_mode && !command_boundary) {
           result->status = SHELL_STATUS_ERROR;
           result->count = subcmd_idx;
           return SHELL_EPARSE;
@@ -2061,9 +2023,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       }
     }
 
-    if (limits->strict_mode && !inside_parameter_expansion && c == ')' &&
-        !closes_arithmetic && arith_depth == 0 &&
-        substitution_paren_depth == 0 && !closes_group &&
+    if (limits->strict_mode && c == ')' && !closes_arithmetic &&
+        arith_depth == 0 && substitution_paren_depth == 0 && !closes_group &&
         !closes_function_paren && !has_unsupported_control) {
       result->status = SHELL_STATUS_ERROR;
       result->count = subcmd_idx;
@@ -2074,9 +2035,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
 
     /* A dollar not starting one of the complete expansion forms handled
      * above is a literal shell-word byte. In particular, Bash accepts `$`,
-     * `$:`, and `path$` as pathnames. Do not overload brace_depth as a
-     * pseudo-error channel here: `${...}`, `$'...'`, and `$(...)` already
-     * have structural validation at their respective scanners. */
+     * `$:`, and `path$` as pathnames. `${...}`, `$'...'`, and `$(...)` already
+     * have structural validation at their respective scanners, so a brace
+     * here is an ordinary word byte, including after `$$` or an escaped `\$`.
+     */
 
     /* Bash combines stdout and stderr with &>word / &>>word. It is one
      * redirect, not a background separator followed by an ordinary word. */

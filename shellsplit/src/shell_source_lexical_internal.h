@@ -309,6 +309,23 @@ static inline bool shell_source_logical_next_is(const char *input,
   return logical < length && input[logical] == expected;
 }
 
+/* `$$` is the process-ID special parameter and owns both bytes. A scanner that
+ * steps over a lone `$` must consume the pair together: stepping over only the
+ * first byte lets the second open `${`, `$(` or `$((`, which Bash never starts
+ * after a `$$`, so `echo $${x;y}` would hide the `;` that ends the command.
+ * input is an immutable readable span and position < length; after names the
+ * byte following the pair, past any removed continuation, and is written only
+ * on a match. Any byte but a `$` followed by a `$` is a non-match. */
+static inline SHELL_NONNULL(1, 4) bool shell_source_skip_pid_parameter(
+    const char *input, size_t length, size_t position, size_t *after) {
+  size_t second = 0;
+  if (input[position] != '$' ||
+      !shell_source_logical_next_is(input, length, position, '$', &second))
+    return false;
+  *after = second + 1;
+  return true;
+}
+
 /* Match punctuation after the shell has removed unquoted escaped physical line
  * endings.  `spelling` is an operator spelling (rather than a shell word), so
  * no horizontal whitespace or comment may intervene.  On success `after`

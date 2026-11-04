@@ -512,6 +512,12 @@ static SHELL_NONNULL(1) bool word_has_array_designator_after(const char *input,
       position = after - 1;
       continue;
     }
+    size_t pid_after = 0;
+    if (!in_single &&
+        shell_source_skip_pid_parameter(input, length, position, &pid_after)) {
+      position = pid_after - 1;
+      continue;
+    }
     if (!in_single && c == '$' &&
         shell_source_logical_next_is(input, length, position, '{', NULL)) {
       size_t after = 0;
