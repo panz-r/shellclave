@@ -649,6 +649,8 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
   bool command_word_seen = false;
   /* Bash stops reading it whole once a redirect follows an assignment word. */
   bool assignment_seen = false, subscript_blocked = false;
+  /* The previous token was a `>&` or `<&` operator waiting for its operand. */
+  bool duplication_operand_pending = false;
 
   while (pos < end && out->count < SHELL_DEP_MAX_TOKENS) {
     bool plain_word = false;
@@ -682,7 +684,21 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
       }
     }
     uint32_t tok_start = pos;
-    uint32_t redirect_end = scan_redirect_token(cmd, pos, end);
+    /* The word after `>&` is its NUMBER operand even when a redirect operator
+     * touches it: `2>&1>f` is `2>&1` and `>f`, so `1` is not the descriptor
+     * prefix of a `1>` redirect. */
+    bool duplication_operand = false;
+    if (duplication_operand_pending) {
+      size_t digits_after = 0;
+      uint32_t digits_fd = 0;
+      shell_source_io_number_t digits = shell_source_parse_io_number(
+          cmd, pos, end, &digits_after, &digits_fd);
+      duplication_operand = digits != SHELL_SOURCE_IO_NUMBER_NONE &&
+                            digits != SHELL_SOURCE_IO_NUMBER_OVERFLOW;
+      duplication_operand_pending = false;
+    }
+    uint32_t redirect_end =
+        duplication_operand ? pos : scan_redirect_token(cmd, pos, end);
     /* Inline document ranges remain separate for document construction, but
      * belong to this execution stage. They must not become argv or FILE
      * redirects when a stage resumes its ordinary words after the marker. */
@@ -696,7 +712,8 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
                                                     &operator_pos, &ignored_fd);
     operator_pos =
         shell_source_skip_escaped_line_endings(cmd, end, operator_pos);
-    if (numeric_prefix != SHELL_SOURCE_IO_NUMBER_OVERFLOW &&
+    if (!duplication_operand &&
+        numeric_prefix != SHELL_SOURCE_IO_NUMBER_OVERFLOW &&
         shell_source_match_logical_punctuation(cmd, end, operator_pos, "<<",
                                                NULL)) {
       size_t after = shell_source_skip_redirect(cmd, pos, end);
@@ -732,6 +749,16 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
     } else if (redirect_end != pos) {
       subscript_blocked |= assignment_seen;
       pos = redirect_end;
+      /* `>&-` closes and takes no operand, so only a final `&` waits. */
+      size_t operator_end = shell_source_skip_escaped_line_endings_backward(
+          cmd + tok_start, pos - tok_start, pos - tok_start);
+      if (operator_end > 1 && cmd[tok_start + operator_end - 1] == '&') {
+        size_t before = shell_source_skip_escaped_line_endings_backward(
+            cmd + tok_start, pos - tok_start, operator_end - 1);
+        duplication_operand_pending =
+            before > 0 && (cmd[tok_start + before - 1] == '>' ||
+                           cmd[tok_start + before - 1] == '<');
+      }
       uint32_t target = pos;
       while (target < end) {
         size_t target_continued =

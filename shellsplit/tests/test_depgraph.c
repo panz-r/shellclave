@@ -4640,6 +4640,64 @@ TEST(background_is_command_local) {
   }
 }
 
+/* The word after `>&` or `<&` is the NUMBER operand, so the operator that
+ * touches it starts a fresh redirect: `2>&1>f` is `2>&1` and then `>f`, just as
+ * with a space before `>f`. Reading `1>` as a descriptor prefix leaves `f` an
+ * argument and, for a test builtin name, a command nothing inventoried. */
+TEST(duplication_operand_does_not_take_the_next_redirect) {
+  static const struct {
+    const char *joined, *spaced;
+  } pairs[] = {
+      {"echo hi 2>&1>/dev/null", "echo hi 2>&1 >/dev/null"},
+      {"echo hi >&2>f z", "echo hi >&2 >f z"},
+      {"echo hi >&2>>f", "echo hi >&2 >>f"},
+      {"echo hi <&0>f", "echo hi <&0 >f"},
+      {"echo hi >&2<f", "echo hi >&2 <f"},
+      {"echo hi >&1>f 2>g", "echo hi >&1 >f 2>g"},
+      {"echo hi >&2>f>g", "echo hi >&2 >f >g"},
+      {"echo hi >&2>&1>f", "echo hi >&2 >&1 >f"},
+      {"echo hi 2>&1|cat", "echo hi 2>&1 |cat"},
+      {">&2>x", ">&2 >x"},
+      {">&2>test", ">&2 >test"},
+      {">&2>[", ">&2 >["},
+      {">&2>[ x ]", ">&2 >[ x ]"},
+      {"2>&1>test", "2>&1 >test"},
+      {"{ echo hi 2>&1>f; }", "{ echo hi 2>&1 >f; }"},
+  };
+  for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+    shell_dep_graph_t joined, spaced;
+    ASSERT(parse(pairs[i].joined, &joined) == SHELL_DEP_OK);
+    ASSERT(parse(pairs[i].spaced, &spaced) == SHELL_DEP_OK);
+    bool same = joined.node_count == spaced.node_count &&
+                joined.edge_count == spaced.edge_count;
+    uint32_t commands = count_type(&joined, SHELL_NODE_CMD);
+    same = same && commands == count_type(&spaced, SHELL_NODE_CMD);
+    for (uint32_t c = 0; same && c < commands; c++) {
+      const shell_dep_cmd_t *a = &joined.nodes[find_nth_cmd(&joined, c)].cmd;
+      const shell_dep_cmd_t *b = &spaced.nodes[find_nth_cmd(&spaced, c)].cmd;
+      same = a->token_count == b->token_count;
+      for (uint32_t t = 0; same && t < a->token_count; t++)
+        same = a->token_lens[t] == b->token_lens[t] &&
+               !memcmp(a->tokens[t], b->tokens[t], a->token_lens[t]);
+    }
+    if (!same)
+      printf("    %s differs from %s (nodes %u/%u, edges %u/%u)\n",
+             pairs[i].joined, pairs[i].spaced, joined.node_count,
+             spaced.node_count, joined.edge_count, spaced.edge_count);
+    ASSERT(same);
+  }
+  /* The target is a redirect operand, not an argument or a command. */
+  shell_dep_graph_t g;
+  ASSERT(parse("echo hi 2>&1>/dev/null", &g) == SHELL_DEP_OK);
+  ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.token_count == 2);
+  ASSERT(parse(">&2>test", &g) == SHELL_DEP_OK);
+  ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.token_count == 0);
+  ASSERT(parse("echo $(echo hi 2>&1>f)", &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 2);
+  ASSERT(g.nodes[find_nth_cmd(&g, 1)].cmd.token_count == 2);
+  pass_count++;
+}
+
 TEST(composition_metadata_matrix) {
   static const struct {
     const char *command;
@@ -18945,6 +19003,7 @@ int main(int argc, char **argv) {
   RUN(continued_process_substitution_topology);
   RUN(continued_terminal_redirect_topology);
   RUN(background_is_command_local);
+  RUN(duplication_operand_does_not_take_the_next_redirect);
   RUN(composition_metadata_matrix);
   RUN(posix_brace_group_pipeline);
   RUN(pipeline_negation_metadata);
