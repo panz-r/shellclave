@@ -895,6 +895,10 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     size_t after = 0;
     if (shell_source_skip_extglob(state->input, state->length, state->position,
                                   &after)) {
+      /* After a quoted prefix the pattern continues that word, as in
+       * `"a"@(b)`; finish it from start_pos instead of restarting here. */
+      if (state->position != start_pos)
+        goto ordinary_word;
       token->type = SHELL_TOKEN_EXTGLOB;
       token->start = state->input + state->position;
       token->length = after - state->position;

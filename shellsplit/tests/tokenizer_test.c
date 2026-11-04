@@ -1644,6 +1644,71 @@ static void test_glob_class_continuation_keeps_the_feature(void) {
   test("A continuation inside a glob class keeps the glob feature", valid);
 }
 
+/* A quoted prefix and an adjacent extglob are one shell word. The extglob
+ * opener must not restart the token and drop the prefix: the token spans have
+ * to cover every byte of the word, and the redirect-operand forms are valid. */
+static void test_quoted_prefix_extglob_is_one_word(void) {
+  static const struct {
+    const char *source;
+    /* Source text of each token, space-separated; a token never contains
+     * a space in these cases. */
+    const char *words;
+  } cases[] = {
+      {": >\"a\"@(b)", ": > \"a\"@(b)"},
+      {": > \"a\"@(b)", ": > \"a\"@(b)"},
+      {"cat <\"a\"@(b)", "cat < \"a\"@(b)"},
+      {"echo \"a\"@(b)", "echo \"a\"@(b)"},
+      {"echo 'a'@(b)", "echo 'a'@(b)"},
+      {"echo \"a\"?(b)", "echo \"a\"?(b)"},
+      {"echo \"a\"*(b)", "echo \"a\"*(b)"},
+      {"echo \"a\"+(b)", "echo \"a\"+(b)"},
+      {"echo \"a\"!(b)", "echo \"a\"!(b)"},
+      {"echo \"a\"@(b)\"c\"", "echo \"a\"@(b)\"c\""},
+      {"echo \"a\"@(b)c@(d)", "echo \"a\"@(b)c@(d)"},
+      {"echo \"a\"\"b\"@(c)", "echo \"a\"\"b\"@(c)"},
+      {"echo \"a\"@(b) c", "echo \"a\"@(b) c"},
+      {"\"a\"@(b)", "\"a\"@(b)"},
+      /* Neighbors that already kept the whole word. */
+      {"echo a\"b\"@(c)", "echo a\"b\"@(c)"},
+      {"echo a@(b)", "echo a@(b)"},
+      {"echo @(b)", "echo @(b)"},
+      {"echo \"a\"*", "echo \"a\"*"},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    size_t length = strlen(source);
+    shell_tokenizer_state_t state;
+    shell_token_t token;
+    char words[128] = "";
+    valid = shell_tokenizer_init(&state, source, length, NULL);
+    while (valid && shell_tokenizer_next(&state, &token)) {
+      size_t used = strlen(words);
+      valid = used + token.length + 2 < sizeof(words);
+      if (!valid)
+        break;
+      snprintf(words + used, sizeof(words) - used, "%s%.*s", used ? " " : "",
+               (int)token.length, token.start);
+    }
+    valid = valid && strcmp(words, cases[i].words) == 0;
+    if (!valid)
+      fprintf(stderr, "tokens [%s], expected [%s]: %s\n", words, cases[i].words,
+              source);
+    static shell_source_result_t draft;
+    shell_parse_result_t parsed = {0};
+    shell_dep_graph_t graph = {0};
+    valid = valid &&
+            shell_parse_draft(source, length, NULL, &draft) ==
+                SHELL_SOURCE_COMPLETE &&
+            shell_parse_fast(source, length, NULL, &parsed) == SHELL_OK &&
+            shell_dep_graph_parse(source, length, ".", NULL, &graph) ==
+                SHELL_DEP_OK;
+    if (!valid)
+      fprintf(stderr, "not admitted: %s\n", source);
+  }
+  test("A quoted prefix and an extglob stay one word", valid);
+}
+
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
@@ -9898,6 +9963,7 @@ int main(void) {
   test_nested_brace_group_is_a_feature();
   test_descriptor_duplication_is_not_background();
   test_glob_class_continuation_keeps_the_feature();
+  test_quoted_prefix_extglob_is_one_word();
   test_current_shell_wrapper_chain_contract();
   test_expansion_line_continuation_contract();
   test_redirect_operand_safety_contract();
