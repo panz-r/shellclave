@@ -71,7 +71,7 @@ static SHELL_NONNULL(1, 2) const dep_process_guard_t *dep_condition_guard(
     return found;
   uint32_t candidate = map->guard_count + 1, match = 0;
   map->guard_root =
-      dep_index_insert(map->guard_index, map->guard_root, candidate,
+      shell_avl_insert(map->guard_index, map->guard_root, candidate,
                        sizeof(map->guards) / sizeof(map->guards[0]),
                        dep_process_guard_compare, map, source, &match);
   if (!match)

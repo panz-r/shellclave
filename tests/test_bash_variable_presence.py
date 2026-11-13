@@ -26,6 +26,17 @@ class VariablePresence(unittest.TestCase):
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
+    def unmodeled(self, source, *, bash_error=False):
+        """A reached read error, or an operand the graph cannot prove valid,
+        has no dependency model (SHELL_DEP_EUNMODELED). bash_error asserts
+        that the pinned Bash reports a shell-level error for it."""
+        with self.subTest(source=source, unmodeled=True):
+            result = subprocess.run([self.probe, "--status", source],
+                                    capture_output=True, check=True, timeout=10)
+            self.assertEqual(int(result.stdout), -6)
+            if bash_error:
+                self.assertNotEqual(self.bash_result(source).stderr, b"")
+
     def qualify(self, source, *, builtin=False, known=True, locale="C"):
         with self.subTest(source=source, builtin=builtin, locale=locale):
             expected = 2 if self.bash_result(source, locale).returncode == 0 else 1
@@ -109,6 +120,8 @@ class VariablePresence(unittest.TestCase):
             source += "[[ -v tail ]]" if tail_set else "[[ ! -v tail ]]"
             source += " && [[ ! -v REPLY ]]; } <<<payload"
             self.assertEqual(self.bash_result(source).returncode, 0)
+            # An invalid target name is a reported read error, which the
+            # `||` handles.
             self.qualify(source)
 
     def test_presence_and_scope(self):
@@ -222,9 +235,10 @@ class VariablePresence(unittest.TestCase):
                 'unset CONFIG; CONFIG=value unset "$target" CONFIG; [[ ! -v CONFIG ]]',
                 'unset FUNCNAME; FUNCNAME=value unset "$target" FUNCNAME; [[ ! -v FUNCNAME ]]',
                 'format=%s; printf -- "$format" value; read -n0 FUNCNAME',
-                'target=unused; read -n0 -- "$target"; read -n0 FUNCNAME',
         ):
             self.qualify(source, builtin=True, known=False)
+        # A dynamic read target name may be invalid: no dependency model.
+        self.unmodeled('target=unused; read -n0 -- "$target"; read -n0 FUNCNAME')
         for target in ("unused", "-f", "-invalid"):
             self.qualify(f"target={target}; unset \"$target\" FUNCNAME; "
                          "read -n0 FUNCNAME; [[ -v FUNCNAME ]]", known=False)
@@ -279,7 +293,6 @@ class VariablePresence(unittest.TestCase):
                 "unset CONFIG; CONFIG= export CONFIG; [[ -v CONFIG ]]",
                 "exec {fd}>&1 && { exec {fd}>&-; [[ -v fd ]]; }",
                 "exec {fd}>&1 && { unset fd; [[ ! -v fd ]]; }",
-                "unset CONFIG; CONFIG=; read -n-invalid CONFIG; [[ -v CONFIG ]]",
                 "unset PWD OLDPWD; cd / && [[ -v OLDPWD ]]",
                 "PWD=; cd / && [[ -v OLDPWD ]]",
                 "unset PWD OLDPWD; PWD= cd / && [[ -v OLDPWD ]]",
@@ -287,16 +300,19 @@ class VariablePresence(unittest.TestCase):
                 "unset A; A= : \"$( [[ -v A ]] )\"; [[ -v A ]]",
                 "unset A; read -n0 A; [[ -v A ]]",
                 "unset A; read -r A <<<payload; [[ -v A ]]",
-                "unset fd; true {fd}>&1 9>&- 1>&9 || [[ -v fd ]]",
-                "unset fd; true 9>&- 1>&9 {fd}>&1 || [[ -v fd ]]",
-                "unset fd; ( true {fd}>&1 9>&- 1>&9 ); [[ -v fd ]]",
-                "unset fd; { true; } {fd}>&1 9>&- 1>&9 || [[ -v fd ]]",
+                "unset fd; true {fd}>&1 1>/nonexistent/x || [[ -v fd ]]",
+                "unset fd; true 1>/nonexistent/x {fd}>&1 || [[ -v fd ]]",
+                "unset fd; ( true {fd}>&1 1>/nonexistent/x ); [[ -v fd ]]",
+                "unset fd; { true; } {fd}>&1 1>/nonexistent/x || [[ -v fd ]]",
                 "[[ -v UID ]]", "unset UID; [[ -v UID ]]",
                 "[[ -v LC_ALL ]]", "[[ ! -v POSIXLY_CORRECT ]]",
                 "CONFIG=; : \"$( [[ -v CONFIG ]] )\"; [[ -v CONFIG ]]",
                 "unset CONFIG; : \"$( [[ -v CONFIG ]] )\"; [[ -v CONFIG ]]",
         ):
             self.qualify(source)
+        # An invalid read count is a reported read error.
+        self.unmodeled("unset CONFIG; CONFIG=; read -n-invalid CONFIG; "
+                       "[[ -v CONFIG ]]", bash_error=True)
         for source in ("test x -o 1 -eq invalid", "test '' -a 1 -eq invalid"):
             self.assertEqual(self.bash_result(source).returncode, 2)
             self.qualify(source, builtin=True, known=False)
@@ -436,8 +452,6 @@ class VariablePresence(unittest.TestCase):
                 "unset OPTARG; { getopts :a OPTARG -b; }; [[ -v OPTARG ]]",
                 "unset OPTARG; getopts -x :a OPTARG; [[ -v OPTARG ]]",
                 "OPTARG=; getopts -x :a OPTARG; [[ -v OPTARG ]]",
-                "unset OPTARG; getopts :a OPTARG -b 9>&- 0<&9; "
-                "[[ -v OPTARG ]]",
         ):
             self.qualify(source)
         for spec in ("", "a", "a:"):

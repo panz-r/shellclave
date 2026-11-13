@@ -805,6 +805,15 @@ static void diagnostic_resolution(shell_dep_limits_t *limits,
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     diagnostic_resolution_t fixture = {cases[i].value, cases[i].status, 0, 0};
     uint8_t unresolved[SHELL_DEP_MAX_NODES];
+    /* An empty or ambiguous resolved path certainly fails setup: a
+     * shell-level error which no dependency graph models. */
+    if (cases[i].stopped) {
+      CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                           graph, diagnostic_resolve, &fixture,
+                                           unresolved) == SHELL_DEP_EUNMODELED);
+      CHECK(fixture.paths == 1 && fixture.later == 0);
+      continue;
+    }
     CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
                                          graph, diagnostic_resolve, &fixture,
                                          unresolved) == SHELL_DEP_OK);
@@ -1039,7 +1048,6 @@ static void assignment_effects(shell_dep_limits_t *limits,
       {"UID=$(printf skipped) \"${\\\n@:\\\n-data}\"", 0, 0},
       {"UID=$(printf skipped) \"${!prefix@}\"suffix", 0, 0},
       {"UID=$(printf data) {,}", 0, 1},
-      {"UID=$(printf skipped) ''", 0, 0},
       {"UID=$(printf skipped) \"$missing\"", 0, 0},
       {"UID=$(printf skipped) \"${missing:-}\"", 0, 0},
       {"UID=$(printf skipped) \"$(true)\"", 0, 1},
@@ -1048,7 +1056,6 @@ static void assignment_effects(shell_dep_limits_t *limits,
       {"UID=$(printf skipped) \"$@\"\"\"", 0, 0},
       {"UID=$(printf skipped) literal$missing", 0, 0},
       {"UID=$(printf skipped) $missing-suffix", 0, 0},
-      {"UID=$(printf skipped) $''", 0, 0},
       {"UID=$(printf skipped) *", 0, 0},
       {"UID=$(printf skipped) {,}suffix", 0, 0},
       {"UID=$(printf skipped) {a,b}", 0, 0},
@@ -1078,6 +1085,13 @@ static void assignment_effects(shell_dep_limits_t *limits,
       {"false && export x=1", 0, 0},
       {"sh -c \"$(exec 2>&1; UID=$(printf skipped) true 1>&- 2>&-)\"", 0, 1},
   };
+  /* A statically empty command name certainly fails its lookup, a
+   * shell-level error which no dependency graph models. */
+  static const char *const empty_names[] = {"UID=$(printf skipped) ''",
+                                            "UID=$(printf skipped) $''"};
+  for (size_t i = 0; i < sizeof(empty_names) / sizeof(empty_names[0]); i++)
+    CHECK(shell_dep_graph_parse(empty_names[i], strlen(empty_names[i]), "/",
+                                limits, graph) == SHELL_DEP_EUNMODELED);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     const char *source = cases[i].source;
     parse(source, limits, graph);
@@ -1372,9 +1386,10 @@ static void nullable_assignments(shell_dep_limits_t *limits,
       {"UID=${missing:?rhs} $maybe & printf after", true},
       {"UID=$(printf data) $maybe 1>&- 2>&-; printf after", false},
       {"exec 3>&1; UID=${missing:?rhs} $maybe 3>&-; printf after >&3", false},
-      {"IFS=0123456789 UID=1 $maybe 4>&- 5>&4\n"
+      /* The setup may succeed, so `$maybe` may run and change directory. */
+      {"IFS=0123456789 UID=1 $maybe 4>fail\n"
        "exec {fd}>&1; printf after >&\"$fd\"",
-       true},
+       false},
   };
   for (unsigned i = 0; i < sizeof(continuation) / sizeof(continuation[0]);
        i++) {
@@ -1391,14 +1406,14 @@ static void nullable_assignments(shell_dep_limits_t *limits,
   }
 
   /* A rejected RHS runs only on the null path, where preceding IFS commits
-   * are visible. It still executes printf, but its ambiguous redirect cannot
-   * supply captured stdout. */
-  parse("IFS=0123456789 UID=$(exec {fd}>&1; printf rhs >&$fd) $maybe", limits,
-        graph);
-  CHECK(command(graph, "printf") != UINT32_MAX);
-  for (uint32_t edge = 0; edge < graph->edge_count; edge++)
-    CHECK(!(graph->edges[edge].type == SHELL_EDGE_SUBST &&
-            (graph->edges[edge].flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)));
+   * are visible. Its printf then meets an ambiguous redirect: a certain
+   * shell-level error, so no dependency graph models the input. */
+  {
+    static const char source[] =
+        "IFS=0123456789 UID=$(exec {fd}>&1; printf rhs >&$fd) $maybe";
+    CHECK(shell_dep_graph_parse(source, sizeof(source) - 1, "/", limits,
+                                graph) == SHELL_DEP_EUNMODELED);
+  }
 
   /* A prefix committed before the readonly error invalidates its old named
    * descriptor proof. Mixed IFS/descriptor facts must not select the valid
@@ -1406,7 +1421,7 @@ static void nullable_assignments(shell_dep_limits_t *limits,
   static const char *const unresolved[] = {
       "exec {fd}>out; fd=changed UID=$(printf rhs >&\"$fd\") $maybe",
       "IFS=0123456789 x=$(exec {fd}>&1; printf rhs >&$fd) UID=1 $maybe",
-      ("IFS=0123456789 UID=1 $maybe 4>&- 5>&4\n"
+      ("IFS=0123456789 UID=1 $maybe 4>fail\n"
        "exec {fd}>&1; printf after >&$fd"),
   };
   for (unsigned i = 0; i < sizeof(unresolved) / sizeof(unresolved[0]); i++) {
@@ -1414,20 +1429,14 @@ static void nullable_assignments(shell_dep_limits_t *limits,
                                 limits, graph) == SHELL_DEP_EPARSE);
     CHECK(graph->node_count == 0 && graph->edge_count == 0);
   }
-  parse("exec {fd}>out; fd=changed UID=1 $maybe 4>&- 5>&4 || "
-        "printf after >&\"$fd\"",
-        limits, graph);
-  uint32_t after = command(graph, "printf");
-  CHECK(after != UINT32_MAX);
-  bool writes_file = false;
-  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
-    const shell_dep_edge_t *item = &graph->edges[edge];
-    writes_file |= item->type == SHELL_EDGE_WRITE && item->from == after &&
-                   graph->nodes[item->to].type == SHELL_NODE_DOC &&
-                   graph->nodes[item->to].doc.path_len == 3 &&
-                   !memcmp(graph->nodes[item->to].doc.path, "out", 3);
+  /* A certainly failing setup is a shell-level error: no model. */
+  {
+    static const char source[] =
+        "exec {fd}>out; fd=changed UID=1 $maybe 4>\"\" || "
+        "printf after >&\"$fd\"";
+    CHECK(shell_dep_graph_parse(source, sizeof(source) - 1, "/", limits,
+                                graph) == SHELL_DEP_EUNMODELED);
   }
-  CHECK(writes_file); /* The abort-only prefix must not affect the OR path. */
 
   static const char *const resolved[] = {
       "UID=$(printf '%s' \"$payload\") $maybe >\"$path\"",
@@ -1491,30 +1500,29 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
     const char *source;
     bool capture;
   } cases[] = {
-      {"exec 3>&-; sh -c \"$(echo 2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$(echo >&3 2>&1)\"", false},
-      {"exec 3>&-; sh -c \"$(echo >&3)\"", false},
-      {"exec 3>&-; sh -c \"$(echo 2>&- >&3)\"", false},
-      {"exec 3>&-; sh -c \"$(2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$({ echo body; } 2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$( (echo body) 2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$(time echo 2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$(false && echo 2>&1 >&3)\"", false},
-      {"exec 3>&-; sh -c \"$(true || echo 2>&1 >&3)\"", false},
-      {"sh -c \"$(echo 2>&1 >'')\"", true},
-      {"sh -c \"$(echo >'' 2>&1)\"", false},
-      {"exec 3>&-; cat <(echo 2>&1 >&3)", true},
-      {"exec 3>&-; cat <(echo >&3 2>&1)", false},
-      {"exec 3>&-; sh -c \"$(echo 2>&1 1>&3-)\"", true},
-      {"exec 3>&-; sh -c \"$(echo 2>&1 {fd}>&3)\"", true},
+      {"sh -c \"$(echo 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(echo >/missing/x 2>&1)\"", false},
+      {"sh -c \"$(echo >/missing/x)\"", false},
+      {"sh -c \"$(echo 2>&- >/missing/x)\"", false},
+      {"sh -c \"$(2>&1 >/missing/x)\"", true},
+      {"sh -c \"$({ echo body; } 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$( (echo body) 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(time echo 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(false && echo 2>&1 >/missing/x)\"", false},
+      {"sh -c \"$(true || echo 2>&1 >/missing/x)\"", false},
+      {"sh -c \"$(echo 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(echo >/missing/x 2>&1)\"", false},
+      {"cat <(echo 2>&1 >/missing/x)", true},
+      {"cat <(echo >/missing/x 2>&1)", false},
+      {"sh -c \"$(echo 2>&1 1>/missing/x)\"", true},
+      {"sh -c \"$(echo 2>&1 {fd}>/missing/x)\"", true},
       {"sh -c \"$(exec 2>&1; echo ok &)\"", true},
-      {"exec 10>&-; sh -c \"$({ exec 10>&-; } 2>&1)\"", true},
-      {"exec 3>&- 10>&-; sh -c \"$(: 2>&1 10>&- 4>&3)\"", true},
-      {"exec 3>&- 4>&- 63>&-; sh -c \"$(read -u63 -n0 probe; "
-       "{ true 2>&1 5>left 6>right 7>&3; })\"",
+      {"exec 10>&-; sh -c \"$(: 2>&1 10>&- 4>/missing/x)\"", true},
+      {"exec 63<<<seed; sh -c \"$(read -u63 -n0 probe; "
+       "{ true 2>&1 5>left 6>right 7>/missing/x; })\"",
        true},
-      {"exec 3>&- 4>&- 63>&-; sh -c \"$(read -u63 -n0 probe; "
-       "{ true 5>left 6>right 2>&- 7>&3; })\"",
+      {"exec 63<<<seed; sh -c \"$(read -u63 -n0 probe; "
+       "{ true 5>left 6>right 2>&- 7>/missing/x; })\"",
        false},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1528,12 +1536,6 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
         for (uint32_t out = 0; out < graph->edge_count; out++)
           capture |= graph->edges[out].type == SHELL_EDGE_SUBST &&
                      graph->edges[out].from == item->to;
-      /* These bodies either fail setup or are skipped: no body stdin use. */
-      if (i < 16 && graph->nodes[item->to].type == SHELL_NODE_CMD &&
-          graph->nodes[item->to].cmd.token_count &&
-          graph->nodes[item->to].cmd.token_lens[0] == 4 &&
-          !memcmp(graph->nodes[item->to].cmd.tokens[0], "echo", 4))
-        CHECK(item->type != SHELL_EDGE_READ);
     }
     if (capture != cases[i].capture)
       fprintf(stderr, "diagnostic capture: %s\n", cases[i].source);
@@ -1552,7 +1554,14 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
     CHECK(shellsplit_test_graph_equal(graph, other));
 #endif
   }
-  parse("exec 3>&-; echo 2>&1 >&3 | cat", limits, graph);
+  /* The group saves fd 2 at fd 10, and the persistent close destroys that
+   * save: Bash cannot restore fd 2 (reference Bash captures "10: Bad file
+   * descriptor"). No dependency model. */
+  static const char destroyed[] =
+      "exec 10>&-; sh -c \"$({ exec 10>&-; } 2>&1)\"";
+  CHECK(shell_dep_graph_parse(destroyed, sizeof(destroyed) - 1, "/", limits,
+                              graph) == SHELL_DEP_EUNMODELED);
+  parse("echo 2>&1 >/missing/x | cat", limits, graph);
   uint32_t echo = command(graph, "echo"), cat = command(graph, "cat");
   bool piped = false;
   for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
@@ -1563,7 +1572,7 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
   CHECK(piped);
   /* More than 16 distinct prefix sinks fit the graph. Split into three
    * owners to stay within the independent per-command lexical token bound. */
-  char source[1024] = "exec 3>&-;";
+  char source[1024] = ":;";
   for (unsigned owner = 0; owner < 3; owner++) {
     strcat(source, " echo");
     for (unsigned i = 0; i < 8; i++) {
@@ -1571,7 +1580,7 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
       snprintf(redirect, sizeof(redirect), " 2>error%u", owner * 8 + i);
       strcat(source, redirect);
     }
-    strcat(source, " >&3;");
+    strcat(source, " >/missing/x;");
   }
   parse(source, limits, graph);
   unsigned destinations = 0;
@@ -1609,10 +1618,10 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
   CHECK(shellsplit_test_graph_equal(graph, other));
   size_t previous = 0;
   for (unsigned count = 4; count <= 32; count *= 2) {
-    strcpy(source, "exec 3>&-;");
+    strcpy(source, ":;");
     for (unsigned i = 0; i < count; i++) {
       char stage[40];
-      snprintf(stage, sizeof(stage), " echo 2>error%u >&3;", i);
+      snprintf(stage, sizeof(stage), " echo 2>error%u >/missing/x;", i);
       strcat(source, stage);
     }
     shellsplit_test_source_scan_reset();
@@ -1684,8 +1693,7 @@ static void expansion_diagnostics(shell_dep_limits_t *limits,
       {"sh -c \"$(: 2>&1 >${missing:?expansion-marker} 2>&-)\"", true},
       {"sh -c \"$(: >${missing:?expansion-marker} 2>&1)\"", false},
       {"sh -c \"$(: 2>&- >${missing:?expansion-marker} 2>&1)\"", false},
-      {"sh -c \"$(exec 3>&-; : 2>&1 >&3 >${missing:?expansion-marker})\"",
-       true},
+      {"sh -c \"$(: 2>&1 >/missing/x >${missing:?expansion-marker})\"", true},
       {"sh -c \"$(: 2>&1 <<<$((1/0)) 2>&-)\"", true},
       {"sh -c \"$(: <<<$((1/0)) 2>&1 1>&- 2>&-)\"", false},
       {"sh -c \"$(: 2>&1 <<EOF 2>&-\n${missing:?expansion-marker}\nEOF\n)\"",
@@ -1867,6 +1875,16 @@ static void file_diagnostics(shell_dep_limits_t *limits,
              values[i].word);
     file_diagnostic_resolution_t fixture = {values[i].value, values[i].status,
                                             0};
+    /* A resolved pathname which is empty or several words certainly fails:
+     * a shell-level error which no dependency graph models. */
+    if (values[i].failed) {
+      CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                           graph, file_diagnostic_resolve,
+                                           &fixture,
+                                           NULL) == SHELL_DEP_EUNMODELED);
+      CHECK(fixture.calls == 1);
+      continue;
+    }
     CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
                                          graph, file_diagnostic_resolve,
                                          &fixture, NULL) == SHELL_DEP_OK);
@@ -1935,7 +1953,7 @@ static void file_diagnostics(shell_dep_limits_t *limits,
 static void terminal_pipe_capacity(shell_dep_limits_t *limits,
                                    shell_dep_graph_t *graph,
                                    shell_dep_graph_t *other) {
-  const char *regression = "exec 3>&-; echo 2>&1 >&3 | cat <input";
+  const char *regression = "echo 2>&1 >/missing/x | cat <input";
   shell_dep_limits_t bounded = *limits;
   bounded.max_nodes = 5;
   bounded.max_edges = 3;
@@ -1949,18 +1967,17 @@ static void terminal_pipe_capacity(shell_dep_limits_t *limits,
     uint32_t producers;
     bool diagnostic, timer_pipe;
   } cases[] = {
-      {"exec 3>&-; echo 2>&1 >&3 | cat <input", 1, true, false},
-      {"exec 3>&-; echo 2>&1 >&3 | cat <&-", 1, true, false},
-      {"exec 3>&-; { echo 2>&1 >&3; } | cat <input", 2, true, false},
-      {"exec 3>&-; (echo 2>&1 >&3) | cat <input", 2, true, false},
-      {"exec 3>&-; time echo 2>&1 >&3 | cat <input", 1, true, false},
+      {"echo 2>&1 >/missing/x | cat <input", 1, true, false},
+      {"echo 2>&1 >/missing/x | cat <&-", 1, true, false},
+      {"{ echo 2>&1 >/missing/x; } | cat <input", 2, true, false},
+      {"(echo 2>&1 >/missing/x) | cat <input", 2, true, false},
+      {"time echo 2>&1 >/missing/x | cat <input", 1, true, false},
       {"echo | : <&-", 1, false, false},
       {"echo | cat <input", 1, false, false},
       {"{ echo one; echo two; } 2>&1 | cat <input", 2, false, false},
       {"{ time echo; } 2>&1 | cat <input", 3, false, true},
-      {"exec 3>&-; printf '%s' \"$(echo 2>&1 >&3 | cat <input)\"", 1, true,
-       false},
-      {"exec 3>&-; cat <(echo 2>&1 >&3 | cat <input)", 1, true, false},
+      {"printf '%s' \"$(echo 2>&1 >/missing/x | cat <input)\"", 1, true, false},
+      {"cat <(echo 2>&1 >/missing/x | cat <input)", 1, true, false},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     const char *source = cases[i].source;
@@ -1989,13 +2006,6 @@ static void terminal_pipe_capacity(shell_dep_limits_t *limits,
                 time->report_external_fd_count == 0);
           timer_pipe = true;
         }
-      }
-      if (cases[i].diagnostic) {
-        CHECK(item->type != SHELL_EDGE_READ || item->to != echo);
-        if (item->from == echo)
-          CHECK(item->type != SHELL_EDGE_WRITE &&
-                item->type != SHELL_EDGE_APPEND &&
-                (item->type != SHELL_EDGE_PIPE || item->source_fd == 2));
       }
     }
     CHECK(producers == cases[i].producers &&
@@ -2267,12 +2277,9 @@ int main(void) {
   CHECK(boundaries == 3);
 
   /* Many conditional routes shared by deeply nested groups must not consume
-   * the public edge budget once per redundant intermediate exposure. */
-  char alternatives[2048] = "";
-  size_t used = 0;
-  for (unsigned fd = 3; fd <= 9; fd++)
-    used += (size_t)snprintf(alternatives + used, sizeof(alternatives) - used,
-                             "probe && exec 2>&%u; ", fd);
+   * the public edge budget once per redundant intermediate exposure. The
+   * executor contract opens only 0, 1 and 2 as external descriptors. */
+  char alternatives[2048] = "probe && exec 2>&1; probe && exec 2>&0; ";
   for (unsigned i = 0; i < 60; i++)
     strcat(alternatives, "{ ");
   strcat(alternatives, "wc;");
@@ -2288,7 +2295,7 @@ int main(void) {
     }
   CHECK(outer != UINT32_MAX);
   CHECK(route(graph, outer, 0, true, 0) && route(graph, outer, 1, false, 1));
-  for (unsigned fd = 2; fd <= 9; fd++)
+  for (unsigned fd = 0; fd <= 2; fd++)
     CHECK(route(graph, outer, 2, false, fd));
 
   for (uint32_t max_nodes = 1; max_nodes <= 4; max_nodes++)

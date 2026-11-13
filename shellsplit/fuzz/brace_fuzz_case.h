@@ -615,6 +615,8 @@ struct shell_substitution_fuzz_case_t {
    * parse or Shellgate evaluation. */
   bool depgraph_truncated;
   bool depgraph_rejected;
+  /* A reached certain shell-level error: no dependency model. */
+  bool depgraph_unmodeled = false;
   /* Unsafe decoded source fails at semantic parsing, unlike graph-only
    * rejection of an otherwise valid lexical command. */
   bool source_rejected = false;
@@ -1059,23 +1061,27 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1};
-  case 27:
-    /* The heredoc body is expanded before fd 4's known setup failure. */
-    return {"{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
-            2,
-            1,
-            0,
-            1,
-            0,
-            0,
-            0,
-            true,
-            false,
-            1,
-            1,
-            0,
-            1,
-            1};
+  case 27: {
+    /* fd 4 copies the just-closed fd 3: a certain setup error. */
+    shell_substitution_fuzz_case_t item = {
+        "{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
+        2,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        true,
+        false,
+        1,
+        1,
+        0,
+        1,
+        1};
+    item.depgraph_unmodeled = true;
+    return item;
+  }
   case 28:
     return {"cat <<A <<B <<C <<D <<E <<F <<G <<H\n"
             "one\nA\ntwo\nB\nthree\nC\nfour\nD\nfive\nE\nsix\nF\n"

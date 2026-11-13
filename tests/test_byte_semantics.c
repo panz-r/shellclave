@@ -283,6 +283,14 @@ static void invalid_read_targets(void) {
     const char *source = sources[c];
     CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
           SHELL_SOURCE_COMPLETE);
+    /* An unhandled invalid target (`;` after the read) is a reported read
+     * error with no dependency model; where `&&`/`||` consume the read's
+     * status, the error is handled and the failure routes the fallback. */
+    if (c % 3 == 2) {
+      CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
+                                  &graph) == SHELL_DEP_EUNMODELED);
+      continue;
+    }
     CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
                                 &graph) == SHELL_DEP_OK);
     CHECK(shell_dep_graph_validate(&graph).valid);

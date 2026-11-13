@@ -79,6 +79,32 @@ typedef enum {
   SHELL_DEP_EWORKSPACE = -4,
   /* The expansion callback failed or returned malformed canonical bytes. */
   SHELL_DEP_EEXPAND = -5,
+  /* No dependency graph captures every requirement for a safe run of the
+   * input, although its syntax may be valid (syntax classification is
+   * independent of this result). An application must not run it. A returned
+   * graph is a guarantee: it captures the input's semantics, and given the
+   * requirements it states, no shell-level error occurs at runtime. Inputs
+   * the graph cannot represent that way return this code; the represented
+   * set grows conservatively.
+   *
+   * The executor contract: the input starts with descriptors 0, 1 and 2 open
+   * as the conventional stdin (readable), stdout and stderr, and every other
+   * descriptor closed. Every descriptor a redirection copies or moves from, or
+   * `read -u` reads, must exist on every path reaching that use. Where only a
+   * failed redirection open can leave it missing, that open becomes a
+   * requirement (SHELL_DEP_EDGE_FLAG_REQUIRED on its edges); a failure the
+   * input handles, as with `exec 3<file || exit`, needs none. Any other path
+   * without it is unmodeled: a conditional open, an earlier close, or a
+   * `{name}` variable which may hold no descriptor. A reached operation which
+   * always fails, such as an open of an empty pathname or a statically empty
+   * command name, is unmodeled too. So is a reached `read` which may report an
+   * error: an invalid, missing or unresolved option operand or target name, or
+   * a counting read from a descriptor which may lack read access. End of input,
+   * a timeout and a zero-count read are ordinary outcomes. An `exec` close
+   * which may close one of Bash's own saved descriptors is unmodeled too: Bash
+   * would then fail to restore them. Redirection targets are always
+   * representable. */
+  SHELL_DEP_EUNMODELED = -6,
 } shell_dep_error_t;
 
 typedef enum {
@@ -104,7 +130,8 @@ typedef enum {
   SHELL_NODE_ENDPOINT,
   /* Shell-owned Bash `time` operation for one pipeline. */
   SHELL_NODE_TIME,
-  /* A descriptor inherited when the complete submitted command starts. */
+  /* A descriptor inherited when the complete submitted command starts. The
+   * executor contract (SHELL_DEP_EUNMODELED) opens only 0, 1 and 2. */
   SHELL_NODE_FD,
   SHELL_NODE_FILE_COMPARISON,
 } shell_dep_node_type_t;
@@ -247,6 +274,12 @@ typedef enum {
    * special parameter operands; it does not establish export, presence,
    * unconditional execution or a complete recursive value. */
   SHELL_DEP_EDGE_FLAG_ENV_READ = 1 << 23,
+  /* The redirection open this edge records must succeed for a safe run: a
+   * later descriptor use depends on it. An application must check or provide
+   * the resource (for example, that the file exists and can be opened in this
+   * mode) before running the input. Without such requirements a returned
+   * graph would not describe every possible shell-level failure. */
+  SHELL_DEP_EDGE_FLAG_REQUIRED = UINT32_C(1) << 24,
   /* FILE_TEST flags identify metadata predicates. SYMLINK inspects the link;
    * all other predicates follow it. Flags may be combined for uncertain
    * operator roles. NONEMPTY tests whether the size is greater than zero.
@@ -393,6 +426,24 @@ typedef enum {
  * directory. Arithmetic and conditional commands have no argv tokens; their
  * spans borrow the original immutable input just as simple-command tokens do.
  */
+/* Whether a command consumes its standard input as shell code, decided by
+ * the reference Bash's invocation grammar for an executed `bash` (or `rbash`,
+ * by name or path): no `-c` command string, and either `-s` or no script-file
+ * operand once option processing ends. Option errors, `--help` and
+ * `--version` exit before reading. Only the reference Bash is modeled: any
+ * other shell interpreter name, a dynamic command name, or a dynamic word
+ * while Bash still scans options is UNKNOWN. Other commands are NONE; this
+ * fact does not follow external wrappers such as `env` or `sudo`. */
+typedef enum {
+  SHELL_DEP_STDIN_CODE_NONE = 0,
+  /* Reads commands from standard input and executes them. */
+  SHELL_DEP_STDIN_CODE_EXECUTES,
+  /* Reads standard input as code without executing it (`-n`, `-D`,
+   * `--dump-strings`, `--dump-po-strings`, `--pretty-print`). */
+  SHELL_DEP_STDIN_CODE_PARSES,
+  SHELL_DEP_STDIN_CODE_UNKNOWN,
+} shell_dep_stdin_code_t;
+
 typedef struct {
   shell_command_kind_t kind;
   /* Borrowed CONDITIONAL spans in source/expansion order, separate from argv.
@@ -475,6 +526,8 @@ typedef struct {
   uint32_t pipe_stdin_target;
   uint32_t pipe_stdout_source;
   uint32_t pipe_stdout_target;
+  /* Whether the executed command reads its standard input as shell code. */
+  shell_dep_stdin_code_t stdin_code;
 } shell_dep_cmd_t;
 
 typedef struct {
@@ -1161,17 +1214,26 @@ typedef struct {
  * command/compound lifetime, including nested uses and escaping aliases. Timing
  * alone does not require physical identities. Incoming standard-FD occupancy
  * uses the actual phase snapshot, including scope restoration and reopening;
- * historical closes outside this lifetime do not enable tracking. Symbolic
- * occupancy preserves the first-two-free and high-slot-search conditions for
- * moved and retained pipe ends, without enumerating inherited descriptor tables
- * or increasing pressure for unrelated source lifetimes. Named allocations and
- * temporary descriptor saves retain the same joint constraints, including
- * low-slot availability. Existence observations restrict a version;
- * opens/closes change it. Private allocation selectors preserve named/save/pipe
- * identities in fd 0..63 through closes, reuse, undo, and recursive imports,
- * without a separate version per hidden numeric choice. Named variables retain
- * their selected numeric value after close. The existing conservative
- * observed/private tail model applies above that range. Imported aliases of one
+ * historical closes outside this lifetime do not enable tracking. Occupancy of
+ * fds 0..63 is kept per descriptor (whether each may be free, and whether it
+ * may be open), separately for each combination of the inherited and current
+ * low-interval (0..9) cases, without enumerating inherited descriptor tables.
+ * Moved and retained pipe ends, named allocations and temporary descriptor
+ * saves take every place Bash's lowest-free search allows under it, including
+ * the first-two-free and high-slot-search conditions and low-slot
+ * availability. An allocation with several possible places binds its
+ * descriptor to all of them, each place keeping its prior contents on the
+ * paths where the descriptor went elsewhere; it never adds a version per
+ * place. Relations between descriptors (that two allocations took the same
+ * place, or how many descriptors are free) are not kept, so routes depending
+ * on them are a sound superset of the runtime routes. Results are exact when
+ * every allocation has one possible place. Versions split only by the
+ * inherited low-interval case, when that case changes a later observable
+ * place. Existence observations restrict a version; opens/closes change it.
+ * Named, save and pipe identities in fd 0..63 survive closes, reuse, undo,
+ * and recursive imports. Named variables retain their selected numeric value
+ * after close. The existing conservative observed/private tail model applies
+ * above that range. Imported aliases of one
  * selected descriptor share one child-local slot; closing either alias affects
  * both in that child, not its parent bindings. Child reads can still advance
  * shared open-file descriptions. The graph models possible provenance, not byte
@@ -1250,6 +1312,16 @@ typedef struct {
  * preconditions is invalid API use and is not checked at runtime.
  * Parsing errors that are detected before route resolution do not require
  * workspace.
+ *
+ * Cost. Descriptor analysis is one forward interpretation over the execution
+ * events, on one persistent state: hash-consed Patricia maps keyed by 32-bit
+ * (descriptor, facet) keys, where a missing key means the executor contract.
+ * An event costs O((k + 1) log K) for the k keys it reads or writes among K
+ * live keys; a merge costs O(d log K) for the d keys that differ, with path
+ * versions bounded per state; a child expansion starts from its parent's
+ * checkpoint state in O(1) and pays only for what it uses; publication visits
+ * each owner's own uses. The analysis is O(n log n) in the source size n.
+ * shellsplit/tests/fd_scaling_test.c enforces this per construct family.
  */
 shell_dep_error_t
 shell_dep_graph_parse(const char *cmd, size_t cmd_len, const char *initial_cwd,

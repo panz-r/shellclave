@@ -293,8 +293,8 @@ int main(void) {
   fixture = (fixture_t){.source = source, .status = SHELL_EXPAND_RESOLVED};
   CHECK(shell_dep_graph_parse_resolved(source, strlen(source), NULL, &limits,
                                        graph, expand_word, &fixture, NULL) ==
-        SHELL_DEP_OK); /* Empty expansion is shell redirection failure. */
-  CHECK(shell_dep_graph_validate(graph).valid);
+        SHELL_DEP_EUNMODELED); /* An empty redirect path certainly fails. */
+  CHECK(graph->node_count == 0 && graph->edge_count == 0);
 
   source = "echo \"$V\"; if true; then echo no; fi";
   fixture = (fixture_t){.source = source, .status = SHELL_EXPAND_UNRESOLVED};
@@ -333,10 +333,10 @@ int main(void) {
                         .status = SHELL_EXPAND_RESOLVED};
   CHECK(shell_dep_resolved_workspace_size(strlen(source), &limits, &required));
   limits.workspace_size = required;
+  /* Two resolved words make an ambiguous redirect: a certain shell error. */
   CHECK(shell_dep_graph_parse_resolved(source, strlen(source), NULL, &limits,
                                        graph, expand_word, &fixture,
-                                       unresolved) == SHELL_DEP_OK);
-  CHECK(shell_dep_graph_validate(graph).valid);
+                                       unresolved) == SHELL_DEP_EUNMODELED);
   CHECK(fixture.calls == 1);
   CHECK(shell_dep_graph_parse_resolved("", 0, NULL, &limits, graph, NULL, NULL,
                                        unresolved) == SHELL_DEP_EINPUT);

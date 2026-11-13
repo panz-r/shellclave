@@ -109,6 +109,30 @@ static void test_dynamic_arithmetic_is_rejected(void) {
   TEST("Dynamic arithmetic is rejected before abstraction", valid);
 }
 
+/* A final lone backslash is a literal word of a complete source, also as a
+ * redirect operand. Its word ends at the end of input; abstraction must not
+ * scan past it. The sources are copied without a terminator so that a read
+ * beyond the span is caught under sanitizers. */
+static void test_final_backslash_redirect_operand(void) {
+  static const char *const sources[] = {"<\\", "cat <\\", "cat >\\"};
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(sources) / sizeof(sources[0]); i++) {
+    size_t length = strlen(sources[i]);
+    char *copy = malloc(length);
+    valid = copy != NULL;
+    if (!valid)
+      break;
+    memcpy(copy, sources[i], length);
+    shell_abstract_command_t *result = NULL;
+    valid = shell_abstract_command_parse(copy, length, &result) ==
+                SHELL_ABSTRACT_OK &&
+            result != NULL;
+    shell_abstract_command_free(result);
+    free(copy);
+  }
+  TEST("A final backslash redirect operand ends at the end of input", valid);
+}
+
 static void test_timed_complete_command_abstraction(void) {
   printf("\n=== Timed Complete Command Abstraction ===\n");
 
@@ -1617,6 +1641,7 @@ int main(void) {
   test_abstraction_matrix();
   test_bounded_span_and_statuses();
   test_dynamic_arithmetic_is_rejected();
+  test_final_backslash_redirect_operand();
   test_timed_complete_command_abstraction();
   test_compound_variable_quote_boundaries();
   test_compound_substitution_boundaries();

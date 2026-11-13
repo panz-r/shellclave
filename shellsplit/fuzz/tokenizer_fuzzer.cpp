@@ -718,9 +718,14 @@ static int test_fixed_oracles(void) {
           (success ? " && echo >/etc/reached" : " || echo >/etc/reached");
       std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
       shell_dep_graph_t &graph = *graph_storage;
-      if (shell_dep_graph_parse(source.data(), source.size(), ".", nullptr,
-                                &graph) != SHELL_DEP_OK ||
-          !shell_dep_graph_validate(&graph).valid)
+      shell_dep_error_t status = shell_dep_graph_parse(
+          source.data(), source.size(), ".", nullptr, &graph);
+      if (fixture.unmodeled) {
+        if (status != SHELL_DEP_EUNMODELED)
+          return fixed_oracle_failure(__LINE__);
+        continue;
+      }
+      if (status != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid)
         return fixed_oracle_failure(__LINE__);
       bool reached = false;
       for (uint32_t e = 0; e < graph.edge_count; e++) {
@@ -746,9 +751,14 @@ static int test_fixed_oracles(void) {
   for (const auto &fixture : shellsplit_test_expansion_time_routes) {
     std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
     shell_dep_graph_t &graph = *graph_storage;
-    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
-                              nullptr, &graph) != SHELL_DEP_OK ||
-        !shell_dep_graph_validate(&graph).valid)
+    shell_dep_error_t error = shell_dep_graph_parse(
+        fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
+    if (fixture.unmodeled) {
+      if (error != SHELL_DEP_EUNMODELED)
+        return fixed_oracle_failure(__LINE__);
+      continue;
+    }
+    if (error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid)
       return fixed_oracle_failure(__LINE__);
     unsigned timers = 0;
     uint32_t writer = UINT32_MAX, file = UINT32_MAX;
@@ -825,7 +835,8 @@ static int test_fixed_oracles(void) {
     }
     if (file != (fixture.active && fixture.file) ||
         writer != (fixture.active && fixture.writer) ||
-        inspection != (fixture.active && fixture.shell_word) || redirect ||
+        inspection != (fixture.active && fixture.shell_word) ||
+        redirect != (fixture.active && fixture.redirect) ||
         (!fixture.active && substitution)) {
       std::fprintf(stderr, "expansion setup oracle: %s\n", fixture.source);
       return fixed_oracle_failure(__LINE__);
@@ -881,7 +892,8 @@ static int test_fixed_oracles(void) {
     shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t error = shell_dep_graph_parse(
         fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
-    if (fixture.resolved
+    if (fixture.unmodeled ? error != SHELL_DEP_EUNMODELED
+        : fixture.resolved
             ? error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid
             : error != SHELL_DEP_EPARSE || graph.node_count || graph.edge_count)
       return fixed_oracle_failure(__LINE__);
@@ -891,6 +903,11 @@ static int test_fixed_oracles(void) {
     shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t error = shell_dep_graph_parse(
         fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
+    if (fixture.unmodeled) {
+      if (error != SHELL_DEP_EUNMODELED)
+        return fixed_oracle_failure(__LINE__);
+      continue;
+    }
     if (!fixture.supported) {
       if (error != SHELL_DEP_EPARSE || graph.node_count || graph.edge_count)
         return fixed_oracle_failure(__LINE__);
@@ -941,10 +958,11 @@ static int test_fixed_oracles(void) {
     shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t graph_error =
         shell_dep_graph_parse(fixture.source, length, ".", nullptr, &graph);
-    if (fixture.supported ? graph_error != SHELL_DEP_OK ||
-                                !shell_dep_graph_validate(&graph).valid
-                          : graph_error != SHELL_DEP_EPARSE ||
-                                graph.node_count || graph.edge_count)
+    if (fixture.unmodeled   ? graph_error != SHELL_DEP_EUNMODELED
+        : fixture.supported ? graph_error != SHELL_DEP_OK ||
+                                  !shell_dep_graph_validate(&graph).valid
+                            : graph_error != SHELL_DEP_EPARSE ||
+                                  graph.node_count || graph.edge_count)
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_setup_time_outcomes) {
@@ -2085,6 +2103,15 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
 
+  /* An empty command name is a certain error (reference Bash: ": command not
+   * found"): no model. */
+  {
+    static const char empty_name[] = "''<() /bin/echo /tmp/input";
+    std::unique_ptr<shell_dep_graph_t> graph(new shell_dep_graph_t{});
+    if (shell_dep_graph_parse(empty_name, sizeof(empty_name) - 1, "/workspace",
+                              nullptr, graph.get()) != SHELL_DEP_EUNMODELED)
+      return fixed_oracle_failure(__LINE__);
+  }
   static const struct {
     const char *source;
     const char *paths[2];
@@ -2093,7 +2120,6 @@ static int test_fixed_oracles(void) {
       {"<() /bin/echo hello", {nullptr, nullptr}},
       {"X=x </dev/null <()>() /bin/echo hello", {nullptr, nullptr}},
       {"<() /bin/echo /tmp/input", {"/tmp/input", nullptr}},
-      {"''<() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
       {"command <() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
       {"$(printf program) /tmp/input", {"/tmp/input", nullptr}}};
   for (const auto &item : file_argument_cases) {
@@ -2550,21 +2576,26 @@ static int test_fixed_oracles(void) {
   }
 
   static const char *const static_legacy_redirect_cases[] = {
-      "printf x >&\"\"",
       "printf x >&literal{path}",
       "printf x >&literal$destination",
       "printf x >&literal${destination}",
       "printf x >&literal$((1 + 2))",
       "printf x >&\"\"literal$(printf target)",
-      "printf x >&file{one,two}",
       "printf x >&{$destination}",
-      "printf x >&{{1,2}}",
-      "printf x >&{{1,2}",
       "printf x >&file[[[[[:unfinished",
       "printf x >&{[$'a']}",
       "printf x >&{[$'']}",
       "printf x >&$'a\\0b'",
   };
+  /* Certain errors: an empty target, or a brace expansion yielding several
+   * words ("ambiguous redirect"). No model. */
+  for (const char *input : {"printf x >&\"\"", "printf x >&file{one,two}",
+                            "printf x >&{{1,2}}", "printf x >&{{1,2}"}) {
+    std::unique_ptr<shell_dep_graph_t> graph(new shell_dep_graph_t{});
+    if (shell_dep_graph_parse(input, strlen(input), "/tmp", NULL,
+                              graph.get()) != SHELL_DEP_EUNMODELED)
+      return fixed_oracle_failure(__LINE__);
+  }
   for (const char *input : static_legacy_redirect_cases) {
     shell_processed_commands_t processed = {};
     std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
@@ -2692,7 +2723,6 @@ static int test_fixed_oracles(void) {
    * silently change that model. */
   static const char *const named_fd_snapshot_rejections[] = {
       "printf x {fd}<in \"$(cat <&$fd)\"",
-      "exec {fd}<in; exec {fd}<&-; printf x \"$(cat <&$fd)\"",
       "printf > >(cat <&$fd) {fd}<in",
       "shopt -s varredir_close; : {fd}<in; printf x \"$(cat <&$fd)\"",
       "x+=value shopt -u varredir_close; : {fd}<in; "
@@ -2724,6 +2754,15 @@ static int test_fixed_oracles(void) {
       "exec {fd}>base; probe && { fd=1; }; printf after >&$fd",
       "exec {fd}<base; probe && { unset fd; }; echo \"$(cat <&$fd)\"",
   };
+  /* A closed name keeps its value, so the copy certainly fails: no model. */
+  {
+    static const char closed_name[] =
+        "exec {fd}<in; exec {fd}<&-; printf x \"$(cat <&$fd)\"";
+    std::unique_ptr<shell_dep_graph_t> graph(new shell_dep_graph_t{});
+    if (shell_dep_graph_parse(closed_name, sizeof(closed_name) - 1, "/tmp",
+                              NULL, graph.get()) != SHELL_DEP_EUNMODELED)
+      return fixed_oracle_failure(__LINE__);
+  }
   for (const char *input : named_fd_snapshot_rejections) {
     std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
     shell_dep_graph_t &graph = *graph_storage;
@@ -3024,9 +3063,6 @@ static int test_fixed_oracles(void) {
       {"time { exec 2>new; } 2>&2", SHELL_TIME_REPORT_MULTIPLE,
        SHELL_TIME_REPORT_ROUTE_GRAPH | SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2,
        true, "new"},
-      {"exec 2>old || exit; { exec 3>&2; } 2>local; time exec 2>&3",
-       SHELL_TIME_REPORT_MULTIPLE, SHELL_TIME_REPORT_ROUTE_GRAPH,
-       SHELL_DEP_FD_NONE, true, "local"},
       {"{ exec 3>keep 2>new; } 2>local && time exec 2>&3",
        SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
        SHELL_DEP_FD_NONE, true, "keep"},
@@ -3079,6 +3115,17 @@ static int test_fixed_oracles(void) {
        SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
        SHELL_DEP_FD_NONE, true, "base"},
   };
+  /* Precision gap: when `2>local` fails the group never sets fd 3, and that
+   * miss is not yet attributed to the failed open, so the later copy is not
+   * excused (reference Bash reports to local). No model for now. */
+  {
+    static const char unattributed[] =
+        "exec 2>old || exit; { exec 3>&2; } 2>local; time exec 2>&3";
+    std::unique_ptr<shell_dep_graph_t> graph(new shell_dep_graph_t{});
+    if (shell_dep_graph_parse(unattributed, sizeof(unattributed) - 1, "/tmp",
+                              NULL, graph.get()) != SHELL_DEP_EUNMODELED)
+      return fixed_oracle_failure(__LINE__);
+  }
   for (const timed_route_oracle &item : timed_route_cases) {
     std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
     shell_dep_graph_t &graph = *graph_storage;
@@ -3950,7 +3997,8 @@ static int test_fixed_oracles(void) {
   }
 
   /* Static nonnumeric duplicate operands fail setup; they never become FILE
-   * resources or execute the group body. */
+   * resources or execute the group body. The failure is certain (reference
+   * Bash: "ambiguous redirect"), so no graph models it. */
   static const char *const invalid_group_legacy_redirects[] = {
       "{ printf x; } 2>&combined",
       "{ printf x; } {fd}>&combined",
@@ -3968,7 +4016,7 @@ static int test_fixed_oracles(void) {
         processed.group_io_op_count != 1 ||
         processed.group_io_ops[0].kind != SHELL_GROUP_IO_FAILED_REDIRECT ||
         shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) !=
-            SHELL_DEP_OK)
+            SHELL_DEP_EUNMODELED)
       return fixed_oracle_failure(__LINE__);
     shell_processed_commands_free(&processed);
   }
@@ -5242,8 +5290,33 @@ static void descriptor_move_source(uint8_t selector, char (&input)[512]) {
              source, source);
 }
 
+/* Forms whose every rendering makes reference Bash report a descriptor
+ * error: a move or copy leaves a used descriptor closed, a quoted or empty
+ * operand is no move, an empty command name, or a Bash save is destroyed
+ * (55-58). None has a dependency model. */
+static bool descriptor_move_unmodeled(unsigned form) {
+  static const unsigned forms[] = {
+      0,  2,  3,  5,  6,  11, 12, 17, 18, 19, 20, 24, 25, 26, 27, 30, 36,
+      42, 44, 49, 52, 53, 55, 56, 57, 58, 61, 63, 66, 67, 69, 70, 71, 72};
+  for (unsigned rejected : forms)
+    if (form == rejected)
+      return true;
+  return false;
+}
+
 static int test_descriptor_move(uint8_t selector, const char *input) {
   unsigned form = selector % descriptor_move_form_count;
+  if (descriptor_move_unmodeled(form)) {
+    shell_dep_graph_t graph = {};
+    shell_dep_error_t error =
+        shell_dep_graph_parse(input, strlen(input), nullptr, nullptr, &graph);
+    if (error != SHELL_DEP_EUNMODELED) {
+      fprintf(stderr, "descriptor move rejection oracle %u (error %d): %s\n",
+              selector, error, input);
+      return 1;
+    }
+    return 0;
+  }
   bool expected_route =
       form == 1 || form == 4 || form == 5 || form == 7 ||
       (form >= 8 && form != 12 && form < 26) || form == 28 || form == 29 ||
@@ -5683,7 +5756,7 @@ static int test_tokenizer_state(const char *input, size_t length) {
   bool lexical_complete = !state.in_quotes && !state.in_arithmetic &&
                           !state.in_conditional && !state.conditional_invalid &&
 
-                          state.brace_depth == 0 &&
+                          state.brace_depth == 0 && state.paren_depth == 0 &&
                           state.brace_group_depth == 0 && !state.heredoc_error;
   shell_tokenize_status_t full_status =
       shell_tokenize_commands(input, length, &commands, &command_count);
@@ -6927,6 +7000,20 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
     shell_processed_commands_free(&processed);
     return failed;
   }
+  if (item.depgraph_unmodeled) {
+    bool failed = fast_error != SHELL_OK || full_error != SHELL_TOKENIZE_OK ||
+                  process_error != SHELL_PROCESS_OK ||
+                  graph_error != SHELL_DEP_EUNMODELED;
+    if (failed && g_verbose)
+      fprintf(stderr,
+              "generated substitution unmodeled case failed: %s "
+              "(graph=%d)\n",
+              item.command.c_str(), graph_error);
+    shell_netstring_buffer_free(&netargv_sequence);
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    return failed;
+  }
   if (item.depgraph_rejected) {
     bool failed = fast_error != SHELL_OK || full_error != SHELL_TOKENIZE_OK ||
                   process_error != SHELL_PROCESS_OK ||
@@ -7342,9 +7429,6 @@ static void run_fixed_oracles() {
     uint32_t fd;
     bool input;
   } read_inputs[] = {
-      {"exec {fd}<<<saved && read -n-0\"$fd\" value <<<payload", 0, false},
-      {"exec {fd}<<<saved && read -N \"-00${fd} \" value <<<payload", 0, false},
-      {"exec {fd}<<<saved && read -u-00\"$fd\" value <<<payload", 0, false},
       {"exec {fd}<<<saved && read -u00\"$fd\" value", SHELL_DEP_FD_NAMED, true},
       {"unset fd; read -u-00\"$fd\" value <<<payload", 0, true},
       {"unset fd; read -u3\"$fd\" value 3<<<payload", 3, true},
@@ -7354,63 +7438,25 @@ static void run_fixed_oracles() {
       {"unset BASH_REMATCH; result=$(inner=$(read BASH_REMATCH <<<payload))", 0,
        true},
       {"unset RANDOM; result=$(read -n0 RANDOM)", 0, false},
-      {"unset _; : 1; read -n\"$_\" value <<<payload", 0, true},
-      {"unset '_'; builtin : 1; builtin read -n\"${_}\" value <<<payload", 0,
-       true},
-      {"unset count; read -n0 -- \"$target\"; "
-       "read -n\"$count\" value <<<payload",
-       0, true},
-      {"unset fd; read -n\"$fd\" -p\"$fd\" value <<<payload", 0, false},
-      {"unset fd; read -u\"$fd\" -n\"$fd\" value <<<payload", 0, false},
       {"unset fd; read -n0\"$fd\" value <<<payload", 0, false},
-      {"unset fd; read -- -p\"$fd\" value <<<payload", 0, false},
-      {"unset fd; read -- \"$fd\"- value <<<payload", 0, false},
-      {"exec {fd}<<<saved && read -n-\"$fd\" value <<<payload", 0, false},
-      {"exec {fd}<<<saved && read -N -\"$fd\" value <<<payload", 0, false},
-      {"exec {fd}<<<saved && read -t-\"$fd\" value <<<payload", 0, false},
-      {"exec {fd}<<<saved && read -u-\"$fd\" value <<<payload", 0, false},
-      {"read -n-1\"$unknown\" value <<<payload", 0, false},
-      {"read -u-1\"$unknown\" value <<<payload", 0, false},
-      {"read -n\"$unknown\"x value <<<payload", 0, false},
-      {"read -u\"$unknown\"x value <<<payload", 0, false},
-      {"read -- pre\"$unknown\"- value <<<payload", 0, false},
-      {"read -- \"$unknown\"~ value <<<payload", 0, false},
       {"unset fd; read -p\"$fd\" -e value <<<payload", 0, true},
-      {"unset fd; read -n\"$fd\" -a value <<<payload", 0, false},
-      {"exec 3<&-; read -u3 -e value <<<payload", 0, false},
       {"read -t0.0000000\"$unknown\" value <<<payload", 0, false},
       {"read -t0.0000005\"$unknown\" value <<<payload", 0, true},
-      {"unset empty; read -- $empty~ value <<<payload", 0, false},
-      {"read -- pre<(printf generated >child) value <<<payload", 0, false},
-      {"read -- >(printf generated >child)suffix value <<<payload", 0, false},
       {"read -p pre<(printf generated >child) value <<<payload", 0, true},
       {"exec {input}<<<saved && { unset empty; "
        "read -u\"$input\" oth\"$empty\"er; }",
        SHELL_DEP_FD_NAMED, true},
-      {"unset empty; read -- -p\"$empty\" RANDOM <<<payload", 0, false},
-      {"read -u3 RANDOM 3<&-", 0, false},
       {"unset empty; read -n0 other\"$empty\"", 0, false},
-      {"read -- bad-\"$unknown\" value <<<payload", 0, false},
-      {"read -- first bad-\"$unknown\" value <<<payload", 0, true},
       {"read -t0 -- -p\"$unknown\" value <<<payload", 0, false},
       {"exec 3<<<payload; <() read -u3 value", 3, true},
       {"exec 3<<<payload; command <() read <() -u3 value", 3, true},
       {"<() read -n0 value <<<payload", 0, false},
       {"printf payload | read value", 0, true},
       {"read -u3 value <unused 3<input", 3, true},
-      {"read -u3 -u4 value 3<&- 4<<<payload", 0, false},
       {"read -t0 value <input", 0, false},
       {"read -N0 value <input", 0, false},
-      {"read -- \"$target\" later <<<payload", 0, true},
-      {"read first \"$target\" later <<<payload", 0, true},
       {"read -t0 first \"$target\" later <<<payload", 0, false},
-      {"exec 63<&-; read -u63 value <(printf payload)", 63, true},
       {"exec 63<&-; read -p <(printf payload) -u63 value", 63, true},
-      {"exec 63<&-; read -u63 <(printf payload)", 63, false},
-      {"read -u3 value 3>writeonly", 3, false},
-      {"exec {out}>out && { read out 0<&-; printf x >&\"$out\"; }", 0, false},
-      {"unset fd; exec {fd}<input; read -u\"$fd\" 3 value 3<<<payload", 3,
-       true},
       {"exec {fd}<<<old; read -u \"$fd\" value {fd}<<<new", SHELL_DEP_FD_NAMED,
        true},
       {"exec 3<&-; exec {fd}<<<payload; "
@@ -7430,27 +7476,9 @@ static void run_fixed_oracles() {
       {"read -t18446744073709551617 value <<<payload", 0, true},
       {"read -t-18446744073709551615.5 value <<<payload", 0, true},
       {"read -t18446744073709551616 value <<<payload", 0, false},
-      {"read -t-18446744073709551616.5 value <<<payload", 0, false},
-      {"exec {input}<<<payload && read -u\"$input\" -- \"$input\"",
-       SHELL_DEP_FD_NAMED, false},
-      {"exec {input}<<<payload {out}>out && { "
-       "read -u\"$input\" -- first \"$input\" out; printf x >&\"$out\"; }",
-       SHELL_DEP_FD_NAMED, true},
-      {"exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
-       "read -- $empty value <<<payload; printf x >&\"$out\"; }",
-       0, true},
-      {"exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
-       "read -- \"\"$empty value <<<payload; printf x >&\"$out\"; }",
-       0, false},
-      {"exec {fd}>out && { read -p\"$fd\" -u3 fd 3<&-; "
-       "printf x >&\"$fd\"; }",
-       0, false},
       {"{ time printf payload; } 2>&1 | "
        "{ exec {fd}<&0; read -u\"$fd\" value; }",
        SHELL_DEP_FD_NAMED, true},
-      {"exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
-       "read -p\"$empty\" out value <<<payload; printf x >&\"$out\"; }",
-       0, true},
   };
   const shell_dep_limits_t read_limits = SHELL_DEP_LIMITS_DEFAULT;
   static const struct {
@@ -7487,9 +7515,6 @@ static void run_fixed_oracles() {
       {"target=bad-name; read -n0 first \"$target\" last <<<payload "
        "|| printf fallback >fallback",
        "fallback", nullptr},
-      {"value=$(read -N0 first \"$target\" last <<<payload) "
-       "|| printf fallback >fallback",
-       "fallback", nullptr},
       {"! read -n0 first \"$target\" last <<<payload "
        "&& printf fallback >fallback",
        "fallback", nullptr},
@@ -7499,17 +7524,8 @@ static void run_fixed_oracles() {
        nullptr, "fallback"},
       {"a=$(false) b=${choice:+$(true)$(false)} && printf fallback >fallback",
        nullptr, "fallback"},
-      {"exec 3<&-; a=$(true) b=${choice:+$(read -u11 -n0 probe)$(true)} && "
-       "{ true 3<&11 || printf fallback >fallback; }",
-       "fallback", nullptr},
       {"a=$(false) b=$(\\\n) || printf fallback >fallback", "fallback",
        nullptr},
-      {"exec 3<&-; value=${choice:+$(read -u11 -n0 probe)} && "
-       "{ true 3<&11 || printf fallback >fallback; }",
-       "fallback", nullptr},
-      {"exec 3<&-; choice || read -u11 -n0 probe && "
-       "{ true 3<&11 || printf fallback >fallback; }",
-       "fallback", nullptr},
       {"a=$(false) b=$() || printf fallback >fallback", "fallback", nullptr},
       {"a=$(false) b=$(# comment\n) || printf fallback >fallback", "fallback",
        nullptr},
@@ -7517,12 +7533,6 @@ static void run_fixed_oracles() {
       {"a=$(false) b=` # comment\n` || printf fallback >fallback", nullptr,
        "fallback"},
       {"false; value=$() || printf fallback >fallback", nullptr, "fallback"},
-      {"exec 3<&-; a=$(read -u11 -n0 probe) b=$(</dev/null) && "
-       "{ true 3<&11 || printf fallback >fallback; }",
-       "fallback", nullptr},
-      {"exec 3<&-; a=$(read -u11 -n0 probe) b=$() && "
-       "{ true 3<&11 || printf fallback >fallback; }",
-       nullptr, "fallback"},
       {"value=$(< <()) && printf success >success || printf fallback >fallback",
        "fallback", "success"},
       {"value=$(< >( \n)) && printf success >success || printf fallback "
@@ -7541,9 +7551,6 @@ static void run_fixed_oracles() {
        "fallback", nullptr},
       {"read -t \"$timeout\" -t1 -u11 -n0 probe 11<<<input || "
        "printf fallback >fallback",
-       "fallback", nullptr},
-      {"exec 1>&-; value=$(read -u1 -n0 probe); "
-       "true 3>&1 || printf fallback >fallback",
        "fallback", nullptr},
       {"exec 3<&- 4<&- 63<&-; path=${choice:+<(:)} read -u63 -n0 value "
        "|| printf fallback >fallback",
@@ -7592,6 +7599,110 @@ static void run_fixed_oracles() {
       abort();
     }
   }
+  /* No model: a copy source must exist on every path that reaches it, and
+   * fd 11 is never opened (descriptors above 2 start closed) and fd 1 was
+   * closed. Last, a precision gap (read_input_test dynamic_target_failures):
+   * the analysis does not follow a status out of a substitution, so it
+   * cannot see `||` consume the read error. */
+  static const char *const unmodeled_inputs[] = {
+      "exec 3<&-; a=$(true) b=${choice:+$(read -u11 -n0 probe)$(true)} && "
+      "{ true 3<&11 || printf fallback >fallback; }",
+      "exec 3<&-; value=${choice:+$(read -u11 -n0 probe)} && "
+      "{ true 3<&11 || printf fallback >fallback; }",
+      "exec 3<&-; choice || read -u11 -n0 probe && "
+      "{ true 3<&11 || printf fallback >fallback; }",
+      "exec 3<&-; a=$(read -u11 -n0 probe) b=$(</dev/null) && "
+      "{ true 3<&11 || printf fallback >fallback; }",
+      "exec 3<&-; a=$(read -u11 -n0 probe) b=$() && "
+      "{ true 3<&11 || printf fallback >fallback; }",
+      "exec 1>&-; value=$(read -u1 -n0 probe); "
+      "true 3>&1 || printf fallback >fallback",
+      "value=$(read -N0 first \"$target\" last <<<payload) "
+      "|| printf fallback >fallback",
+      /* Reference Bash reports a read error for each of these (an invalid
+       * number, timeout or descriptor specification, an invalid identifier,
+       * a closed or write-only descriptor, or a failed duplication before
+       * the read), except -n"$_", rejected by the dynamic read option rule. */
+      "exec {fd}<<<saved && read -n-0\"$fd\" value <<<payload",
+      "exec {fd}<<<saved && read -N \"-00${fd} \" value <<<payload",
+      "exec {fd}<<<saved && read -u-00\"$fd\" value <<<payload",
+      "unset _; : 1; read -n\"$_\" value <<<payload",
+      "unset '_'; builtin : 1; builtin read -n\"${_}\" value <<<payload",
+      "unset count; read -n0 -- \"$target\"; "
+      "read -n\"$count\" value <<<payload",
+      "unset fd; read -n\"$fd\" -p\"$fd\" value <<<payload",
+      "unset fd; read -u\"$fd\" -n\"$fd\" value <<<payload",
+      "unset fd; read -- -p\"$fd\" value <<<payload",
+      "unset fd; read -- \"$fd\"- value <<<payload",
+      "exec {fd}<<<saved && read -n-\"$fd\" value <<<payload",
+      "exec {fd}<<<saved && read -N -\"$fd\" value <<<payload",
+      "exec {fd}<<<saved && read -t-\"$fd\" value <<<payload",
+      "exec {fd}<<<saved && read -u-\"$fd\" value <<<payload",
+      "read -n-1\"$unknown\" value <<<payload",
+      "read -u-1\"$unknown\" value <<<payload",
+      "read -n\"$unknown\"x value <<<payload",
+      "read -u\"$unknown\"x value <<<payload",
+      "read -- pre\"$unknown\"- value <<<payload",
+      "read -- \"$unknown\"~ value <<<payload",
+      "unset fd; read -n\"$fd\" -a value <<<payload",
+      "exec 3<&-; read -u3 -e value <<<payload",
+      "unset empty; read -- $empty~ value <<<payload",
+      "read -- pre<(printf generated >child) value <<<payload",
+      "read -- >(printf generated >child)suffix value <<<payload",
+      "unset empty; read -- -p\"$empty\" RANDOM <<<payload",
+      "read -u3 RANDOM 3<&-",
+      "read -- bad-\"$unknown\" value <<<payload",
+      "read -- first bad-\"$unknown\" value <<<payload",
+      "read -u3 -u4 value 3<&- 4<<<payload",
+      "read -- \"$target\" later <<<payload",
+      "read first \"$target\" later <<<payload",
+      "exec 63<&-; read -u63 value <(printf payload)",
+      "exec 63<&-; read -u63 <(printf payload)",
+      "read -u3 value 3>writeonly",
+      "exec {out}>out && { read out 0<&-; printf x >&\"$out\"; }",
+      "unset fd; exec {fd}<input; read -u\"$fd\" 3 value 3<<<payload",
+      "read -t-18446744073709551616.5 value <<<payload",
+      "exec {input}<<<payload && read -u\"$input\" -- \"$input\"",
+      "exec {input}<<<payload {out}>out && { "
+      "read -u\"$input\" -- first \"$input\" out; printf x >&\"$out\"; }",
+      "exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
+      "read -- $empty value <<<payload; printf x >&\"$out\"; }",
+      "exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
+      "read -- \"\"$empty value <<<payload; printf x >&\"$out\"; }",
+      "exec {fd}>out && { read -p\"$fd\" -u3 fd 3<&-; "
+      "printf x >&\"$fd\"; }",
+      "exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
+      "read -p\"$empty\" out value <<<payload; printf x >&\"$out\"; }",
+      /* Certain shell-level errors: a copy from the closed fd 3, or a
+       * redirect from an empty name. */
+      "exec 3>&-; echo 2>&1 >&3 | cat <input",
+      "exec 3>&-; { echo 2>&1 >&3; } | cat <input",
+      "exec 3>&-; sh -c \"$(echo 2>&1 >&3)\"",
+      "exec 3>&-; sh -c \"$(echo >&3 2>&1)\"",
+      "exec 3>&-; sh -c \"$({ echo body; } 2>&1 >&3)\"",
+      "exec 3>&-; cat <(echo 2>&1 >&3)",
+      "sh -c \"$(exec 2>&1; x=$(<''))\"",
+      /* fd 11 starts closed, and {fd} takes fd 10 (reference Bash: "read:
+       * 11: invalid file descriptor"). */
+      "read -u11 value {fd}<<<payload",
+      /* The second read runs after a failed first one, where fd 63 or 62
+       * may be absent: a possible unhandled read error. */
+      "exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
+      "\"$(: | read -u63 -n0 first || read -u63 second)\"",
+      "exec 3<&- 4<&- 62<&- 63<&-; : ${choice:+<(printf payload)} "
+      "\"$(exec 62<&63; : | { read -u62 -n0 first; } || read -u62 second)\"",
+      /* Precision gap: Bash runs the second read only after the first
+       * succeeded, but the analysis does not carry that proof out of the
+       * pipeline's group. */
+      "exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
+      "\"$(: | { read -u63 -n0 first; } && read -u63 second)\"",
+  };
+  for (const char *source : unmodeled_inputs)
+    if (shell_dep_graph_parse(source, strlen(source), nullptr, &read_limits,
+                              &graph) != SHELL_DEP_EUNMODELED) {
+      fprintf(stderr, "unmodeled input oracle failed: %s\n", source);
+      abort();
+    }
   for (bool success : {false, true}) {
     std::string source = "exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
                          "\"$(read -u63 -n0 first ";
@@ -7609,7 +7720,10 @@ static void run_fixed_oracles() {
         input |= node.cmd.token_lens[t] == 6 &&
                  !memcmp(node.cmd.tokens[t], "second", 6);
     }
-    if (status != SHELL_DEP_OK || input != success ||
+    /* After a failed first read, fd 63 may be absent, so the second read
+     * may report an unhandled error: no model. */
+    if ((success ? status != SHELL_DEP_OK || !input
+                 : status != SHELL_DEP_EUNMODELED) ||
         !shellsplit_test_depgraph_invariants(source.data(), source.size(),
                                              status, &graph, &read_limits)) {
       fprintf(stderr, "process descriptor outcome correlation: %s\n",
@@ -7623,17 +7737,8 @@ static void run_fixed_oracles() {
     bool input;
   } private_inputs[] = {
       {"exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
-       "\"$(: | read -u63 -n0 first || read -u63 second)\"",
-       63, false},
-      {"exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
        "\"$(: | read -u63 -n0 first && read -u63 second)\"",
        63, true},
-      {"exec 3<&- 4<&- 62<&- 63<&-; : ${choice:+<(printf payload)} "
-       "\"$(exec 62<&63; : | { read -u62 -n0 first; } || read -u62 second)\"",
-       62, false},
-      {"exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
-       "\"$(: | { read -u63 -n0 first; } && read -u63 second)\"",
-       63, false},
   };
   for (const auto &fixture : private_inputs) {
     shell_dep_error_t status = shell_dep_graph_parse(
@@ -7667,7 +7772,6 @@ static void run_fixed_oracles() {
     const char *source;
     bool payload;
   } allocation_cases[] = {
-      {"read -u11 value {fd}<<<payload", true},
       {"exec 3<&-; read -u11 -n0 probe && "
        "read -u11 value {fd}<<<payload",
        false},
@@ -7677,22 +7781,24 @@ static void run_fixed_oracles() {
       {"exec 3<&-; : | read -u11 -n0 probe && "
        "read -u11 value {fd}<<<payload",
        false},
+      /* fd 3 starts closed, so the probe certainly fails and the read after
+       * `&&` never runs (reference Bash: "3: invalid file descriptor"). */
       {"exec 3<&-; : <(:) \"$(read -u3 -n0 probe && "
        "read -u11 value {fd}<<<payload)\"",
        false},
       {"exec 3<&- 11<>/dev/null && exec {a}<<<first && "
        "{ exec 11<&-; : <(:) \"$(read -u3 -n0 probe && "
        "{ exec {a}<&-; read -u11 value {b}<<<payload; })\"; }",
-       true},
+       false},
       {"exec 3<&-; : <(:) \"$(read -u3 -n0 probe && "
        "{ exec 8>&9- && read -u11 value {fd}<<<payload; })\"",
-       true}};
+       false}};
   for (const auto &test : allocation_cases) {
     shell_dep_error_t status = shell_dep_graph_parse(
         test.source, strlen(test.source), nullptr, &read_limits, &graph);
     uint32_t reader = UINT32_MAX;
     unsigned readers = 0, payload_inputs = 0;
-    bool routing = true, inherited_input = false;
+    bool routing = true;
     for (uint32_t n = 0; n < graph.node_count; n++) {
       const auto &node = graph.nodes[n];
       if (node.type != SHELL_NODE_CMD || node.cmd.token_count < 3 ||
@@ -7715,9 +7821,6 @@ static void run_fixed_oracles() {
                    !edge.target_fd_name_len &&
                    edge.flags == SHELL_DEP_EDGE_FLAG_NONE;
       const auto &document = graph.nodes[edge.from];
-      inherited_input |= input && edge.to == reader &&
-                         document.type == SHELL_NODE_FD &&
-                         document.fd.number == 11;
       if (!input || document.type != SHELL_NODE_DOC ||
           document.doc.kind != SHELL_DOC_HERESTRING ||
           document.doc.value_len != 7 ||
@@ -7728,8 +7831,6 @@ static void run_fixed_oracles() {
       payload_inputs++;
     }
     if (status != SHELL_DEP_OK || readers != 1 || !routing ||
-        (!strcmp(test.source, "read -u11 value {fd}<<<payload") &&
-         !inherited_input) ||
         payload_inputs != static_cast<unsigned>(test.payload) ||
         !shellsplit_test_depgraph_invariants(test.source, strlen(test.source),
                                              status, &graph, &read_limits)) {
@@ -7739,14 +7840,16 @@ static void run_fixed_oracles() {
     }
   }
   fixed_oracle_phase("process lifetime pressure");
+  /* Two live process-substitution pipes beside sixteen short-lived ones.
+   * (As read arguments, <(:) words are invalid identifiers: no model.) */
   for (bool before : {false, true}) {
     std::string source = "exec 10<&-; ";
     if (!before)
-      source += "read -n0 -u63 value <(:) <(:); ";
+      source += "cat <(:) <(:); ";
     for (unsigned i = 0; i < 16; i++)
       source += ": <(:); ";
     if (before)
-      source += "read -n0 -u63 value <(:) <(:)";
+      source += "cat <(:) <(:)";
     shell_dep_error_t status = shell_dep_graph_parse(
         source.data(), source.size(), nullptr, &read_limits, &graph);
     if (status != SHELL_DEP_OK ||
@@ -7799,7 +7902,10 @@ static void run_fixed_oracles() {
   }
   for (const char *value : {"${choice:+<(printf payload)}",
                             "${outer:+${inner:+<(printf payload)}}"}) {
-    std::string source = occupied + "exec 0<&-; path=" + value + " read value";
+    /* Without the substitution, read fails on closed stdin; `|| true`
+     * handles that error. */
+    std::string source =
+        occupied + "exec 0<&-; path=" + value + " read value || true";
     shell_dep_error_t status = shell_dep_graph_parse(
         source.data(), source.size(), nullptr, &read_limits, &graph);
     bool input = false;
@@ -7860,8 +7966,6 @@ static void run_fixed_oracles() {
     const char *source;
     uint32_t nodes, edges;
   } terminal_capacity[] = {
-      {"exec 3>&-; echo 2>&1 >&3 | cat <input", 5, 3},
-      {"exec 3>&-; { echo 2>&1 >&3; } | cat <input", 6, 4},
       {"echo | : <&-", 3, 1},
       {"{ time echo; } 2>&1 | cat <input", 7, 3},
   };
@@ -7884,11 +7988,7 @@ static void run_fixed_oracles() {
     const char *source;
     bool capture;
   } setup_diagnostics[] = {
-      {"exec 3>&-; sh -c \"$(echo 2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$(echo >&3 2>&1)\"", false},
-      {"exec 3>&-; sh -c \"$({ echo body; } 2>&1 >&3)\"", true},
       {"exec 3>&-; sh -c \"$(false && echo 2>&1 >&3)\"", false},
-      {"exec 3>&-; cat <(echo 2>&1 >&3)", true},
       {"sh -c \"$(exec 2>&1; x=${missing:?expansion-marker})\"", true},
       {"sh -c \"$(exec 2>&1; x=$((1/0)))\"", true},
       {"sh -c \"$(exec 2>&1; : ${missing:?expansion-marker} 1>&- 2>&-)\"",
@@ -7898,7 +7998,6 @@ static void run_fixed_oracles() {
       {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && x=$((1/0)))\"", false},
       {"sh -c \"$(x=1)\"", false},
       {"sh -c \"$(exec 2>&1; x=$(<input))\"", true},
-      {"sh -c \"$(exec 2>&1; x=$(<''))\"", true},
       {"sh -c \"$(exec 2>&1; x=$(< <(true 1>&- 2>&-)))\"", true},
       {"sh -c \"$(: 2>&1 >$(<input) 1>&- 2>&-)\"", true},
   };
@@ -8895,6 +8994,12 @@ static void run_fixed_oracles() {
   for (const auto &fixture : shellsplit_test_tilde_words) {
     size_t length = strlen(fixture.word), decoded = 0;
     std::string source = std::string("echo >") + fixture.word;
+    if (fixture.ambiguous_redirect) {
+      if (shell_dep_graph_parse(source.data(), source.size(), ".", nullptr,
+                                &graph) != SHELL_DEP_EUNMODELED)
+        abort();
+      continue;
+    }
     bool valid = shell_visit_static_word(fixture.word, length, nullptr, nullptr,
                                          &decoded) != fixture.generic_dynamic &&
                  shell_dep_graph_parse(source.data(), source.size(), ".",

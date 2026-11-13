@@ -504,14 +504,17 @@ static void test_builtin_option_semantics(void) {
       shell_dep_graph_t graph = {0};
       shell_dep_error_t graph_status =
           shell_dep_graph_parse(source, (size_t)length, NULL, NULL, &graph);
-      if (graph_status != (supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE))
+      bool unmodeled = shellsplit_test_builtin_options[i].unmodeled;
+      shell_dep_error_t expected = unmodeled   ? SHELL_DEP_EUNMODELED
+                                   : supported ? SHELL_DEP_OK
+                                               : SHELL_DEP_EPARSE;
+      if (graph_status != expected)
         fprintf(stderr,
                 "builtin option graph classification mismatch: %s "
                 "status=%d expected=%d\n",
-                source, graph_status,
-                supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE);
-      CHECK(graph_status == (supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE));
-      if (supported)
+                source, graph_status, expected);
+      CHECK(graph_status == expected);
+      if (expected == SHELL_DEP_OK)
         CHECK(shell_dep_graph_validate(&graph).valid);
       else
         CHECK(graph.node_count == 0 && graph.edge_count == 0);
@@ -4893,6 +4896,11 @@ static void test_word_expansion_recognition(void) {
                             success ? "&&" : "||");
       CHECK(length > 0 && (size_t)length < sizeof(source));
       shell_dep_graph_t graph = {0};
+      if (shellsplit_test_substitution_status_cases[i].unmodeled) {
+        CHECK(shell_dep_graph_parse(source, (size_t)length, ".", NULL,
+                                    &graph) == SHELL_DEP_EUNMODELED);
+        continue;
+      }
       CHECK(shell_dep_graph_parse(source, (size_t)length, ".", NULL, &graph) ==
             SHELL_DEP_OK);
       CHECK(shell_dep_graph_validate(&graph).valid);

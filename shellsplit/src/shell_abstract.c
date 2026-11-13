@@ -1217,10 +1217,12 @@ abstract_command_parse_impl(const char *command, size_t command_length,
          * separately. A redirect consumes their complete shell word, not just
          * its first fragment. Find that boundary once and consume the fragments
          * in order; this is semantic ownership, not parse-result verification.
+         * The prevalidated source is complete, so its word always ends,
+         * including at a final lone backslash.
          */
         size_t after = 0;
-        (void)shell_source_skip_shell_word(command, command_length,
-                                           tok->position, &after);
+        (void)shell_source_skip_complete_shell_word(command, command_length,
+                                                    tok->position, &after);
         redirect_word = *tok;
         redirect_word.length = after - tok->position;
         tok = &redirect_word;

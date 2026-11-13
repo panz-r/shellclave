@@ -368,8 +368,10 @@ int main(int argc, char **argv) {
   CHECK(!setup_file("never") && setup_file("yes"));
   parse("((0)) | ((1)) && cat <yes");
   CHECK(setup_file("yes"));
-  parse("((1)) <\"\" && cat <never");
-  CHECK(!setup_file("never"));
+  /* A setup which certainly fails is a shell-level error: no model. */
+  current = "((1)) <\"\" && cat <never";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EUNMODELED);
   parse("cd /tmp && ((1)) && cat <input");
   for (uint32_t n = 0; n < graph->node_count; ++n)
     if (graph->nodes[n].type == SHELL_NODE_CMD &&
@@ -424,7 +426,7 @@ int main(int argc, char **argv) {
   } subshells[] = {
       {"((printf ok); printf tail)", "( (printf ok); printf tail )", "printf"},
       {"((cat secret.txt) 3>&1)", "( (cat secret.txt) 3>&1 )", "cat"},
-      {"((true) >\"\") && printf x", "( (true) >\"\" ) && printf x", "true"},
+      {"((true) >out) && printf x", "( (true) >out ) && printf x", "true"},
       {"x; ((cat) ); y", "x; ( (cat) ); y", "cat"},
   };
   for (size_t i = 0; i < sizeof(subshells) / sizeof(subshells[0]); i++) {

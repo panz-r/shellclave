@@ -162,7 +162,8 @@ static bool shellsplit_test_depgraph_invariants(
 
   if (error != SHELL_DEP_OK && error != SHELL_DEP_EINPUT &&
       error != SHELL_DEP_ETRUNC && error != SHELL_DEP_EPARSE &&
-      error != SHELL_DEP_EWORKSPACE && error != SHELL_DEP_EEXPAND)
+      error != SHELL_DEP_EWORKSPACE && error != SHELL_DEP_EEXPAND &&
+      error != SHELL_DEP_EUNMODELED)
     return false;
   if ((error == SHELL_DEP_OK &&
        (graph->status & ~SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC) !=
@@ -171,7 +172,8 @@ static bool shellsplit_test_depgraph_invariants(
        (graph->status & ~SHELL_DEP_STATUS_UNRESOLVED_ARITHMETIC) !=
            SHELL_DEP_STATUS_TRUNCATED) ||
       ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
-        error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND) &&
+        error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND ||
+        error == SHELL_DEP_EUNMODELED) &&
        graph->status != SHELL_DEP_STATUS_ERROR) ||
       graph->node_count > max_nodes || graph->edge_count > max_edges ||
       graph->cwd_buf.len > max_cwd ||
@@ -180,7 +182,8 @@ static bool shellsplit_test_depgraph_invariants(
     return false;
 
   if (error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
-      error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND)
+      error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND ||
+      error == SHELL_DEP_EUNMODELED)
     return graph->node_count == 0 && graph->edge_count == 0;
   if (!shell_dep_graph_validate(graph).valid)
     return false;
@@ -214,7 +217,15 @@ static bool shellsplit_test_depgraph_invariants(
                                  SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                                  SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
                                  SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP |
-                                 SHELL_DEP_EDGE_FLAG_ENV_READ)) != 0 ||
+                                 SHELL_DEP_EDGE_FLAG_ENV_READ |
+                                 SHELL_DEP_EDGE_FLAG_REQUIRED)) != 0 ||
+                ((edge->flags & SHELL_DEP_EDGE_FLAG_REQUIRED) != 0 &&
+                 ((edge->type != SHELL_EDGE_READ &&
+                   edge->type != SHELL_EDGE_WRITE &&
+                   edge->type != SHELL_EDGE_APPEND &&
+                   edge->type != SHELL_EDGE_FD_OPEN) ||
+                  (graph->nodes[edge->from].type != SHELL_NODE_DOC &&
+                   graph->nodes[edge->to].type != SHELL_NODE_DOC))) ||
                 ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
                  (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
                 ((edge->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |

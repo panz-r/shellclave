@@ -214,7 +214,6 @@ static inline SHELL_NONNULL(1, 2, 6) void dep_observe_conditional_file(
 typedef struct {
   dep_route_state_t *state;
   dep_route_journal_t *journal;
-  const dep_owner_routes_t *baseline;
   const dep_prefix_assignment_set_t *prefixes;
   bool impossible;
 } dep_test_context_t;
@@ -229,15 +228,14 @@ static SHELL_NONNULL(1, 3) unsigned dep_test_lookup(const char *name,
   uint32_t root;
   while (dep_route_next(&iterator, test->journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    unsigned prefix =
-        test->prefixes
-            ? dep_prefix_assignment_visible(test->prefixes, &word, &one,
-                                            test->journal, test->baseline)
-            : SHELL_TEST_FALSE;
+    unsigned prefix = test->prefixes
+                          ? dep_prefix_assignment_visible(test->prefixes, &word,
+                                                          &one, test->journal)
+                          : SHELL_TEST_FALSE;
     if (prefix & SHELL_TEST_TRUE)
       result |= SHELL_TEST_TRUE;
     if (prefix & SHELL_TEST_FALSE)
-      result |= dep_presence_root(root, test->journal, test->baseline,
+      result |= dep_presence_root(root, test->journal,
                                   (dep_fd_ref_t){.name = name,
                                                  .name_len = (uint32_t)length,
                                                  .value = SHELL_DEP_FD_NAMED});
@@ -254,12 +252,12 @@ static SHELL_NONNULL(1, 4) bool dep_test_assume(const char *name, size_t length,
     return true;
   }
   dep_token_t word = {name, (uint32_t)length};
-  if (test->prefixes && dep_prefix_assignment_visible(
-                            test->prefixes, &word, test->state, test->journal,
-                            test->baseline) == SHELL_TEST_TRUE)
+  if (test->prefixes &&
+      dep_prefix_assignment_visible(test->prefixes, &word, test->state,
+                                    test->journal) == SHELL_TEST_TRUE)
     return true;
   bool possible;
-  bool stored = dep_presence_assume(test->state, test->journal, test->baseline,
+  bool stored = dep_presence_assume(test->state, test->journal,
                                     (dep_fd_ref_t){.name = name,
                                                    .name_len = (uint32_t)length,
                                                    .value = SHELL_DEP_FD_NAMED},
@@ -268,16 +266,14 @@ static SHELL_NONNULL(1, 4) bool dep_test_assume(const char *name, size_t length,
   return stored;
 }
 
-static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7, 9) bool dep_test_select_program(
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 8) bool dep_test_select_program(
     const dep_snapshot_source_t *source, const shell_test_program_t *program,
     const dep_route_state_t *input, dep_route_journal_t *journal,
-    const dep_owner_routes_t *baseline, dep_route_state_t *output, bool *ready,
-    unsigned desired, bool *failed) {
+    dep_route_state_t *output, bool *ready, unsigned desired, bool *failed) {
   *output = (dep_route_state_t){0};
   *ready = false;
   dep_route_state_t entries = *input;
-  if (!dep_prefixes_resolve(&entries, &source->prefix_assignments, journal,
-                            baseline))
+  if (!dep_prefixes_resolve(&entries, &source->prefix_assignments, journal))
     return false;
   dep_route_iterator_t iterator = dep_route_iterator(&entries);
   uint32_t root;
@@ -285,7 +281,6 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7, 9) bool dep_test_select_program(
     dep_route_state_t one = dep_route_state_single(root);
     dep_test_context_t test = {.state = &one,
                                .journal = journal,
-                               .baseline = baseline,
                                .prefixes = &source->prefix_assignments};
     unsigned result = shell_test_evaluate(program, dep_test_lookup, &test);
     if (!(result & (desired == SHELL_TEST_FALSE
@@ -311,16 +306,16 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7, 9) bool dep_test_select_program(
   return true;
 }
 
-static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 8) bool dep_test_select(
+static SHELL_NONNULL(1, 2, 3, 4, 5, 7) bool dep_test_select(
     const dep_snapshot_source_t *source, const dep_route_state_t *input,
-    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
-    dep_route_state_t *output, bool *ready, unsigned desired, bool *failed) {
-  return dep_test_select_program(source, source->test, input, journal, baseline,
-                                 output, ready, desired, failed);
+    dep_route_journal_t *journal, dep_route_state_t *output, bool *ready,
+    unsigned desired, bool *failed) {
+  return dep_test_select_program(source, source->test, input, journal, output,
+                                 ready, desired, failed);
 }
 
 static SHELL_NONNULL(1, 2, 3, 7) shell_dep_error_t
-    dep_test_body_status_at(const shell_dep_graph_t *graph,
+    dep_test_body_status_at(shell_dep_graph_t *graph,
                             const dep_subgraph_streams_t *streams,
                             const dep_parse_context_t *context, uint32_t owner,
                             uint16_t expression_root, bool primary,
@@ -343,22 +338,18 @@ static SHELL_NONNULL(1, 2, 3, 7) shell_dep_error_t
     program.root = expression_root;
   dep_route_state_t state =
       dep_snapshot_alternatives(&context->workspace->snapshot_tables[table]);
-  const dep_owner_routes_t *baseline =
-      &context->workspace->snapshot_tables[context->snapshot->persistent[0]]
-           .routes;
   unsigned result = 0;
   dep_route_iterator_t iterator = dep_route_iterator(&state);
   uint32_t root;
-  while (
-      dep_route_next(&iterator, &context->workspace->snapshot_journal, &root)) {
+  while (dep_route_next(&iterator, &context->workspace->journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
     for (unsigned wanted = SHELL_TEST_FALSE; wanted <= SHELL_TEST_TRUE;
          ++wanted) {
       dep_route_state_t selected;
       bool ready, failed = false;
-      if (!dep_test_select_program(
-              source, &program, &one, &context->workspace->snapshot_journal,
-              baseline, &selected, &ready, wanted, &failed))
+      if (!dep_test_select_program(source, &program, &one,
+                                   &context->workspace->journal, &selected,
+                                   &ready, wanted, &failed))
         return SHELL_DEP_ETRUNC;
       if (ready)
         result |= wanted;

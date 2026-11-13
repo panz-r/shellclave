@@ -412,7 +412,6 @@ static void check_opaque_unsets(void) {
       {"printf -- \"$format\" value; "
        "read -n0 FUNCNAME && cat <important.txt",
        false},
-      {"read -n0 -- \"$name\"; read -n0 FUNCNAME && cat <important.txt", false},
       {"(FUNCNAME=value unset FUNCNAME); "
        "read -n0 FUNCNAME && cat <important.txt",
        false},
@@ -438,6 +437,14 @@ static void check_opaque_unsets(void) {
     CHECK(truth(source) == SHELL_CONDITIONAL_TRUE);
     CHECK(has_file_read("important.txt") == cases[i].reads);
   }
+  /* An invalid read count is a reported read error: no dependency model. */
+  current = "CONFIG=; read -n-invalid CONFIG; [[ -v CONFIG ]]";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EUNMODELED);
+  /* A dynamic read target name may be invalid: no dependency model. */
+  current = "read -n0 -- \"$name\"; read -n0 FUNCNAME";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EUNMODELED);
   CHECK(truth("unset -- \"$name\" FUNCNAME; printf -v FUNCNAME %s value; "
               "[[ -v FUNCNAME ]]") == SHELL_CONDITIONAL_TRUE);
   CHECK(truth("unset -- \"$name\" GROUPS; GROUPS=value; [[ -v GROUPS ]]") ==
@@ -864,8 +871,12 @@ int main(int argc, char **argv) {
   limits = fixture.limits;
   graph = fixture.graph[0];
   if (argc == 3) {
-    printf("%d\n",
-           !strcmp(argv[1], "--test") ? test_truth(argv[2]) : truth(argv[2]));
+    if (!strcmp(argv[1], "--status"))
+      printf("%d\n", shell_dep_graph_parse(argv[2], strlen(argv[2]),
+                                           "/workspace", &limits, graph));
+    else
+      printf("%d\n",
+             !strcmp(argv[1], "--test") ? test_truth(argv[2]) : truth(argv[2]));
     shellsplit_graph_fixture_destroy(&fixture);
     return 0;
   }
@@ -906,8 +917,6 @@ int main(int argc, char **argv) {
       {"unset CONFIG; printf -v CONFIG %s value; [[ -v CONFIG ]]",
        SHELL_CONDITIONAL_TRUE},
       {"CONFIG=; read -t0 CONFIG; [[ -v CONFIG ]]", SHELL_CONDITIONAL_TRUE},
-      {"CONFIG=; read -n-invalid CONFIG; [[ -v CONFIG ]]",
-       SHELL_CONDITIONAL_TRUE},
       {"exec {fd}>&1 && { exec {fd}>&-; [[ -v fd ]]; }",
        SHELL_CONDITIONAL_TRUE},
       {"exec {fd}>&1 && { unset fd; [[ -v fd ]]; }", SHELL_CONDITIONAL_FALSE},
@@ -998,8 +1007,6 @@ int main(int argc, char **argv) {
        SHELL_CONDITIONAL_FALSE},
       {"OPTARG=; getopts -x :a OPTARG; [[ -v OPTARG ]]",
        SHELL_CONDITIONAL_TRUE},
-      {"unset OPTARG; getopts :a OPTARG -b 9>&- 0<&9; [[ -v OPTARG ]]",
-       SHELL_CONDITIONAL_FALSE},
       {"unset DEST; getopts a DEST -b; [[ -v DEST ]]", SHELL_CONDITIONAL_TRUE},
       {"unset DEST; getopts a: DEST -a; [[ -v DEST ]]", SHELL_CONDITIONAL_TRUE},
       {"unset DEST; getopts a DEST; [[ -v DEST ]]", SHELL_CONDITIONAL_TRUE},
@@ -1013,15 +1020,14 @@ int main(int argc, char **argv) {
        SHELL_CONDITIONAL_TRUE},
       {"unset OPTARG; getopts a invalid-name -a; [[ -v OPTARG ]]",
        SHELL_CONDITIONAL_UNKNOWN},
-      {"unset fd; true {fd}>out 9>&- 1>&9 || [[ -v fd ]]",
+      {"unset fd; true {fd}>out 1>fail || [[ -v fd ]]",
        SHELL_CONDITIONAL_UNKNOWN},
-      {"unset fd; true {fd}>&1 9>&- 1>&9 || [[ -v fd ]]",
-       SHELL_CONDITIONAL_TRUE},
-      {"unset fd; true 9>&- 1>&9 {fd}>out || [[ -v fd ]]",
+      {"unset fd; true {fd}>&1 1>fail || [[ -v fd ]]", SHELL_CONDITIONAL_TRUE},
+      {"unset fd; true 1>fail {fd}>out || [[ -v fd ]]",
        SHELL_CONDITIONAL_FALSE},
-      {"unset fd; ( true {fd}>out 9>&- 1>&9 ); [[ -v fd ]]",
+      {"unset fd; ( true {fd}>out 1>fail ); [[ -v fd ]]",
        SHELL_CONDITIONAL_FALSE},
-      {"unset fd; { true; } {fd}>&1 9>&- 1>&9 || [[ -v fd ]]",
+      {"unset fd; { true; } {fd}>&1 1>fail || [[ -v fd ]]",
        SHELL_CONDITIONAL_TRUE},
       {"[[ -v UID ]]", SHELL_CONDITIONAL_TRUE},
       {"unset UID; [[ -v UID ]]", SHELL_CONDITIONAL_TRUE},
@@ -1049,6 +1055,10 @@ int main(int argc, char **argv) {
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
     CHECK(truth(cases[i].source) == cases[i].expected);
+  /* A setup which certainly fails is a shell-level error: no model. */
+  current = "unset OPTARG; getopts :a OPTARG -b 0<\"\"; [[ -v OPTARG ]]";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EUNMODELED);
   static const struct {
     const char *source;
     shell_conditional_truth_t expected;

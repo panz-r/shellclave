@@ -4254,13 +4254,16 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     out->verdict = derr == SHELL_DEP_EWORKSPACE ? SG_VERDICT_UNDETERMINED
                                                 : SG_VERDICT_REJECT;
     bool parse_error = derr == SHELL_DEP_EPARSE || derr == SHELL_DEP_EINPUT;
+    bool unmodeled = derr == SHELL_DEP_EUNMODELED;
     out->deny_reason =
         bw_copy(&bw,
                 derr == SHELL_DEP_EWORKSPACE ? "depgraph workspace unavailable"
                 : parse_error                ? "parse error"
+                : unmodeled                  ? "no safe dependency model"
                                              : "depgraph error",
                 derr == SHELL_DEP_EWORKSPACE ? 30
                 : parse_error                ? 11
+                : unmodeled                  ? 24
                                              : 14);
     if (derr != SHELL_DEP_EWORKSPACE)
       sg_init_rejected_subcommand(out, out->deny_reason);
@@ -4269,7 +4272,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       out->verdict = SG_VERDICT_UNDETERMINED;
       return SG_ERR_TRUNC;
     }
-    return derr == SHELL_DEP_EWORKSPACE ? SG_ERR_MEMORY : SG_ERR_PARSE;
+    return derr == SHELL_DEP_EWORKSPACE ? SG_ERR_MEMORY
+           : unmodeled                  ? SG_ERR_UNMODELED
+                                        : SG_ERR_PARSE;
   }
 
   /* This is graph-level information, not a property of whichever command

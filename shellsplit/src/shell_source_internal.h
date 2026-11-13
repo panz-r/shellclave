@@ -4310,6 +4310,25 @@ static inline bool shell_source_skip_shell_word(const char *input,
                                            true);
 }
 
+/* The word scanner reports a final lone backslash incomplete, since received
+ * input may continue it. A complete source ends the word there, and Bash reads
+ * the backslash as a literal byte (`test \` has the argument `\`). Skip one
+ * word of a complete source, recovering that end when everything before the
+ * backslash is a complete word. input is an immutable span, position < length,
+ * and after is written only on success. */
+static SHELL_NONNULL(1, 4) inline bool shell_source_skip_complete_shell_word(
+    const char *input, size_t length, size_t position, size_t *after) {
+  if (shell_source_skip_shell_word(input, length, position, after))
+    return true;
+  size_t body = 0;
+  if (input[length - 1] != '\\' ||
+      !shell_source_skip_shell_word(input, length - 1, position, &body) ||
+      body != length - 1)
+    return false;
+  *after = length;
+  return true;
+}
+
 /* Recognize Bash's file-content substitution from its complete body, not its
  * first byte. A single fd-0 input redirect may have list trivia and one final
  * semicolon. Other commands, descriptors, or redirects are ordinary shell

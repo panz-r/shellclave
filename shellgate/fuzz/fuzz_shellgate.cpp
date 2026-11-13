@@ -196,7 +196,8 @@ void validate_result(const sg_result_t *result, sg_error_t error,
       result->suggestion_count > 2 || result->deny_suggestion_count > 2 ||
       (result->unresolved_expansion_flags &
        ~(SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH |
-         SG_EXPANSION_UNRESOLVED_CONDITION)) != 0 ||
+         SG_EXPANSION_UNRESOLVED_CONDITION |
+         SG_EXPANSION_UNRESOLVED_ARITHMETIC)) != 0 ||
       (error == SG_ERR_TRUNC && !result->truncated) ||
       (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
       (error == SG_ERR_TRUNC &&
@@ -204,6 +205,13 @@ void validate_result(const sg_result_t *result, sg_error_t error,
         result->verdict == SG_VERDICT_ALLOW_CONDITIONAL)) ||
       result->has_violations != (result->violation_count != 0) ||
       !valid_buffer_string(result->deny_reason, buffer, buffer_size)) {
+    fprintf(stderr,
+            "result fields: error=%d verdict=%d truncated=%d subcommands=%u "
+            "violations=%u suggestions=%u/%u unresolved=%u has_violations=%d\n",
+            error, result->verdict, result->truncated, result->subcommand_count,
+            result->violation_count, result->suggestion_count,
+            result->deny_suggestion_count, result->unresolved_expansion_flags,
+            result->has_violations);
     invariant_failure("result field outside its documented bounds");
   }
 
@@ -510,13 +518,26 @@ void run_expansion_query_oracles() {
     if (!buffer.reset_for(length))
       invariant_failure("resolved expansion oracle buffer allocation");
     sg_result_t result = {};
-    if (sg_gate_evaluate(gate, fixture.command, length, buffer.data(),
-                         buffer.size(), &result) != SG_OK ||
-        state.calls != 1 || result.subcommand_count == 0 ||
+    sg_error_t error = sg_gate_evaluate(gate, fixture.command, length,
+                                        buffer.data(), buffer.size(), &result);
+    /* One empty word names no file: a certain redirect failure, which no
+     * graph models, after the one expansion. */
+    if (strcmp(fixture.records, "0:,") == 0) {
+      if (error != SG_ERR_UNMODELED || state.calls != 1) {
+        fprintf(stderr, "resolved expansion fixture: %s (error %d)\n",
+                fixture.command, error);
+        invariant_failure("resolved empty redirect operand contract");
+      }
+      continue;
+    }
+    if (error != SG_OK || state.calls != 1 || result.subcommand_count == 0 ||
         result.unresolved_expansion_flags != 0 ||
         result.requires_substitution_evaluation != fixture.inspection ||
-        result.subcommands[0].has_dynamic_substitution_io != fixture.dynamic)
+        result.subcommands[0].has_dynamic_substitution_io != fixture.dynamic) {
+      fprintf(stderr, "resolved expansion fixture: %s (error %d, calls %zu)\n",
+              fixture.command, error, state.calls);
       invariant_failure("resolved expansion topology or callback contract");
+    }
     uint32_t flags = fixture.violation == SG_VIOL_SHELL_OBFUSCATION
                          ? result.violation_type_flags
                          : result.subcommands[0].violation_type_flags;
@@ -813,10 +834,19 @@ void run_generated_expansion_case(const uint8_t *data, size_t size) {
     break;
   }
   fixture.seen.resize(fixture.source.size());
-  /* A failed named open leaves `$fd` unbound. Its later numeric redirection
-   * is unsupported dynamic-FD syntax, rather than a successful alias use. */
-  bool unsupported_fd =
-      shape == 5 && fixture.modes[1] >= 4 && fixture.modes[1] <= 6;
+  /* Purposes each shape queries, one bit per purpose. */
+  static const unsigned purposes[] = {1, 6, 6, 7, 6, 2, 3};
+  /* A path word resolved to no word, an empty word or several words is a
+   * certain redirect failure ("ambiguous redirect" or an empty name), which
+   * no graph models. In shape 5 it is reached before the unbound `$fd`. */
+  bool certain_path_failure = false;
+  for (unsigned purpose = 1; purpose < 3; purpose++) {
+    /* An unresolved leaf answers the only file substitution of depth 1. */
+    bool answered = purpose != 2 || depth > 1 || !fixture.unresolved_leaf;
+    certain_path_failure |= ((purposes[shape] >> purpose) & 1u) && answered &&
+                            fixture.modes[purpose] >= 4 &&
+                            fixture.modes[purpose] <= 6;
+  }
   if (sg_gate_set_expand_word_netargv(g_expansion_gate, generated_expand_word,
                                       &fixture) != SG_OK ||
       sg_gate_set_stop_mode(g_expansion_gate, SG_EVAL_ALL) != SG_OK)
@@ -830,7 +860,7 @@ void run_generated_expansion_case(const uint8_t *data, size_t size) {
                                         fixture.source.size(), buffer.data(),
                                         buffer.size(), &result);
     if (error != SG_OK && error != SG_ERR_TRUNC && error != SG_ERR_EXPAND &&
-        !(unsupported_fd && error == SG_ERR_PARSE)) {
+        !(certain_path_failure && error == SG_ERR_UNMODELED)) {
       fprintf(stderr,
               "generated expansion shape=%u modes=%u/%u/%u error=%d "
               "source=%s reason=%s\n",
@@ -874,11 +904,18 @@ void run_generated_expansion_case(const uint8_t *data, size_t size) {
   if (fixture.error_seen) {
     if (full_error != SG_ERR_EXPAND)
       invariant_failure("invalid callback data was not rejected");
-  } else if (unsupported_fd) {
-    if (full_error != SG_ERR_PARSE || fixture.calls[1] != 1)
-      invariant_failure("failed named open did not reject unbound alias");
+  } else if (certain_path_failure) {
+    if (full_error != SG_ERR_UNMODELED) {
+      fprintf(stderr,
+              "generated expansion shape=%u depth=%u modes=%u/%u/%u leaf=%d "
+              "error=%d source=%s\n",
+              shape, depth, fixture.modes[0], fixture.modes[1],
+              fixture.modes[2], fixture.unresolved_leaf, full_error,
+              fixture.source.c_str());
+      invariant_failure("certain path failure was not rejected");
+    }
+    /* Rejected at the failing path word; later queries may be skipped. */
   } else {
-    static const unsigned purposes[] = {1, 6, 6, 7, 6, 2, 3};
     uint32_t expected_flags = 0;
     for (unsigned purpose = 0; purpose < 3; purpose++) {
       size_t expected_calls = (purposes[shape] >> purpose) & 1u;
@@ -1135,9 +1172,18 @@ void run_semantic_reference_oracles() {
       {"sh -c \"$(: 2>&1 >${missing:?expansion-marker})\"", true},
       {"sh -c \"$(: >${missing:?expansion-marker} 2>&1)\"", false},
       {"sh -c \"$(exec 2>&1; x=$(<input))\"", true},
-      {"sh -c \"$(exec 2>&1; x=$(<''))\"", true},
       {"sh -c \"$(exec 2>&1; x=$(< <(true 1>&- 2>&-)))\"", true},
   };
+  /* Reading an empty name is a certain failure: no model. */
+  {
+    static const char empty_name[] = "sh -c \"$(exec 2>&1; x=$(<''))\"";
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, strlen(empty_name));
+    sg_result_t result = {};
+    if (sg_gate_evaluate(option_gate, empty_name, strlen(empty_name),
+                         buffer.data(), buffer.size(),
+                         &result) != SG_ERR_UNMODELED)
+      invariant_failure("empty file substitution was not rejected");
+  }
   for (const auto &fixture : assignment_captures) {
     auto &buffer =
         eval_buffer_for(g_eval_buffers.result, strlen(fixture.source));
@@ -1164,11 +1210,9 @@ void run_semantic_reference_oracles() {
     sg_error_t error = sg_gate_evaluate(option_gate, empty_file_source,
                                         sizeof(empty_file_source) - 1,
                                         buffer.data(), buffer.size(), &result);
-    if (error != SG_OK || result.truncated || result.subcommand_count == 0 ||
-        !result.requires_substitution_evaluation ||
-        !result.subcommands[0].requires_substitution_evaluation)
-      invariant_failure("failed file read lost its outer inspection consumer");
-    validate_result(&result, error, buffer.data(), buffer.size());
+    /* The resolved empty name is a certain read failure: no model. */
+    if (error != SG_ERR_UNMODELED)
+      invariant_failure("empty resolved file read was not rejected");
   }
   sg_gate_set_expand_word_netargv(option_gate, nullptr, nullptr);
   static const struct {
@@ -1220,8 +1264,10 @@ void run_semantic_reference_oracles() {
                            buffer.data(), buffer.size(), &result);
       bool reached =
           (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-      if (error != SG_OK || result.truncated ||
-          reached != (success ? fixture.succeeds : fixture.fails))
+      if (fixture.unmodeled
+              ? error != SG_ERR_UNMODELED
+              : error != SG_OK || result.truncated ||
+                    reached != (success ? fixture.succeeds : fixture.fails))
         invariant_failure("substitution outcome reachability mismatch");
       validate_result(&result, error, buffer.data(), buffer.size());
     }
@@ -1240,9 +1286,12 @@ void run_semantic_reference_oracles() {
       writes += result.subcommands[command].write_count;
       reads += result.subcommands[command].read_count;
     }
-    if (error != SG_OK || result.truncated ||
-        writes != fixture.opens + fixture.writes || reads != fixture.reads ||
-        result.requires_substitution_evaluation != fixture.shell_word)
+    if (fixture.reached
+            ? error != SG_ERR_UNMODELED
+            : error != SG_OK || result.truncated ||
+                  writes != fixture.opens + fixture.writes ||
+                  reads != fixture.reads ||
+                  result.requires_substitution_evaluation != fixture.shell_word)
       invariant_failure("static empty pathname setup contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
@@ -1253,6 +1302,11 @@ void run_semantic_reference_oracles() {
     sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
                                         buffer.data(), buffer.size(), &result);
     validate_result(&result, error, buffer.data(), buffer.size());
+    if (fixture.unmodeled) {
+      if (error != SG_ERR_UNMODELED)
+        invariant_failure("expansion control model contract mismatch");
+      continue;
+    }
     bool named_write = false;
     for (uint32_t c = 0; c < result.subcommand_count; c++) {
       const auto &command = result.subcommands[c];
@@ -1261,10 +1315,16 @@ void run_semantic_reference_oracles() {
           (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
     }
     if (error != SG_OK || result.truncated ||
-        result.requires_substitution_evaluation ||
-        result.has_dynamic_substitution_io ||
-        named_write != fixture.named_write)
+        result.requires_substitution_evaluation != fixture.subst_eval ||
+        result.has_dynamic_substitution_io != fixture.dynamic_io ||
+        named_write != fixture.named_write) {
+      fprintf(stderr,
+              "expansion control fixture: %s (error %d, inspect %d, dynamic "
+              "%d, named write %d)\n",
+              fixture.source, error, result.requires_substitution_evaluation,
+              result.has_dynamic_substitution_io, named_write);
       invariant_failure("expansion control timing contract mismatch");
+    }
   }
   for (bool redirect : {false, true}) {
     expansion_config.sensitive_write_paths[0] =
@@ -1282,7 +1342,8 @@ void run_semantic_reference_oracles() {
                            buffer.size(), &result);
       validate_result(&result, error, buffer.data(), buffer.size());
       bool inspection = fixture.active && fixture.shell_word;
-      bool writer = !redirect && fixture.active && fixture.writer;
+      bool writer =
+          fixture.active && (redirect ? fixture.redirect : fixture.writer);
       if (error != SG_OK || result.truncated ||
           result.requires_substitution_evaluation != inspection ||
           (inspection && !result.has_dynamic_substitution_io) ||
@@ -1301,7 +1362,9 @@ void run_semantic_reference_oracles() {
     sg_result_t result = {};
     sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
                                         buffer.data(), buffer.size(), &result);
-    if (fixture.supported
+    if (fixture.unmodeled
+            ? error != SG_ERR_UNMODELED || result.verdict != SG_VERDICT_REJECT
+        : fixture.supported
             ? error != SG_OK || result.verdict == SG_VERDICT_REJECT
             : error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
       invariant_failure("builtin option grammar contract mismatch");
@@ -1314,7 +1377,9 @@ void run_semantic_reference_oracles() {
     sg_result_t result = {};
     sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
                                         buffer.data(), buffer.size(), &result);
-    if (fixture.resolved
+    if (fixture.unmodeled
+            ? error != SG_ERR_UNMODELED || result.verdict != SG_VERDICT_REJECT
+        : fixture.resolved
             ? error != SG_OK || result.verdict == SG_VERDICT_REJECT
             : error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
       invariant_failure("builtin operand routing contract mismatch");
@@ -1335,6 +1400,11 @@ void run_semantic_reference_oracles() {
     sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
                                         buffer.data(), buffer.size(), &result);
     validate_result(&result, error, buffer.data(), buffer.size());
+    if (fixture.unmodeled) {
+      if (error != SG_ERR_UNMODELED || result.verdict != SG_VERDICT_REJECT)
+        invariant_failure("IFS unmodeled route contract mismatch");
+      continue;
+    }
     if (!fixture.supported) {
       if (error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
         invariant_failure("IFS unsupported route contract mismatch");
@@ -1393,17 +1463,9 @@ void run_semantic_reference_oracles() {
       {"exec 3>out || exit; builtin command /bin/true {fd}>&3; "
        "printf payload >&\"$fd\"",
        true, 1},
-      {"exec 3>out || exit; exec 4>&-; "
-       "builtin command /bin/true 4>&3-; printf payload >&3",
-       false, 0},
-      {"exec 3>out || exit; exec 4>&-; "
-       "builtin \"$runner\" 4>&3-; printf payload >&3",
-       false, 0},
       {"exec 3>out 4>base || exit; exec 10>&- 11>&-; "
        "exec {fd}>&3 {fd}>&4; echo \"$(printf payload >&10)\"",
        true, 1},
-      {"exec 3>base 4>out; : 3>&4- 3>&4; printf payload >&4", true, 1},
-      {"exec 3>base 4>out; { :; } 3>&4- 3>&4; printf payload >&4", true, 1},
       {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
        "exec {pad}>out {fd}>two; } && "
        "{ exec 10>&${fd}-; printf payload >&10; }",
@@ -1422,9 +1484,6 @@ void run_semantic_reference_oracles() {
       {"exec 1>out || exit; exec 10>&-; { :; } 10>&10; exec {fd}>&1; "
        "printf payload >&10",
        true, 1},
-      {"exec 3>out || exit; exec 10>& - 11>& - 12>& -; "
-       "{ printf payload >&11; } 3>&1",
-       false, 0},
       {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
        ": {out}>&${fd}-; printf payload >&\"$out\"",
        true, 1},
@@ -1443,11 +1502,6 @@ void run_semantic_reference_oracles() {
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- 11>&3-; printf payload >&10",
        true, 1},
-      {"exec 3>out 4>base || exit; exec 8>&- 10>&- 11>&- 12>&-; "
-       "exec {fd}>&3; : 3>&${fd}- {fd}>&4 5>&8; printf payload >&10",
-       true, 1},
-      {"exec 4>&-; exec 3>out || exit; { :; } 4>&3-; printf payload >&3", false,
-       0},
       {"exec 4>&-; exec 3>out || exit; { :; } 4>&3- || printf payload >&3",
        false, 0},
       {"exec 3>base 20>out || exit; exec 10>&- 11>&- 21>&- 22>&-; "
@@ -1459,15 +1513,37 @@ void run_semantic_reference_oracles() {
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- {fd}>&-; cat < <(printf payload >&10)",
        true, 1},
-      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
-       "exec {fd}>&3; exec {fd}>&- 11>&3-; printf payload >&11",
-       false, 0},
-      {"exec 10>&-; exec {fd}>&1; : 10>&- 3>&${fd}-; printf payload", false, 0},
   };
   outcome_config.sensitive_write_paths[0] = "out";
   if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
       SG_OK)
     invariant_failure("move outcome configuration failed");
+  /* Reference Bash reports a descriptor error for each: a move or copy leaves
+   * the used descriptor closed, or a persistent close destroys a save. */
+  static const char *const unmodeled_moves[] = {
+      "exec 3>out || exit; exec 4>&-; "
+      "builtin command /bin/true 4>&3-; printf payload >&3",
+      "exec 3>out || exit; exec 4>&-; "
+      "builtin \"$runner\" 4>&3-; printf payload >&3",
+      "exec 3>base 4>out; : 3>&4- 3>&4; printf payload >&4",
+      "exec 3>base 4>out; { :; } 3>&4- 3>&4; printf payload >&4",
+      "exec 3>out || exit; exec 10>& - 11>& - 12>& -; "
+      "{ printf payload >&11; } 3>&1",
+      "exec 3>out 4>base || exit; exec 8>&- 10>&- 11>&- 12>&-; "
+      "exec {fd}>&3; : 3>&${fd}- {fd}>&4 5>&8; printf payload >&10",
+      "exec 4>&-; exec 3>out || exit; { :; } 4>&3-; printf payload >&3",
+      "exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+      "exec {fd}>&3; exec {fd}>&- 11>&3-; printf payload >&11",
+      "exec 10>&-; exec {fd}>&1; : 10>&- 3>&${fd}-; printf payload",
+  };
+  for (const char *source : unmodeled_moves) {
+    size_t length = std::strlen(source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    if (sg_gate_evaluate(option_gate, source, length, buffer.data(),
+                         buffer.size(), &result) != SG_ERR_UNMODELED)
+      invariant_failure("move error was not rejected");
+  }
   for (const auto &fixture : moves) {
     size_t length = std::strlen(fixture.source);
     auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
@@ -1507,21 +1583,6 @@ void run_semantic_reference_oracles() {
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "builtin \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
        "7:builtin,4:$cmd,7:payload,", false, 0},
-      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
-       "! 0<&0 1>&3 2>&10 && printf payload >out",
-       "6:printf,7:payload,", true, 1},
-      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
-       "0<&0 1>&3 2>&10 && printf payload >out",
-       "6:printf,7:payload,", false, 0},
-      {"exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
-       ": 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", true, 1},
-      {"exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
-       "{ :; } 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", true, 1},
-      {"exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
-       "\"$cmd\" 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", true, 2},
       {"exec 1>original || exit; exec 9>&- 10>&- 11>&- 12>&-; "
        "{ echo \"$(exec 10>out; printf payload >&10)\"; } 1>temporary",
        "6:printf,7:payload,", false, 1},
@@ -1532,6 +1593,28 @@ void run_semantic_reference_oracles() {
        "{ : > >(exec 10>&-; exec 10>out; printf payload >&10); } 1>temporary",
        "6:printf,7:payload,", true, 1},
   };
+  /* Reference Bash reports a descriptor error for each: a copy from a closed
+   * descriptor, or a move that leaves its used source closed. */
+  static const char *const unmodeled_dispatch[] = {
+      "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+      "! 0<&0 1>&3 2>&10 && printf payload >out",
+      "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+      "0<&0 1>&3 2>&10 && printf payload >out",
+      "exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
+      ": 1>&4- 12>&11- 1>&11; printf payload",
+      "exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
+      "{ :; } 1>&4- 12>&11- 1>&11; printf payload",
+      "exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
+      "\"$cmd\" 1>&4- 12>&11- 1>&11; printf payload",
+  };
+  for (const char *source : unmodeled_dispatch) {
+    size_t length = std::strlen(source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    if (sg_gate_evaluate(option_gate, source, length, buffer.data(),
+                         buffer.size(), &result) != SG_ERR_UNMODELED)
+      invariant_failure("dispatch error was not rejected");
+  }
   for (const auto &fixture : dispatch) {
     size_t length = std::strlen(fixture.source);
     auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
@@ -1919,13 +2002,14 @@ void run_semantic_reference_oracles() {
       named_fd_result.verdict != SG_VERDICT_ALLOW ||
       named_fd_result.subcommand_count != 2)
     invariant_failure("named-fd close oracle mismatch");
+  /* The closed name keeps its value, so the copy certainly fails. */
   static const char named_fd_closed_use_input[] =
       "exec {fd}>/tmp/fuzz-close; exec {fd}>&-; printf bytes >&$fd";
   eval_buffer_for(named_fd_buffer, sizeof(named_fd_closed_use_input) - 1);
   if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_closed_use_input,
                        sizeof(named_fd_closed_use_input) - 1,
                        named_fd_buffer.data(), named_fd_buffer.size(),
-                       &named_fd_result) != SG_ERR_PARSE ||
+                       &named_fd_result) != SG_ERR_UNMODELED ||
       named_fd_result.verdict != SG_VERDICT_REJECT)
     invariant_failure("named-fd closed-use oracle mismatch");
 
@@ -2237,7 +2321,6 @@ void run_semantic_reference_oracles() {
       "printf x >&literal${destination}",
       "printf x >&literal$((1 + 2))",
       "printf x >&\"\"literal$(printf target)",
-      "printf x >&file{one,two}",
       "printf x >&*.log",
       "printf x >& >(consumer)",
       "exec 3>out; printf x >&3",
@@ -2247,6 +2330,17 @@ void run_semantic_reference_oracles() {
   sg_gate_t *named_fd_gate = sg_gate_new();
   if (!named_fd_gate || sg_gate_set_reject_mask(named_fd_gate, 0) != SG_OK)
     invariant_failure("named-fd semantic oracle gate setup failed");
+  {
+    /* Brace expansion yields several words: an "ambiguous redirect". */
+    static const char ambiguous[] = "printf x >&file{one,two}";
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, sizeof(ambiguous) - 1);
+    sg_result_t result = {};
+    if (sg_gate_evaluate(named_fd_gate, ambiguous, sizeof(ambiguous) - 1,
+                         buffer.data(), buffer.size(),
+                         &result) != SG_ERR_UNMODELED)
+      invariant_failure("ambiguous redirect was not rejected");
+  }
   for (const char *input : named_fd_cases) {
     reusable_eval_buffer &buffer =
         eval_buffer_for(g_eval_buffers.result, std::strlen(input));
@@ -2262,7 +2356,6 @@ void run_semantic_reference_oracles() {
 
   static const char *const named_fd_snapshot_rejections[] = {
       "printf x {fd}<in \"$(cat <&$fd)\"",
-      "exec {fd}<in; exec {fd}<&-; printf x \"$(cat <&$fd)\"",
       "exec {fd}>&-",
       "exec {fd}<&-",
       "printf x >&$destination",
@@ -2302,6 +2395,18 @@ void run_semantic_reference_oracles() {
   named_fd_gate = sg_gate_new();
   if (!named_fd_gate || sg_gate_set_reject_mask(named_fd_gate, 0) != SG_OK)
     invariant_failure("named-fd snapshot rejection gate setup failed");
+  {
+    /* A closed name keeps its value, so the copy certainly fails. */
+    static const char closed_name[] =
+        "exec {fd}<in; exec {fd}<&-; printf x \"$(cat <&$fd)\"";
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, sizeof(closed_name) - 1);
+    sg_result_t result = {};
+    if (sg_gate_evaluate(named_fd_gate, closed_name, sizeof(closed_name) - 1,
+                         buffer.data(), buffer.size(),
+                         &result) != SG_ERR_UNMODELED)
+      invariant_failure("closed named-fd use was not rejected");
+  }
   for (const char *input : named_fd_snapshot_rejections) {
     reusable_eval_buffer &buffer =
         eval_buffer_for(g_eval_buffers.result, std::strlen(input));
@@ -2729,6 +2834,13 @@ void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
   if (item.source_rejected) {
     if (error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
       invariant_failure("generated unsafe ANSI source was not rejected");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    sg_gate_free(gate);
+    return;
+  }
+  if (item.depgraph_unmodeled) {
+    if (error != SG_ERR_UNMODELED || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("generated substitution unmodeled contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
     sg_gate_free(gate);
     return;
@@ -3162,10 +3274,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
   sg_error_t err = sg_gate_evaluate(g, cmd.data(), cmd.size(), result_buf,
                                     buf_size, &result);
-  /* Arbitrary bytes routinely form malformed shell syntax. Parse errors are
-   * expected outcomes of the public evaluator, not harness failures. */
+  /* Arbitrary bytes routinely form malformed shell syntax, or valid syntax
+   * with no safe dependency model. Both are expected outcomes of the public
+   * evaluator, not harness failures. */
   if (err != SG_OK && err != SG_BLANK && err != SG_ERR_PARSE &&
-      err != SG_ERR_TRUNC && err != SG_ERR_MEMORY)
+      err != SG_ERR_UNMODELED && err != SG_ERR_TRUNC && err != SG_ERR_MEMORY)
     invariant_failure("unexpected sg_gate_evaluate error");
   if (err == SG_ERR_MEMORY)
     return 0;

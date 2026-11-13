@@ -1053,11 +1053,13 @@ TEST(named_fd_process_substitution_policy_contract) {
          result.requires_substitution_evaluation);
 
   /* A comment after the group's redirects cannot make its descriptor state
-   * conditional merely by containing connector punctuation. */
+   * conditional merely by containing connector punctuation. The group's own
+   * redirect is a duplication of a contract descriptor, which cannot fail,
+   * so the body's allocation is proven for the later read. */
   static const char *const commented_connectors[] = {
-      "{ exec {fd}</tmp/group-input; } >/dev/null # && comment\n"
+      "{ exec {fd}</tmp/group-input; } >&2 # && comment\n"
       "printf '%s' \"$(cat <&$fd)\"",
-      "{ exec {fd}</tmp/group-input; } >/dev/null # || comment\n"
+      "{ exec {fd}</tmp/group-input; } >&2 # || comment\n"
       "printf '%s' \"$(cat <&$fd)\"",
   };
   for (size_t i = 0;
@@ -1168,6 +1170,16 @@ TEST(named_fd_process_substitution_policy_contract) {
   };
   for (size_t i = 0;
        i < sizeof(snapshot_rejections) / sizeof(snapshot_rejections[0]); i++) {
+    /* A bound-then-closed name still resolves, so reading it is a certain
+     * descriptor failure (unmodeled), unlike an unbound name, which is a
+     * parse error. */
+    if (i == 1) {
+      ASSERT(sg_gate_evaluate(gate, snapshot_rejections[i],
+                              strlen(snapshot_rejections[i]), eval_buf,
+                              sizeof(eval_buf), &result) == SG_ERR_UNMODELED);
+      ASSERT(result.verdict == SG_VERDICT_REJECT);
+      continue;
+    }
     ASSERT(sg_gate_evaluate(gate, snapshot_rejections[i],
                             strlen(snapshot_rejections[i]), eval_buf,
                             sizeof(eval_buf), &result) == SG_ERR_PARSE);
@@ -1247,14 +1259,17 @@ TEST(named_fd_process_substitution_policy_contract) {
          result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
          result.subcommands[1].verdict == SG_VERDICT_ALLOW);
 
+  /* A bound-then-closed name still resolves, so using it is a certain
+   * descriptor failure (unmodeled), unlike an unbound name, which is a
+   * parse error. */
   static const char closed_named_fd_use[] =
       "exec {fd}>/tmp/closed-out; exec {fd}>&-; printf payload >&$fd";
   ASSERT(sg_gate_evaluate(gate, closed_named_fd_use,
                           sizeof(closed_named_fd_use) - 1, eval_buf,
-                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+                          sizeof(eval_buf), &result) == SG_ERR_UNMODELED);
   ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
          result.subcommands[0].verdict == SG_VERDICT_REJECT &&
-         strcmp(eval_buf, "parse error") == 0);
+         strcmp(eval_buf, "no safe dependency model") == 0);
 
   /* Assignment prefixes are temporary in Bash. Shellgate must not reject the
    * command by discarding the descriptor route before its redirect expands. */
@@ -1386,6 +1401,10 @@ TEST(named_fd_builtin_operand_policy_contract) {
     sg_result_t result;
     sg_error_t status =
         eval_cmd(gate, shellsplit_test_builtin_routes[i].source, &result);
+    if (shellsplit_test_builtin_routes[i].unmodeled) {
+      ASSERT(status == SG_ERR_UNMODELED && result.verdict == SG_VERDICT_REJECT);
+      continue;
+    }
     if (shellsplit_test_builtin_routes[i].resolved) {
       if (status != SG_OK || result.verdict == SG_VERDICT_REJECT)
         fprintf(stderr, "builtin policy route case %zu failed: %s (%d, %d)\n",
@@ -1457,10 +1476,17 @@ TEST(named_fd_builtin_ordered_assignment_policy_contract) {
       "printf x >&$fd",
       "exec {fd}>/tmp/builtin-route; printf '%%n' fd; printf x >&$fd",
       "exec {fd}>/tmp/builtin-route; printf '%b%n' '\\c' fd; printf x >&$fd",
+  };
+  sg_result_t result = {0};
+  /* A readonly read target is a reported read error: no dependency model. */
+  static const char *const readonly_targets[] = {
       "exec {fd}>/tmp/builtin-route; read UID fd <<<one; printf x >&$fd",
       "exec {fd}>/tmp/builtin-route; read EUID fd <<<one; printf x >&$fd",
   };
-  sg_result_t result = {0};
+  for (size_t i = 0; i < sizeof(readonly_targets) / sizeof(readonly_targets[0]);
+       i++)
+    ASSERT(eval_cmd(gate, readonly_targets[i], &result) == SG_ERR_UNMODELED &&
+           result.verdict == SG_VERDICT_REJECT);
   for (size_t i = 0; i < sizeof(preserved) / sizeof(preserved[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, preserved[i], &result));
     ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3);
@@ -1853,16 +1879,23 @@ TEST(setup_diagnostic_substitution_contract) {
   static const struct {
     const char *source;
     bool inspection;
+    bool unmodeled;
   } cases[] = {
-      {"exec 3>&-; sh -c \"$(echo 2>&1 >&3)\"", true},
-      {"exec 3>&-; sh -c \"$(echo >&3 2>&1)\"", false},
-      {"exec 3>&-; sh -c \"$(echo 2>&- >&3)\"", false},
-      {"exec 3>&-; sh -c \"$({ echo body; } 2>&1 >&3)\"", true},
-      {"sh -c \"$(echo 2>&1 >'')\"", true},
-      {"sh -c \"$(echo >'' 2>&1)\"", false},
+      {"exec 3>out; sh -c \"$(echo 2>&1 >&3)\"", true, false},
+      {"exec 3>out; sh -c \"$(echo >&3 2>&1)\"", false, false},
+      {"exec 3>out; sh -c \"$(echo 2>&- >&3)\"", false, false},
+      {"exec 3>out; sh -c \"$({ echo body; } 2>&1 >&3)\"", true, false},
+      /* A reached empty pathname certainly fails: no dependency model. */
+      {"sh -c \"$(echo 2>&1 >'')\"", true, true},
+      {"sh -c \"$(echo >'' 2>&1)\"", false, true},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_result_t result = {0};
+    if (cases[i].unmodeled) {
+      ASSERT(eval_cmd(gate, cases[i].source, &result) == SG_ERR_UNMODELED &&
+             result.verdict == SG_VERDICT_REJECT);
+      continue;
+    }
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(!result.truncated);
     ASSERT(result.has_dynamic_substitution_io == cases[i].inspection);
@@ -2052,7 +2085,6 @@ TEST(rejected_assignment_effect_contract) {
       {"UID=$(printf skipped) \"${@:-}\"", 0, false, false},
       {"UID=$(printf skipped) \"${@?error}\"", 0, false, false},
       {"UID=$(printf skipped) \"${@:?error}\"", 0, false, false},
-      {"UID=$(printf skipped) ''", 0, false, false},
       {"UID=$(printf skipped) \"$missing\"", 0, false, false},
       {"UID=$(printf skipped) $missing true", 0, false, false},
       {"UID=$(printf skipped) $missing-suffix", 0, false, false},
@@ -2071,6 +2103,12 @@ TEST(rejected_assignment_effect_contract) {
       {"export -p UID=1 x=2", 1, true, false},
       {"export -- UID=1 x=2", 1, true, false},
   };
+  /* A statically empty command name certainly fails its lookup, a
+   * shell-level error with no dependency model. */
+  sg_result_t empty_name = {0};
+  ASSERT(eval_cmd(gate, "UID=$(printf skipped) ''", &empty_name) ==
+             SG_ERR_UNMODELED &&
+         empty_name.verdict == SG_VERDICT_REJECT);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
@@ -3210,7 +3248,10 @@ TEST(builtin_option_semantic_contract) {
       ASSERT(length > 0 && (size_t)length < sizeof(source));
       sg_result_t result;
       sg_error_t status = eval_cmd(gate, source, &result);
-      if (shellsplit_test_builtin_options[i].supported) {
+      if (shellsplit_test_builtin_options[i].unmodeled) {
+        ASSERT(status == SG_ERR_UNMODELED &&
+               result.verdict == SG_VERDICT_REJECT);
+      } else if (shellsplit_test_builtin_options[i].supported) {
         if (status != SG_OK)
           fprintf(stderr, "builtin option gate mismatch: %s status=%d\n",
                   source, status);
@@ -3786,13 +3827,27 @@ TEST(builtin_argument_read_setup_contract) {
   ASSERT(gate != NULL);
   ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
-  static const char *const cases[] = {
-      "test \"$count\" -eq 0 1>&- 2>&1",
-      "[ \"$count\" -eq 0 ] 1>&- 2>&1",
+  static const struct {
+    const char *source;
+    bool unmodeled;
+  } cases[] = {
+      /* Closing stdout then duplicating it certainly fails: no dependency
+       * model, and the gate rejects what it cannot model. */
+      {"test \"$count\" -eq 0 1>&- 2>&1", true},
+      {"[ \"$count\" -eq 0 ] 1>&- 2>&1", true},
+      /* The same builtin arguments over fallible-but-modelable redirects
+       * keep the original contract: parsed, allowed, argv-unresolved. */
+      {"test \"$count\" -eq 0 1>/dev/null 2>&1", false},
+      {"[ \"$count\" -eq 0 ] 1>/dev/null 2>&1", false},
   };
   for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
     sg_result_t result;
-    ASSERT_SG_OK(eval_cmd(gate, cases[i], &result));
+    if (cases[i].unmodeled) {
+      ASSERT(eval_cmd(gate, cases[i].source, &result) == SG_ERR_UNMODELED);
+      ASSERT(result.verdict == SG_VERDICT_REJECT);
+      continue;
+    }
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
     ASSERT(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV);
     ASSERT(!(result.unresolved_expansion_flags &
@@ -5186,7 +5241,8 @@ TEST(expansion_phases_survive_failed_setup) {
           sg_result_t result;
           sg_error_t error = eval_cmd(gate, fixture->source, &result);
           bool inspection = fixture->active && fixture->shell_word;
-          bool writes = !redirect && fixture->active && fixture->writer;
+          bool writes = fixture->active &&
+                        (redirect ? fixture->redirect : fixture->writer);
           bool expected =
               error == SG_OK && !result.truncated &&
               result.requires_substitution_evaluation == inspection &&
@@ -5238,10 +5294,15 @@ TEST(expansion_control_effects_require_reachable_setup) {
       for (unsigned repeat = 0; repeat < 1u + anomaly; repeat++) {
         sg_result_t result;
         sg_error_t error = eval_cmd(gate, fixture->source, &result);
-        bool expected = error == SG_OK && !result.truncated &&
-                        result.verdict != SG_VERDICT_REJECT &&
-                        !result.requires_substitution_evaluation &&
-                        !result.has_dynamic_substitution_io;
+        if (fixture->unmodeled) {
+          valid &= error == SG_ERR_UNMODELED;
+          continue;
+        }
+        bool expected =
+            error == SG_OK && !result.truncated &&
+            result.verdict != SG_VERDICT_REJECT &&
+            result.requires_substitution_evaluation == fixture->subst_eval &&
+            result.has_dynamic_substitution_io == fixture->dynamic_io;
         bool named_write = false;
         for (uint32_t c = 0; c < result.subcommand_count; c++) {
           const sg_subcommand_result_t *command = &result.subcommands[c];
@@ -5252,8 +5313,10 @@ TEST(expansion_control_effects_require_reachable_setup) {
         expected = expected && named_write == fixture->named_write;
         if (!expected) {
           printf("\n    expansion control gate: %s (error %d, "
-                 "named write %d, anomaly %u)\n",
-                 fixture->source, error, named_write, anomaly);
+                 "named write %d, anomaly %u, reqsubst %d/%d, dynio %d/%d)\n",
+                 fixture->source, error, named_write, anomaly,
+                 result.requires_substitution_evaluation, fixture->subst_eval,
+                 result.has_dynamic_substitution_io, fixture->dynamic_io);
           valid = false;
         }
       }
@@ -5585,21 +5648,13 @@ TEST(compound_heredoc_substitution_cross_product_contract) {
     ASSERT(dynamic_consumers == cases[ci].dynamic_consumers);
   }
 
-  /* Heredoc expansion precedes the later failing duplication, so `id` still
-   * executes and its dynamic document route remains visible. The group body
-   * never runs, however, so neither command inherits that route as a dynamic
-   * consumer. */
+  /* Reference Bash expands the heredoc first (`id` runs), then fails the
+   * group on the `4<&3` duplication of the just-closed fd 3, so the body
+   * never runs. That certain shell-level error leaves no dependency model. */
   sg_result_t invalid_group_result;
-  ASSERT_SG_OK(eval_cmd(gate, "{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
-                        &invalid_group_result));
-  ASSERT(invalid_group_result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         invalid_group_result.requires_substitution_evaluation &&
-         invalid_group_result.has_dynamic_substitution_io &&
-         invalid_group_result.subcommand_count == 2);
-  for (uint32_t i = 0; i < invalid_group_result.subcommand_count; i++)
-    ASSERT(
-        !invalid_group_result.subcommands[i].has_dynamic_substitution_io &&
-        !invalid_group_result.subcommands[i].requires_substitution_evaluation);
+  ASSERT(eval_cmd(gate, "{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
+                  &invalid_group_result) == SG_ERR_UNMODELED &&
+         invalid_group_result.verdict == SG_VERDICT_REJECT);
 
   static const char overflow[] =
       "cat <<A <<B <<C <<D <<E <<F <<G <<H <<I\n"
@@ -6072,8 +6127,9 @@ TEST(eval_input_contract_matrix) {
       {"quoted-prefix legacy combined redirect",
        "cmd >&\"\"literal$(printf target)", SG_OK, SG_VERDICT_UNDETERMINED,
        false},
+      /* Brace expansion yields several words: Bash's "ambiguous redirect". */
       {"brace-expansion-prefixed legacy combined redirect",
-       "cmd >&file{one,two}", SG_OK, SG_VERDICT_UNDETERMINED, false},
+       "cmd >&file{one,two}", SG_ERR_UNMODELED, SG_VERDICT_REJECT, false},
       {"dynamic legacy combined redirect", "cmd >&~", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
       {"glob-suffix legacy combined redirect", "cmd >&*.log", SG_OK,
@@ -6093,8 +6149,8 @@ TEST(eval_input_contract_matrix) {
       {"zero-padded overflowed legacy descriptor target",
        "cmd >&00000000000000000000000000000000002147483648", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
-      {"empty legacy descriptor target", "cmd >&\"\"", SG_OK,
-       SG_VERDICT_UNDETERMINED, false},
+      {"empty legacy descriptor target", "cmd >&\"\"", SG_ERR_UNMODELED,
+       SG_VERDICT_REJECT, false},
       {"truncated legacy pathname", "cmd >&$'a\\0b'", SG_OK,
        SG_VERDICT_UNDETERMINED, false},
   };
@@ -8353,8 +8409,18 @@ TEST(expansion_error_diagnostic_boundaries) {
       fixture.calls = 0;
       char *buffer = sg_test_eval_buffer_for_prefix(storage, 512);
       sg_result_t result = {0};
-      ASSERT_SG_OK(sg_gate_evaluate(gate, sources[source].source, source_length,
-                                    buffer, workspace + 512, &result));
+      sg_error_t error =
+          sg_gate_evaluate(gate, sources[source].source, source_length, buffer,
+                           workspace + 512, &result);
+      if (source != 0) {
+        /* A reached pathname the resolver cannot make usable certainly
+         * fails: no dependency model. (An empty argv word stays valid, so
+         * source 0 keeps SG_OK.) */
+        ASSERT(error == SG_ERR_UNMODELED &&
+               result.verdict == SG_VERDICT_REJECT);
+        continue;
+      }
+      ASSERT(error == SG_OK);
       ASSERT(fixture.calls == 1 && !result.truncated &&
              result_fields_stay_in_buffer(&result, buffer, 512));
       if (source == 0) {
@@ -8530,6 +8596,10 @@ TEST(assignment_tilde_expansion_contract) {
     rule.calls = contract.calls = 0;
     snprintf(source, sizeof(source), "echo >%s", word);
     sg_result_t result = {0};
+    if (shellsplit_test_tilde_words[i].ambiguous_redirect) {
+      ASSERT(eval_cmd(gate, source, &result) == SG_ERR_UNMODELED);
+      continue;
+    }
     ASSERT_SG_OK(eval_cmd(gate, source, &result));
     ASSERT(contract.valid &&
            rule.calls == shellsplit_test_tilde_words[i].argument_dynamic);
@@ -9150,6 +9220,13 @@ TEST(resolved_filename_substitution_consumer_contract) {
     ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
                                                  &contract));
     sg_result_t result = {0};
+    if (cases[i].failed) {
+      /* The resolver reports an empty pathname: a reached empty pathname
+       * certainly fails, so there is no dependency model. */
+      ASSERT(eval_cmd(gate, cases[i].source, &result) == SG_ERR_UNMODELED &&
+             result.verdict == SG_VERDICT_REJECT);
+      continue;
+    }
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(contract.valid && contract.calls == 1 && rule.calls == 1);
     unsigned owners = 0;
@@ -9644,7 +9721,9 @@ TEST(nested_path_expansion_ownership) {
     }
   }
   /* A known failed open does not undo nested pathname expansions already
-   * reached while producing that operand. */
+   * reached while producing that operand: the resolver still runs for the
+   * inner path (leaf_calls proves reachability). But a reached empty
+   * pathname certainly fails, so there is no dependency model. */
   for (unsigned failed_parent = 0; failed_parent < 2; failed_parent++) {
     nested_path_expansion_t state = {.leaf_status = SHELL_EXPAND_UNRESOLVED,
                                      .empty_redirect = !failed_parent,
@@ -9653,11 +9732,10 @@ TEST(nested_path_expansion_ownership) {
     ASSERT_SG_OK(
         sg_gate_set_expand_word_netargv(gate, expand_nested_path, &state));
     sg_result_t result = {0};
-    ASSERT_SG_OK(eval_cmd(gate, "echo >\"$(<\"$(<\"$FILE\")\")\"", &result));
-    ASSERT(state.valid && state.leaf_calls == 1 &&
-           result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_PATH &&
-           result.subcommands[0].unresolved_expansion_flags ==
-               SG_EXPANSION_UNRESOLVED_PATH);
+    ASSERT(eval_cmd(gate, "echo >\"$(<\"$(<\"$FILE\")\")\"", &result) ==
+               SG_ERR_UNMODELED &&
+           result.verdict == SG_VERDICT_REJECT);
+    ASSERT(state.valid && state.leaf_calls == 1);
   }
   sg_gate_free(gate);
 }
@@ -9764,16 +9842,20 @@ TEST(expansion_path_failure_and_reachability_contract) {
     ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
                                                  &contract));
     sg_result_t result = {0};
-    ASSERT_SG_OK(eval_cmd(
-        gate, "echo first >\"$FAIL\" >\"$SAME\" && echo second >\"$LATER\"",
-        &result));
+    /* Whichever unusable pathname the resolver reports, the reached first
+     * redirect certainly fails: no dependency model. Suppression still
+     * holds, so the later words are never resolved. */
+    ASSERT(
+        eval_cmd(gate,
+                 "echo first >\"$FAIL\" >\"$SAME\" && echo second >\"$LATER\"",
+                 &result) == SG_ERR_UNMODELED &&
+        result.verdict == SG_VERDICT_REJECT);
     if (!contract.valid || contract.calls != 1)
       printf("\n    failure case %zu: valid=%d calls=%zu rules=%zu/%zu/%zu\n",
              i, contract.valid, contract.calls, rules[0].calls, rules[1].calls,
              rules[2].calls);
     ASSERT(contract.valid && contract.calls == 1);
     ASSERT(rules[0].calls == 1 && rules[1].calls == 0 && rules[2].calls == 0);
-    ASSERT(result.subcommand_count == 2 && !result.truncated);
     sg_gate_free(gate);
   }
 
@@ -9796,10 +9878,13 @@ TEST(expansion_path_failure_and_reachability_contract) {
   ASSERT_SG_OK(sg_gate_set_expand_word_netargv(
       group_gate, expand_by_source_word, &group_contract));
   sg_result_t group_result = {0};
-  ASSERT_SG_OK(eval_cmd(group_gate,
-                        "{ echo \"$BODY\"; } >\"$FAIL\" && "
-                        "echo later >\"$LATER\"",
-                        &group_result));
+  /* The empty group redirect certainly fails: no dependency model, with the
+   * same suppression of later words as above. */
+  ASSERT(eval_cmd(group_gate,
+                  "{ echo \"$BODY\"; } >\"$FAIL\" && "
+                  "echo later >\"$LATER\"",
+                  &group_result) == SG_ERR_UNMODELED &&
+         group_result.verdict == SG_VERDICT_REJECT);
   ASSERT(group_contract.valid && group_contract.calls == 1);
   ASSERT(group_rules[0].calls == 1 && group_rules[1].calls == 0 &&
          group_rules[2].calls == 0);
@@ -9897,6 +9982,11 @@ TEST(substitution_status_callback_reachability) {
       ASSERT(length > 0 && (size_t)length < sizeof(source));
       fixture.argument_calls = 0;
       sg_result_t result = {0};
+      if (shellsplit_test_substitution_status_cases[i].unmodeled) {
+        ASSERT(eval_cmd(gate, source, &result) == SG_ERR_UNMODELED &&
+               result.verdict == SG_VERDICT_REJECT);
+        continue;
+      }
       ASSERT_SG_OK(eval_cmd(gate, source, &result));
       bool expected =
           success ? shellsplit_test_substitution_status_cases[i].succeeds
@@ -9924,6 +10014,17 @@ TEST(substitution_status_callback_reachability) {
   for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
     fixture.argument_calls = 0;
     sg_result_t result = {0};
+    if (i < 7) {
+      /* Every file-substitution or redirect control reaches an empty
+       * pathname: a certain failure with no dependency model. The
+       * resolver still runs once for the reached word. */
+      ASSERT(eval_cmd(gate, controls[i], &result) == SG_ERR_UNMODELED &&
+             result.verdict == SG_VERDICT_REJECT);
+      ASSERT(fixture.argument_calls == 1 && fixture.cwd_valid);
+      continue;
+    }
+    /* A here-string whose expansion may abort (`${MAYBE:?}`) has no
+     * pathname to resolve; that possible abort is modeled control flow. */
     ASSERT_SG_OK(eval_cmd(gate, controls[i], &result));
     ASSERT(fixture.argument_calls == 1 && fixture.cwd_valid);
   }
@@ -10039,20 +10140,27 @@ TEST(file_substitution_diagnostic_receiver) {
   static const struct {
     const char *source, *value;
     bool outer_inspection;
+    bool unmodeled;
   } cases[] = {
-      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"", "0:,", true},
-      {"sh -c \"$(exec 2>&1; x=$(<\"$@\"))\"", "", true},
-      {"sh -c \"$(exec 2>&1; x=$(<\"$@\"))\"", "1:a,1:b,", true},
-      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"", "10:/tmp/input,", true},
-      {"sh -c \"$(x=$(<\"$FILE\"))\"", "10:/tmp/input,", false},
-      {"sh -c \"$(exec 2>&-; x=$(<\"$FILE\"))\"", "0:,", false},
-      {"sh -c \"$(exec 2<input; x=$(<\"$FILE\"))\"", "0:,", false},
-      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\") 1>&- 2>&-)\"", "0:,", true},
-      {"sh -c \"$(x=$(<\"$FILE\") 2>&1)\"", "0:,", false},
-      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && x=$(<\"$FILE\"))\"", "0:,",
+      /* Only a single usable pathname resolves; empty, empty-payload, and
+       * multi-segment file paths certainly fail, so there is no
+       * dependency model. */
+      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"", "0:,", true, true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$@\"))\"", "", true, true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$@\"))\"", "1:a,1:b,", true, true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"", "10:/tmp/input,", true,
        false},
-      {"sh -c \"$(: 2>&1 >$(<\"$FILE\") 1>&- 2>&-)\"", "0:,", true},
-      {"sh -c \"$(x=$(exec 2>&1; y=$(<\"$FILE\")))\"", "0:,", false},
+      {"sh -c \"$(x=$(<\"$FILE\"))\"", "10:/tmp/input,", false, false},
+      {"sh -c \"$(exec 2>&-; x=$(<\"$FILE\"))\"", "0:,", false, true},
+      {"sh -c \"$(exec 2<input; x=$(<\"$FILE\"))\"", "0:,", false, true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\") 1>&- 2>&-)\"", "0:,", true, true},
+      {"sh -c \"$(x=$(<\"$FILE\") 2>&1)\"", "0:,", false, true},
+      /* Short-circuited by `false &&`, so the empty path is never
+       * reached: SG_OK with no evaluation. */
+      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && x=$(<\"$FILE\"))\"", "0:,",
+       false, false},
+      {"sh -c \"$(: 2>&1 >$(<\"$FILE\") 1>&- 2>&-)\"", "0:,", true, true},
+      {"sh -c \"$(x=$(exec 2>&1; y=$(<\"$FILE\")))\"", "0:,", false, true},
   };
   sg_gate_t *gate = sg_gate_new();
   ASSERT_NOT_NULL(gate);
@@ -10064,6 +10172,12 @@ TEST(file_substitution_diagnostic_receiver) {
     ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_file_diagnostic,
                                                  &fixture));
     sg_result_t result = {0};
+    if (cases[i].unmodeled) {
+      ASSERT(eval_cmd(gate, cases[i].source, &result) == SG_ERR_UNMODELED &&
+             result.verdict == SG_VERDICT_REJECT);
+      ASSERT(fixture.calls == 1);
+      continue;
+    }
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(!result.truncated && result.subcommand_count != 0);
     ASSERT(fixture.calls == (i == 9 ? 0 : 1));
@@ -10103,14 +10217,16 @@ TEST(file_substitution_path_failure_is_local) {
   ASSERT_SG_OK(
       sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
   sg_result_t result = {0};
-  ASSERT_SG_OK(eval_cmd(gate, "echo \"$(<\"$FILE\")\" \"$TAIL\"", &result));
+  /* The file-substitution path resolves empty: a reached empty pathname
+   * certainly fails, so there is no dependency model. The resolver still
+   * runs once per word, proving the failure is local to the reached
+   * expansion rather than a skipped command. */
+  ASSERT(eval_cmd(gate, "echo \"$(<\"$FILE\")\" \"$TAIL\"", &result) ==
+             SG_ERR_UNMODELED &&
+         result.verdict == SG_VERDICT_REJECT);
   ASSERT(contract.valid && contract.calls == 3);
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
     ASSERT(rules[i].calls == 1);
-  ASSERT(result.subcommand_count == 1);
-  ASSERT((result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) !=
-         0);
-  ASSERT(!result.requires_substitution_evaluation);
   sg_gate_free(gate);
 }
 
@@ -10157,6 +10273,12 @@ TEST(empty_path_static_resolved_equivalence) {
       ASSERT(length > 0 && (size_t)length < sizeof(source));
       calls = 0;
       sg_result_t result = {0};
+      /* A reached empty pathname certainly fails: no dependency model. */
+      if (shellsplit_test_empty_paths[i].reached) {
+        ASSERT(eval_cmd(gate, source, &result) == SG_ERR_UNMODELED &&
+               result.verdict == SG_VERDICT_REJECT);
+        continue;
+      }
       ASSERT_SG_OK(eval_cmd(gate, source, &result));
       unsigned writes = 0, reads = 0;
       for (uint32_t command = 0; command < result.subcommand_count; command++) {
@@ -10227,11 +10349,19 @@ TEST(static_empty_path_callback_reachability) {
     ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
                                                  &contract));
     sg_result_t result = {0};
-    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    if (i == 2) {
+      /* `false &&` short-circuits before the empty redirect is reached. */
+      ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    } else {
+      /* A literal empty redirect certainly fails: no dependency model. The
+       * argument callbacks reached before it still run, and later redirect
+       * words stay suppressed (call counts below verify both). */
+      ASSERT(eval_cmd(gate, cases[i].source, &result) == SG_ERR_UNMODELED &&
+             result.verdict == SG_VERDICT_REJECT);
+    }
     ASSERT(contract.valid && rules[0].calls == cases[i].argument_calls &&
            rules[1].calls == cases[i].tail_calls && rules[2].calls == 0);
     ASSERT(rules[3].calls == (i == 6) && rules[4].calls == (i == 7));
-    ASSERT(!result.requires_substitution_evaluation && !result.truncated);
   }
   sg_gate_free(gate);
 }
@@ -10269,13 +10399,17 @@ TEST(resolved_named_redirect_failure_effects) {
       ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
                                                    &contract));
       sg_result_t result = {0};
-      ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+      /* None of the mock views resolves to a single usable pathname
+       * (empty, empty payload, or multi-segment): every reached redirect
+       * certainly fails, so there is no dependency model. The resolver
+       * still runs once for the failing word, and no write is reported. */
+      ASSERT(eval_cmd(gate, cases[i].source, &result) == SG_ERR_UNMODELED &&
+             result.verdict == SG_VERDICT_REJECT);
       unsigned writes = 0;
       for (uint32_t command = 0; command < result.subcommand_count; command++)
         writes += result.subcommands[command].write_count;
-      ASSERT(contract.valid && rule.calls == 1 && writes == cases[i].writes);
-      ASSERT(((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
-             cases[i].sensitive);
+      ASSERT(contract.valid && rule.calls == 1 && writes == 0);
+      ASSERT((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) == 0);
     }
   }
   sg_gate_free(gate);
@@ -11921,30 +12055,6 @@ TEST(descriptor_setup_dispatch) {
       {"exec 3>/etc/dispatch-a || exit; exec 10>&- 11>&- 12>&-; "
        "builtin \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
        "7:builtin,4:$cmd,7:payload,", 0, false},
-      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
-       "! 0<&0 1>&3 2>&10 && printf payload >/etc/dispatch-a",
-       "6:printf,7:payload,", 1, true},
-      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
-       "0<&0 1>&3 2>&10 && printf payload >/etc/dispatch-a",
-       "6:printf,7:payload,", 0, false},
-      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
-       "! 0<<<literal 1>&3 2>&10 && printf payload >/etc/dispatch-a",
-       "6:printf,7:payload,", 1, true},
-      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
-       "! 0<<EOF 1>&3 2>&10 && printf payload >/etc/dispatch-a\nliteral\nEOF\n",
-       "6:printf,7:payload,", 1, true},
-      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
-       "exec 10>&- 11>&- 12>&-; : 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", 1, true},
-      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
-       "exec 10>&- 11>&- 12>&-; { :; } 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", 1, true},
-      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
-       "exec 10>&- 11>&- 12>&-; \"$cmd\" 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", 2, true},
-      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
-       "exec 10>&- 11>&- 12>&-; /bin/true 1>&4- 12>&11- 1>&11; printf payload",
-       "6:printf,7:payload,", 1, false},
       {"exec 1>/tmp/dispatch-original || exit; "
        "exec 9>&- 10>&- 11>&- 12>&-; "
        "{ echo \"$(exec 10>/etc/dispatch-a; printf payload >&10)\"; } "
@@ -11978,6 +12088,34 @@ TEST(descriptor_setup_dispatch) {
     }
     ASSERT(found && !result.truncated);
   }
+  /* Certain shell-level errors: a duplication of the closed fd 10 or 11
+   * fails the setup. No dependency graph models a script that errors. */
+  static const char *const certain_dispatch[] = {
+      "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+      "! 0<&0 1>&3 2>&10 && printf payload >/etc/dispatch-a",
+      "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+      "0<&0 1>&3 2>&10 && printf payload >/etc/dispatch-a",
+      "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+      "! 0<<<literal 1>&3 2>&10 && printf payload >/etc/dispatch-a",
+      "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+      "! 0<<EOF 1>&3 2>&10 && printf payload >/etc/dispatch-a\nliteral\nEOF\n",
+      "exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+      "exec 10>&- 11>&- 12>&-; : 1>&4- 12>&11- 1>&11; printf payload",
+      "exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+      "exec 10>&- 11>&- 12>&-; { :; } 1>&4- 12>&11- 1>&11; printf payload",
+      "exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+      "exec 10>&- 11>&- 12>&-; \"$cmd\" 1>&4- 12>&11- 1>&11; printf payload",
+      "exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+      "exec 10>&- 11>&- 12>&-; /bin/true 1>&4- 12>&11- 1>&11; printf payload",
+  };
+  for (size_t i = 0; i < sizeof(certain_dispatch) / sizeof(certain_dispatch[0]);
+       i++) {
+    sg_result_t result = {0};
+    ASSERT(sg_gate_evaluate(gate, certain_dispatch[i],
+                            strlen(certain_dispatch[i]), eval_buf,
+                            sizeof(eval_buf), &result) == SG_ERR_UNMODELED &&
+           result.verdict == SG_VERDICT_REJECT);
+  }
   sg_gate_free(gate);
 }
 
@@ -12000,16 +12138,8 @@ TEST(descriptor_move_evaluation) {
     bool writes;
   } cases[] = {
       {"exec 3>/etc/move-out; exec 1>&3-; echo next", true},
-      {"exec 4>&-; exec 3>/etc/move-out; : 4>&3-; echo next >&3", false},
-      {"exec 3>/etc/move-out 4>&1; : 4>&3-; echo next >&3", true},
-      {"exec 4>&-; exec 3>/etc/move-out; { :; } 4>&3-; echo next >&3", false},
-      {"exec 3>/etc/move-out 4>&1; { :; } 4>&3-; echo next >&3", true},
       {"exec {fd}>/etc/move-out; exec 1>&${fd}-; echo next", true},
-      {"exec 3>/etc/move-out; : 4>&\"3-\"; echo next >&3", true},
       {"exec 4>&-; exec 3>/etc/move-out; /bin/true 4>&3-; echo next >&3", true},
-      {"exec 4>&-; exec 3>/etc/move-out; builtin command /bin/true 4>&3-; "
-       "echo next >&3",
-       false},
       {"exec 3>/etc/move-out || exit; builtin command /bin/true {fd}>&3; "
        "echo next >&\"$fd\"",
        true},
@@ -12025,9 +12155,6 @@ TEST(descriptor_move_evaluation) {
       {"exec 3>/etc/move-out || exit; exec 10>&- 11>&-; "
        "{ :; } {fd}>&3 10>&3-; echo next >&10",
        true},
-      {"exec 4>&-; exec 3>/tmp/original; { exec 3>/etc/move-out; } "
-       "4>&3-; echo next >&3",
-       true},
       {"exec {fd}>/etc/move-out; /bin/true {fd}>/tmp/local; "
        "echo next >&\"$fd\"",
        true},
@@ -12038,11 +12165,6 @@ TEST(descriptor_move_evaluation) {
        "exec {pad}>/tmp/move-pad {fd}>/etc/move-out; exec 10>&${fd}-; "
        "echo next >&10",
        true},
-      {"exec 3>/tmp/original 4>/etc/move-out; : 3>&4- 3>&4; echo next >&4",
-       true},
-      {"exec 3>/tmp/original 4>/etc/move-out; { :; } 3>&4- 3>&4; "
-       "echo next >&4",
-       true},
       /* Exact save-slot expectations require successful opens, as in the
        * corresponding Shellsplit and fixed-fuzzer undo fixtures. */
       {"exec 3>/tmp/original 4>/etc/move-out || exit; "
@@ -12051,23 +12173,12 @@ TEST(descriptor_move_evaluation) {
       {"exec 3>/tmp/original 4>/etc/move-out || exit; "
        "exec 10>&- 11>&- 12>&- 13>&-; : 3>&1 3>&4 {fd}>&3; echo next >&12",
        true},
-      {"exec 3>/etc/move-out; exec 10>&- 11>&-; "
-       "{ echo next >&10; } 3>&1",
-       true},
-      {"exec 3>/etc/move-out; exec 11>&- 12>&-; "
-       "{ :; } 3>&1; echo next >&11",
-       false},
-      {"exec 4>/etc/move-out; : 4>&\"\"-; echo next >&4", true},
-      {"exec 4>/etc/move-out; { :; } 4>&''-; echo next >&4", true},
       {"exec 1>/etc/move-out || exit; exec 10>&-; exec 10>&10-; "
        "exec {fd}>&1; echo next >&10",
        true},
       {"exec 1>/etc/move-out || exit; exec 10>&-; { :; } 10>&10; "
        "exec {fd}>&1; echo next >&10",
        true},
-      {"exec 3>/etc/move-out; exec 10>& - 11>& - 12>& -; "
-       "{ echo next >&11; } 3>&1",
-       false},
       {"exec 3>&- 10>&- 11>&-; "
        "{ probe && exec {fd}>/tmp/move-first || "
        "exec {pad}>/etc/move-out {fd}>/tmp/move-second; } && "
@@ -12088,33 +12199,14 @@ TEST(descriptor_move_evaluation) {
       {"exec 3>/etc/move-out || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- 11>&3-; echo next >&10",
        true},
-      {"exec 3>/etc/move-out 4>/tmp/original || exit; "
-       "exec 8>&- 10>&- 11>&- 12>&-; exec {fd}>&3; "
-       ": 3>&${fd}- {fd}>&4 5>&8; echo next >&10",
-       true},
-      {"exec 4>&-; exec 3>/etc/move-out || exit; "
-       "{ :; } 4>&3-; echo next >&3",
-       false},
       {"exec 4>&-; exec 3>/etc/move-out || exit; "
        "{ :; } 4>&3- || echo next >&3",
        false},
       {"exec 3>/tmp/original 20>/etc/move-out || exit; "
        "exec 10>&- 11>&- 21>&- 22>&-; { echo next >&10; } 3>&20-",
        true},
-      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&- 12>&-; "
-       "exec {fd}>&3; exec {fd}>&- 11>&3-; echo next >&11",
-       false},
       {"exec 3>/etc/move-out || exit; exec 10>&- 11>&-; "
        "{ exec 10>/tmp/original; echo next >&10; } 3>&1",
-       true},
-      {"exec 10>&-; exec {fd}>&1; : 10>&- 3>&${fd}-; echo next", false},
-      {"exec 3>/tmp/original 4>/etc/move-out || exit; "
-       "exec 10>&3 11>&- 12>&- 13>&-; "
-       "exec 3>&10- 11>&4 10>&-; echo next >&11",
-       true},
-      {"exec 1>/etc/move-out 3>/tmp/original 4>/tmp/original || exit; "
-       "exec 10>&- 11>&- 12>&-; "
-       "{ exec 11>&-; } 3>&1 4>&1; echo next >&3",
        true},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -12154,6 +12246,87 @@ TEST(descriptor_move_evaluation) {
     shell_netstring_buffer_free(&raw);
     shell_netstring_buffer_free(&typed);
   }
+  /* Certain shell-level errors: a move onto a descriptor other than 0, 1 or
+   * 2 leaves its source closed after the command (reference Bash: a later
+   * `>&3` reports "Bad file descriptor"), a quoted `"3-"` is no move, and a
+   * builtin wrapper keeps the in-shell move semantics. No dependency graph
+   * models a script that errors. */
+  static const char *const certain_moves[] = {
+      "exec 4>&-; exec 3>/etc/move-out; : 4>&3-; echo next >&3",
+      "exec 4>&-; exec 3>/etc/move-out; { :; } 4>&3-; echo next >&3",
+      "exec 3>/etc/move-out; : 4>&\"3-\"; echo next >&3",
+      "exec 4>&-; exec 3>/etc/move-out; builtin command /bin/true 4>&3-; "
+      "echo next >&3",
+      "exec 3>/tmp/original 4>/etc/move-out; : 3>&4- 3>&4; echo next >&4",
+      "exec 3>/tmp/original 4>/etc/move-out; { :; } 3>&4- 3>&4; "
+      "echo next >&4",
+      "exec 3>/etc/move-out; exec 10>&- 11>&-; "
+      "{ echo next >&10; } 3>&1",
+      "exec 3>/etc/move-out; exec 11>&- 12>&-; "
+      "{ :; } 3>&1; echo next >&11",
+      "exec 4>/etc/move-out; : 4>&\"\"-; echo next >&4",
+      "exec 4>/etc/move-out; { :; } 4>&''-; echo next >&4",
+      "exec 3>/etc/move-out; exec 10>& - 11>& - 12>& -; "
+      "{ echo next >&11; } 3>&1",
+      "exec 3>/etc/move-out 4>/tmp/original || exit; "
+      "exec 8>&- 10>&- 11>&- 12>&-; exec {fd}>&3; "
+      ": 3>&${fd}- {fd}>&4 5>&8; echo next >&10",
+      "exec 4>&-; exec 3>/etc/move-out || exit; "
+      "{ :; } 4>&3-; echo next >&3",
+      "exec 3>/etc/move-out || exit; exec 10>&- 11>&- 12>&-; "
+      "exec {fd}>&3; exec {fd}>&- 11>&3-; echo next >&11",
+      "exec 10>&-; exec {fd}>&1; : 10>&- 3>&${fd}-; echo next",
+  };
+  for (size_t i = 0; i < sizeof(certain_moves) / sizeof(certain_moves[0]);
+       i++) {
+    sg_result_t result = {0};
+    ASSERT(sg_gate_evaluate(gate, certain_moves[i], strlen(certain_moves[i]),
+                            eval_buf, sizeof(eval_buf),
+                            &result) == SG_ERR_UNMODELED &&
+           result.verdict == SG_VERDICT_REJECT);
+  }
+  /* A Bash save is destroyed: exec redirects fd 11 onto the save of its own
+   * list, or closes a group's save (reference Bash: "Bad file descriptor").
+   * No dependency model. */
+  static const char *const destroyed_saves[] = {
+      "exec 3>/tmp/original 4>/etc/move-out || exit; "
+      "exec 10>&3 11>&- 12>&- 13>&-; "
+      "exec 3>&10- 11>&4 10>&-; echo next >&11",
+      "exec 1>/etc/move-out 3>/tmp/original 4>/tmp/original || exit; "
+      "exec 10>&- 11>&- 12>&-; "
+      "{ exec 11>&-; } 3>&1 4>&1; echo next >&3",
+      "exec 3</tmp/original 4</etc/move-out || exit; "
+      "exec 10<&3 11<&- 12<&- 13<&-; "
+      "exec 3<&10- 11<&4 10<&-; cat <&11",
+      "exec 0</etc/move-out 3</tmp/original 4</tmp/original || exit; "
+      "exec 10<&- 11<&- 12<&-; "
+      "{ exec 11<&-; } 3<&0 4<&0; cat <&3",
+  };
+  for (size_t i = 0; i < sizeof(destroyed_saves) / sizeof(destroyed_saves[0]);
+       i++) {
+    sg_result_t result = {0};
+    ASSERT(sg_gate_evaluate(gate, destroyed_saves[i],
+                            strlen(destroyed_saves[i]), eval_buf,
+                            sizeof(eval_buf), &result) == SG_ERR_UNMODELED &&
+           result.verdict == SG_VERDICT_REJECT);
+  }
+  /* These fail only where the open of /etc/move-out fails: a move onto an
+   * open descriptor restores its source, and an `exec` inside the group
+   * persists past the group's move (reference Bash with a writable target
+   * writes next and returns 0). The graph requires that open instead. */
+  static const char *const required_moves[] = {
+      "exec 3>/etc/move-out 4>&1; : 4>&3-; echo next >&3",
+      "exec 3>/etc/move-out 4>&1; { :; } 4>&3-; echo next >&3",
+      ("exec 4>&-; exec 3>/tmp/original; { exec 3>/etc/move-out; } "
+       "4>&3-; echo next >&3"),
+  };
+  for (size_t i = 0; i < sizeof(required_moves) / sizeof(required_moves[0]);
+       i++) {
+    sg_result_t result = {0};
+    ASSERT(sg_gate_evaluate(gate, required_moves[i], strlen(required_moves[i]),
+                            eval_buf, sizeof(eval_buf),
+                            &result) != SG_ERR_UNMODELED);
+  }
   /* Check the final consumer, not an earlier FD_OPEN setup: stopped cleanup
    * must keep its exact I/O counts and sensitive-path attribution. */
   static const struct {
@@ -12174,22 +12347,6 @@ TEST(descriptor_move_evaluation) {
       {"exec 4</etc/move-out 10</tmp/original || exit; "
        "exec 11<&- 12<&- 13<&- 14<&-; "
        "exec 10<&4- 14<&12-; cat <&14",
-       true},
-      {"exec 3>/tmp/original 4>/etc/move-out || exit; "
-       "exec 10>&3 11>&- 12>&- 13>&-; "
-       "exec 3>&10- 11>&4 10>&-; echo next >&11",
-       false},
-      {"exec 1>/etc/move-out 3>/tmp/original 4>/tmp/original || exit; "
-       "exec 10>&- 11>&- 12>&-; "
-       "{ exec 11>&-; } 3>&1 4>&1; echo next >&3",
-       false},
-      {"exec 3</tmp/original 4</etc/move-out || exit; "
-       "exec 10<&3 11<&- 12<&- 13<&-; "
-       "exec 3<&10- 11<&4 10<&-; cat <&11",
-       true},
-      {"exec 0</etc/move-out 3</tmp/original 4</tmp/original || exit; "
-       "exec 10<&- 11<&- 12<&-; "
-       "{ exec 11<&-; } 3<&0 4<&0; cat <&3",
        true},
   };
   for (size_t i = 0; i < sizeof(stopped_cases) / sizeof(stopped_cases[0]);
@@ -12339,21 +12496,15 @@ TEST(fd_open_violation_contract) {
          result.subcommands[0].write_count == 1 &&
          result.subcommands[1].write_count == 0);
 
-  /* A known-bad duplication prevents later opens and the command body. An
-   * earlier open remains a real setup side effect even though that body never
-   * executes. */
-  ASSERT_SG_OK(
-      eval_cmd(gate, "exec 3>&-; printf x 4>&3 >/etc/skipped", &result));
-  ASSERT(result.subcommand_count == 2 &&
-         result.subcommands[1].write_count == 0 &&
-         !(result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
-
-  ASSERT_SG_OK(eval_cmd(
-      gate, "exec 3>&-; printf x >/etc/reached 4>&3 >/etc/skipped", &result));
-  ASSERT(
-      result.subcommand_count == 2 && result.subcommands[1].write_count == 1 &&
-      (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) &&
-      (result.subcommands[1].violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+  /* A known-bad duplication of the closed fd 3 is a certain shell-level
+   * error (reference Bash skips the rest of the setup and the body but keeps
+   * earlier opens): no dependency model. */
+  ASSERT(eval_cmd(gate, "exec 3>&-; printf x 4>&3 >/etc/skipped", &result) ==
+             SG_ERR_UNMODELED &&
+         result.verdict == SG_VERDICT_REJECT);
+  ASSERT(eval_cmd(gate, "exec 3>&-; printf x >/etc/reached 4>&3 >/etc/skipped",
+                  &result) == SG_ERR_UNMODELED &&
+         result.verdict == SG_VERDICT_REJECT);
   sg_gate_free(gate);
 }
 
@@ -12835,6 +12986,10 @@ TEST(named_fd_ifs_consumer_violations) {
         &shellsplit_test_ifs_routes[i];
     sg_result_t result;
     sg_error_t status = eval_cmd(gate, fixture->source, &result);
+    if (fixture->unmodeled) {
+      ASSERT(status == SG_ERR_UNMODELED && result.verdict == SG_VERDICT_REJECT);
+      continue;
+    }
     if (!fixture->supported) {
       ASSERT(status == SG_ERR_PARSE && result.verdict == SG_VERDICT_REJECT);
       continue;
@@ -14649,14 +14804,14 @@ TEST(contextual_read_anomaly_contract) {
       {"exec {out}>&1 && { unset empty; read -n0 other\"$empty\"; "
        "printf kept >&\"$out\"; }",
        SG_VERDICT_ALLOW},
-      {"exec {fd}<<<payload && read -n-\"$fd\" value", SG_VERDICT_ALLOW},
-      {"exec {fd}<<<payload && read -n-1\"$fd\" value", SG_VERDICT_ALLOW},
-      {"exec {fd}<<<payload && read -n-00\"$fd\" value", SG_VERDICT_ALLOW},
+      {"exec {fd}<<<payload && read -n-\"$fd\" value", SG_VERDICT_REJECT},
+      {"exec {fd}<<<payload && read -n-1\"$fd\" value", SG_VERDICT_REJECT},
+      {"exec {fd}<<<payload && read -n-00\"$fd\" value", SG_VERDICT_REJECT},
       {"exec {fd}<<<payload && read -u00\"$fd\" value", SG_VERDICT_ALLOW},
       {"unset fd; read -u0\"$fd\" value <<<payload", SG_VERDICT_ALLOW},
-      {"read -u-1\"$unknown\" value <<<payload", SG_VERDICT_ALLOW},
-      {"read -n\"$unknown\"x value <<<payload", SG_VERDICT_ALLOW},
-      {"read -- pre\"$unknown\"- value <<<payload", SG_VERDICT_ALLOW},
+      {"read -u-1\"$unknown\" value <<<payload", SG_VERDICT_REJECT},
+      {"read -n\"$unknown\"x value <<<payload", SG_VERDICT_REJECT},
+      {"read -- pre\"$unknown\"- value <<<payload", SG_VERDICT_REJECT},
       {"unset fd; read -p\"$fd\" -e value <<<payload", SG_VERDICT_ALLOW},
       {"unset fd; echo \"$(read -p\"$fd\" -e value <<<payload)\"",
        SG_VERDICT_ALLOW_CONDITIONAL},
@@ -14665,14 +14820,15 @@ TEST(contextual_read_anomaly_contract) {
       {"unset RANDOM; echo <(read -r RANDOM <<<payload)", SG_VERDICT_ALLOW},
       {"unset RANDOM; echo \"$(read -p\"$RANDOM\" -e value <<<payload)\"",
        SG_VERDICT_ALLOW_CONDITIONAL},
-      {"unset fd; read -n\"$fd\" -a value <<<payload", SG_VERDICT_ALLOW},
+      {"unset fd; read -n\"$fd\" -a value <<<payload", SG_VERDICT_REJECT},
       {"read -t0.0000000\"$unknown\" value <<<payload", SG_VERDICT_ALLOW},
-      {"unset empty; read -- $empty~ value <<<payload", SG_VERDICT_ALLOW},
-      {"read -- pre<(printf generated) value <<<payload", SG_VERDICT_ALLOW},
-      {"unset empty; read -- -p\"$empty\" RANDOM <<<payload", SG_VERDICT_ALLOW},
+      {"unset empty; read -- $empty~ value <<<payload", SG_VERDICT_REJECT},
+      {"read -- pre<(printf generated) value <<<payload", SG_VERDICT_REJECT},
+      {"unset empty; read -- -p\"$empty\" RANDOM <<<payload",
+       SG_VERDICT_REJECT},
       {"exec {out}>&1 && { unset empty; read -- -p\"$empty\" out "
        "<<<payload; printf kept >&\"$out\"; }",
-       SG_VERDICT_ALLOW},
+       SG_VERDICT_REJECT},
       {"exec {fd}<<<payload && read -p\"$fd\" -u \"$fd\" value",
        SG_VERDICT_ALLOW},
       {"exec {fd}<<<payload && read -d\"$fd\" -u${fd} value", SG_VERDICT_ALLOW},
@@ -14701,10 +14857,25 @@ TEST(contextual_read_anomaly_contract) {
       ASSERT_SG_OK(sg_gate_set_anomaly_cache_size(gates[g], g == 1 ? 16 : 0));
     }
   }
+  /* A REJECT row's read reports an error, or has an operand the graph
+   * cannot prove valid: it has no dependency model (SG_ERR_UNMODELED), and
+   * cached evaluation must reject it identically. */
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
     sg_result_t baseline;
+    sg_error_t expected =
+        commands[i].verdict == SG_VERDICT_REJECT ? SG_ERR_UNMODELED : SG_OK;
     shellsplit_test_source_scan_reset();
-    ASSERT_SG_OK(eval_cmd(plain, commands[i].source, &baseline));
+    ASSERT(eval_cmd(plain, commands[i].source, &baseline) == expected);
+    if (expected != SG_OK) {
+      /* An error result defines only its verdict; every gate agrees. */
+      ASSERT(baseline.verdict == SG_VERDICT_REJECT);
+      for (size_t g = 1; g < 3; g++) {
+        sg_result_t result;
+        ASSERT(eval_cmd(gates[g], commands[i].source, &result) == expected);
+        ASSERT(result.verdict == SG_VERDICT_REJECT);
+      }
+      continue;
+    }
     size_t baseline_semantics =
         shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_SEMANTIC_BODIES);
     if (baseline.verdict != commands[i].verdict) {
@@ -14728,7 +14899,8 @@ TEST(contextual_read_anomaly_contract) {
       sg_result_t results[2];
       for (size_t g = 0; g < 2; g++) {
         shellsplit_test_source_scan_reset();
-        ASSERT_SG_OK(eval_cmd(gates[g + 1], commands[i].source, &results[g]));
+        ASSERT(eval_cmd(gates[g + 1], commands[i].source, &results[g]) ==
+               expected);
         size_t work =
             shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_SEMANTIC_BODIES);
         ASSERT(work == baseline_semantics);

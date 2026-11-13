@@ -207,7 +207,9 @@ TEST(canonical_processing_surfaces_agree) {
 
 TEST(supported_syntax_model_matrix) {
   /* These are compact representatives for paths that are uncommon in the
-   * anonymized corpus. Keep them as parser inputs only; none is executed. */
+   * anonymized corpus. Keep them as parser inputs only; none is executed.
+   * Descriptors above 2 start closed (SHELL_DEP_EUNMODELED), so a copied
+   * descriptor is opened first. */
   static const char *const cases[] = {
       "printf x >out",
       "printf x >>out",
@@ -220,8 +222,8 @@ TEST(supported_syntax_model_matrix) {
       "printf x >&combined",
       "printf x 1>&\"combined name\"",
       "printf x >&\\$literal",
-      "printf x >&\"7\"",
-      "printf x >&$'7'",
+      "exec 7>seven; printf x >&\"7\"",
+      "exec 7>seven; printf x >&$'7'",
       "printf x >&\"-\"",
       "printf x {trace}>out {input}<in {both}<>read-write",
       "cat <<EOF\nbody\nEOF\n",
@@ -244,8 +246,8 @@ TEST(supported_syntax_model_matrix) {
       "{ printf x; } &>>all",
       "{ printf x; } &> >(cat)",
       "{ printf x; } >&combined",
-      "{ printf x; } >&\"7\"",
-      "{ printf x; } >&$'7'",
+      "exec 7>seven; { printf x; } >&\"7\"",
+      "exec 7>seven; { printf x; } >&$'7'",
       "{ printf x; } >&\"-\"",
       "{ printf x; } {trace}>out {input}<in {both}<>read-write",
       "{ cat; } <<EOF\nbody\nEOF\n",

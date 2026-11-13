@@ -178,6 +178,10 @@ static inline SHELL_NONNULL(1, 2) bool shellsplit_test_groups_equal(
   return true;
 }
 
+/* Graph equality for differential oracles. The graph contract orders nodes
+ * but not edges, so edges compare as a multiset: equivalent construction
+ * paths may join versions in different orders. Every edge field, every node,
+ * the counts, status and CWD bytes stay exact. */
 static inline SHELL_NONNULL(1, 2) bool shellsplit_test_graph_equal(
     const shell_dep_graph_t *a, const shell_dep_graph_t *b) {
   if (a->node_count != b->node_count || a->edge_count != b->edge_count ||
@@ -193,13 +197,17 @@ static inline SHELL_NONNULL(1, 2) bool shellsplit_test_graph_equal(
       return false;
     }
   }
+  bool matched[SHELL_DEP_MAX_EDGES] = {false};
   for (uint32_t i = 0; i < a->edge_count; i++) {
-    const char *field =
-        shellsplit_test_edge_difference(a->edges + i, b->edges + i);
-    if (field) {
-      fprintf(stderr, "graph edge %u differs: %s\n", i, field);
+    uint32_t j = 0;
+    while (j < b->edge_count && (matched[j] || shellsplit_test_edge_difference(
+                                                   a->edges + i, b->edges + j)))
+      j++;
+    if (j == b->edge_count) {
+      fprintf(stderr, "graph edge %u has no counterpart\n", i);
       return false;
     }
+    matched[j] = true;
   }
   if (memcmp(a->cwd_buf.data, b->cwd_buf.data, a->cwd_buf.len) != 0) {
     fprintf(stderr, "graph CWD bytes differ\n");

@@ -2935,6 +2935,8 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
   size_t count = 0;
   bool expect_command = true;
   bool pipeline_start = true;
+  /* Whether the source holds any token beyond line structure. */
+  bool visible = false;
   shell_pipeline_prefix_state_t pipeline_prefix =
       shell_pipeline_prefix_state_initial(allow_initial_time);
 
@@ -2954,6 +2956,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
       if (pipeline_prefix.time_mode == SHELL_PIPE_TIME_NONE)
         continue;
     }
+    visible = true;
     if (pipeline_start) {
       shell_pipeline_prefix_step_t prefix_step = shell_pipeline_prefix_step(
           &pipeline_prefix,
@@ -3027,10 +3030,11 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
   if (expect_command && pipeline_prefix.time_mode != SHELL_PIPE_TIME_NONE)
     count++;
 
-  /* Syntax was validated before tokenization, so a command-free source is
-   * empty rather than malformed. */
+  /* Validation keeps an unfinished group for diagnostics. Only a source of
+   * line structure alone is blank; a group opener or negation without any
+   * command is malformed, as it is for Bash. */
   if (count == 0)
-    return SHELL_TOKENIZE_BLANK;
+    return visible ? SHELL_TOKENIZE_EPARSE : SHELL_TOKENIZE_BLANK;
 
   if (count > SIZE_MAX / sizeof(shell_command_t))
     return SHELL_TOKENIZE_EOVERFLOW;

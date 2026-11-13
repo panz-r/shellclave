@@ -4394,7 +4394,7 @@ static void indexed_boundary_work(void) {
         while (shell_tokenizer_next(&iterator, &token))
           ++tokens;
         /* At a command word the balanced brackets are one word. */
-        CHECK(!iterator.heredoc_error && tokens >= 1);
+        CHECK(!iterator.heredoc_error && tokens == 1);
       }
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
       size_t work = shellsplit_test_source_scan_work();

@@ -5747,6 +5747,57 @@ static void test_blank_source_convention(void) {
   test("Blank source is reported as BLANK by every command-line API", valid);
 }
 
+/* An unmatched `(` leaves no lexical command record, yet it is incomplete
+ * syntax, not blank source. The tokenizer, the flat processor and the
+ * canonical sequence builder all reject it. */
+static void test_record_less_syntax_is_not_blank(void) {
+  static const char *const cases[] = {"(", "( ", "((", ")", "(!", "( !"};
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    size_t length = strlen(cases[i]);
+    shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
+    size_t count = SIZE_MAX;
+    shell_netstring_buffer_t argv = {0};
+    size_t argv_count = SIZE_MAX;
+    bool features = true;
+    shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
+    size_t command_count = SIZE_MAX;
+    /* The diagnostic tokenizer reads `((` as an arithmetic command and
+     * keeps it as a record. */
+    valid =
+        (strcmp(cases[i], "((") == 0 ||
+         (shell_tokenize_commands(cases[i], length, &commands,
+                                  &command_count) == SHELL_TOKENIZE_EPARSE &&
+          commands == NULL && command_count == 0)) &&
+        shell_process_command(cases[i], length, NULL, &infos, &count) ==
+            SHELL_PROCESS_EPARSE &&
+        infos == NULL && count == 0 &&
+        shell_build_netargv_sequence_buffer(cases[i], length, NULL, &argv,
+                                            &argv_count, &features) ==
+            SHELL_PROCESS_EPARSE &&
+        argv.data == NULL;
+  }
+  test("Record-less incomplete syntax is a parse error, not blank", valid);
+}
+
+/* Flattened records omit group delimiters, yet a group is shell syntax of
+ * the call even around one command without any separator. */
+static void test_single_command_group_has_shell_features(void) {
+  static const char *const cases[] = {"(a)", "( a )", "{ a; }"};
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_netstring_buffer_t argv = {0};
+    size_t count = 0;
+    bool features = false;
+    valid = shell_build_netargv_sequence_buffer(
+                cases[i], strlen(cases[i]), NULL, &argv, &count, &features) ==
+                SHELL_PROCESS_OK &&
+            count == 1 && features;
+    shell_netstring_buffer_free(&argv);
+  }
+  test("A single-command group still reports shell features", valid);
+}
+
 static void test_processed_comment_only_source_is_empty(void) {
   static const char *const cases[] = {
       "# comment-only source",
@@ -9997,6 +10048,8 @@ int main(void) {
   test_tokenizer_empty_source_is_not_a_parse_error();
   test_blank_source_convention();
   test_processed_comment_only_source_is_empty();
+  test_record_less_syntax_is_not_blank();
+  test_single_command_group_has_shell_features();
   test_posix_brace_group_sequence();
   test_posix_brace_group_forms();
   test_command_position_group_syntax_rejected();

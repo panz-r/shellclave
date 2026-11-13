@@ -82,6 +82,9 @@ static SHELL_NONNULL(1, 2) void report_source(const char *name,
   case SHELL_DEP_EEXPAND:
     classification = "expansion resolution failed";
     break;
+  case SHELL_DEP_EUNMODELED:
+    classification = "no safe dependency model; disqualified from execution";
+    break;
   case SHELL_DEP_ETRUNC:
   case SHELL_DEP_EWORKSPACE:
     break;

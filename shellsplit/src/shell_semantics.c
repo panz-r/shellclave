@@ -182,24 +182,6 @@ static SHELL_NONNULL(1, 3,
          match.matches && match.position >= match.length;
 }
 
-/* The word scanner reports a final lone backslash incomplete, since received
- * input may continue it. A complete source ends the word there, and Bash reads
- * the backslash as a literal byte (`test \` has the argument `\`). Recover
- * that end when everything before the backslash is a complete word. input is
- * an immutable span, position < length, and end is written only on success. */
-static SHELL_NONNULL(1, 4) bool semantic_final_backslash_word(const char *input,
-                                                              size_t length,
-                                                              size_t position,
-                                                              size_t *end) {
-  size_t body = 0;
-  if (input[length - 1] != '\\' ||
-      !shell_source_skip_shell_word(input, length - 1, position, &body) ||
-      body != length - 1)
-    return false;
-  *end = length;
-  return true;
-}
-
 /* Semantic roles are assigned to the full logical shell word, while lexical
  * iteration may expose quote or expansion fragments separately.  A missing
  * whole-word span is dynamic in a role where Bash would resolve a target. */
@@ -991,10 +973,8 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
        * executable bodies own their quote/comment state in the shared scoped
        * expansion stream. Keep visiting every lexical fragment for observers,
        * but never rescan a suffix with a fabricated fresh quote context. */
-      if (!shell_source_skip_shell_word(input, input_length, token.position,
-                                        &expansion_word_end) &&
-          !semantic_final_backslash_word(input, input_length, token.position,
-                                         &expansion_word_end))
+      if (!shell_source_skip_complete_shell_word(
+              input, input_length, token.position, &expansion_word_end))
         return false; /* Syntax validation owns incomplete words. */
       if (word_has_unsupported_semantics(input + token.position,
                                          expansion_word_end - token.position))

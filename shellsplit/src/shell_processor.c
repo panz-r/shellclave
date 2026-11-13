@@ -2350,7 +2350,10 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
       status = SHELL_PROCESS_EPARSE;
       goto fail_sequence;
     }
-    if (shell_processed_command_has_dangerous_features(
+    /* Flattened records omit group delimiters, which stay shell syntax of
+     * the call: `(a)` has features though its record has no syntax token. */
+    if (commands[i].group_depth != 0 ||
+        shell_processed_command_has_dangerous_features(
             &commands[i],
             i > 0 && shell_processed_command_has_pipe_output(&commands[i - 1])))
       *has_shell_features = true;

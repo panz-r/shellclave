@@ -117,6 +117,10 @@ typedef enum {
   SG_ERR_TRUNC = -4,
   SG_ERR_IO = -5,
   SG_ERR_EXPAND = -6,
+  /* Shellsplit has no dependency model capturing every requirement for a
+   * safe run of the source (SHELL_DEP_EUNMODELED), although its syntax may be
+   * valid: it must not be executed. The verdict is SG_VERDICT_REJECT. */
+  SG_ERR_UNMODELED = -7,
 } sg_error_t;
 
 typedef enum {

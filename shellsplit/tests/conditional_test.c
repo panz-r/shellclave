@@ -167,6 +167,13 @@ static void parse(const char *source) {
   CHECK(shell_dep_graph_validate(graph).valid);
 }
 
+/* A reached setup which certainly fails is a shell-level error: no model. */
+static void reject(const char *source) {
+  current = source;
+  CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
+                              graph) == SHELL_DEP_EUNMODELED);
+}
+
 static unsigned condition_node(void) {
   for (unsigned i = 0; i < graph->node_count; ++i)
     if (graph->nodes[i].type == SHELL_NODE_CMD &&
@@ -336,12 +343,8 @@ static void check_file_predicates(void) {
         SHELL_CONDITIONAL_FALSE);
   for (unsigned i = 0; i < graph->edge_count; ++i)
     CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
-  parse("exec 99<&-; [[ -e config.json ]] <&99");
-  for (unsigned i = 0; i < graph->edge_count; ++i)
-    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
-  parse("exec 99<&-; test -e config.json <&99");
-  for (unsigned i = 0; i < graph->edge_count; ++i)
-    CHECK(graph->edges[i].type != SHELL_EDGE_FILE_TEST);
+  reject("[[ -e config.json ]] <\"\"");
+  reject("test -e config.json <\"\"");
   parse("test \"$operator\" target");
   bool possible_target = false;
   for (unsigned i = 0; i < graph->edge_count; ++i) {
@@ -442,9 +445,7 @@ static void check_body_setup(void) {
                      graph->nodes[edge->from].doc.kind == SHELL_DOC_HERESTRING;
   }
   CHECK(read_document);
-  parse("exec 99<&-; [[ -n $(cat body-input) ]] <&99");
-  for (unsigned i = 0; i < graph->edge_count; ++i)
-    CHECK(graph->edges[i].type != SHELL_EDGE_READ);
+  reject("[[ -n $(cat body-input) ]] <\"\"");
   parse("[[ -n x ]] {fd}>report; printf x >&$fd");
   report = file_node("report");
   routed = false;
@@ -463,7 +464,12 @@ static void check_body_setup(void) {
     CHECK(!(edge->type == SHELL_EDGE_READ && edge->to == owner));
   }
   CHECK(routed);
-  parse("exec 0<&-; [[ -n <(cat)$(read -u0 value) ]] 0<&-");
+  /* stdin is closed for the conditional's operands: `read -u0` certainly
+   * fails, a descriptor contract violation. */
+  current = "exec 0<&-; [[ -n <(cat)$(read -u0 value) ]] 0<&-";
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EUNMODELED);
+  parse("exec 0<&-; [[ -n <(cat) ]] 0<&-");
   parse("time ! { [[ -z '' ]]; } | cat");
   parse("( [[ -n x ]] & ); printf tail");
 }
@@ -753,8 +759,6 @@ static void check_file_predicate_unresolved_paths(void) {
       {"test -N config.json", NULL, 0},
       {"false && [[ -N \"$path\" ]]", NULL, 0},
       {"false && test -N \"$path\"", NULL, 0},
-      {"exec 99<&-; [[ -N \"$path\" ]] <&99", NULL, 0},
-      {"exec 99<&-; test -N \"$path\" <&99", NULL, 0},
       {"test -n \"$path\"", NULL, 0},
   };
   uint8_t unresolved[SHELL_DEP_MAX_NODES];
@@ -1043,7 +1047,7 @@ static void check_conditional_observation_order(void) {
   for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
     char source[1024];
     int length = snprintf(source, sizeof(source),
-                          "exec 63<<<seed 62<&-; [[ ( %s ) || "
+                          "exec 63<<<seed 62<&- || exit; [[ ( %s ) || "
                           "-n \"$(read -r -u63 -n1 before)\"<(printf pipe)"
                           "\"$(read -r -u62 -n1 after)\" ]]",
                           cases[c].prefix);
@@ -1522,15 +1526,15 @@ static void check_builtin_argument_read_phase(void) {
     unsigned reads;
   } cases[] = {
       {"test \"$count\" -eq 0", 1},
-      {"test \"$count\" -eq 0 1>&- 2>&1", 1},
-      {"[ \"$count\" -eq 0 ] 1>&- 2>&1", 1},
-      {"1>&- 2>&1 test \"$count\" -eq 0", 1},
-      {"test \"$count\" -eq \"$fallback\" 1>&- 2>&1", 2},
-      {"test x -o \"$count\" -eq invalid 1>&- 2>&1", 1},
+      {"test \"$count\" -eq 0 1>fail", 1},
+      {"[ \"$count\" -eq 0 ] 1>fail", 1},
+      {"1>fail test \"$count\" -eq 0", 1},
+      {"test \"$count\" -eq \"$fallback\" 1>fail", 2},
+      {"test x -o \"$count\" -eq invalid 1>fail", 1},
       {"false && test \"$count\" -eq 0", 0},
-      {"{ test \"$count\" -eq 0; } 1>&- 2>&1", 0},
-      {"test -f \"$count\" 1>&- 2>&1", 1},
   };
+  reject("{ test \"$count\" -eq 0; } 1>\"\"");
+  reject("test -f \"$count\" 1>\"\"");
   for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
     for (unsigned resolved = 0; resolved < 2; ++resolved) {
       if (resolved)
@@ -1832,9 +1836,7 @@ static void check_comparisons(void) {
                      graph->nodes[edge->from].doc.kind == SHELL_DOC_HERESTRING;
   }
   CHECK(read_document);
-  parse("exec 99<&-; [[ $(cat left-file) == \"$(cat right-file)\" ]] <&99");
-  for (unsigned e = 0; e < graph->edge_count; ++e)
-    CHECK(graph->edges[e].type != SHELL_EDGE_READ);
+  reject("[[ $(cat left-file) == \"$(cat right-file)\" ]] <\"\"");
   /* A producer's failed return status does not stop comparison expansion. */
   current = "[[ $(false) == \"$(cat right-file)\" ]]";
   comparison_resolver_t resolver = {.values = {"0:,", "1:x,"}};

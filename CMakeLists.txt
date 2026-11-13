@@ -520,12 +520,23 @@ if(BUILD_TESTING)
     SHELLSPLIT_TEST_ALLOCATOR SHELLSPLIT_TEST_SOURCE_SCANS)
   shellclave_add_production_test(shellsplit_descriptor_move_production_test
     shellsplit/tests/descriptor_move_test.c shellsplit)
+  shellclave_add_test(shellsplit_fd_scaling_test
+    shellsplit/tests/fd_scaling_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_fd_scaling_test PRIVATE
+    SHELLSPLIT_TEST_SOURCE_SCANS)
+  set_property(TEST shellsplit_fd_scaling_test APPEND PROPERTY LABELS shellsplit)
   add_library(shellsplit_graph_fixture STATIC shellsplit/tests/graph_fixture.c)
   shellclave_project_target(shellsplit_graph_fixture)
   target_include_directories(shellsplit_graph_fixture PRIVATE shellsplit/include)
   shellclave_add_test(shellsplit_graph_fixture_test shellsplit/tests/graph_fixture_test.c shellsplit)
   target_link_libraries(shellsplit_graph_fixture_test PRIVATE shellsplit_graph_fixture shellsplit)
   set_property(TEST shellsplit_graph_fixture_test APPEND PROPERTY LABELS shellsplit)
+  # Golden-graph serializer for engine redesign stages; run by hand against a
+  # harvested corpus, so it is a tool rather than a registered test.
+  add_executable(shellsplit_golden_graphs shellsplit/tests/golden_graphs.c)
+  shellclave_project_target(shellsplit_golden_graphs)
+  target_link_libraries(shellsplit_golden_graphs PRIVATE shellsplit_graph_fixture shellsplit)
+  target_link_libraries(shellsplit_fd_scaling_test PRIVATE shellsplit_graph_fixture shellsplit_test)
   foreach(fixture_case IN ITEMS presence conditional arithmetic boundary read_input descriptor_move source)
     target_link_libraries(shellsplit_${fixture_case}_test PRIVATE shellsplit_graph_fixture shellsplit_test)
     target_link_libraries(shellsplit_${fixture_case}_production_test PRIVATE shellsplit_graph_fixture shellsplit)
@@ -537,6 +548,18 @@ if(BUILD_TESTING)
   shellclave_add_production_test(shellsplit_depgraph_production_test shellsplit/tests/test_depgraph.c shellsplit)
   shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit_test)
   shellclave_add_test(shellsplit_netstring_test shellsplit/tests/netstring_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_persistent_map_test
+    shellsplit/tests/persistent_map_test.c shellsplit_test)
+  target_include_directories(shellsplit_persistent_map_test PRIVATE shellsplit/src)
+  set_property(TEST shellsplit_persistent_map_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_test(shellsplit_fd_occupancy_test
+    shellsplit/tests/fd_occupancy_test.c shellsplit_test)
+  target_include_directories(shellsplit_fd_occupancy_test PRIVATE shellsplit/src)
+  set_property(TEST shellsplit_fd_occupancy_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_test(shellsplit_avl_index_test
+    shellsplit/tests/avl_index_test.c shellsplit_test)
+  target_include_directories(shellsplit_avl_index_test PRIVATE shellsplit/src)
+  set_property(TEST shellsplit_avl_index_test APPEND PROPERTY LABELS shellsplit)
   foreach(shellsplit_test_target IN ITEMS shellsplit_tokenizer_test
       shellsplit_fast_parser_test shellsplit_abstract_test shellsplit_entropy_test
       shellsplit_depgraph_test shellsplit_interop_test shellsplit_netstring_test

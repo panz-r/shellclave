@@ -5,9 +5,9 @@
  * immutable version as descriptor bindings. Unlike descriptor-orphan state,
  * these capabilities are inherited by recursive shells. Keeping alternatives
  * separate makes conditional unsets conservative without scanning variables. */
-static SHELL_NONNULL(2, 3, 4) unsigned dep_variable_properties(
+static SHELL_NONNULL(2, 3) unsigned dep_variable_properties(
     uint8_t variable, const dep_route_state_t *state,
-    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+    const dep_route_journal_t *journal) {
   unsigned initial = shell_builtin_variable_index_properties(variable);
   if (!(initial & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
     return initial;
@@ -18,7 +18,7 @@ static SHELL_NONNULL(2, 3, 4) unsigned dep_variable_properties(
   uint32_t root;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    dep_route_set_t marker = dep_variable_state(&one, journal, baseline);
+    dep_route_set_t marker = dep_variable_state(&one, journal);
     if (!(marker.routes[word].value & bit))
       properties |= initial;
   }
@@ -33,17 +33,15 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
  * marker is analytic state, independent of scalar values and presence epochs.
  * state contains one execution version. Read the positional snapshot directly;
  * a route union would deduplicate equal words and lose their mask positions. */
-static SHELL_NONNULL(1, 2, 3) dep_route_set_t
+static SHELL_NONNULL(1, 2) dep_route_set_t
     dep_variable_state(const dep_route_state_t *state,
-                       const dep_route_journal_t *journal,
-                       const dep_owner_routes_t *baseline) {
-  (void)baseline;
-  const dep_route_change_t *entry = dep_route_state_change(
+                       const dep_route_journal_t *journal) {
+  uint32_t entry = dep_route_state_snapshot(
       state, journal, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
       DEP_FD_ACCESS_EFFECT_STATE);
   dep_route_set_t marker = {0};
   if (entry)
-    marker = journal->snapshots[entry->snapshot - 1];
+    marker = journal->arena->snapshots[entry - 1];
   else {
     marker.count = 4;
     for (unsigned i = 0; i < 4; ++i)
@@ -55,9 +53,10 @@ static SHELL_NONNULL(1, 2, 3) dep_route_set_t
 /* Resolve only requested resettable assignment restrictions, retaining both
  * versions when an opaque unset may have removed one. No variable/source
  * inventory is traversed, and ordinary writes take the unchanged fast path. */
-static SHELL_NONNULL(1, 2, 3) bool dep_variable_resolve(
-    dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_owner_routes_t *baseline, uint8_t variable) {
+static SHELL_NONNULL(1,
+                     2) bool dep_variable_resolve(dep_route_state_t *state,
+                                                  dep_route_journal_t *journal,
+                                                  uint8_t variable) {
   unsigned initial = shell_builtin_variable_index_properties(variable);
   if ((initial &
        (SHELL_VARIABLE_NOASSIGN | SHELL_VARIABLE_DESPECIALIZES_ON_UNSET)) !=
@@ -71,7 +70,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_variable_resolve(
   bool ready = false, split = false;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    dep_route_set_t marker = dep_variable_state(&one, journal, baseline);
+    dep_route_set_t marker = dep_variable_state(&one, journal);
     bool uncertain = !(marker.routes[word].value & bit) &&
                      (marker.routes[word + 2].value & bit);
     for (unsigned branch = 0; branch < (uncertain ? 2u : 1u); ++branch) {
@@ -101,23 +100,21 @@ static SHELL_NONNULL(1, 2, 3) bool dep_variable_resolve(
   return true;
 }
 
-static SHELL_NONNULL(1, 2, 3, 4) bool dep_prefixes_resolve(
+static SHELL_NONNULL(1, 2, 3) bool dep_prefixes_resolve(
     dep_route_state_t *state, const dep_prefix_assignment_set_t *prefixes,
-    dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
-  for (uint32_t i = 0; i < prefixes->count; ++i)
-    if (!dep_variable_resolve(state, journal, baseline,
-                              prefixes->names[i].variable))
+    dep_route_journal_t *journal) {
+  for (uint32_t i = 0; i < prefixes->special_count; ++i)
+    if (!dep_variable_resolve(state, journal,
+                              prefixes->names[prefixes->special[i]].variable))
       return false;
   return true;
 }
 
-static SHELL_NONNULL(2, 3, 4) shell_builtin_variable_t
+static SHELL_NONNULL(2, 3) shell_builtin_variable_t
     dep_variable_classification(uint8_t variable,
                                 const dep_route_state_t *state,
-                                const dep_route_journal_t *journal,
-                                const dep_owner_routes_t *baseline) {
-  unsigned properties =
-      dep_variable_properties(variable, state, journal, baseline);
+                                const dep_route_journal_t *journal) {
+  unsigned properties = dep_variable_properties(variable, state, journal);
   if (properties & SHELL_VARIABLE_INTEGER)
     return SHELL_BUILTIN_VARIABLE_ARITHMETIC;
   if (properties & SHELL_VARIABLE_FROZEN)
@@ -130,25 +127,23 @@ static SHELL_NONNULL(2, 3, 4) shell_builtin_variable_t
 
 /* The lexical prefix index includes attempted assignments. Visibility depends
  * on whether this execution version can actually install that binding. */
-static SHELL_NONNULL(1, 2, 3, 4, 5) unsigned dep_prefix_assignment_visible(
+static SHELL_NONNULL(1, 2, 3, 4) unsigned dep_prefix_assignment_visible(
     const dep_prefix_assignment_set_t *assignments, const dep_token_t *word,
-    const dep_route_state_t *state, const dep_route_journal_t *journal,
-    const dep_owner_routes_t *baseline) {
+    const dep_route_state_t *state, const dep_route_journal_t *journal) {
   uint32_t root = assignments->root;
   while (root) {
     int order =
         dep_prefix_assignment_compare_word(assignments, root - 1, word, false);
     if (!order) {
       uint8_t variable = assignments->names[root - 1].variable;
-      unsigned properties =
-          dep_variable_properties(variable, state, journal, baseline);
+      unsigned properties = dep_variable_properties(variable, state, journal);
       if (properties & SHELL_VARIABLE_READONLY)
         return SHELL_TEST_FALSE;
       if (!(properties & SHELL_VARIABLE_NOASSIGN))
         return SHELL_TEST_TRUE;
       if (!(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
         return SHELL_TEST_FALSE;
-      dep_route_set_t marker = dep_variable_state(state, journal, baseline);
+      dep_route_set_t marker = dep_variable_state(state, journal);
       unsigned word = (variable - 1u) / 32u;
       uint32_t bit = UINT32_C(1) << ((variable - 1u) % 32u);
       return marker.routes[word + 2].value & bit
@@ -161,13 +156,13 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) unsigned dep_prefix_assignment_visible(
   return SHELL_TEST_FALSE;
 }
 
-static SHELL_NONNULL(1, 2, 3, 4) bool dep_effects_supported(
+static SHELL_NONNULL(1, 2, 3) bool dep_effects_supported(
     const dep_named_mutations_t *mutations, const dep_route_state_t *state,
-    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+    const dep_route_journal_t *journal) {
   for (uint32_t i = 0; i < mutations->count; i++) {
     const dep_named_effect_t *effect = &mutations->effects[i];
     if (effect->variable && effect->prohibited_properties &&
-        (dep_variable_properties(effect->variable, state, journal, baseline) &
+        (dep_variable_properties(effect->variable, state, journal) &
          effect->prohibited_properties))
       return false;
   }

@@ -364,9 +364,9 @@ int main(void) {
   CHECK(report_is(empty, error, &result, "evaluation failed (-1)\n"));
 
   /* Result metadata is usable only after a successful operation. */
-  static const sg_error_t failures[] = {SG_ERR_INVALID, SG_ERR_MEMORY,
-                                        SG_ERR_PARSE,   SG_ERR_TRUNC,
-                                        SG_ERR_IO,      SG_ERR_EXPAND};
+  static const sg_error_t failures[] = {
+      SG_ERR_INVALID, SG_ERR_MEMORY, SG_ERR_PARSE,    SG_ERR_TRUNC,
+      SG_ERR_IO,      SG_ERR_EXPAND, SG_ERR_UNMODELED};
   sg_result_t unused_metadata = {.verdict = SG_VERDICT_UNDETERMINED};
   for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); ++i) {
     char expected[64];

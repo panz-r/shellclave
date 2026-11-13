@@ -82,14 +82,15 @@ typedef enum {
    * identity or access predicate. Includes explicit unknown memo entries;
    * unrelated inventory names and repeated requests must add no work. */
   SHELLSPLIT_TEST_WORK_READ_OBSERVATIONS,
-  /* Memoized selector-image subproblems, charged only on cache misses. */
-  SHELLSPLIT_TEST_WORK_SELECTOR_IMAGE,
   /* Actual named binding tree visits, point updates, resets and restored
    * exclusions. Does not charge a nominal global inventory size. */
   SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION,
   /* Actual raw delimiter and decoded-byte transitions, never body-line
    * counts charged as a nominal delimiter traversal. */
   SHELLSPLIT_TEST_WORK_HEREDOC_PREPARATION,
+  /* Persistent descriptor-map steps: one per node visited by a lookup,
+   * update, diff, merge or traversal (SHELL_PMAP_WORK). */
+  SHELLSPLIT_TEST_WORK_MAP_STEPS,
   SHELLSPLIT_TEST_WORK_COUNT
 } shellsplit_test_metadata_kind_t;
 void shellsplit_test_metadata_charge(shellsplit_test_metadata_kind_t kind);
