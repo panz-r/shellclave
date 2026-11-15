@@ -141,6 +141,14 @@ static bool has_edge(const shell_dep_graph_t *g, shell_dep_edge_type_t type,
   return false;
 }
 
+/* Compares the identities' fields. The structs carry padding, which an
+ * assignment or a callee need not copy, so a byte comparison is not defined. */
+static bool file_identity_equal(const shell_dep_file_identity_t *a,
+                                const shell_dep_file_identity_t *b) {
+  return a->length == b->length && a->absolute == b->absolute &&
+         a->requires_directory == b->requires_directory;
+}
+
 static bool has_edge_fds(const shell_dep_graph_t *g, shell_dep_edge_type_t type,
                          uint32_t from, uint32_t to, uint32_t source_fd,
                          uint32_t target_fd) {
@@ -5478,8 +5486,7 @@ TEST(predecoded_file_identity) {
       ASSERT(shell_dep_doc_file_identity_from_decoded(
                  &graph, doc, decoded, decoded_length, identity,
                  sizeof(identity), &decoded_identity) == known);
-      ASSERT(!memcmp(&decoded_identity, &reference_identity,
-                     sizeof(decoded_identity)));
+      ASSERT(file_identity_equal(&decoded_identity, &reference_identity));
       if (known) {
         ASSERT(strcmp(identity, reference) == 0);
         /* Preflight must leave every byte unchanged on insufficient storage. */
@@ -5497,8 +5504,7 @@ TEST(predecoded_file_identity) {
             &graph, doc, identity, decoded_length, identity, sizeof(identity),
             &decoded_identity));
         ASSERT(strcmp(identity, reference) == 0 &&
-               !memcmp(&decoded_identity, &reference_identity,
-                       sizeof(decoded_identity)));
+               file_identity_equal(&decoded_identity, &reference_identity));
       } else {
         for (size_t j = 0; j < sizeof(identity); j++)
           ASSERT(identity[j] == 'x');

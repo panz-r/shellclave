@@ -397,12 +397,25 @@ static SHELL_NONNULL(1) bool source_operation_contains(const char *input,
          length <= source_operation.end - begin;
 }
 
+/* The first slot of a boundary fact. It is a function of the offset from the
+ * operation's start and the kind, never of the address: the same source must
+ * collide the same way wherever the caller placed it, or the work a parse does
+ * would vary with the allocator and address-space randomization. Nearby
+ * offsets deliberately map to nearby slots: the probe window around a new
+ * boundary then holds its just-completed siblings, which it may replace
+ * (source_index_entry), so a short tail keeps its own boundaries behind long
+ * siblings. key lies in [source_operation.begin, source_operation.end]. */
+static size_t source_index_slot(uintptr_t key, unsigned kind) {
+  size_t offset = (size_t)(key - source_operation.begin);
+  return ((offset >> 3) ^ offset ^ (kind * 31u)) % SHELL_SOURCE_INDEX_CAPACITY;
+}
+
 static SHELL_NONNULL(1) source_index_entry_t *source_index_entry(
     const char *input, size_t length, size_t position, unsigned kind) {
   if (!source_operation.index || !source_operation_contains(input, length))
     return NULL;
   uintptr_t key = (uintptr_t)input + position;
-  size_t slot = ((key >> 3) ^ key ^ (kind * 31u)) % SHELL_SOURCE_INDEX_CAPACITY;
+  size_t slot = source_index_slot(key, kind);
   source_index_entry_t *available = NULL;
   for (size_t probe = 0; probe < SHELL_SOURCE_INDEX_PROBES; probe++) {
     source_index_entry_t *entry = &source_operation.index->entries[slot];
@@ -444,9 +457,7 @@ void shell_source_index_put(const char *input, size_t length, size_t position,
   if (!entry) {
     if (!source_operation.index || !source_operation_contains(input, length))
       return;
-    uintptr_t key = (uintptr_t)input + position;
-    size_t slot =
-        ((key >> 3) ^ key ^ (kind * 31u)) % SHELL_SOURCE_INDEX_CAPACITY;
+    size_t slot = source_index_slot((uintptr_t)input + position, kind);
     entry = &source_operation.index->entries[slot];
     size_t smallest = entry->value - entry->key;
     for (size_t probe = 1; probe < SHELL_SOURCE_INDEX_PROBES; probe++) {
