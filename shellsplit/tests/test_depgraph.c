@@ -5009,6 +5009,70 @@ TEST(digit_prefixed_process_substitution_is_a_word) {
   pass_count++;
 }
 
+TEST(named_fd_prefixed_process_substitution_is_a_word) {
+  /* Bash reads `{fd}<(cmd)` as the literal word `{fd}` joined to the process
+   * substitution (`echo {fd}<(:)` prints `{fd}/dev/fd/63`); a named
+   * descriptor needs a redirect operator that is not `<(` or `>(`. */
+  static const struct {
+    const char *source;
+    uint32_t commands;      /* command nodes, nested ones included */
+    uint32_t first_tokens;  /* argv words of the first command */
+    uint32_t second_tokens; /* argv words of the substitution's command */
+  } words[] = {
+      {"echo {fd}<(touch y)z", 2, 2, 2},
+      {"echo {fd}>(touch y)z", 2, 2, 2},
+      {"echo {fd}<(touch y)", 2, 2, 2},
+      {"echo {fd}>(touch y)", 2, 2, 2},
+      {"cat {fd}<(touch y)", 2, 2, 2},
+      {"echo a {fd}<(touch y) b", 2, 4, 2},
+      {"echo {_a1}>(touch y)", 2, 2, 2},
+      {"echo $(echo {fd}<(touch y))", 3, 2, 2},
+      {"echo {fd}<\\\n(touch y)", 2, 2, 2},
+  };
+  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+    shell_parse_result_t fast;
+    shell_dep_graph_t g;
+    if (shell_parse_fast(words[i].source, strlen(words[i].source), NULL,
+                         &fast) != SHELL_OK)
+      printf("    fast parse rejects: %s\n", words[i].source);
+    ASSERT(shell_parse_fast(words[i].source, strlen(words[i].source), NULL,
+                            &fast) == SHELL_OK);
+    shell_dep_error_t status = parse(words[i].source, &g);
+    if (status != SHELL_DEP_OK)
+      printf("    not accepted: %s\n", words[i].source);
+    ASSERT(status == SHELL_DEP_OK);
+    uint32_t commands = count_type(&g, SHELL_NODE_CMD);
+    if (commands != words[i].commands)
+      printf("    %s: %u commands, expected %u\n", words[i].source, commands,
+             words[i].commands);
+    ASSERT(commands == words[i].commands);
+    ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.token_count ==
+           words[i].first_tokens);
+    ASSERT(g.nodes[find_nth_cmd(&g, 1)].cmd.token_count ==
+           words[i].second_tokens);
+  }
+  /* A named descriptor before any other redirect operator is still one. */
+  static const char *const redirects[] = {
+      "echo {fd}>f",       "echo {fd}<f",  "echo {fd}>>f",
+      "echo {fd}<<<x",     "echo {fd}<>f", "echo {fd}<&0",
+      "echo {fd}>&2",      "exec {fd}>f",  "echo {fd}<<E\nx\nE\n",
+      "echo {fd}<\\\n<<x",
+  };
+  for (size_t i = 0; i < sizeof(redirects) / sizeof(redirects[0]); i++) {
+    shell_dep_graph_t g;
+    shell_dep_error_t status = parse(redirects[i], &g);
+    if (status != SHELL_DEP_OK)
+      printf("    not accepted: %s\n", redirects[i]);
+    ASSERT(status == SHELL_DEP_OK);
+    ASSERT(count_type(&g, SHELL_NODE_CMD) == 1);
+    if (g.nodes[find_nth_cmd(&g, 0)].cmd.token_count != 1)
+      printf("    %s: %u argv words, expected 1\n", redirects[i],
+             (unsigned)g.nodes[find_nth_cmd(&g, 0)].cmd.token_count);
+    ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.token_count == 1);
+  }
+  pass_count++;
+}
+
 TEST(composition_metadata_matrix) {
   static const struct {
     const char *command;
@@ -19452,6 +19516,7 @@ int main(int argc, char **argv) {
   RUN(final_backslash_is_a_literal_word);
   RUN(live_route_states_survive_journal_collection);
   RUN(digit_prefixed_process_substitution_is_a_word);
+  RUN(named_fd_prefixed_process_substitution_is_a_word);
   RUN(bash_stdin_code_invocation_grammar);
   RUN(composition_metadata_matrix);
   RUN(posix_brace_group_pipeline);

@@ -4567,13 +4567,25 @@ static inline bool shell_source_parse_named_fd(const char *input, size_t start,
          shell_source_parse_named_fd_at_word_start(input, start, end, after);
 }
 
+/* The operator after a complete {name} is a redirection only if it is not the
+ * opener of a process substitution: Bash reads `{fd}<(cmd)` and `{fd}>(cmd)`
+ * as the literal word `{fd}` joined to the substitution, as it reads `2<(cmd)`.
+ * after is the position after any escaped line endings, within input[0..end).
+ */
+static inline bool shell_source_named_fd_operator(const char *input, size_t end,
+                                                  size_t after) {
+  size_t open;
+  return after < end && (input[after] == '<' || input[after] == '>') &&
+         !shell_source_process_substitution_open(input, end, after, &open);
+}
+
 static SHELL_NONNULL(1, 4) inline bool shell_source_parse_named_fd_redirect_at_word_start(
     const char *input, size_t start, size_t end, size_t *operator_position) {
   size_t after;
   if (!shell_source_parse_named_fd_at_word_start(input, start, end, &after))
     return false;
   after = shell_source_skip_escaped_line_endings(input, end, after);
-  if (after == end || (input[after] != '<' && input[after] != '>'))
+  if (!shell_source_named_fd_operator(input, end, after))
     return false;
   *operator_position = after;
   return true;
@@ -4594,7 +4606,7 @@ shell_source_parse_named_fd_redirect(const char *input, size_t start,
   if (!shell_source_parse_named_fd(input, start, end, &after))
     return false;
   after = shell_source_skip_escaped_line_endings(input, end, after);
-  if (after >= end || (input[after] != '<' && input[after] != '>'))
+  if (!shell_source_named_fd_operator(input, end, after))
     return false;
   *operator_position = after;
   return true;
