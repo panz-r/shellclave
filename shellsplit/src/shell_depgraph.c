@@ -2868,13 +2868,6 @@ typedef struct {
   uint32_t count;
 } dep_redirect_frame_t;
 
-/* A set of numeric descriptors, one per redirect operation of an owner. */
-typedef struct {
-  uint32_t fds[SHELL_DEP_MAX_TOKENS * 3];
-  shell_avl_node_t index[SHELL_DEP_MAX_TOKENS * 3];
-  uint32_t root, count;
-} dep_fd_set_t;
-
 typedef struct {
   const shell_parse_result_t *fast;
   const dep_redirect_frame_t *frames;
@@ -3405,19 +3398,15 @@ typedef struct {
   uint32_t root[DEP_FAILURE_LEVELS][DEP_ROUTE_STATE_CAPACITY];
   uint8_t parent[DEP_FAILURE_LEVELS][DEP_ROUTE_STATE_CAPACITY];
   uint32_t begin[DEP_FAILURE_LEVELS], end[DEP_FAILURE_LEVELS];
-  /* Versions that may fail at the level's batch, and those whose failure
-   * proves the batch's duplication source closed. */
+  /* Versions that may fail at the level's batch. */
   uint64_t raises[DEP_FAILURE_LEVELS][DEP_FAILURE_WORDS];
-  uint64_t closes_source[DEP_FAILURE_LEVELS][DEP_FAILURE_WORDS];
   dep_route_state_t pending[2][DEP_FAILURE_CLASSES][DEP_ROUTE_STATE_CAPACITY];
   uint64_t present[2][DEP_FAILURE_CLASSES][DEP_FAILURE_WORDS];
   /* For a running-class state: the level and version of the last failure
    * point it absorbed (level DEP_FAILURE_LEVELS when it joins several
-   * lineages), and that failure point's proven-closed source, or
-   * SHELL_DEP_FD_NONE. */
+   * lineages). */
   uint32_t anchor_level[2][DEP_ROUTE_STATE_CAPACITY];
   uint32_t anchor_version[2][DEP_ROUTE_STATE_CAPACITY];
-  uint32_t anchor_closed[2][DEP_ROUTE_STATE_CAPACITY];
 } dep_failure_scan_t;
 
 static SHELL_NONNULL(1, 3) int dep_presence_writer_compare(const void *context,
@@ -8665,29 +8654,6 @@ static SHELL_NONNULL(1) bool dep_publication_crosses_group(
   const shell_group_t *destination =
       &view->fast->groups[view->destination_group];
   return destination->start < source->start || destination->end > source->end;
-}
-
-/* Adds fd to set; false when the set is full. */
-static SHELL_NONNULL(1) bool dep_fd_set_add(dep_fd_set_t *set, uint32_t fd) {
-  uint32_t candidate = set->count + 1, match = 0;
-  set->root = shell_avl_insert(set->index, set->root, candidate,
-                               SHELL_DEP_MAX_TOKENS * 3, dep_numeric_fd_compare,
-                               set->fds, &fd, &match);
-  if (match == candidate)
-    set->fds[set->count++] = fd;
-  return match != 0;
-}
-
-static SHELL_NONNULL(1) bool dep_fd_set_has(const dep_fd_set_t *set,
-                                            uint32_t fd) {
-  uint32_t root = set->root;
-  while (root) {
-    int order = dep_numeric_fd_compare(set->fds, root - 1, &fd);
-    if (!order)
-      return true;
-    root = order < 0 ? set->index[root - 1].right : set->index[root - 1].left;
-  }
-  return false;
 }
 
 typedef enum {

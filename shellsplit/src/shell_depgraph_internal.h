@@ -48,6 +48,17 @@ size_t shell_dep_file_path_normalize(char *path, size_t length)
  * alignment and is exclusively borrowed for this test operation. */
 bool shellsplit_test_route_state_contract(void *workspace, uint32_t count)
     SHELL_NONNULL(1);
+/* Fill the private journal pools to the point a collection is due, collect,
+ * and check what survives: pinned facts through each kind of pin, reclaimed
+ * ids and values, and continued use. No source within the graph limits can
+ * fill the pools, so this drives the collector directly. workspace is as for
+ * shellsplit_test_route_state_contract() and is overwritten. */
+bool shellsplit_test_route_collection_contract(void *workspace)
+    SHELL_NONNULL(1);
+/* Check the process-substitution fork contract on hand-built states: owned
+ * ends survive in the child, are closed in the parent's view, and ownership
+ * moves. workspace is as above and is overwritten. */
+bool shellsplit_test_process_fork_contract(void *workspace) SHELL_NONNULL(1);
 /* Test-only differential oracle: execute the ordered cleanup program without
  * segment-cache reuse. The setting is local to the calling test thread. */
 void shellsplit_test_failure_cleanup_reference(bool enabled);

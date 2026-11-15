@@ -741,10 +741,6 @@ typedef struct {
   uint32_t selector, key;
 } dep_allocation_choices_t;
 
-static bool dep_occupancy_any(shell_fd_occupancy_t occupancy) {
-  return occupancy.may_free || occupancy.may_occupied;
-}
-
 typedef struct {
   dep_allocation_choices_t slots[2];
   bool resource;
@@ -859,7 +855,9 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_named_allocation_choices(
                          dep_fd_numeric(available.routes[candidate].value),
                          DEP_FD_ACCESS_SELECTOR)
              .count &&
-        low_free && dep_occupancy_any(choices->slots[0].tail_domain) &&
+        low_free &&
+        (choices->slots[0].tail_domain.may_free ||
+         choices->slots[0].tail_domain.may_occupied) &&
         !dep_allocation_choice_add(&choices->slots[0],
                                    available.routes[candidate],
                                    choices->slots[0].tail_domain, -1))
@@ -5181,19 +5179,6 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_join_slot(
   return dep_route_state_store_access(destination, journal, fd, access, routes);
 }
 
-/* A source modified by this setup cannot prove parent absence on failure. */
-static SHELL_NONNULL(1, 2) bool dep_fd_setup_modified_source(
-    const dep_route_state_t *local, const dep_route_journal_t *journal,
-    uint32_t source) {
-  dep_route_set_t modified = dep_fd_raw_fact(
-      local, journal, dep_fd_numeric(source), DEP_FD_ACCESS_SETUP_FRAME);
-  if (!modified.count)
-    return false;
-  dep_route_set_t frame = dep_fd_raw_fact(
-      local, journal, dep_fd_numeric(SHELL_DEP_FD_NONE), DEP_FD_ACCESS_ENTRY);
-  return frame.count && modified.routes[0].value == frame.routes[0].value;
-}
-
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 static _Thread_local bool dep_failure_reference;
 
@@ -5314,34 +5299,6 @@ static SHELL_NONNULL(1, 2) bool dep_failure_finish(dep_route_state_t *failed,
               DEP_FD_ACCESS_SETUP_MODE, (dep_route_set_t){.ready = true}));
 }
 
-/* A failure proves an unmodified duplication source closed: Bash checks it
- * before any change. The undos never touch that descriptor. */
-static SHELL_NONNULL(1, 2) bool dep_failure_close_source(
-    dep_route_state_t *state, dep_route_journal_t *journal, uint32_t fd) {
-  dep_route_set_t closed = {0};
-  dep_route_set_set(&closed, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
-  for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_BINDING;
-       access <<= 1)
-    if (!dep_route_state_store_access(state, journal, dep_fd_numeric(fd),
-                                      (dep_fd_access_t)access, closed))
-      return false;
-  return true;
-}
-
-static SHELL_NONNULL(1,
-                     2) bool dep_failure_join_fd(dep_route_state_t *joined,
-                                                 dep_route_journal_t *journal,
-                                                 uint32_t left, uint32_t source,
-                                                 uint32_t fd) {
-  dep_fd_merge_relation_t relation = {.force = true};
-  for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_BINDING;
-       access <<= 1)
-    if (!dep_fd_merge_key(joined, journal, left, source, dep_fd_numeric(fd),
-                          (dep_fd_access_t)access, 0, 0, &relation))
-      return false;
-  return true;
-}
-
 /* Setup-failure outcomes of a redirect list, as a forward dataflow problem
  * with exceptional control flow. Each prepared batch is a statement that may
  * raise a setup failure, and registers undo handlers that Bash runs newest
@@ -5399,7 +5356,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   reference = dep_failure_reference;
 #endif
-  dep_fd_set_t undo_targets = {0};
   collection.roots[3] = NULL;
   collection.states = scan->level;
   collection.state_count = 0;
@@ -5416,16 +5372,11 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
     scan->begin[level] = begin;
     scan->end[level] = end;
     memset(scan->raises[level], 0, sizeof(scan->raises[level]));
-    memset(scan->closes_source[level], 0, sizeof(scan->closes_source[level]));
     collection.state_count = levels;
     dep_route_state_t next = {0};
     collection.roots[4] = &next;
     have_next = false;
     uint32_t children = 0;
-    for (uint32_t op = begin; op < end; op++)
-      if (dep_fd_op_saves_numeric(ops + op) &&
-          !dep_fd_set_add(&undo_targets, ops[op].fd))
-        return false;
     dep_route_iterator_t paths = dep_route_iterator(&local);
     uint32_t root, version = 0;
     while (dep_route_next(&paths, journal, &root)) {
@@ -5448,17 +5399,7 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
       if (outcomes & DEP_STATUS_MAY_FAIL) {
         if (!dep_record_diagnostic(&one, journal))
           return false;
-        const dep_fd_op_t *op = ops + begin;
-        /* Only an unmodified source proves parent absence. A local close or
-         * temporary redirect can instead be restored during this cleanup. */
-        bool closes =
-            dep_fd_op_copies(op->kind) && op->target_fd <= SHELL_DEP_FD_MAX &&
-            !dep_fd_setup_modified_source(&one, journal, op->target_fd) &&
-            !dep_fd_set_has(&undo_targets, op->target_fd) &&
-            !dep_fd_ifs_expansion(op, &one, journal);
         dep_failure_set(scan->raises[level], version);
-        if (closes)
-          dep_failure_set(scan->closes_source[level], version);
         if (reference) {
           /* The test reference unwinds every raise point on its own. */
           dep_route_state_t failed = one;
@@ -5472,8 +5413,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
               &failed, journal, ops, 0, begin, DEP_UNDO_DONE, &failure_pins);
           if (list == DEP_UNDO_EXHAUSTED ||
               !dep_failure_finish(&failed, journal, list) ||
-              (closes &&
-               !dep_failure_close_source(&failed, journal, op->target_fd)) ||
               !dep_fd_add(failures, 1, failed, journal))
             return false;
         }
@@ -5568,9 +5507,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
                              : DEP_FAILURE_LEVELS;
           scan->anchor_version[here][parent] =
               scan->anchor_version[below][child];
-          scan->anchor_closed[here][parent] =
-              partition == 0 ? scan->anchor_closed[below][child]
-                             : SHELL_DEP_FD_NONE;
         }
       }
     }
@@ -5583,12 +5519,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
           dep_route_state_single(scan->root[level][version]);
       dep_route_state_inherit(&raised, &scan->level[level]);
       raised.correlated = true;
-      uint32_t closed = SHELL_DEP_FD_NONE;
-      if (dep_failure_bit(scan->closes_source[level], version)) {
-        closed = ops[scan->begin[level]].target_fd;
-        if (!dep_failure_close_source(&raised, journal, closed))
-          return false;
-      }
       dep_route_state_t *running = &scan->pending[here][0][version];
       if (!dep_failure_bit(scan->present[here][0], version)) {
         *running = raised;
@@ -5598,10 +5528,9 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
           return false;
       } else {
         /* Walk the anchor's lineage back to this level: the running state
-         * differs from this raise point only where those batches, or the
-         * anchor's proven-closed source, changed something. Join into an
-         * uncorrelated copy, as dep_fd_join does: a correlated result stops
-         * a merge. */
+         * differs from this raise point only where those batches changed
+         * something. Join into an uncorrelated copy, as dep_fd_join does: a
+         * correlated result stops a merge. */
         dep_route_state_t joined = dep_route_state_single(running->root);
         uint32_t left = running->root;
         uint32_t walk = scan->anchor_version[here][version];
@@ -5614,19 +5543,11 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
             return false;
           walk = up;
         }
-        uint32_t previous = scan->anchor_closed[here][version];
-        if ((previous != SHELL_DEP_FD_NONE &&
-             !dep_failure_join_fd(&joined, journal, left, raised.root,
-                                  previous)) ||
-            (closed != SHELL_DEP_FD_NONE &&
-             !dep_failure_join_fd(&joined, journal, left, raised.root, closed)))
-          return false;
         running->root = joined.root;
         running->truncated |= joined.truncated;
       }
       scan->anchor_level[here][version] = level;
       scan->anchor_version[here][version] = version;
-      scan->anchor_closed[here][version] = closed;
     }
   }
   /* The undo-list classes matter only while unwinding: a version leaves one
@@ -6020,3 +5941,169 @@ static SHELL_NONNULL(1, 2, 3, 8, 9, 10, 11) bool dep_fd_setup_failures(
           dep_failure_mark_opens(&failures->state[1], journal, completed, ops,
                                  op_count, context));
 }
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+/* Whether the fact of (fd, access) in state is the single route kind/value. */
+static bool dep_test_fact_is(const dep_route_state_t *state,
+                             const dep_route_journal_t *journal, uint32_t fd,
+                             dep_fd_access_t access, dep_route_kind_t kind,
+                             uint32_t value) {
+  dep_route_set_t fact =
+      dep_fd_raw_fact(state, journal, dep_fd_numeric(fd), access);
+  return fact.count == 1 && fact.routes[0].kind == kind &&
+         fact.routes[0].value == value;
+}
+
+static bool dep_test_fresh_workspace(void *workspace) {
+  dep_route_workspace_t *w = workspace;
+  memset(w, 0, sizeof(*w));
+  dep_route_arena_reset(&w->route_arena);
+  dep_route_journal_reset(&w->journal, &w->route_arena);
+  return true;
+}
+
+bool shellsplit_test_route_collection_contract(void *workspace) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_set_t fact = {0};
+  dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, 7});
+  /* Facts a collection must keep, each held a different way: by the live
+   * state (a plain fact, an owned end, a named-binding holder), by a pinned
+   * flow, and by a cursor over remaining alternatives. */
+  dep_route_state_t live = {0}, flowed = {0}, remaining = {0}, names = {0};
+  if (!dep_route_state_append_one(&live, journal, dep_fd_numeric(3),
+                                  DEP_FD_ACCESS_WRITE, fact) ||
+      !dep_process_owned_set(&live, journal, dep_fd_numeric(5), true) ||
+      !dep_route_state_append_one(&names, journal, dep_fd_numeric(9),
+                                  DEP_FD_ACCESS_BINDING, fact))
+    return false;
+  dep_route_set_t holder = {0};
+  dep_route_set_set(&holder, (dep_fd_route_t){DEP_ROUTE_INHERITED, names.root});
+  if (!dep_route_state_append_map(&live, journal, dep_fd_numeric(0),
+                                  DEP_FD_ACCESS_NAMED_BINDINGS, holder) ||
+      !dep_route_state_append_one(&flowed, journal, dep_fd_numeric(6),
+                                  DEP_FD_ACCESS_WRITE, fact) ||
+      !dep_route_state_append_one(&remaining, journal, dep_fd_numeric(7),
+                                  DEP_FD_ACCESS_WRITE, fact))
+    return false;
+  dep_fd_flow_t flow = {.mask = 1u};
+  flow.state[0] = flowed;
+  dep_route_iterator_t cursor = dep_route_iterator(&remaining);
+  /* Fill the pools until a collection is due: more distinct descriptor
+   * states than any source within the graph limits can produce. */
+  dep_route_state_t junk = {0};
+  uint32_t seed = 12345u;
+  const uint32_t pressure = DEP_ROUTE_CHANGE_CAPACITY * 3 / 4;
+  for (uint32_t step = 0;
+       journal->arena->maps.count < pressure ||
+       journal->arena->maps.allocations < DEP_ROUTE_CHANGE_CAPACITY / 16;
+       step++) {
+    if (step == 100000)
+      return false;
+    seed = seed * 1103515245u + 12345u;
+    dep_route_set_t value = {0};
+    dep_route_set_set(&value, (dep_fd_route_t){DEP_ROUTE_INHERITED,
+                                               1000 + (seed >> 8) % 700});
+    if (!dep_route_state_append_one(&junk, journal,
+                                    dep_fd_numeric(10 + (seed >> 16) % 200),
+                                    DEP_FD_ACCESS_WRITE, value))
+      return false;
+  }
+  uint32_t available = shell_pmap_available(&journal->arena->maps);
+  uint32_t snapshots = journal->arena->snapshot_count;
+  dep_domain_collection_t collection = {
+      .workspace = w, .roots = {&live}, .flow = &flow, .remaining = &cursor};
+  dep_route_domains_collect(journal, &collection, &live, NULL);
+  /* The dead states are reclaimed, the interned values they alone used too,
+   * and the allocation counters restart. */
+  if (shell_pmap_available(&journal->arena->maps) < available + 10000u ||
+      journal->arena->snapshot_count >= snapshots ||
+      journal->arena->maps.allocations != 0)
+    return false;
+  /* Every pinned fact reads the same, through every kind of pin. */
+  if (!dep_test_fact_is(&live, journal, 3, DEP_FD_ACCESS_WRITE,
+                        DEP_ROUTE_INHERITED, 7) ||
+      !dep_process_owned(&live, journal, dep_fd_numeric(5)) ||
+      !dep_test_fact_is(&flowed, journal, 6, DEP_FD_ACCESS_WRITE,
+                        DEP_ROUTE_INHERITED, 7) ||
+      !dep_test_fact_is(&remaining, journal, 7, DEP_FD_ACCESS_WRITE,
+                        DEP_ROUTE_INHERITED, 7) ||
+      !dep_route_root_snapshot(dep_named_bindings(live.root, journal).value,
+                               journal, dep_fd_numeric(9),
+                               DEP_FD_ACCESS_BINDING))
+    return false;
+  /* Reclaimed ids are reusable: later updates and reads still work. */
+  dep_route_set_t later = {0};
+  dep_route_set_set(&later, (dep_fd_route_t){DEP_ROUTE_INHERITED, 99});
+  return dep_route_state_append_one(&live, journal, dep_fd_numeric(4),
+                                    DEP_FD_ACCESS_WRITE, later) &&
+         dep_test_fact_is(&live, journal, 4, DEP_FD_ACCESS_WRITE,
+                          DEP_ROUTE_INHERITED, 99) &&
+         dep_test_fact_is(&live, journal, 3, DEP_FD_ACCESS_WRITE,
+                          DEP_ROUTE_INHERITED, 7);
+}
+
+/* A forked child keeps the process-substitution ends its parent owns; the
+ * parent closes exactly those numbers and gives up their ownership. */
+bool shellsplit_test_process_fork_contract(void *workspace) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_set_t open = {0};
+  dep_route_set_set(&open, (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
+  dep_route_state_t parent = {0};
+  /* fds 20 and 21 are owned ends, fd 22 an unrelated open descriptor. */
+  for (uint32_t fd = 20; fd <= 22; fd++)
+    if (!dep_route_state_append_one(&parent, journal, dep_fd_numeric(fd),
+                                    DEP_FD_ACCESS_BINDING, open) ||
+        (fd < 22 &&
+         !dep_process_owned_set(&parent, journal, dep_fd_numeric(fd), true)))
+      return false;
+  /* A group forks: the child keeps every descriptor and owns nothing, and the
+   * origin it records for the parent has the owned ends closed. */
+  dep_route_state_t child = parent;
+  if (!dep_fd_private_begin(&child, journal, 0) ||
+      dep_process_owned_root(&child, journal) != 0 ||
+      !dep_test_fact_is(&child, journal, 20, DEP_FD_ACCESS_BINDING,
+                        DEP_ROUTE_INHERITED, UINT32_MAX))
+    return false;
+  dep_route_set_t origin = dep_fd_raw_fact(&child, journal, dep_fd_numeric(0),
+                                           DEP_FD_ACCESS_PRIVATE_ENTRY);
+  if (origin.count != 1)
+    return false;
+  dep_route_state_t returned = dep_route_state_single(origin.routes[0].value);
+  if (!dep_test_fact_is(&returned, journal, 20, DEP_FD_ACCESS_BINDING,
+                        DEP_ROUTE_CLOSED, UINT32_MAX) ||
+      !dep_test_fact_is(&returned, journal, 21, DEP_FD_ACCESS_BINDING,
+                        DEP_ROUTE_CLOSED, UINT32_MAX) ||
+      !dep_test_fact_is(&returned, journal, 22, DEP_FD_ACCESS_BINDING,
+                        DEP_ROUTE_INHERITED, UINT32_MAX) ||
+      dep_process_owned_root(&returned, journal) != 0)
+    return false;
+  /* Another command range forks the same way for its child but leaves the
+   * recorded parent view as it was. */
+  child = parent;
+  if (!dep_fd_private_begin(&child, journal, SHELL_MAX_GROUPS) ||
+      dep_process_owned_root(&child, journal) != 0)
+    return false;
+  origin = dep_fd_raw_fact(&child, journal, dep_fd_numeric(SHELL_MAX_GROUPS),
+                           DEP_FD_ACCESS_PRIVATE_ENTRY);
+  if (origin.count != 1)
+    return false;
+  returned = dep_route_state_single(origin.routes[0].value);
+  if (!dep_test_fact_is(&returned, journal, 20, DEP_FD_ACCESS_BINDING,
+                        DEP_ROUTE_INHERITED, UINT32_MAX))
+    return false;
+  /* Cleanup closes the owned ends in the forking parent itself. */
+  dep_route_state_t cleaned = parent;
+  return dep_process_cleanup(&cleaned, journal) &&
+         dep_process_owned_root(&cleaned, journal) == 0 &&
+         dep_test_fact_is(&cleaned, journal, 20, DEP_FD_ACCESS_BINDING,
+                          DEP_ROUTE_CLOSED, UINT32_MAX) &&
+         dep_test_fact_is(&cleaned, journal, 21, DEP_FD_ACCESS_BINDING,
+                          DEP_ROUTE_CLOSED, UINT32_MAX) &&
+         dep_test_fact_is(&cleaned, journal, 22, DEP_FD_ACCESS_BINDING,
+                          DEP_ROUTE_INHERITED, UINT32_MAX);
+}
+#endif
