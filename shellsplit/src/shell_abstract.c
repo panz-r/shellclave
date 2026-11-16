@@ -1942,7 +1942,7 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
   size_t rendered_count = 0;
   for (size_t c = 0; c < stages.count; c++) {
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages.commands[c]);
+    shell_processed_argv_iterator_init(&iterator, &stages.commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       /* A redirect-only simple command has no executable. Preserve it as an
@@ -2017,7 +2017,7 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
   char *position = outer;
   for (size_t c = 0; c < stages.count; c++) {
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages.commands[c]);
+    shell_processed_argv_iterator_init(&iterator, &stages.commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       size_t inner_length = empty_stage_signature_length(&stages.commands[c]);
@@ -2121,7 +2121,7 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
   size_t rendered_count = 0;
   for (size_t c = 0; c < stages->count; c++) {
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages->commands[c]);
+    shell_processed_argv_iterator_init(&iterator, &stages->commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       size_t raw_record_length = 0;
@@ -2212,7 +2212,7 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
   char *type_position = typed;
   for (size_t c = 0; c < stages->count; c++) {
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages->commands[c]);
+    shell_processed_argv_iterator_init(&iterator, &stages->commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       size_t prefix_length = 0;

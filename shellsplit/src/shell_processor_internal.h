@@ -179,14 +179,25 @@ typedef struct {
   size_t redirection_operand_end;
 } shell_processed_word_iterator_t;
 
+/* command must outlive the iteration and not change during it. */
 void shell_processed_word_iterator_init(
     shell_processed_word_iterator_t *iterator, const shell_command_t *command)
-    SHELL_NONNULL(1);
+    SHELL_NONNULL(1, 2);
 bool shell_processed_word_iterator_next(
     shell_processed_word_iterator_t *iterator, shell_token_t *word)
     SHELL_NONNULL(1, 2);
-size_t shell_processed_command_word_count(const shell_command_t *command);
+/* Iterate argv words: the lexical words after any leading assignments, which
+ * shell_processed_word_iterator_*() alone still yields. Same requirements as
+ * shell_processed_word_iterator_init(). */
+void shell_processed_argv_iterator_init(
+    shell_processed_word_iterator_t *iterator, const shell_command_t *command)
+    SHELL_NONNULL(1, 2);
+/* Count of argv words, so zero for a command of only redirects or
+ * assignments. */
+size_t shell_processed_command_word_count(const shell_command_t *command)
+    SHELL_NONNULL(1);
 bool shell_processed_command_has_dangerous_features(
-    const shell_command_t *command, bool has_pipe_input);
-bool shell_processed_command_has_pipe_output(const shell_command_t *command);
+    const shell_command_t *command, bool has_pipe_input) SHELL_NONNULL(1);
+bool shell_processed_command_has_pipe_output(const shell_command_t *command)
+    SHELL_NONNULL(1);
 #endif

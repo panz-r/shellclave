@@ -21,8 +21,10 @@ extern "C" {
  * record but set has_shell_features. Arithmetic commands likewise contribute
  * no argv record and set that flag; their anomaly signatures remain separate.
  * Redirect-only simple commands are rejected because they have no
- * policy-evaluable argv. Enclosing group I/O
- * cannot turn an empty timing endpoint into a policy subject.
+ * policy-evaluable argv. Assignments before the command name are not argv: the
+ * record starts at the executable and has_shell_features is set. A stage of
+ * only assignments likewise contributes no record and sets that flag. Enclosing
+ * group I/O cannot turn an empty timing endpoint into a policy subject.
  * Supported compound groups contain simple-command lists, pipelines and nested
  * brace/subshell groups. Control compounds, function declarations, array
  * semantics, dynamic/mutating arithmetic, wider [[ … ]] predicates, $"…", ;&

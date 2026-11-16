@@ -48,6 +48,14 @@ typedef struct {
    */
   shell_token_t *command_tokens;
   size_t command_token_count;
+  /* The first assignment_prefix_count command_tokens are the `name=value` and
+   * `name+=value` assignments that precede the command name (with any wholly
+   * elided process words among them); zero when there are none. They change
+   * the command's environment or shell variables and are never argv: netargv
+   * rendering starts after them, and a command that has them reports
+   * shell_command_info_has_dangerous_features(). A command with only
+   * assignments has no argv, like a redirect-only command. */
+  size_t assignment_prefix_count;
   bool has_pipe_input;                // Has pipe input (| or |&)
   bool has_pipe_output;               // Has pipe output (| or |&)
   shell_pipe_mode_t pipe_output_mode; // stdout or stdout+stderr pipe output

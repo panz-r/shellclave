@@ -60,10 +60,21 @@ defines the outer payload:
 | Raw anomaly sequence | `shell_build_command_netseq_buffer()` | One decoded executable name per execution stage |
 | Typed anomaly sequence | `shell_build_type_netseq_buffer()` | One nested netargv signature per execution stage: executable followed by abstract type symbols |
 
-An argv-less redirect-only operation or empty timed pipeline contributes an
-empty executable-name sentinel to anomaly sequences. Those stages are distinct
+An argv-less redirect-only or assignment-only operation, or an empty timed
+pipeline, contributes an empty executable-name sentinel to anomaly sequences. Those stages are distinct
 from commands with policy-evaluable argv. A multi-argument executable stage
 remains one anomaly item; its arguments are nested in its type signature.
+
+The first element of a netargv is the executable. Assignments that precede the
+command name (`FOO=1 BAR+=2 ls -l`) change its environment but are not argv, so
+every netargv and anomaly builder starts after them, and the command is reported
+as having shell features. A stage of only assignments runs no program: argv
+sequences omit it and report the feature, as for arithmetic, so
+`PATH=/tmp/x; ls` is never indistinguishable from `ls`. An assignment together
+with a redirect or pipe and no command is a redirect-only operation and is
+rejected. `shell_command_info_t.assignment_prefix_count` gives the number of
+leading `command_tokens` that are assignments, and the graph carries the
+assignments themselves as ENVVAR nodes.
 
 Arithmetic commands have no argv-policy record. Argv-sequence builders omit
 them and report shell syntax through their feature output. Processed-command

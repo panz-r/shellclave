@@ -521,10 +521,16 @@ static void test_builtin_option_semantics(void) {
       shell_netstring_buffer_t sequence = {0};
       size_t count = 0;
       bool features = false;
+      /* A stage of only assignments and a redirect does real I/O without
+       * argv, so netargv rejects it as it does a bare redirect, unless a
+       * command substitution nests it outside the immediate list. */
+      bool redirect_only = strstr(source, "OPTIND='fd=2' >/dev/null") != NULL &&
+                           strchr(contexts[c].prefix, '$') == NULL;
       CHECK(shell_build_netargv_sequence_buffer(source, (size_t)length, NULL,
                                                 &sequence, &count, &features) ==
-            (syntax_supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
-      if (!syntax_supported)
+            (syntax_supported && !redirect_only ? SHELL_PROCESS_OK
+                                                : SHELL_PROCESS_EPARSE));
+      if (!syntax_supported || redirect_only)
         CHECK(sequence.data == NULL && sequence.length == 0 && count == 0 &&
               !features);
       shell_netstring_buffer_free(&sequence);
@@ -1160,6 +1166,95 @@ static void test_canonical_sequences(void) {
             &count) == SHELL_PROCESS_EPARSE);
   CHECK(command_netseq.data == NULL && anomaly_type_netseq.data == NULL &&
         count == 0);
+}
+
+/* Leading assignments change the command's environment but are not argv:
+ * argv[0] is the executable, and the assignments are reported as a shell
+ * feature instead of being rendered as words. */
+static void test_assignment_prefix_is_not_argv(void) {
+  static const struct {
+    const char *source;
+    shell_process_status_t status;
+    const char *netargv; /* NUL-free expected sequence, if status is OK */
+    size_t count;
+    bool features;
+  } cases[] = {
+      {"x=1 echo hi", SHELL_PROCESS_OK, "12:4:echo,2:hi,,", 1, true},
+      {"FOO=1 BAR+=2 ls -l", SHELL_PROCESS_OK, "10:2:ls,2:-l,,", 1, true},
+      {"x=$(echo a) echo b", SHELL_PROCESS_OK, "11:4:echo,1:b,,", 1, true},
+      {"x='a b' y=\"$z\" cmd", SHELL_PROCESS_OK, "6:3:cmd,,", 1, true},
+      /* Only leading words are assignments. */
+      {"echo x=1", SHELL_PROCESS_OK, "13:4:echo,3:x=1,,", 1, false},
+      {"env x=1 echo", SHELL_PROCESS_OK, "19:3:env,3:x=1,4:echo,,", 1, false},
+      {"\"x\"=1 echo", SHELL_PROCESS_OK, "13:3:x=1,4:echo,,", 1, false},
+      /* A stage of only assignments runs nothing: no record, but flagged. */
+      {"x=1", SHELL_PROCESS_OK, "", 0, true},
+      {"x=1 y=2", SHELL_PROCESS_OK, "", 0, true},
+      {"PATH=/tmp/x; ls", SHELL_PROCESS_OK, "5:2:ls,,", 1, true},
+      {"x=1 & ls", SHELL_PROCESS_OK, "5:2:ls,,", 1, true},
+      /* Assignment plus a redirect or pipe is real I/O without argv. */
+      {"x=1 >f", SHELL_PROCESS_EPARSE, NULL, 0, false},
+      {"x=1 | cat", SHELL_PROCESS_EPARSE, NULL, 0, false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_netstring_buffer_t sequence = {0};
+    size_t count = 0;
+    bool features = false;
+    shell_process_status_t status = shell_build_netargv_sequence_buffer(
+        cases[i].source, strlen(cases[i].source), NULL, &sequence, &count,
+        &features);
+    if (status != cases[i].status)
+      fprintf(stderr, "assignment prefix: %s status=%d\n", cases[i].source,
+              status);
+    CHECK(status == cases[i].status);
+    if (status == SHELL_PROCESS_OK) {
+      size_t expected = strlen(cases[i].netargv);
+      if (sequence.length != expected ||
+          (expected && memcmp(sequence.data, cases[i].netargv, expected) != 0))
+        fprintf(stderr, "assignment prefix: %s rendered %.*s\n",
+                cases[i].source, (int)sequence.length,
+                (const char *)sequence.data);
+      CHECK(sequence.length == expected &&
+            (expected == 0 ||
+             memcmp(sequence.data, cases[i].netargv, expected) == 0));
+      CHECK(count == cases[i].count && features == cases[i].features);
+    }
+    shell_netstring_buffer_free(&sequence);
+  }
+
+  /* The per-command record keeps every word and says how many lead. */
+  shell_processed_commands_t processed = {0};
+  static const char source[] = "A=1 B=2 ls -l";
+  CHECK(shell_process_commands(source, strlen(source), NULL, &processed) ==
+        SHELL_PROCESS_OK);
+  CHECK(processed.command_count == 1);
+  const shell_command_info_t *info = &processed.commands[0];
+  CHECK(info->command_token_count == 4 && info->assignment_prefix_count == 2);
+  CHECK(shell_command_info_has_dangerous_features(info));
+  shell_netstring_buffer_t rendered = {0};
+  CHECK(shell_render_netargv_buffer(info, NULL, &rendered) == SHELL_PROCESS_OK);
+  CHECK(rendered.length == strlen("2:ls,2:-l,") &&
+        memcmp(rendered.data, "2:ls,2:-l,", rendered.length) == 0);
+  shell_netstring_buffer_free(&rendered);
+  shell_processed_commands_free(&processed);
+  static const char plain[] = "echo A=1";
+  CHECK(shell_process_commands(plain, strlen(plain), NULL, &processed) ==
+        SHELL_PROCESS_OK);
+  CHECK(processed.commands[0].assignment_prefix_count == 0 &&
+        !shell_command_info_has_dangerous_features(&processed.commands[0]));
+  shell_processed_commands_free(&processed);
+
+  /* Anomaly sequences name the executable too, and keep an assignment-only
+   * stage as an explicit stage with the empty sentinel. */
+  shell_netstring_buffer_t raw = {0}, type = {0};
+  size_t count = 0;
+  static const char anomaly[] = "FOO=1 ls; x=2";
+  CHECK(shell_build_anomaly_netseqs_buffer(anomaly, strlen(anomaly), NULL, &raw,
+                                           &type, &count) == SHELL_PROCESS_OK);
+  CHECK(count == 2 && raw.length == strlen("2:ls,0:,") &&
+        memcmp(raw.data, "2:ls,0:,", raw.length) == 0);
+  shell_netstring_buffer_free(&raw);
+  shell_netstring_buffer_free(&type);
 }
 
 static void test_netstring_error_boundaries(void) {
@@ -6905,6 +7000,7 @@ int main(void) {
   test_comment_boundary_work();
   test_array_prefix_semantics();
   test_builtin_option_semantics();
+  test_assignment_prefix_is_not_argv();
   test_printf_effect_schedule();
   test_readonly_builtin_effect_schedule();
   test_declaration_prefix_promotion_roles();

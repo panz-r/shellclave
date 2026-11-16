@@ -579,8 +579,6 @@ void shell_processed_word_iterator_init(
 
 bool shell_processed_word_iterator_next(
     shell_processed_word_iterator_t *iterator, shell_token_t *word) {
-  if (!iterator->command)
-    return false;
   const shell_command_t *command = iterator->command;
   while (iterator->token_index < command->token_count) {
     const shell_token_t *token = &command->tokens[iterator->token_index++];
@@ -621,9 +619,35 @@ bool shell_processed_word_iterator_next(
   return false;
 }
 
+/* A leading `name=value` or `name+=value` word is an environment or shell
+ * variable assignment that precedes the command name, never argv. */
+static SHELL_NONNULL(1) bool processed_word_is_assignment(
+    const shell_token_t *word) {
+  shell_source_assignment_word_t assignment;
+  return shell_source_parse_scalar_assignment_word(word->start, word->length,
+                                                   &assignment);
+}
+
+/* Start an iteration over argv words: the lexical words after any leading
+ * assignments. The assignments remain visible to the lexical iterator, which
+ * feature detection uses to find executable substitutions in their values. */
+void shell_processed_argv_iterator_init(
+    shell_processed_word_iterator_t *iterator, const shell_command_t *command) {
+  shell_processed_word_iterator_init(iterator, command);
+  for (;;) {
+    shell_processed_word_iterator_t before = *iterator;
+    shell_token_t word;
+    if (!shell_processed_word_iterator_next(iterator, &word) ||
+        !processed_word_is_assignment(&word)) {
+      *iterator = before;
+      return;
+    }
+  }
+}
+
 size_t shell_processed_command_word_count(const shell_command_t *command) {
   shell_processed_word_iterator_t iterator;
-  shell_processed_word_iterator_init(&iterator, command);
+  shell_processed_argv_iterator_init(&iterator, command);
   shell_token_t word;
   size_t count = 0;
   while (shell_processed_word_iterator_next(&iterator, &word))
@@ -631,16 +655,13 @@ size_t shell_processed_command_word_count(const shell_command_t *command) {
   return count;
 }
 
-/* A bare Bash timing operation is shell structure without executable argv.
- * Keep it distinct from a redirect-only command: the latter performs real I/O
- * and must remain unpolicyable, while the former can be omitted from policy
- * netargv without losing an execution decision. */
-static SHELL_NONNULL(1) bool shell_processed_command_is_empty_timing(
-    const shell_command_t *command) {
-  if (command->pipeline_time_mode == SHELL_PIPE_TIME_NONE ||
-      shell_processed_command_word_count(command) != 0)
-    return false;
+/* The command's syntax is only list and pipeline-modifier structure: no
+ * redirect and no pipe. Word tokens are ignored when ignore_words is set. */
+static SHELL_NONNULL(1) bool shell_processed_command_is_structure_only(
+    const shell_command_t *command, bool ignore_words) {
   for (size_t i = 0; i < command->token_count; i++) {
+    if (ignore_words && !shell_token_type_is_syntax(command->tokens[i].type))
+      continue;
     switch (command->tokens[i].type) {
     case SHELL_TOKEN_PIPE_TIME:
     case SHELL_TOKEN_PIPE_TIME_OPTION:
@@ -653,6 +674,39 @@ static SHELL_NONNULL(1) bool shell_processed_command_is_empty_timing(
     }
   }
   return true;
+}
+
+/* A bare Bash timing operation is shell structure without executable argv.
+ * Keep it distinct from a redirect-only command: the latter performs real I/O
+ * and must remain unpolicyable, while the former can be omitted from policy
+ * netargv without losing an execution decision. */
+static SHELL_NONNULL(1) bool shell_processed_command_is_empty_timing(
+    const shell_command_t *command) {
+  return command->pipeline_time_mode != SHELL_PIPE_TIME_NONE &&
+         shell_processed_command_word_count(command) == 0 &&
+         shell_processed_command_is_structure_only(command, false);
+}
+
+/* A command of only assignments runs no program and does no I/O, like an
+ * arithmetic command it only changes shell state. Policy netargv omits it, and
+ * the feature flag reports it: `PATH=/tmp/x; ls` must not look like plain
+ * `ls`. A redirect or pipe makes it real I/O, which stays unpolicyable. */
+static SHELL_NONNULL(1) bool shell_processed_command_is_assignment_only(
+    const shell_command_t *command) {
+  shell_processed_word_iterator_t iterator;
+  shell_processed_word_iterator_init(&iterator, command);
+  shell_token_t word;
+  return shell_processed_command_word_count(command) == 0 &&
+         shell_processed_word_iterator_next(&iterator, &word) &&
+         shell_processed_command_is_structure_only(command, true);
+}
+
+/* A simple command the policy netargv omits: it has no argv and is shell
+ * structure or shell state rather than real I/O. */
+static SHELL_NONNULL(1) bool shell_processed_command_is_omitted(
+    const shell_command_t *command) {
+  return shell_processed_command_is_empty_timing(command) ||
+         shell_processed_command_is_assignment_only(command);
 }
 
 /* --- EXECUTION-STAGE COLLECTION ---------------------------------------- */
@@ -955,8 +1009,6 @@ shell_processed_commands_parse(const char *command_line, size_t command_length,
 
 bool shell_processed_command_has_dangerous_features(
     const shell_command_t *command, bool has_pipe_input) {
-  if (!command)
-    return false;
   /* Compound prefix tokens are intentionally omitted from flattened records;
    * their retained metadata is authoritative even without a list separator. */
   if (has_pipe_input || command->pipeline_time_mode != SHELL_PIPE_TIME_NONE ||
@@ -969,16 +1021,19 @@ bool shell_processed_command_has_dangerous_features(
   shell_processed_word_iterator_t iterator;
   shell_processed_word_iterator_init(&iterator, command);
   shell_token_t word;
+  bool first = true;
   while (shell_processed_word_iterator_next(&iterator, &word)) {
-    if (shell_source_word_has_executable_substitution(word.start, word.length))
+    /* Leading assignments change the command's environment but are not in
+     * its netargv, so a command carrying them needs shell-aware handling. */
+    if ((first && processed_word_is_assignment(&word)) ||
+        shell_source_word_has_executable_substitution(word.start, word.length))
       return true;
+    first = false;
   }
   return false;
 }
 
 bool shell_processed_command_has_pipe_output(const shell_command_t *command) {
-  if (!command)
-    return false;
   for (size_t i = 0; i < command->token_count; i++) {
     if (command->tokens[i].type == SHELL_TOKEN_PIPE ||
         command->tokens[i].type == SHELL_TOKEN_PIPE_BOTH)
@@ -1178,6 +1233,15 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   info->shell_token_count = shell_count;
   info->command_tokens = command_tokens;
   info->command_token_count = command_count;
+  info->assignment_prefix_count = 0;
+  for (size_t i = 0; i < command_count; i++) {
+    if (shell_source_word_is_elided(command_tokens[i].start,
+                                    command_tokens[i].length))
+      continue;
+    if (!processed_word_is_assignment(&command_tokens[i]))
+      break;
+    info->assignment_prefix_count = i + 1;
+  }
   info->pipe_output_mode = pipe_output_mode;
   info->has_pipe_output = pipe_output_mode != SHELL_PIPE_MODE_NONE;
   info->pipeline_negation_count = pipeline_negation_count;
@@ -1817,7 +1881,8 @@ static SHELL_NONNULL(1, 3) shell_process_status_t
  * runtime expansions; quoted empty words still count as arguments. */
 static SHELL_NONNULL(1) bool command_info_has_arguments(
     const shell_command_info_t *info) {
-  for (size_t i = 0; i < info->command_token_count; i++)
+  for (size_t i = info->assignment_prefix_count; i < info->command_token_count;
+       i++)
     if (!shell_source_word_is_elided(info->command_tokens[i].start,
                                      info->command_tokens[i].length))
       return true;
@@ -2166,7 +2231,8 @@ static SHELL_NONNULL(1, 2) char *render_word_into(const shell_token_t *token,
 shell_process_status_t shell_measure_netargv(const shell_command_info_t *info,
                                              size_t *total) {
   *total = 0;
-  for (size_t i = 0; i < info->command_token_count; i++) {
+  for (size_t i = info->assignment_prefix_count; i < info->command_token_count;
+       i++) {
     const shell_token_t *token = &info->command_tokens[i];
     if (shell_source_word_is_elided(token->start, token->length))
       continue;
@@ -2187,7 +2253,8 @@ shell_process_status_t shell_measure_netargv(const shell_command_info_t *info,
 
 static SHELL_NONNULL(1, 2) char *write_netargv_unchecked(
     const shell_command_info_t *info, char *position) {
-  for (size_t i = 0; i < info->command_token_count; i++) {
+  for (size_t i = info->assignment_prefix_count; i < info->command_token_count;
+       i++) {
     const shell_token_t *token = &info->command_tokens[i];
     if (shell_source_word_is_elided(token->start, token->length))
       continue;
@@ -2225,7 +2292,7 @@ static shell_process_status_t
 measure_basic_netargv(const shell_command_t *command, size_t *total) {
   *total = 0;
   shell_processed_word_iterator_t iterator;
-  shell_processed_word_iterator_init(&iterator, command);
+  shell_processed_argv_iterator_init(&iterator, command);
   shell_token_t word;
   while (shell_processed_word_iterator_next(&iterator, &word)) {
     size_t length = 0;
@@ -2246,7 +2313,7 @@ measure_basic_netargv(const shell_command_t *command, size_t *total) {
 static SHELL_NONNULL(1, 2) char *write_basic_netargv(
     const shell_command_t *command, char *position) {
   shell_processed_word_iterator_t iterator;
-  shell_processed_word_iterator_init(&iterator, command);
+  shell_processed_argv_iterator_init(&iterator, command);
   shell_token_t word;
   while (shell_processed_word_iterator_next(&iterator, &word)) {
     size_t length = 0;
@@ -2296,7 +2363,7 @@ bool shell_command_info_has_dangerous_features(
   if (info->pipeline_time_mode != SHELL_PIPE_TIME_NONE ||
       info->pipeline_negation_count != 0 || info->shell_token_count != 0 ||
       info->has_pipe_input || info->has_pipe_output || info->has_redirections ||
-      info->has_error_redirection)
+      info->has_error_redirection || info->assignment_prefix_count != 0)
     return true;
 
   /* Substitutions remain explicit netargv values. They can execute shell code,
@@ -2343,7 +2410,7 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   for (size_t i = 0; i < count; i++) {
     if (shell_processed_command_word_count(&commands[i]) == 0) {
       if (commands[i].kind != SHELL_COMMAND_SIMPLE ||
-          shell_processed_command_is_empty_timing(&commands[i])) {
+          shell_processed_command_is_omitted(&commands[i])) {
         *has_shell_features = true;
         continue;
       }
@@ -2388,7 +2455,7 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   char *position = encoded;
   for (size_t i = 0; i < count; i++) {
     if (commands[i].kind != SHELL_COMMAND_SIMPLE ||
-        shell_processed_command_is_empty_timing(&commands[i]))
+        shell_processed_command_is_omitted(&commands[i]))
       continue;
     size_t length = 0;
     (void)measure_basic_netargv(&commands[i], &length);
@@ -2475,7 +2542,7 @@ shell_process_status_t shell_build_command_netseq_from_stages(
       continue;
     }
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages->commands[i]);
+    shell_processed_argv_iterator_init(&iterator, &stages->commands[i]);
     shell_token_t token;
     if (!shell_processed_word_iterator_next(&iterator, &token)) {
       status = SHELL_PROCESS_EPARSE;
@@ -2524,7 +2591,7 @@ shell_process_status_t shell_build_command_netseq_from_stages(
       continue;
     }
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages->commands[i]);
+    shell_processed_argv_iterator_init(&iterator, &stages->commands[i]);
     shell_token_t token;
     if (!shell_processed_word_iterator_next(&iterator, &token)) {
       free(encoded);

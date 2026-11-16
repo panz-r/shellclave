@@ -9524,11 +9524,6 @@ static void test_processed_word_iterator_boundary_contract(void) {
                         !shell_processed_word_iterator_next(&iterator, &word);
   valid = valid && fragment_valid;
 
-  /* NULL is the documented empty/exhausted iterator, not fabricated parser
-   * metadata. Nonempty commands must carry valid source-ordered spans. */
-  shell_processed_word_iterator_init(&iterator, NULL);
-  valid = valid && !shell_processed_word_iterator_next(&iterator, &word);
-
   static const char lf_source[] = "a\\\nb";
   shell_token_t lf = {.type = SHELL_TOKEN_ARGUMENT,
                       .start = lf_source + 3,
@@ -11478,9 +11473,7 @@ int main(void) {
         shell_processed_word_iterator_next(&iterator, &redirect_word[0]) &&
         shell_processed_word_iterator_next(&iterator, &redirect_word[1]) &&
         !shell_processed_word_iterator_next(&iterator, &redirect_word[2]);
-    shell_processed_word_iterator_init(&iterator, NULL);
     bool valid =
-        shell_processed_command_word_count(NULL) == 0 &&
         shell_processed_command_word_count(&command) == 3 &&
         !shell_processed_word_iterator_next(&iterator, &command_word[3]) &&
         command_words && command_word[0].start == tokens[0].start &&
@@ -11489,12 +11482,10 @@ int main(void) {
         shell_processed_command_word_count(&redirects) == 2 && redirect_words &&
         redirect_word[0].start == redirections[0].start &&
         redirect_word[1].start == redirections[10].start &&
-        !shell_processed_command_has_dangerous_features(NULL, false) &&
         shell_processed_command_has_dangerous_features(&plain, true) &&
         shell_processed_command_has_dangerous_features(&command, false) &&
         shell_processed_command_has_dangerous_features(&nested_word, false) &&
         !shell_processed_command_has_dangerous_features(&only_words, false) &&
-        !shell_processed_command_has_pipe_output(NULL) &&
         shell_processed_command_has_pipe_output(&command) &&
         !shell_processed_command_has_pipe_output(&plain);
     test("Processed-command word iterator respects redirection operands",
