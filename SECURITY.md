@@ -45,11 +45,16 @@ A gate evaluates every installed policy, each installed with an outcome, and a
 command's verdict is the most restrictive outcome among its subcommands, in the
 order `REJECT`, `DENY_ESCALATE`, `DENY`, `NEEDS_REASON`, `REVIEW`,
 `UNDETERMINED`, `DISCOURAGE`, `AUDIT`, `ALLOW`. The
-library defines that order, not what the application does for each outcome. A
-verdict is what the policies decided and is never altered by what must hold for
-the input to run as analyzed: those are the result's `requirements`, which
-Shellsplit states and the gate passes on unchanged (see below). A missing allow
-rule yields `UNDETERMINED`. Assignment-only and redirect-only operations, such as `VALUE=x`
+library defines that order, not what the application does for each outcome.
+Applications can declare outputs and override relations between policies: each
+output is rooted at a policy, names the relations it follows, and is that
+policy's outcome when it matched, else what the first matching policy it
+overrides delivers; `verdict` is the most
+restrictive output, and `outputs` holds the vector. An override can replace a
+stricter outcome with a weaker one, and the library cannot check that the
+overriding policy is really the more specific. A verdict is what the policies decided and is never altered by
+what must hold for the input to run as analyzed: those are the result's `requirements`, which Shellsplit states
+and the gate passes on unchanged (see below). A missing allow rule yields `UNDETERMINED`. Assignment-only and redirect-only operations, such as `VALUE=x`
 and `>output`, also lack argv-policy coverage. Prefix assignments and redirects
 on a command have effects separate from its matched argv. The README's
 [policy coverage rules](README.md#what-policy-rules-cover) describe these

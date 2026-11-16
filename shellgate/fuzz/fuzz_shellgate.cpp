@@ -203,8 +203,7 @@ void validate_result(const sg_result_t *result, sg_error_t error,
          SG_EXPANSION_UNRESOLVED_ARITHMETIC)) != 0 ||
       (error == SG_ERR_TRUNC && !result->truncated) ||
       (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
-      (error == SG_ERR_TRUNC && (result->verdict == SG_VERDICT_ALLOW ||
-                                 result->verdict == SG_VERDICT_ALLOW)) ||
+      (error == SG_ERR_TRUNC && result->verdict == SG_VERDICT_ALLOW) ||
       !valid_buffer_string(result->deny_reason, buffer, buffer_size)) {
     fprintf(stderr,
             "result fields: error=%d verdict=%d truncated=%d subcommands=%u "
@@ -233,6 +232,12 @@ void validate_result(const sg_result_t *result, sg_error_t error,
       invariant_failure("subcommand string outside the output buffer");
     if (subcommand->matches != (subcommand->matched_policies != 0))
       invariant_failure("subcommand match flag disagrees with matched bits");
+    if (subcommand->output_count == 0 ||
+        subcommand->output_count > SG_MAX_OUTPUTS)
+      invariant_failure("subcommand output count outside its bounds");
+    for (uint32_t k = 0; k < subcommand->output_count; k++)
+      if (!valid_verdict(subcommand->outputs[k].verdict))
+        invariant_failure("subcommand output has an invalid verdict");
     if (((subcommand->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
          0) &&
         !((result->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0))
@@ -241,6 +246,14 @@ void validate_result(const sg_result_t *result, sg_error_t error,
         !result->has_dynamic_substitution_io)
       invariant_failure("subcommand dynamic-I/O flag lacks top-level flag");
   }
+  if (result->output_count == 0 || result->output_count > SG_MAX_OUTPUTS)
+    invariant_failure("result output count outside its bounds");
+  for (uint32_t k = 0; k < result->output_count; k++)
+    if (!valid_verdict(result->outputs[k].verdict))
+      invariant_failure("result output has an invalid verdict");
+  if (result->output_count == 1 &&
+      result->verdict != result->outputs[0].verdict)
+    invariant_failure("single-output verdict disagrees with its output");
   for (uint32_t i = 0; i < result->suggestion_count; i++)
     if (!valid_buffer_string(result->suggestions[i], buffer, buffer_size))
       invariant_failure("suggestion outside the output buffer");
@@ -290,6 +303,8 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       left.suggestion_count != right.suggestion_count ||
       left.deny_suggestion_count != right.deny_suggestion_count ||
       left.attention_index != right.attention_index ||
+      left.output_count != right.output_count ||
+      left.deciding_user_data != right.deciding_user_data ||
       left.truncated != right.truncated ||
       left.subcommand_truncated != right.subcommand_truncated ||
       left.short_circuited != right.short_circuited ||
@@ -306,6 +321,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
     const sg_subcommand_result_t &a = left.subcommands[i];
     const sg_subcommand_result_t &b = right.subcommands[i];
     if (a.matches != b.matches || a.verdict != b.verdict ||
+        a.output_count != b.output_count ||
         a.matched_policies != b.matched_policies ||
         !equal_string(a.display_command, b.display_command) ||
         !equal_string(a.reject_reason, b.reject_reason) ||
@@ -318,6 +334,20 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
         a.unresolved_expansion_flags != b.unresolved_expansion_flags)
       return false;
   }
+  for (uint32_t k = 0; k < left.output_count; k++)
+    if (left.outputs[k].verdict != right.outputs[k].verdict ||
+        left.outputs[k].policy != right.outputs[k].policy ||
+        left.outputs[k].user_data != right.outputs[k].user_data)
+      return false;
+  for (uint32_t i = 0; i < left.subcommand_count; i++)
+    for (uint32_t k = 0; k < left.subcommands[i].output_count; k++)
+      if (left.subcommands[i].outputs[k].verdict !=
+              right.subcommands[i].outputs[k].verdict ||
+          left.subcommands[i].outputs[k].policy !=
+              right.subcommands[i].outputs[k].policy ||
+          left.subcommands[i].outputs[k].user_data !=
+              right.subcommands[i].outputs[k].user_data)
+        return false;
   for (uint32_t i = 0; i < left.suggestion_count; i++)
     if (!equal_string(left.suggestions[i], right.suggestions[i]))
       return false;

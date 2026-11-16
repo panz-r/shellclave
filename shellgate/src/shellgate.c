@@ -277,14 +277,36 @@ typedef struct {
   bool owned;
 } sg_policy_entry_t;
 
+/* One relation: "overrider" stands in front of "overridden". */
+typedef struct {
+  uint8_t overrider, overridden;
+} sg_relation_t;
+
+/* Matches are kept as a bit per policy in a uint32_t, relations as a bit per
+ * relation in a uint64_t, and policy indexes in a uint8_t. */
+_Static_assert(SG_MAX_POLICIES <= 32, "policy bits must fit a uint32_t");
+_Static_assert(SG_MAX_RELATIONS <= 64, "relation bits must fit a uint64_t");
+_Static_assert(SG_MAX_POLICIES <= UINT8_MAX, "policy index must fit a uint8_t");
+
 /* Index 0 is the allow policy and index 1 the deny policy; both exist from
  * construction, so policy_count >= 2. */
-enum { SG_ALLOW_SLOT = 0, SG_DENY_SLOT = 1 };
+enum { SG_ALLOW_SLOT = 0, SG_DENY_SLOT = 1, SG_SLOT_COUNT = 2 };
 
 struct sg_gate {
   sg_policy_entry_t policies[SG_MAX_POLICIES];
   uint32_t policy_count;
   sg_verdict_t stop_outcome;
+
+  /* Relations, in creation order; the id of a relation is its position.
+   * "overrider" stands in front of "overridden". Two relations may connect the
+   * same policies. */
+  sg_relation_t relations[SG_MAX_RELATIONS];
+  uint32_t relation_count;
+  /* Declared outputs, in declaration order: the root policy of each, and the
+   * set of relations it follows (bit i is relation i). */
+  uint8_t output_roots[SG_MAX_OUTPUTS];
+  uint64_t output_relations[SG_MAX_OUTPUTS];
+  uint32_t output_count;
 
   char cwd[512];
   uint32_t reject_mask;
@@ -460,6 +482,41 @@ static int sg_verdict_rank(sg_verdict_t verdict) {
   return ranks[verdict];
 }
 
+/* The user pointer behind the scalar verdict of `outputs`, `count` of them,
+ * whose most restrictive is `verdict`. It is given only when exactly one output
+ * is that restrictive: with a tie no single policy decided it, so NULL. */
+static void *sg_scalar_user_data(const sg_output_t *outputs, uint32_t count,
+                                 sg_verdict_t verdict) {
+  const sg_output_t *only = NULL;
+  uint32_t ties = 0;
+  for (uint32_t k = 0; k < count; k++)
+    if (outputs[k].verdict == verdict) {
+      only = &outputs[k];
+      ties++;
+    }
+  return ties == 1 ? only->user_data : NULL;
+}
+
+/* Output k of the whole command: the most restrictive over its subcommands.
+ * `floor_undetermined` lifts anything weaker to UNDETERMINED, for an argv-less
+ * redirect or unresolved arithmetic, which must not read as plainly allowed
+ * yet must not mask a stricter result either. */
+static sg_output_t sg_aggregate_output(const sg_result_t *out, uint32_t k,
+                                       bool floor_undetermined) {
+  sg_output_t worst = {.verdict = SG_VERDICT_ALLOW, .policy = UINT32_MAX};
+  for (uint32_t i = 0; i < out->subcommand_count; i++) {
+    sg_output_t each = out->subcommands[i].outputs[k];
+    if (i == 0 ||
+        sg_verdict_rank(each.verdict) > sg_verdict_rank(worst.verdict))
+      worst = each;
+  }
+  if (floor_undetermined &&
+      sg_verdict_rank(worst.verdict) < sg_verdict_rank(SG_VERDICT_UNDETERMINED))
+    worst =
+        (sg_output_t){.verdict = SG_VERDICT_UNDETERMINED, .policy = UINT32_MAX};
+  return worst;
+}
+
 /* Verdicts that stop a command from proceeding as it is, and so carry the
  * command's deny_reason. A permitting outcome, however weak, is not one. */
 static bool sg_verdict_needs_attention(sg_verdict_t verdict) {
@@ -482,6 +539,74 @@ static const char *sg_outcome_reason(sg_verdict_t outcome) {
   default:
     return NULL;
   }
+}
+
+/* The most restrictive result found so far; on a tie the earlier one stays. */
+typedef struct {
+  bool found;
+  sg_verdict_t verdict;
+  uint32_t policy;
+} sg_pick_t;
+
+static void sg_pick(sg_pick_t *pick, sg_verdict_t verdict, uint32_t policy) {
+  if (!pick->found || sg_verdict_rank(verdict) > sg_verdict_rank(pick->verdict))
+    *pick = (sg_pick_t){.found = true, .verdict = verdict, .policy = policy};
+}
+
+/* What `policy` delivers: its own outcome if it matched. Otherwise it cannot
+ * override what it stands in front of, so it delivers what the first of those
+ * policies delivers, taking the output's relations in creation order and going
+ * depth first. Each policy is visited once, which ends any cycle. Returns
+ * whether a matched policy was found. */
+static bool sg_resolve_policy(const sg_gate_t *gate, uint64_t relations,
+                              uint32_t policy, uint32_t matched,
+                              uint32_t *visited, sg_pick_t *pick) {
+  uint32_t bit = UINT32_C(1) << policy;
+  if (*visited & bit)
+    return false;
+  *visited |= bit;
+  if (matched & bit) {
+    *pick = (sg_pick_t){.found = true,
+                        .verdict = gate->policies[policy].outcome,
+                        .policy = policy};
+    return true;
+  }
+  for (uint32_t r = 0; r < gate->relation_count; r++)
+    if ((relations & (UINT64_C(1) << r)) &&
+        gate->relations[r].overrider == policy &&
+        sg_resolve_policy(gate, relations, gate->relations[r].overridden,
+                          matched, visited, pick))
+      return true;
+  return false;
+}
+
+/* The number of results a gate gives: its declared outputs, or one. */
+static uint32_t sg_output_total(const sg_gate_t *gate) {
+  return gate->output_count ? gate->output_count : 1;
+}
+
+/* Output k from the policies that matched. With no declared outputs the one
+ * output is the most restrictive match. Nothing matched along the way is
+ * UNDETERMINED. */
+static sg_output_t sg_resolve_output(const sg_gate_t *gate, uint32_t k,
+                                     uint32_t matched) {
+  sg_pick_t pick = {0};
+  if (gate->output_count == 0) {
+    for (uint32_t pi = 0; pi < gate->policy_count; pi++)
+      if (matched & (UINT32_C(1) << pi))
+        sg_pick(&pick, gate->policies[pi].outcome, pi);
+  } else {
+    uint32_t visited = 0;
+    (void)sg_resolve_policy(gate, gate->output_relations[k],
+                            gate->output_roots[k], matched, &visited, &pick);
+  }
+  if (pick.found)
+    return (sg_output_t){
+        .verdict = pick.verdict,
+        .policy = pick.policy,
+        .user_data = st_policy_user_data(gate->policies[pick.policy].policy)};
+  return (sg_output_t){.verdict = SG_VERDICT_UNDETERMINED,
+                       .policy = UINT32_MAX};
 }
 
 sg_error_t sg_gate_set_stop_outcome(sg_gate_t *gate, sg_verdict_t outcome) {
@@ -1246,12 +1371,93 @@ sg_error_t sg_gate_add_policy_borrowed(sg_gate_t *gate,
   return sg_gate_add_policy(gate, policy, outcome, false);
 }
 
+sg_error_t sg_gate_add_override(sg_gate_t *gate, uint32_t overrider,
+                                uint32_t overridden, uint32_t *relation) {
+  if (overrider >= gate->policy_count || overridden >= gate->policy_count ||
+      overrider == overridden || gate->relation_count == SG_MAX_RELATIONS)
+    return SG_ERR_INVALID;
+  *relation = gate->relation_count;
+  gate->relations[gate->relation_count++] = (sg_relation_t){
+      .overrider = (uint8_t)overrider, .overridden = (uint8_t)overridden};
+  return SG_OK;
+}
+
+uint32_t sg_gate_relation_count(const sg_gate_t *gate) {
+  return gate->relation_count;
+}
+
+void sg_gate_relation_at(const sg_gate_t *gate, uint32_t relation,
+                         uint32_t *overrider, uint32_t *overridden) {
+  *overrider = gate->relations[relation].overrider;
+  *overridden = gate->relations[relation].overridden;
+}
+
+sg_error_t sg_gate_add_output(sg_gate_t *gate, uint32_t root,
+                              const uint32_t *relations,
+                              uint32_t relation_count) {
+  if (root >= gate->policy_count || gate->output_count == SG_MAX_OUTPUTS)
+    return SG_ERR_INVALID;
+  uint64_t mask = 0;
+  for (uint32_t i = 0; i < relation_count; i++) {
+    if (relations[i] >= gate->relation_count)
+      return SG_ERR_INVALID;
+    mask |= UINT64_C(1) << relations[i];
+  }
+  gate->output_roots[gate->output_count] = (uint8_t)root;
+  gate->output_relations[gate->output_count++] = mask;
+  return SG_OK;
+}
+
+uint32_t sg_gate_output_count(const sg_gate_t *gate) {
+  return gate->output_count;
+}
+
+void sg_gate_clear_outputs(sg_gate_t *gate) { gate->output_count = 0; }
+
+void sg_gate_clear_overrides(sg_gate_t *gate) {
+  gate->relation_count = 0;
+  memset(gate->output_relations, 0, sizeof(gate->output_relations));
+}
+
 void sg_gate_remove_policy(sg_gate_t *gate, uint32_t index) {
   if (gate->policies[index].owned)
     st_policy_free((st_policy_t *)gate->policies[index].policy);
   memmove(&gate->policies[index], &gate->policies[index + 1],
           (gate->policy_count - index - 1) * sizeof(gate->policies[0]));
   gate->policy_count--;
+
+  /* Drop the relations that name the removed policy and the outputs rooted at
+   * it, and renumber what follows. A relation keeps its place among the rest,
+   * so the order in which an output tries them is unchanged. */
+  uint32_t relation_map[SG_MAX_RELATIONS];
+  uint32_t kept = 0;
+  for (uint32_t r = 0; r < gate->relation_count; r++) {
+    sg_relation_t relation = gate->relations[r];
+    if (relation.overrider == index || relation.overridden == index) {
+      relation_map[r] = UINT32_MAX;
+      continue;
+    }
+    relation.overrider -= relation.overrider > index;
+    relation.overridden -= relation.overridden > index;
+    relation_map[r] = kept;
+    gate->relations[kept++] = relation;
+  }
+  uint32_t old_relation_count = gate->relation_count;
+  gate->relation_count = kept;
+  kept = 0;
+  for (uint32_t o = 0; o < gate->output_count; o++) {
+    if (gate->output_roots[o] == index)
+      continue;
+    uint64_t mask = 0;
+    for (uint32_t r = 0; r < old_relation_count; r++)
+      if ((gate->output_relations[o] & (UINT64_C(1) << r)) &&
+          relation_map[r] != UINT32_MAX)
+        mask |= UINT64_C(1) << relation_map[r];
+    gate->output_roots[kept] =
+        (uint8_t)(gate->output_roots[o] - (gate->output_roots[o] > index));
+    gate->output_relations[kept++] = mask;
+  }
+  gate->output_count = kept;
 }
 
 uint32_t sg_gate_policy_count(const sg_gate_t *gate) {
@@ -2051,15 +2257,55 @@ static void sg_init_rejected_subcommand(sg_result_t *out,
  * leave its optimistic initial verdict observable to the caller. Source
  * syntax and unsupported-feature paths explicitly reject before reaching this
  * helper; this helper is only for failures while constructing or evaluating
- * an otherwise accepted representation. */
+ * an otherwise accepted representation. A failure after the outputs were
+ * aggregated drops them, so sg_complete_outputs makes every output
+ * UNDETERMINED as well. */
 static SHELL_NONNULL(1) sg_error_t
     sg_fail_undetermined(sg_result_t *out, sg_error_t error) {
   out->verdict = SG_VERDICT_UNDETERMINED;
+  out->output_count = 0;
+  out->deciding_user_data = NULL;
   return error;
+}
+
+static sg_error_t sg_gate_evaluate_body(sg_gate_t *gate, const char *cmd,
+                                        size_t cmd_len, char *buf,
+                                        size_t buf_size, sg_result_t *out);
+
+/* Paths that end before the policies are resolved report only a scalar
+ * verdict. Give them the vector shape: each output is that verdict. */
+static void sg_complete_outputs(const sg_gate_t *gate, sg_result_t *out) {
+  uint32_t total = sg_output_total(gate);
+  for (uint32_t i = 0; i < out->subcommand_count; i++) {
+    sg_subcommand_result_t *sr = &out->subcommands[i];
+    if (sr->output_count != 0)
+      continue;
+    sr->output_count = total;
+    for (uint32_t k = 0; k < total; k++)
+      sr->outputs[k] =
+          (sg_output_t){.verdict = sr->verdict, .policy = UINT32_MAX};
+  }
+  if (out->output_count != 0)
+    return;
+  out->output_count = total;
+  for (uint32_t k = 0; k < total; k++)
+    out->outputs[k] =
+        (sg_output_t){.verdict = out->verdict, .policy = UINT32_MAX};
 }
 
 sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                             char *buf, size_t buf_size, sg_result_t *out) {
+  sg_error_t status =
+      sg_gate_evaluate_body(gate, cmd, cmd_len, buf, buf_size, out);
+  /* SG_ERR_INVALID can return before the result is initialized. */
+  if (status != SG_ERR_INVALID)
+    sg_complete_outputs(gate, out);
+  return status;
+}
+
+static sg_error_t sg_gate_evaluate_body(sg_gate_t *gate, const char *cmd,
+                                        size_t cmd_len, char *buf,
+                                        size_t buf_size, sg_result_t *out) {
   if (buf_size == 0)
     return SG_ERR_INVALID;
   if (cmd_len == 0 || memchr(cmd, '\0', cmd_len) != NULL)
@@ -2456,19 +2702,16 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     sr->write_count += graph_index->group_writes[ni];
     sr->read_count += graph_index->group_reads[ni];
 
-    /* Evaluate every installed policy, so no match hides another. The
-     * allow and deny slots build suggestions when the caller wants them; the
-     * match-only path avoids constructing any. The verdict is the most
-     * restrictive outcome among the matches. */
-    st_eval_result_t slot_eval[2] = {{0}, {0}};
+    /* Evaluate every installed policy, so no match hides another, and record
+     * which matched. The allow and deny slots build suggestions when the
+     * caller wants them; the match-only path avoids constructing any. */
+    st_eval_result_t slot_eval[SG_SLOT_COUNT] = {{0}, {0}};
     uint32_t matched_mask = 0;
-    sg_verdict_t best = SG_VERDICT_UNDETERMINED;
-    bool matched_any = false;
     bool policy_failed = false, failed_memory = false, deny_slot_failed = false;
     for (uint32_t pi = 0; pi < gate->policy_count; pi++) {
       const sg_policy_entry_t *entry = &gate->policies[pi];
       st_eval_result_t *eval =
-          pi < 2 && gate->suggestions ? &slot_eval[pi] : NULL;
+          pi < SG_SLOT_COUNT && gate->suggestions ? &slot_eval[pi] : NULL;
       bool matches = false;
       st_error_t err =
           eval ? st_policy_eval_view(entry->policy, policy_netargv_view, eval)
@@ -2488,42 +2731,41 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         deny_slot_failed = deny_slot_failed || pi == SG_DENY_SLOT;
         continue;
       }
-      if (!matches)
-        continue;
-      matched_mask |= UINT32_C(1) << pi;
-      if (!matched_any ||
-          sg_verdict_rank(entry->outcome) > sg_verdict_rank(best))
-        best = entry->outcome;
-      matched_any = true;
+      if (matches)
+        matched_mask |= UINT32_C(1) << pi;
     }
+    /* Resolve each output from the matches; the subcommand's verdict is the
+     * most restrictive of them. Policies are deterministic and a shape that
+     * matches nothing is UNDETERMINED, not an error; the only failure is an
+     * allocation inside a policy, which leaves every output UNDETERMINED and
+     * is reported. */
+    sr->output_count = sg_output_total(gate);
+    sg_verdict_t best = SG_VERDICT_ALLOW;
+    for (uint32_t k = 0; k < sr->output_count; k++) {
+      sr->outputs[k] = policy_failed
+                           ? (sg_output_t){.verdict = SG_VERDICT_UNDETERMINED,
+                                           .policy = UINT32_MAX}
+                           : sg_resolve_output(gate, k, matched_mask);
+      if (k == 0 ||
+          sg_verdict_rank(sr->outputs[k].verdict) > sg_verdict_rank(best))
+        best = sr->outputs[k].verdict;
+    }
+    sr->deciding_user_data =
+        sg_scalar_user_data(sr->outputs, sr->output_count, best);
+    bool matched_any = matched_mask != 0;
     sr->matched_policies = matched_mask;
     sr->matches = matched_any;
+    sr->verdict = best;
     if (policy_failed) {
-      /* An unevaluated policy might have matched something more restrictive:
-       * nothing weaker than UNDETERMINED survives, and a stricter known
-       * outcome is kept. The failure is still reported. */
       evaluation_error = failed_memory ? SG_ERR_MEMORY : SG_ERR_PARSE;
-      if (!matched_any ||
-          sg_verdict_rank(best) <= sg_verdict_rank(SG_VERDICT_UNDETERMINED)) {
-        sr->matches = false;
-        sr->matched_policies = 0;
-        sr->verdict = SG_VERDICT_UNDETERMINED;
-        sr->reject_reason =
-            deny_slot_failed ? bw_copy(&bw, "deny policy evaluation failed", 29)
-                             : bw_copy(&bw, "policy evaluation failed", 24);
-      } else {
-        sr->verdict = best;
-        const char *reason = sg_outcome_reason(best);
-        sr->reject_reason =
-            reason ? bw_copy(&bw, reason, strlen(reason)) : NULL;
-      }
-    } else if (matched_any) {
-      sr->verdict = best;
+      sr->reject_reason =
+          deny_slot_failed ? bw_copy(&bw, "deny policy evaluation failed", 29)
+                           : bw_copy(&bw, "policy evaluation failed", 24);
+    } else if (best != SG_VERDICT_UNDETERMINED) {
       const char *reason = sg_outcome_reason(best);
       sr->reject_reason = reason ? bw_copy(&bw, reason, strlen(reason)) : NULL;
     } else {
-      sr->verdict = SG_VERDICT_UNDETERMINED;
-      if (gate->suggestions) {
+      if (gate->suggestions && !matched_any) {
         sg_error_t added =
             bw_add_policy_suggestions(&bw, slot_eval[SG_ALLOW_SLOT].suggestions,
                                       slot_eval[SG_ALLOW_SLOT].suggestion_count,
@@ -2664,37 +2906,34 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     return SG_OK;
   }
 
-  /* The command's verdict is its most restrictive subcommand. An argv-less
-   * redirect and unresolved arithmetic are UNDETERMINED: they must not mask a
-   * stricter verdict from another simple command in the same list. */
-  sg_verdict_t worst = SG_VERDICT_ALLOW;
-  for (uint32_t i = 0; i < out->subcommand_count; i++) {
-    sg_verdict_t verdict = out->subcommands[i].verdict;
-    if (sg_verdict_rank(verdict) > sg_verdict_rank(worst))
-      worst = verdict;
+  /* Each output is its most restrictive subcommand; the verdict is the most
+   * restrictive output. An argv-less redirect and unresolved arithmetic are
+   * UNDETERMINED: they must not mask a stricter result in the same list. */
+  bool floor_undetermined =
+      has_unpolicyable_io_only_command ||
+      (out->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC);
+  out->output_count = sg_output_total(gate);
+  for (uint32_t k = 0; k < out->output_count; k++) {
+    out->outputs[k] = sg_aggregate_output(out, k, floor_undetermined);
+    if (k == 0 || sg_verdict_rank(out->outputs[k].verdict) >
+                      sg_verdict_rank(out->verdict))
+      out->verdict = out->outputs[k].verdict;
   }
+  out->deciding_user_data =
+      sg_scalar_user_data(out->outputs, out->output_count, out->verdict);
   if (has_unpolicyable_io_only_command &&
-      sg_verdict_rank(worst) <= sg_verdict_rank(SG_VERDICT_UNDETERMINED)) {
-    worst = SG_VERDICT_UNDETERMINED;
-    if (!out->deny_reason)
-      out->deny_reason = bw_copy(
-          &bw, "redirect-only shell operation is not argv-policy-evaluable",
-          58);
-  }
-  if ((out->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC) &&
-      sg_verdict_rank(worst) < sg_verdict_rank(SG_VERDICT_UNDETERMINED))
-    worst = SG_VERDICT_UNDETERMINED;
-  out->verdict = worst;
+      out->verdict == SG_VERDICT_UNDETERMINED && !out->deny_reason)
+    out->deny_reason = bw_copy(
+        &bw, "redirect-only shell operation is not argv-policy-evaluable", 58);
 
   /* Rendering is part of evaluation success. A caller that receives a
    * truncated result will normally retry with a larger buffer, so no learning
    * or calibration state may change until every diagnostic has fit. */
   if (bw.overflow) {
     out->truncated = true;
-    out->verdict = SG_VERDICT_UNDETERMINED;
     free(owned_cmd_seq);
     free(owned_type_seq);
-    return SG_ERR_TRUNC;
+    return sg_fail_undetermined(out, SG_ERR_TRUNC);
   }
 
   /* Deferred anomaly model update — after a complete verdict is known. */

@@ -640,6 +640,21 @@ TEST(policy_list_accessors_and_user_pointers) {
     index++;
   ASSERT(st_policy_user_data(sg_gate_policy_at(gate, index, NULL)) ==
          &list_tags[4]);
+  /* An output carries the deciding policy's pointer itself, with no lookup
+   * through the gate, at the subcommand and at the command. A policy that
+   * set none, and an output nothing decided, give NULL. */
+  ASSERT(result.outputs[0].policy == 4 &&
+         result.outputs[0].user_data == &list_tags[4]);
+  ASSERT(result.subcommands[0].outputs[0].user_data == &list_tags[4]);
+  /* The scalar verdict carries the pointer the same way. */
+  ASSERT(result.deciding_user_data == &list_tags[4]);
+  ASSERT(result.subcommands[0].deciding_user_data == &list_tags[4]);
+  ASSERT_SG_OK(eval_cmd(gate, "echo hi", &result));
+  ASSERT(result.outputs[0].policy == 0 && result.outputs[0].user_data == NULL);
+  ASSERT_SG_OK(eval_cmd(gate, "zzz", &result));
+  ASSERT(result.outputs[0].policy == UINT32_MAX &&
+         result.outputs[0].user_data == NULL);
+  ASSERT(result.deciding_user_data == NULL);
   sg_gate_free(gate);
 }
 
@@ -798,6 +813,534 @@ TEST(policy_list_requirements_stand_beside_permitting_outcomes) {
   ASSERT_SG_OK(eval_cmd(gate, "date +%s", &result));
   ASSERT(result.requirements == 0 && result.verdict == SG_VERDICT_AUDIT);
   sg_gate_free(gate);
+}
+
+/* --- OUTPUTS AND OVERRIDES --- */
+
+/* A gate whose allow and deny policies match nothing, so that the policies
+ * under test start at index 2 in the order given. */
+static sg_gate_t *chain_gate(const char *const *cpls,
+                             const sg_verdict_t *outcomes, size_t count) {
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(binding_policy("zz-a"),
+                                                    binding_policy("zz-b"));
+  if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK) {
+    sg_gate_free(gate);
+    return NULL;
+  }
+  for (size_t i = 0; i < count; i++)
+    if (sg_gate_add_policy_owned(gate, binding_policy(cpls[i]), outcomes[i]) !=
+        SG_OK) {
+      sg_gate_free(gate);
+      return NULL;
+    }
+  return gate;
+}
+
+TEST(gate_setter_contract) {
+  static const char *paths[] = {"/tmp", "/home/user"};
+  static const sg_stop_mode_t modes[] = {
+      SG_STOP_FIRST_FAIL, SG_STOP_FIRST_PASS,    SG_STOP_FIRST_ALLOW,
+      SG_STOP_FIRST_DENY, SG_STOP_FIRST_OUTCOME, SG_EVAL_ALL};
+  static const uint32_t masks[] = {0, UINT32_MAX, SG_REJECT_MASK_DEFAULT};
+  sg_gate_t *g = sg_gate_new();
+  ASSERT_NOT_NULL(g);
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+    ASSERT_SG_OK(sg_gate_set_cwd(g, paths[i]));
+  /* A working directory that does not fit is refused and changes nothing. */
+  char long_cwd[513];
+  memset(long_cwd, 'x', sizeof(long_cwd) - 1);
+  long_cwd[sizeof(long_cwd) - 1] = '\0';
+  ASSERT_SG_OK(sg_gate_set_cwd(g, "/stable"));
+  ASSERT(sg_gate_set_cwd(g, long_cwd) == SG_ERR_TRUNC);
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++)
+    ASSERT_SG_OK(sg_gate_set_stop_mode(g, modes[i]));
+  for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); i++)
+    ASSERT_SG_OK(sg_gate_set_reject_mask(g, masks[i]));
+  ASSERT_SG_OK(sg_gate_set_suggestions(g, true));
+  ASSERT_SG_OK(sg_gate_set_suggestions(g, false));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(g, NULL, NULL));
+  ASSERT(sg_gate_set_stop_mode(g, (sg_stop_mode_t)-1) == SG_ERR_INVALID);
+  ASSERT(sg_gate_set_stop_mode(g, (sg_stop_mode_t)(SG_EVAL_ALL + 1)) ==
+         SG_ERR_INVALID);
+  sg_gate_free(g);
+}
+
+TEST(policy_list_equal_outcomes_keep_the_first) {
+  static const char *const cpls[] = {"ls", "ls"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_REVIEW, SG_VERDICT_REVIEW};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 2); /* 2 and 3 tie */
+  ASSERT_NOT_NULL(gate);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.subcommands[0].matched_policies == ((1u << 2) | (1u << 3)));
+  /* With no outputs declared, the first of equal matches is the decider. */
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_REVIEW &&
+         result.outputs[0].policy == 2);
+  sg_gate_free(gate);
+}
+
+TEST(output_default_is_one_result) {
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  ASSERT(sg_gate_output_count(gate) == 0);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.output_count == 1 && result.subcommands[0].output_count == 1);
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_REVIEW &&
+         result.outputs[0].policy == 2);
+  ASSERT(result.subcommands[0].outputs[0].verdict == SG_VERDICT_REVIEW &&
+         result.subcommands[0].outputs[0].policy == 2);
+  ASSERT(result.verdict == result.outputs[0].verdict);
+  ASSERT_SG_OK(eval_cmd(gate, "zzz", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_UNDETERMINED &&
+         result.outputs[0].policy == UINT32_MAX);
+  sg_gate_free(gate);
+}
+
+TEST(output_vector_and_scalar_projection) {
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  /* A three-dimensional gate: allow, review and discourage policies. */
+  ASSERT_SG_OK(sg_gate_add_output(gate, 0, NULL, 0));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, NULL, 0));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, NULL, 0));
+  ASSERT(sg_gate_output_count(gate) == 3);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.output_count == 3);
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_REVIEW &&
+         result.outputs[1].policy == 2);
+  ASSERT(result.outputs[2].verdict == SG_VERDICT_UNDETERMINED);
+  /* The scalar is the most restrictive output. */
+  ASSERT(result.verdict == SG_VERDICT_REVIEW);
+  ASSERT_SG_OK(eval_cmd(gate, "echo a", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_ALLOW &&
+         result.outputs[0].policy == 0);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  /* Over two commands an output is the most restrictive of its subcommands. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo a; ls", &result));
+  ASSERT(result.subcommand_count == 2);
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_REVIEW);
+  ASSERT_SG_OK(eval_cmd(gate, "ls; ls", &result));
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_REVIEW);
+
+  /* The outputs are bounded and must be installed policies. */
+  ASSERT(sg_gate_add_output(gate, 7, NULL, 0) == SG_ERR_INVALID);
+  while (sg_gate_output_count(gate) < SG_MAX_OUTPUTS)
+    ASSERT_SG_OK(sg_gate_add_output(gate, 0, NULL, 0));
+  ASSERT(sg_gate_add_output(gate, 0, NULL, 0) == SG_ERR_INVALID);
+  sg_gate_clear_outputs(gate);
+  ASSERT(sg_gate_output_count(gate) == 0);
+  sg_gate_free(gate);
+}
+
+TEST(output_scalar_decider_needs_a_unique_most_restrictive) {
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  /* Three dimensions: allow, review and discourage policies. */
+  ASSERT_SG_OK(sg_gate_add_output(gate, 0, NULL, 0));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, NULL, 0));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, NULL, 0));
+  sg_result_t result = {0};
+  /* Only the review output is the most restrictive: it decides the scalar. */
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_REVIEW);
+  ASSERT(result.deciding_user_data == &list_tags[2]);
+  ASSERT(result.subcommands[0].deciding_user_data == &list_tags[2]);
+  /* Every output is UNDETERMINED: a tie, and nothing decided it. */
+  ASSERT_SG_OK(eval_cmd(gate, "zzz", &result));
+  ASSERT(result.deciding_user_data == NULL);
+
+  /* Two outputs tied at the most restrictive name no single policy, even when
+   * the same policy decided both. */
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, NULL, 0));
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_REVIEW);
+  ASSERT(result.outputs[1].user_data == &list_tags[2] &&
+         result.outputs[3].user_data == &list_tags[2]);
+  ASSERT(result.deciding_user_data == NULL);
+  ASSERT(result.subcommands[0].deciding_user_data == NULL);
+
+  /* A gate with a single output is always unique. */
+  sg_gate_clear_outputs(gate);
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.deciding_user_data == &list_tags[2]);
+  sg_gate_free(gate);
+}
+
+TEST(override_falls_through_to_the_general_policy) {
+  static const char *const cpls[] = {"echo *", "echo ok"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_DENY, SG_VERDICT_ALLOW};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 2); /* 2 broad, 3 specific */
+  ASSERT_NOT_NULL(gate);
+  uint32_t relation = 0;
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &relation));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, &relation, 1));
+  sg_result_t result = {0};
+
+  /* Both match: the specific policy overrides the broad one. The raw matches
+   * still show both. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo ok", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_ALLOW &&
+         result.outputs[0].policy == 3);
+  ASSERT(result.subcommands[0].matched_policies == ((1u << 2) | (1u << 3)));
+  /* The specific policy does not match: it cannot override, so the output is
+   * what the broad one delivers. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo no", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_DENY &&
+         result.outputs[0].policy == 2);
+  /* Nothing along the relations matches. */
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_UNDETERMINED);
+
+  /* An output rooted at the broad policy follows no relation: no override. */
+  sg_gate_clear_outputs(gate);
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, NULL, 0));
+  ASSERT_SG_OK(eval_cmd(gate, "echo ok", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_DENY);
+  /* An output that does not name the relation does not follow it either. */
+  sg_gate_clear_outputs(gate);
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, NULL, 0));
+  ASSERT_SG_OK(eval_cmd(gate, "echo no", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_UNDETERMINED);
+  sg_gate_free(gate);
+}
+
+TEST(override_chain_is_first_match) {
+  /* C denies any echo, B reviews a number, A audits exactly 5. */
+  static const char *const cpls[] = {"echo *", "echo #n", "echo 5"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_DENY, SG_VERDICT_REVIEW,
+                                          SG_VERDICT_AUDIT};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 3); /* C=2, B=3, A=4 */
+  ASSERT_NOT_NULL(gate);
+  uint32_t a_over_b = 0, b_over_c = 0, c_over_b = 0;
+  ASSERT_SG_OK(sg_gate_add_override(gate, 4, 3, &a_over_b));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &b_over_c));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 2, 3, &c_over_b));
+  const uint32_t chain[] = {a_over_b, b_over_c};
+  ASSERT_SG_OK(sg_gate_add_output(gate, 4, chain, 2));
+  sg_result_t result = {0};
+  /* A, B and C all match: A alone is the result. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo 5", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_AUDIT &&
+         result.outputs[0].policy == 4);
+  ASSERT(result.subcommands[0].matched_policies ==
+         ((1u << 2) | (1u << 3) | (1u << 4)));
+  /* Only B and C match: B overriding C. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo 7", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_REVIEW &&
+         result.outputs[0].policy == 3);
+  /* Only C matches. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo x", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_DENY &&
+         result.outputs[0].policy == 2);
+  /* The same policies in other positions of another chain: C in front of B.
+   * That relation is a separate object, so the first output is unchanged. */
+  const uint32_t reversed[] = {c_over_b};
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, reversed, 1));
+  ASSERT_SG_OK(eval_cmd(gate, "echo 7", &result));
+  ASSERT(result.output_count == 2);
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_REVIEW);
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_DENY &&
+         result.outputs[1].policy == 2);
+  sg_gate_free(gate);
+}
+
+TEST(override_cycle_gives_two_outputs) {
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_ALLOW, SG_VERDICT_DENY};
+  static int marks[2];
+  /* A=2 allow, B=3 deny, each with its own pointer set before installing. */
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(binding_policy("zz-a"),
+                                                    binding_policy("zz-b"));
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  for (size_t i = 0; i < 2; i++) {
+    st_policy_t *policy = binding_policy("echo *");
+    ASSERT_NOT_NULL(policy);
+    st_policy_set_user_data(policy, &marks[i]);
+    ASSERT_SG_OK(sg_gate_add_policy_owned(gate, policy, outcomes[i]));
+  }
+  uint32_t both[2] = {0};
+  ASSERT_SG_OK(sg_gate_add_override(gate, 2, 3, &both[0]));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &both[1]));
+  /* Both outputs follow both relations, which form a cycle. */
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, both, 2));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, both, 2));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo hi", &result));
+  ASSERT(result.output_count == 2);
+  /* A overriding B, and B overriding A. */
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_ALLOW &&
+         result.outputs[0].policy == 2);
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_DENY &&
+         result.outputs[1].policy == 3);
+  ASSERT(result.verdict == SG_VERDICT_DENY);
+  /* Each dimension reports the pointer of the policy that decided it, and the
+   * scalar the pointer of the most restrictive one. */
+  ASSERT(result.outputs[0].user_data == &marks[0] &&
+         result.outputs[1].user_data == &marks[1]);
+  ASSERT(result.deciding_user_data == &marks[1]);
+  ASSERT(result.subcommands[0].deciding_user_data == &marks[1]);
+  /* A traversal that matches nothing still ends. */
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_UNDETERMINED &&
+         result.outputs[1].verdict == SG_VERDICT_UNDETERMINED);
+  sg_gate_free(gate);
+}
+
+TEST(override_relations_are_objects_shared_by_outputs) {
+  /* Two chains over the same policies with opposite order, from one gate. */
+  static const char *const cpls[] = {"echo ok", "echo *", "echo #n"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_ALLOW, SG_VERDICT_DENY,
+                                          SG_VERDICT_REVIEW};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 3); /* P=2, Q=3, R=4 */
+  ASSERT_NOT_NULL(gate);
+  uint32_t p_q = 0, q_p = 0, q_r = 0;
+  ASSERT_SG_OK(sg_gate_add_override(gate, 2, 3, &p_q));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &q_p));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 4, &q_r));
+  /* Two relations may connect the same policies. */
+  uint32_t q_p_again = 0;
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &q_p_again));
+  ASSERT(sg_gate_relation_count(gate) == 4 && q_p_again != q_p);
+  const uint32_t first[] = {p_q};
+  const uint32_t second[] = {q_p, q_r};
+  const uint32_t third[] = {p_q, q_r}; /* shares p_q with the first */
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, first, 1));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, second, 2));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, third, 2));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo ok", &result));
+  ASSERT(result.outputs[0].policy == 2 &&
+         result.outputs[0].verdict == SG_VERDICT_ALLOW);
+  ASSERT(result.outputs[1].policy == 3 &&
+         result.outputs[1].verdict == SG_VERDICT_DENY);
+  ASSERT(result.outputs[2].policy == 2);
+  /* Q matches `echo 7` and R matches it too, but P does not: the first output
+   * falls through from P to Q; the second starts at Q. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo 7", &result));
+  ASSERT(result.outputs[0].policy == 3);
+  ASSERT(result.outputs[1].policy == 3);
+  ASSERT(result.outputs[2].policy == 3);
+  uint32_t overrider = 0, overridden = 0;
+  sg_gate_relation_at(gate, q_r, &overrider, &overridden);
+  ASSERT(overrider == 3 && overridden == 4);
+  sg_gate_free(gate);
+}
+
+TEST(override_fan_out_tries_relations_in_creation_order) {
+  static const char *const cpls[] = {"echo ok", "echo *", "echo *"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_ALLOW, SG_VERDICT_REVIEW,
+                                          SG_VERDICT_DENY};
+  sg_result_t result = {0};
+  /* The root (2) does not match; it fans out to 3 (review) and 4 (deny). */
+  for (unsigned reversed = 0; reversed < 2; reversed++) {
+    sg_gate_t *gate = chain_gate(cpls, outcomes, 3);
+    ASSERT_NOT_NULL(gate);
+    uint32_t relations[2] = {0};
+    ASSERT_SG_OK(
+        sg_gate_add_override(gate, 2, reversed ? 4 : 3, &relations[0]));
+    ASSERT_SG_OK(
+        sg_gate_add_override(gate, 2, reversed ? 3 : 4, &relations[1]));
+    ASSERT_SG_OK(sg_gate_add_output(gate, 2, relations, 2));
+    ASSERT_SG_OK(eval_cmd(gate, "echo no", &result));
+    /* The first relation created that reaches a match decides, not the
+     * strictest. */
+    ASSERT(result.outputs[0].verdict ==
+           (reversed ? SG_VERDICT_DENY : SG_VERDICT_REVIEW));
+    sg_gate_free(gate);
+  }
+}
+
+TEST(override_declaration_validation_and_removal) {
+  static const char *const cpls[] = {"echo *", "echo ok", "ls"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_DENY, SG_VERDICT_ALLOW,
+                                          SG_VERDICT_REVIEW};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 3); /* 2 broad, 3 ok, 4 ls */
+  ASSERT_NOT_NULL(gate);
+  uint32_t relation = 0, ok_over_broad = 0, ls_over_ok = 0;
+  ASSERT(sg_gate_add_override(gate, 9, 2, &relation) == SG_ERR_INVALID);
+  ASSERT(sg_gate_add_override(gate, 2, 9, &relation) == SG_ERR_INVALID);
+  ASSERT(sg_gate_add_override(gate, 2, 2, &relation) == SG_ERR_INVALID);
+  ASSERT(sg_gate_relation_count(gate) == 0);
+  /* The relations are bounded; the same pair may be related again. */
+  for (uint32_t i = 0; i < SG_MAX_RELATIONS; i++)
+    ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &relation));
+  ASSERT(relation == SG_MAX_RELATIONS - 1);
+  ASSERT(sg_gate_add_override(gate, 3, 2, &relation) == SG_ERR_INVALID);
+  ASSERT(sg_gate_relation_count(gate) == SG_MAX_RELATIONS);
+  sg_gate_clear_overrides(gate);
+  ASSERT(sg_gate_relation_count(gate) == 0);
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &ok_over_broad));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 4, 3, &ls_over_ok));
+  ASSERT(ok_over_broad == 0 && ls_over_ok == 1);
+  /* An output may only name relations that exist. */
+  const uint32_t unknown[] = {5};
+  ASSERT(sg_gate_add_output(gate, 3, unknown, 1) == SG_ERR_INVALID);
+  ASSERT(sg_gate_add_output(gate, 9, NULL, 0) == SG_ERR_INVALID);
+  ASSERT(sg_gate_output_count(gate) == 0);
+  const uint32_t first[] = {ok_over_broad};
+  const uint32_t both[] = {ok_over_broad, ls_over_ok};
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, first, 1));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 4, both, 2));
+
+  /* Removing the broad policy removes the relation that names it, renumbers
+   * the rest, and keeps the other relation in the second output: "echo ok" is
+   * now 2 and "ls" is 3, with the relation 3 -> 2 now stored as id 0. */
+  sg_gate_remove_policy(gate, 2);
+  ASSERT(sg_gate_policy_count(gate) == 4);
+  ASSERT(sg_gate_relation_count(gate) == 1);
+  uint32_t overrider = 0, overridden = 0;
+  sg_gate_relation_at(gate, 0, &overrider, &overridden);
+  ASSERT(overrider == 3 && overridden == 2);
+  ASSERT(sg_gate_output_count(gate) == 2);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_REVIEW &&
+         result.outputs[1].policy == 3);
+  ASSERT_SG_OK(eval_cmd(gate, "echo ok", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_ALLOW &&
+         result.outputs[0].policy == 2);
+  /* An output rooted at a removed policy is dropped. */
+  sg_gate_remove_policy(gate, 2);
+  ASSERT(sg_gate_output_count(gate) == 1);
+  sg_gate_clear_overrides(gate);
+  ASSERT(sg_gate_relation_count(gate) == 0);
+  sg_gate_free(gate);
+}
+
+TEST(override_removal_of_an_overrider_and_a_borrowed_policy) {
+  st_policy_t *borrowed = binding_policy("pwd");
+  ASSERT_NOT_NULL(borrowed);
+  static const char *const cpls[] = {"echo *", "echo ok"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_DENY, SG_VERDICT_ALLOW};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 2); /* 2 broad, 3 specific */
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_add_policy_borrowed(gate, borrowed, SG_VERDICT_AUDIT));
+  uint32_t over_broad = 0, over_borrowed = 0;
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &over_broad));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 3, 4, &over_borrowed));
+  const uint32_t both[] = {over_broad, over_borrowed};
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, both, 2));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 4, NULL, 0));
+
+  /* Removing the overrider drops both relations and the output rooted at it;
+   * the output rooted at the borrowed policy keeps its place. */
+  sg_gate_remove_policy(gate, 3);
+  ASSERT(sg_gate_relation_count(gate) == 0);
+  ASSERT(sg_gate_output_count(gate) == 1);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "pwd", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_AUDIT &&
+         result.outputs[0].policy == 3);
+
+  /* Removing a borrowed policy does not free it: it is still ours. */
+  sg_gate_remove_policy(gate, 3);
+  ASSERT(sg_gate_policy_count(gate) == 3 && sg_gate_output_count(gate) == 0);
+  ASSERT(st_policy_rule_count(borrowed) == 1);
+  sg_gate_free(gate);
+  st_policy_free(borrowed);
+}
+
+TEST(output_vector_keeps_each_outcome_beside_requirements) {
+  static const char *const cpls[] = {"date *", "date *"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_AUDIT,
+                                          SG_VERDICT_DISCOURAGE};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 2);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_add_output(gate, 2, NULL, 0));
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, NULL, 0));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "date +%s", &result));
+  ASSERT(result.outputs[0].verdict == SG_VERDICT_AUDIT);
+  ASSERT(result.outputs[1].verdict == SG_VERDICT_DISCOURAGE);
+  /* A requirement belongs to the subcommand that carries it and leaves every
+   * output as the policies resolved it. (The inner `echo x` matches no policy
+   * here, so the command as a whole stays UNDETERMINED.) */
+  ASSERT_SG_OK(eval_cmd(gate, "date \"$(echo x)\"", &result));
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  bool found = false;
+  for (uint32_t i = 0; i < result.subcommand_count; i++) {
+    const sg_subcommand_result_t *sub = &result.subcommands[i];
+    if (sub->matched_policies != ((1u << 2) | (1u << 3)))
+      continue;
+    found = true;
+    ASSERT(sub->outputs[0].verdict == SG_VERDICT_AUDIT &&
+           sub->outputs[0].policy == 2);
+    ASSERT(sub->outputs[1].verdict == SG_VERDICT_DISCOURAGE &&
+           sub->outputs[1].policy == 3);
+    ASSERT(((sub->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  }
+  ASSERT(found);
+  sg_gate_free(gate);
+}
+
+TEST(policy_allocation_failure_returns_the_error_and_no_verdict) {
+  /* A three-dimensional gate, so the vector is covered as well. */
+  sg_result_t result = {0};
+  size_t allocations = 0;
+  sg_output_t expected[3] = {{0}};
+  sg_verdict_t expected_verdict = SG_VERDICT_UNDETERMINED;
+  for (unsigned pass = 0; pass < 2; pass++) {
+    sg_gate_t *probe = list_gate();
+    ASSERT_NOT_NULL(probe);
+    ASSERT_SG_OK(sg_gate_add_output(probe, 0, NULL, 0));
+    ASSERT_SG_OK(sg_gate_add_output(probe, 2, NULL, 0));
+    ASSERT_SG_OK(sg_gate_add_output(probe, 3, NULL, 0));
+    st_test_alloc_reset();
+    ASSERT_SG_OK(eval_cmd(probe, "ls; cat f", &result));
+    if (pass == 0) {
+      allocations = st_test_alloc_count();
+      ASSERT(result.output_count == 3);
+      memcpy(expected, result.outputs, sizeof(expected));
+      expected_verdict = result.verdict;
+    }
+    st_test_alloc_reset();
+    sg_gate_free(probe);
+  }
+  ASSERT(allocations > 0);
+
+  bool saw_error = false, saw_deny_slot = false, saw_policy = false;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    sg_gate_t *gate = list_gate();
+    ASSERT_NOT_NULL(gate);
+    ASSERT_SG_OK(sg_gate_add_output(gate, 0, NULL, 0));
+    ASSERT_SG_OK(sg_gate_add_output(gate, 2, NULL, 0));
+    ASSERT_SG_OK(sg_gate_add_output(gate, 3, NULL, 0));
+    st_test_alloc_fail_at(fail_at);
+    sg_error_t error = eval_cmd(gate, "ls; cat f", &result);
+    st_test_alloc_reset();
+    if (error == SG_OK) {
+      /* The failure fell where it costs nothing: the answer is unchanged. */
+      ASSERT(result.verdict == expected_verdict);
+      for (uint32_t k = 0; k < 3; k++)
+        ASSERT(result.outputs[k].verdict == expected[k].verdict &&
+               result.outputs[k].policy == expected[k].policy);
+    } else {
+      /* The error is returned and no verdict is claimed, in the scalar or in
+       * any dimension. */
+      saw_error = true;
+      ASSERT(error == SG_ERR_MEMORY);
+      /* A policy that could not be evaluated says so on its subcommand; a
+       * failure while rendering suggestions afterwards has no such message. */
+      for (uint32_t i = 0; i < result.subcommand_count; i++) {
+        const char *reason = result.subcommands[i].reject_reason;
+        if (reason && !strcmp(reason, "deny policy evaluation failed"))
+          saw_deny_slot = true;
+        else if (reason && !strcmp(reason, "policy evaluation failed"))
+          saw_policy = true;
+      }
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+      ASSERT(result.output_count == 3);
+      for (uint32_t k = 0; k < result.output_count; k++)
+        ASSERT(result.outputs[k].verdict == SG_VERDICT_UNDETERMINED &&
+               result.outputs[k].policy == UINT32_MAX);
+    }
+    sg_gate_free(gate);
+  }
+  ASSERT(saw_error && saw_deny_slot && saw_policy);
 }
 
 TEST(anomaly_component_borrowed_views) {
@@ -8208,6 +8751,9 @@ TEST(unevaluated_subcommand_row_authorizes_nothing) {
          result.subcommands[0].verdict == SG_VERDICT_ALLOW);
   ASSERT(!result.subcommands[1].matches);
   ASSERT(result.subcommands[1].verdict == SG_VERDICT_UNDETERMINED);
+  /* Neither does its output vector, which is completed after the failure. */
+  ASSERT(result.subcommands[1].output_count == 1);
+  ASSERT(result.subcommands[1].outputs[0].verdict == SG_VERDICT_UNDETERMINED);
   free(buffer);
   sg_gate_free(gate);
 }
@@ -12847,6 +13393,40 @@ TEST(anomaly_update_outcome_contract) {
   sg_gate_free(format);
 }
 
+TEST(failed_learning_withholds_every_output) {
+  static int tags[2];
+  sg_gate_t *gate = chain_gate(NULL, NULL, 0);
+  ASSERT_NOT_NULL(gate);
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_ALLOW, SG_VERDICT_AUDIT};
+  for (uint32_t i = 0; i < 2; i++) {
+    st_policy_t *policy = binding_policy("echo *");
+    ASSERT_NOT_NULL(policy);
+    st_policy_set_user_data(policy, &tags[i]);
+    ASSERT_SG_OK(sg_gate_add_policy_owned(gate, policy, outcomes[i]));
+    ASSERT_SG_OK(sg_gate_add_output(gate, 2 + i, NULL, 0));
+  }
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 100.0, NULL));
+  ASSERT_SG_OK(sg_gate_set_anomaly_cache_size(gate, 0));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo a", &result));
+  ASSERT(result.verdict == SG_VERDICT_AUDIT);
+  ASSERT(result.deciding_user_data == &tags[1]);
+
+  /* A learning failure is an error: the verdict is withheld, and so is every
+   * output, whatever the policies had resolved. */
+  sg_test_anomaly_update_fail_with(SG_ANOMALY_ERR_FORMAT);
+  ASSERT(eval_cmd(gate, "echo a", &result) == SG_ERR_PARSE);
+  sg_test_anomaly_result_reset();
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(result.output_count == 2);
+  for (uint32_t k = 0; k < result.output_count; k++) {
+    ASSERT(result.outputs[k].verdict == SG_VERDICT_UNDETERMINED);
+    ASSERT(result.outputs[k].user_data == NULL);
+  }
+  ASSERT(result.deciding_user_data == NULL);
+  sg_gate_free(gate);
+}
+
 TEST(anomaly_update_reuses_scored_netseq) {
   static const char *command = "cat a ; grep b ; sort";
   shell_netstring_buffer_t sequence = {0};
@@ -13954,6 +14534,20 @@ int main(int argc, char **argv) {
   RUN(policy_list_borrowed_policy_serves_several_gates);
   RUN(policy_list_stop_outcome);
   RUN(policy_list_requirements_stand_beside_permitting_outcomes);
+  RUN(gate_setter_contract);
+  RUN(policy_list_equal_outcomes_keep_the_first);
+  RUN(output_default_is_one_result);
+  RUN(output_vector_and_scalar_projection);
+  RUN(output_scalar_decider_needs_a_unique_most_restrictive);
+  RUN(override_falls_through_to_the_general_policy);
+  RUN(override_chain_is_first_match);
+  RUN(override_cycle_gives_two_outputs);
+  RUN(override_relations_are_objects_shared_by_outputs);
+  RUN(override_fan_out_tries_relations_in_creation_order);
+  RUN(override_declaration_validation_and_removal);
+  RUN(override_removal_of_an_overrider_and_a_borrowed_policy);
+  RUN(output_vector_keeps_each_outcome_beside_requirements);
+  RUN(policy_allocation_failure_returns_the_error_and_no_verdict);
   RUN(anomaly_component_borrowed_views);
   RUN(malformed_source_before_capacity);
   RUN(substitution_capacity_fails_closed);
@@ -14196,6 +14790,7 @@ int main(int argc, char **argv) {
   RUN(anomaly_type_netseq_allocation_failure);
   RUN(anomaly_model_failure_verdict_contract);
   RUN(anomaly_update_outcome_contract);
+  RUN(failed_learning_withholds_every_output);
   RUN(anomaly_update_reuses_scored_netseq);
   RUN(anomaly_ansi_c_netseq_update);
   RUN(anomaly_cache_model_transition_matrix);

@@ -39,7 +39,14 @@ outcome. A gate holds an ordered list of policies, each installed with an
 outcome (`ALLOW`, `AUDIT`, `DISCOURAGE`, `REVIEW`, `NEEDS_REASON`, `DENY`,
 `DENY_ESCALATE`); every policy is evaluated, and the verdict is the most
 restrictive outcome among the matches. The library defines their order, not
-what the application does for each. The
+what the application does for each. A more specific policy can override a
+broader one: each relation (`sg_gate_add_override`) is its own object between
+two policies, and the application chooses how many results the gate gives.
+Each declared output (`sg_gate_add_output`) is one verdict per subcommand,
+rooted at a policy and decided by the first matching policy along the
+relations it names, so the same policies can form different chains in
+different outputs and a gate can answer with one verdict or a vector. The
+scalar `verdict` is the most restrictive output. The
 [policy coverage rules](#what-policy-rules-cover) below define which commands
 participate. The fields below identify incomplete coverage and unresolved
 argument, pathname or conditional-string expansions.

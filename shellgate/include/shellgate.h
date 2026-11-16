@@ -100,9 +100,12 @@ typedef enum {
  * The library gives an outcome no behavior beyond its place in the order
  * below.
  *
- * A subcommand's verdict is the most restrictive outcome among the policies
- * it matched, and a command's verdict is its most restrictive subcommand.
- * From most to least restrictive:
+ * A gate gives each subcommand one result per output (see OUTPUTS AND
+ * OVERRIDES); a gate that declares none has one output, the most restrictive
+ * outcome among the policies the subcommand matched. A subcommand's scalar
+ * verdict is the most restrictive of its outputs, and a command's output is
+ * its most restrictive subcommand's, with the scalar again the most restrictive
+ * output. From most to least restrictive:
  *   REJECT, DENY_ESCALATE, DENY, NEEDS_REASON, REVIEW, UNDETERMINED,
  *   DISCOURAGE, AUDIT, ALLOW.
  * ALLOW, AUDIT and DISCOURAGE are the permitting outcomes: none of them is a
@@ -126,6 +129,8 @@ typedef enum {
   SG_VERDICT_DENY_ESCALATE = 8,
 } sg_verdict_t;
 
+/* How evaluation stops early. The modes act on each subcommand's scalar
+ * verdict (or on whether it matched any policy). */
 typedef enum {
   SG_STOP_FIRST_FAIL = 0,
   SG_STOP_FIRST_PASS = 1, /* stops after first subcommand matching any policy */
@@ -137,18 +142,46 @@ typedef enum {
   SG_EVAL_ALL = 5,
 } sg_stop_mode_t;
 
+/* One output of the gate: a verdict, and the policy whose outcome produced it.
+ * A gate has as many outputs as the caller declared (see sg_gate_add_output),
+ * so its verdict can be one value or several dimensions. */
+#define SG_MAX_OUTPUTS 8
+typedef struct {
+  sg_verdict_t verdict;
+  /* Index of the policy that decided it (see sg_gate_policy_at), or UINT32_MAX
+   * when no policy applied or the verdict is gate-produced (REJECT, a floor).
+   */
+  uint32_t policy;
+  /* The deciding policy's user pointer (st_policy_user_data) as it was when the
+   * call evaluated, so the application's own record is at hand without the gate
+   * or the index; NULL when there is no deciding policy or none was set. It is
+   * never interpreted by the library. */
+  void *user_data;
+} sg_output_t;
+
 /* Per-subcommand result: lightweight, pointers into output buffer. */
 typedef struct {
   /* True when at least one installed policy matched this subcommand. */
   bool matches;
+  /* The most restrictive of `outputs`: a one-value summary. */
   sg_verdict_t verdict;
+  /* The user pointer (see sg_output_t.user_data) of the policy that decided
+   * `verdict`, when exactly one output is the most restrictive. If several
+   * outputs tie, no single policy decided it: NULL. A gate with one output
+   * always has one. The scalar is only a summary; the chain behind it is in
+   * `outputs`. */
+  void *deciding_user_data;
+  /* One result per gate output, in the order they were declared; one for a
+   * gate that declared none. See OUTPUTS AND OVERRIDES. */
+  sg_output_t outputs[SG_MAX_OUTPUTS];
+  uint32_t output_count;
   /* Bit i is set when the policy at index i (see sg_gate_policy_at) matched,
    * so `matches` is `matched_policies != 0`. Every installed policy is
-   * evaluated: an earlier match never hides a later one. Indexes are stable
-   * until sg_gate_remove_policy. If a policy cannot be evaluated the call
-   * reports the error and the subcommand keeps its most restrictive known
-   * outcome, but never one weaker than UNDETERMINED; when that leaves it
-   * UNDETERMINED it reports no matches. */
+   * evaluated: an earlier match never hides a later one, and overrides do not
+   * remove a match from this mask. Indexes are stable until
+   * sg_gate_remove_policy. A policy that matches nothing is not an error;
+   * the only failure is an allocation inside a policy, which leaves every
+   * output UNDETERMINED and is reported by the call. */
   uint32_t matched_policies;
   /* Readable diagnostic display only. It is lossy and must never be parsed. */
   const char *display_command;
@@ -213,7 +246,19 @@ typedef enum {
 /* Top-level evaluation result: metadata + pointer array into buffer.
  */
 typedef struct {
+  /* The most restrictive of `outputs`: a one-value summary. */
   sg_verdict_t verdict;
+  /* The user pointer (see sg_output_t.user_data) of the policy that decided
+   * `verdict`, when exactly one output is the most restrictive. If several
+   * outputs tie, no single policy decided it: NULL. A gate with one output
+   * always has one. The scalar is only a summary; the chain behind it is in
+   * `outputs`. */
+  void *deciding_user_data;
+  /* One result per gate output, in the order they were declared (one for a
+   * gate that declared none). Each is the most restrictive of that output over
+   * the subcommands. */
+  sg_output_t outputs[SG_MAX_OUTPUTS];
+  uint32_t output_count;
   const char *deny_reason;
 
   sg_subcommand_result_t subcommands[SG_MAX_SUBCOMMAND_RESULTS];
@@ -402,6 +447,77 @@ uint32_t sg_gate_policy_count(const sg_gate_t *gate) SHELL_NONNULL(1);
  * from a matched index to its own data. */
 const st_policy_t *sg_gate_policy_at(const sg_gate_t *gate, uint32_t index,
                                      sg_verdict_t *outcome) SHELL_NONNULL(1);
+
+/* --- OUTPUTS AND OVERRIDES ---
+ *
+ * The caller chooses what a gate answers. Each declared output is one result
+ * per subcommand, so a gate can give one verdict or a vector of them, one per
+ * dimension.
+ *
+ * A relation "a overrides b" is its own object: a stands in front of b. It
+ * connects two installed policies and is added with one call; the same two
+ * policies may be related again by another relation. An output is rooted at a
+ * policy and names the relations that make up its chain, so the same policies
+ * can appear in many outputs with different continuations, and a relation can
+ * be shared by several outputs.
+ *
+ * An output is its root's outcome when the root matched. When the root did not
+ * match, it cannot override anything, and the output is what the policies it
+ * stands in front of deliver: the output's relations from that policy are
+ * tried in the order they were created, depth first, and the first policy that
+ * matched decides. A chain a->b->c therefore reads as "first matching of a, b,
+ * c". When nothing along the relations matched, the output is UNDETERMINED.
+ * Each policy is visited once per output, so a cycle is harmless: with
+ * relations a->b and b->a, an output rooted at a is a overriding b and one
+ * rooted at b is b overriding a, two results.
+ *
+ * Relations matter only to the outputs that name them. A gate that declares no
+ * outputs has one output, the most restrictive of all matches.
+ * `result.verdict` and `subcommand.verdict` project the vector down to a scalar
+ * as the most restrictive output; callers that use several dimensions read
+ * `outputs`.
+ *
+ * The library cannot check that an overrider is really more specific than
+ * what it overrides: one that is too broad lets its outcome replace a stricter
+ * one.
+ *
+ * Policy and relation indexes are positions in their lists. Removing a policy
+ * removes the relations that name it, drops the outputs rooted at it, and
+ * renumbers the rest. */
+#define SG_MAX_RELATIONS 64
+
+/* Add the relation "the policy at `overrider` overrides the policy at
+ * `overridden`" and store its id in `relation`. Returns SG_ERR_INVALID,
+ * changing nothing, if either is not an installed policy, they are the same, or
+ * SG_MAX_RELATIONS relations exist. */
+sg_error_t sg_gate_add_override(sg_gate_t *gate, uint32_t overrider,
+                                uint32_t overridden, uint32_t *relation)
+    SHELL_NONNULL(1, 4);
+
+/* The relation with id `relation`, which must be below
+ * sg_gate_relation_count(). */
+uint32_t sg_gate_relation_count(const sg_gate_t *gate) SHELL_NONNULL(1);
+void sg_gate_relation_at(const sg_gate_t *gate, uint32_t relation,
+                         uint32_t *overrider, uint32_t *overridden)
+    SHELL_NONNULL(1, 3, 4);
+
+/* Declare an output rooted at the policy at `root`, after the ones already
+ * declared, that follows the `relation_count` relations whose ids are listed in
+ * `relations`; `relations` may be NULL when the count is 0. The same root may
+ * appear in several outputs. At most SG_MAX_OUTPUTS. Returns SG_ERR_INVALID,
+ * changing nothing, for a root that is not installed, an id that is not a
+ * relation, or when the outputs are full. */
+sg_error_t sg_gate_add_output(sg_gate_t *gate, uint32_t root,
+                              const uint32_t *relations,
+                              uint32_t relation_count) SHELL_NONNULL(1);
+
+/* The number of declared outputs, 0 for the implicit single output. */
+uint32_t sg_gate_output_count(const sg_gate_t *gate) SHELL_NONNULL(1);
+
+/* Remove every declared output, or every relation (which empties the relation
+ * lists of the outputs). */
+void sg_gate_clear_outputs(sg_gate_t *gate) SHELL_NONNULL(1);
+void sg_gate_clear_overrides(sg_gate_t *gate) SHELL_NONNULL(1);
 
 /* --- ANOMALY DETECTION CONFIGURATION --- */
 
