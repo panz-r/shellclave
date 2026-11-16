@@ -446,6 +446,360 @@ TEST(policy_binding_lifecycle) {
   st_policy_free(deny);
 }
 
+/* --- POLICY LIST --- */
+
+static int list_tags[8];
+
+/* A gate whose list holds every outcome: allow `echo *`, deny `rm *`, and one
+ * policy per further outcome. Each extra carries its list index as its user
+ * pointer. */
+static sg_gate_t *list_gate(void) {
+  static const struct {
+    const char *cpl;
+    sg_verdict_t outcome;
+  } extras[] = {
+      {"ls", SG_VERDICT_REVIEW},
+      {"cat *", SG_VERDICT_DISCOURAGE},
+      {"sudo *", SG_VERDICT_NEEDS_REASON},
+      {"shutdown", SG_VERDICT_DENY_ESCALATE},
+      {"date *", SG_VERDICT_AUDIT},
+  };
+  st_policy_t *allow = binding_policy("echo *");
+  st_policy_t *deny = binding_policy("rm *");
+  sg_gate_t *gate =
+      allow && deny ? sg_gate_new_with_policies_owned(allow, deny) : NULL;
+  if (!gate) {
+    st_policy_free(allow);
+    st_policy_free(deny);
+    return NULL;
+  }
+  for (size_t i = 0; i < sizeof(extras) / sizeof(extras[0]); i++) {
+    st_policy_t *policy = binding_policy(extras[i].cpl);
+    if (!policy ||
+        sg_gate_add_policy_owned(gate, policy, extras[i].outcome) != SG_OK) {
+      st_policy_free(policy);
+      sg_gate_free(gate);
+      return NULL;
+    }
+    st_policy_set_user_data(policy, &list_tags[2 + i]);
+  }
+  if (sg_gate_set_reject_mask(gate, 0) != SG_OK) {
+    sg_gate_free(gate);
+    return NULL;
+  }
+  return gate;
+}
+
+TEST(policy_list_outcomes) {
+  static const struct {
+    const char *command;
+    sg_verdict_t verdict;
+    uint32_t matched;
+  } cases[] = {
+      {"echo hi", SG_VERDICT_ALLOW, 1u << 0},
+      {"rm x", SG_VERDICT_DENY, 1u << 1},
+      {"ls", SG_VERDICT_REVIEW, 1u << 2},
+      {"cat f", SG_VERDICT_DISCOURAGE, 1u << 3},
+      {"sudo x", SG_VERDICT_NEEDS_REASON, 1u << 4},
+      {"shutdown", SG_VERDICT_DENY_ESCALATE, 1u << 5},
+      {"date +%s", SG_VERDICT_AUDIT, 1u << 6},
+      {"zzz", SG_VERDICT_UNDETERMINED, 0},
+  };
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
+    ASSERT(result.subcommand_count == 1);
+    ASSERT(result.verdict == cases[i].verdict);
+    ASSERT(result.subcommands[0].verdict == cases[i].verdict);
+    ASSERT(result.subcommands[0].matched_policies == cases[i].matched);
+    ASSERT(result.subcommands[0].matches == (cases[i].matched != 0));
+  }
+  ASSERT_STR(sg_verdict_name(SG_VERDICT_REVIEW), "REVIEW");
+  ASSERT_STR(sg_verdict_name(SG_VERDICT_AUDIT), "AUDIT");
+  ASSERT_STR(sg_verdict_name(SG_VERDICT_NEEDS_REASON), "NEEDS_REASON");
+  ASSERT_STR(sg_verdict_name(SG_VERDICT_DISCOURAGE), "DISCOURAGE");
+  ASSERT_STR(sg_verdict_name(SG_VERDICT_DENY_ESCALATE), "DENY_ESCALATE");
+  sg_gate_free(gate);
+}
+
+TEST(policy_list_overlap_reports_every_match) {
+  /* Indexes: 0 allow, 1 deny, 2 AUDIT, 3 DISCOURAGE, 4 REVIEW,
+   * 5 NEEDS_REASON, 6 DENY, 7 DENY_ESCALATE. */
+  static const struct {
+    const char *cpl;
+    sg_verdict_t outcome;
+  } extras[] = {
+      {"echo *", SG_VERDICT_AUDIT},
+      {"echo *", SG_VERDICT_DISCOURAGE},
+      {"echo risky", SG_VERDICT_REVIEW},
+      {"echo risky", SG_VERDICT_NEEDS_REASON},
+      {"echo bad", SG_VERDICT_DENY},
+      {"echo bad", SG_VERDICT_DENY_ESCALATE},
+  };
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(binding_policy("echo *"),
+                                                    binding_policy("never"));
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  for (size_t i = 0; i < sizeof(extras) / sizeof(extras[0]); i++)
+    ASSERT_SG_OK(sg_gate_add_policy_owned(gate, binding_policy(extras[i].cpl),
+                                          extras[i].outcome));
+  ASSERT(sg_gate_policy_count(gate) == 8);
+  static const struct {
+    const char *command;
+    sg_verdict_t verdict;
+    uint32_t matched;
+  } cases[] = {
+      {"echo ok", SG_VERDICT_DISCOURAGE, 0x01u | 0x04u | 0x08u},
+      {"echo risky", SG_VERDICT_NEEDS_REASON,
+       0x01u | 0x04u | 0x08u | 0x10u | 0x20u},
+      {"echo bad", SG_VERDICT_DENY_ESCALATE,
+       0x01u | 0x04u | 0x08u | 0x40u | 0x80u},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
+    ASSERT(result.subcommand_count == 1);
+    ASSERT(result.verdict == cases[i].verdict);
+    ASSERT(result.subcommands[0].matched_policies == cases[i].matched);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(policy_list_command_verdict_is_most_restrictive) {
+  static const struct {
+    const char *command;
+    sg_verdict_t verdict;
+  } cases[] = {
+      {"echo a; ls", SG_VERDICT_REVIEW},
+      {"ls; rm x", SG_VERDICT_DENY},
+      {"rm x; shutdown", SG_VERDICT_DENY_ESCALATE},
+      {"cat f; sudo x", SG_VERDICT_NEEDS_REASON},
+      {"echo a; date +%s", SG_VERDICT_AUDIT},
+      {"cat f; echo a", SG_VERDICT_DISCOURAGE},
+      {"echo a; date +%s; cat f", SG_VERDICT_DISCOURAGE},
+      /* A discouragement never masks a subcommand that matched nothing. */
+      {"cat f; zzz", SG_VERDICT_UNDETERMINED},
+      {"ls; zzz", SG_VERDICT_REVIEW},
+  };
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
+    if (result.verdict != cases[i].verdict)
+      fprintf(stderr, "policy list: %s -> %s, expected %s\n", cases[i].command,
+              sg_verdict_name(result.verdict),
+              sg_verdict_name(cases[i].verdict));
+    ASSERT(result.verdict == cases[i].verdict);
+  }
+  /* The reason and attention index name the first subcommand that needs it. */
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo a; ls", &result));
+  ASSERT_STR(result.deny_reason, "review policy match");
+  ASSERT(result.attention_index == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "echo a; echo b", &result));
+  ASSERT(result.deny_reason == NULL);
+  /* A weak allow denies nothing: no command-level reason, but the advice is
+   * on its subcommand. */
+  ASSERT_SG_OK(eval_cmd(gate, "cat f", &result));
+  ASSERT(result.verdict == SG_VERDICT_DISCOURAGE);
+  ASSERT(result.deny_reason == NULL);
+  ASSERT_STR(result.subcommands[0].reject_reason, "discourage policy match");
+  sg_gate_free(gate);
+}
+
+TEST(policy_list_accessors_and_user_pointers) {
+  static const sg_verdict_t outcomes[] = {
+      SG_VERDICT_ALLOW,      SG_VERDICT_DENY,         SG_VERDICT_REVIEW,
+      SG_VERDICT_DISCOURAGE, SG_VERDICT_NEEDS_REASON, SG_VERDICT_DENY_ESCALATE,
+      SG_VERDICT_AUDIT,
+  };
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  ASSERT(sg_gate_policy_count(gate) == 7);
+  for (uint32_t i = 0; i < 7; i++) {
+    sg_verdict_t outcome = SG_VERDICT_UNDETERMINED;
+    const st_policy_t *policy = sg_gate_policy_at(gate, i, &outcome);
+    ASSERT(policy != NULL && outcome == outcomes[i]);
+    ASSERT(st_policy_user_data(policy) == (i < 2 ? NULL : &list_tags[i]));
+    ASSERT(sg_gate_policy_at(gate, i, NULL) == policy);
+  }
+  ASSERT(sg_gate_policy_at(gate, 0, NULL) ==
+         sg_gate_allow_policy_borrowed(gate));
+  ASSERT(sg_gate_policy_at(gate, 1, NULL) ==
+         sg_gate_deny_policy_borrowed(gate));
+  /* A result's matched bits lead back to the application's own records. */
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "sudo x", &result));
+  uint32_t matched = result.subcommands[0].matched_policies;
+  ASSERT(matched == 1u << 4);
+  uint32_t index = 0;
+  while (!(matched & (1u << index)))
+    index++;
+  ASSERT(st_policy_user_data(sg_gate_policy_at(gate, index, NULL)) ==
+         &list_tags[4]);
+  sg_gate_free(gate);
+}
+
+TEST(policy_list_add_remove_and_limits) {
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(binding_policy("echo *"),
+                                                    binding_policy("never"));
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT(sg_gate_policy_count(gate) == 2);
+
+  /* Only the policy outcomes can be installed; an error changes nothing and
+   * leaves an owned policy with the caller. */
+  static const sg_verdict_t rejected[] = {
+      SG_VERDICT_REJECT, SG_VERDICT_UNDETERMINED, (sg_verdict_t)99};
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    st_policy_t *spare = binding_policy("ls");
+    ASSERT_NOT_NULL(spare);
+    ASSERT(sg_gate_add_policy_owned(gate, spare, rejected[i]) ==
+           SG_ERR_INVALID);
+    ASSERT(sg_gate_add_policy_borrowed(gate, spare, rejected[i]) ==
+           SG_ERR_INVALID);
+    ASSERT(sg_gate_policy_count(gate) == 2);
+    st_policy_free(spare);
+  }
+
+  /* Removal frees an owned policy and renumbers the ones after it. */
+  ASSERT_SG_OK(
+      sg_gate_add_policy_owned(gate, binding_policy("ls"), SG_VERDICT_AUDIT));
+  ASSERT_SG_OK(sg_gate_add_policy_owned(gate, binding_policy("cat *"),
+                                        SG_VERDICT_REVIEW));
+  ASSERT_SG_OK(
+      sg_gate_add_policy_owned(gate, binding_policy("pwd"), SG_VERDICT_DENY));
+  ASSERT(sg_gate_policy_count(gate) == 5);
+  sg_gate_remove_policy(gate, 3);
+  ASSERT(sg_gate_policy_count(gate) == 4);
+  sg_verdict_t outcome = SG_VERDICT_ALLOW;
+  ASSERT(sg_gate_policy_at(gate, 3, &outcome) != NULL &&
+         outcome == SG_VERDICT_DENY);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "cat f", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT_SG_OK(eval_cmd(gate, "pwd", &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY);
+  ASSERT(result.subcommands[0].matched_policies == 1u << 3);
+
+  /* The list is bounded. */
+  while (sg_gate_policy_count(gate) < SG_MAX_POLICIES)
+    ASSERT_SG_OK(
+        sg_gate_add_policy_owned(gate, binding_policy("ls"), SG_VERDICT_AUDIT));
+  st_policy_t *extra = binding_policy("ls");
+  ASSERT_NOT_NULL(extra);
+  ASSERT(sg_gate_add_policy_owned(gate, extra, SG_VERDICT_AUDIT) ==
+         SG_ERR_INVALID);
+  ASSERT(sg_gate_policy_count(gate) == SG_MAX_POLICIES);
+  st_policy_free(extra);
+  sg_gate_free(gate);
+}
+
+TEST(policy_list_borrowed_policy_serves_several_gates) {
+  st_policy_t *shared = binding_policy("ls");
+  sg_gate_t *first = sg_gate_new_with_policies_owned(binding_policy("echo *"),
+                                                     binding_policy("never"));
+  sg_gate_t *second = sg_gate_new_with_policies_owned(binding_policy("echo *"),
+                                                      binding_policy("never"));
+  ASSERT(shared != NULL && first != NULL && second != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(first, 0));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(second, 0));
+  ASSERT_SG_OK(sg_gate_add_policy_borrowed(first, shared, SG_VERDICT_REVIEW));
+  ASSERT_SG_OK(
+      sg_gate_add_policy_borrowed(second, shared, SG_VERDICT_DENY_ESCALATE));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(first, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_REVIEW);
+  ASSERT_SG_OK(eval_cmd(second, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY_ESCALATE);
+  /* Each gate holds its own outcome for the same policy object. */
+  sg_verdict_t outcome = SG_VERDICT_ALLOW;
+  ASSERT(sg_gate_policy_at(first, 2, &outcome) == shared &&
+         outcome == SG_VERDICT_REVIEW);
+  ASSERT(sg_gate_policy_at(second, 2, &outcome) == shared &&
+         outcome == SG_VERDICT_DENY_ESCALATE);
+  /* The borrowing gates go first; the application frees what it owns. */
+  sg_gate_free(first);
+  sg_gate_free(second);
+  st_policy_free(shared);
+}
+
+TEST(policy_list_stop_outcome) {
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  sg_result_t result = {0};
+
+  /* Stop on the first subcommand with the chosen outcome. */
+  ASSERT_SG_OK(sg_gate_set_stop_outcome(gate, SG_VERDICT_REVIEW));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_OUTCOME));
+  ASSERT_SG_OK(eval_cmd(gate, "echo a; ls; rm x", &result));
+  ASSERT(result.subcommand_count == 2 && result.short_circuited);
+  ASSERT(result.verdict == SG_VERDICT_REVIEW);
+
+  /* The default outcome is ALLOW. */
+  sg_gate_t *fresh = list_gate();
+  ASSERT_NOT_NULL(fresh);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(fresh, SG_STOP_FIRST_OUTCOME));
+  ASSERT_SG_OK(eval_cmd(fresh, "ls; echo a; rm x", &result));
+  ASSERT(result.subcommand_count == 2 && result.short_circuited);
+  sg_gate_free(fresh);
+
+  /* Any match stops FIRST_PASS, including a new outcome. */
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_PASS));
+  ASSERT_SG_OK(eval_cmd(gate, "cat f; echo a", &result));
+  ASSERT(result.subcommand_count == 1 && result.short_circuited);
+
+  /* A value that is not a policy outcome changes nothing. */
+  ASSERT(sg_gate_set_stop_outcome(gate, SG_VERDICT_UNDETERMINED) ==
+         SG_ERR_INVALID);
+  ASSERT(sg_gate_set_stop_outcome(gate, SG_VERDICT_REJECT) == SG_ERR_INVALID);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_OUTCOME));
+  ASSERT_SG_OK(eval_cmd(gate, "echo a; ls; rm x", &result));
+  ASSERT(result.subcommand_count == 2);
+  ASSERT(sg_gate_set_stop_mode(gate, (sg_stop_mode_t)(SG_EVAL_ALL + 1)) ==
+         SG_ERR_INVALID);
+  sg_gate_free(gate);
+}
+
+TEST(policy_list_requirements_stand_beside_permitting_outcomes) {
+  sg_gate_t *gate = list_gate();
+  ASSERT_NOT_NULL(gate);
+  sg_result_t result = {0};
+
+  /* A requirement to inspect runtime words is reported beside the verdict and
+   * never changes it: AUDIT stays AUDIT, and the audit policy stays visible. */
+  ASSERT_SG_OK(eval_cmd(gate, "date \"$(echo x)\"", &result));
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(result.verdict == SG_VERDICT_AUDIT);
+  bool audited = false;
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    audited = audited || (result.subcommands[i].matched_policies & (1u << 6));
+  ASSERT(audited);
+
+  /* So is the weak allow, and its advice stays visible on the subcommand that
+   * matched it. */
+  ASSERT_SG_OK(eval_cmd(gate, "cat \"$(echo x)\"", &result));
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(result.verdict == SG_VERDICT_DISCOURAGE);
+
+  bool advised = false;
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    if (result.subcommands[i].matched_policies & (1u << 3)) {
+      advised = true;
+      ASSERT_STR(result.subcommands[i].reject_reason,
+                 "discourage policy match");
+    }
+  ASSERT(advised);
+
+  /* Nothing is outstanding without a substitution. */
+  ASSERT_SG_OK(eval_cmd(gate, "date +%s", &result));
+  ASSERT(result.requirements == 0 && result.verdict == SG_VERDICT_AUDIT);
+  sg_gate_free(gate);
+}
+
 TEST(anomaly_component_borrowed_views) {
   sg_gate_t *gate = sg_gate_new();
   ASSERT(gate);
@@ -7693,6 +8047,11 @@ TEST(helper_contracts) {
                   {SG_VERDICT_DENY, "DENY"},
                   {SG_VERDICT_REJECT, "REJECT"},
                   {SG_VERDICT_UNDETERMINED, "UNDETERMINED"},
+                  {SG_VERDICT_REVIEW, "REVIEW"},
+                  {SG_VERDICT_AUDIT, "AUDIT"},
+                  {SG_VERDICT_NEEDS_REASON, "NEEDS_REASON"},
+                  {SG_VERDICT_DISCOURAGE, "DISCOURAGE"},
+                  {SG_VERDICT_DENY_ESCALATE, "DENY_ESCALATE"},
                   {(sg_verdict_t)-1, "UNKNOWN"}};
   for (size_t i = 0; i < sizeof(verdicts) / sizeof(verdicts[0]); i++)
     ASSERT_STR(sg_verdict_name(verdicts[i].verdict), verdicts[i].name);
@@ -13587,6 +13946,14 @@ int main(int argc, char **argv) {
   }
   RUN(temp_fixture_cleanup);
   RUN(policy_binding_lifecycle);
+  RUN(policy_list_outcomes);
+  RUN(policy_list_overlap_reports_every_match);
+  RUN(policy_list_command_verdict_is_most_restrictive);
+  RUN(policy_list_accessors_and_user_pointers);
+  RUN(policy_list_add_remove_and_limits);
+  RUN(policy_list_borrowed_policy_serves_several_gates);
+  RUN(policy_list_stop_outcome);
+  RUN(policy_list_requirements_stand_beside_permitting_outcomes);
   RUN(anomaly_component_borrowed_views);
   RUN(malformed_source_before_capacity);
   RUN(substitution_capacity_fails_closed);

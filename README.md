@@ -34,7 +34,12 @@ these operations with optional anomaly scoring.
 ## Security model and limitations
 
 An `ALLOW` verdict means that every command included in policy evaluation
-matched an allow rule and none matched a deny rule. The
+matched an allow policy and no installed policy gave a more restrictive
+outcome. A gate holds an ordered list of policies, each installed with an
+outcome (`ALLOW`, `AUDIT`, `DISCOURAGE`, `REVIEW`, `NEEDS_REASON`, `DENY`,
+`DENY_ESCALATE`); every policy is evaluated, and the verdict is the most
+restrictive outcome among the matches. The library defines their order, not
+what the application does for each. The
 [policy coverage rules](#what-policy-rules-cover) below define which commands
 participate. The fields below identify incomplete coverage and unresolved
 argument, pathname or conditional-string expansions.
@@ -58,7 +63,12 @@ the receiving role determines how the application must inspect the data.
 |---|---|
 | `SG_OK` and `ALLOW` | Check completeness, unresolved values, and application-specific requirements |
 | Nonzero `requirements` | Satisfy each before executing: inspect generated shell-word content in its receiving context, and check or provide a required open. Use Shellsplit's graph to locate the routes and edges |
+| `AUDIT` | Permitted like `ALLOW`; record the command |
+| `DISCOURAGE` | A weak allow, not a denial: advise the agent not to run it, and let it proceed if it persists; the advice stays on the subcommand's `reject_reason` and `matched_policies` |
+| `REVIEW` | Have a reviewer decide |
+| `NEEDS_REASON` | Refuse until the reason to run it has been explained and audited |
 | `DENY` | Refuse according to the explicit deny-policy match |
+| `DENY_ESCALATE` | Refuse harder than `DENY`: stop the agent and escalate to its parent agent or the user |
 | `REJECT` | Refuse execution because the source is malformed, uses unsupported semantics, or contains a feature prohibited by the gate configuration |
 | `UNDETERMINED` | Keep the execution decision pending until the reason for the indeterminate result has been resolved |
 | Any evaluation error | Withhold authorization; diagnose the error or retry within resource limits |

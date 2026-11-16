@@ -83,26 +83,73 @@ typedef enum {
   SG_ERR_UNMODELED = -7,
 } sg_error_t;
 
+/* Outcomes. A policy is installed with one of the policy outcomes:
+ *   ALLOW, AUDIT, DISCOURAGE, REVIEW, NEEDS_REASON, DENY, DENY_ESCALATE.
+ * The gate itself also produces REJECT (the source cannot be evaluated),
+ * UNDETERMINED (no policy matched, or evaluation could not complete). The
+ * intended meanings, which the application carries out:
+ *   AUDIT           permitted; the application records the command.
+ *   DISCOURAGE      a weak allow: advise the agent not to run it. It is not a
+ *                   denial, and the agent may proceed if it persists.
+ *   REVIEW          a reviewer decides.
+ *   NEEDS_REASON    denied until the reason to run it has been explained and
+ *                   audited.
+ *   DENY            denied.
+ *   DENY_ESCALATE   harder than DENY: stop the agent and escalate to its
+ *                   parent agent or the user.
+ * The library gives an outcome no behavior beyond its place in the order
+ * below.
+ *
+ * A subcommand's verdict is the most restrictive outcome among the policies
+ * it matched, and a command's verdict is its most restrictive subcommand.
+ * From most to least restrictive:
+ *   REJECT, DENY_ESCALATE, DENY, NEEDS_REASON, REVIEW, UNDETERMINED,
+ *   DISCOURAGE, AUDIT, ALLOW.
+ * ALLOW, AUDIT and DISCOURAGE are the permitting outcomes: none of them is a
+ * denial, and a command whose subcommands all permit is itself permitted.
+ * The policies that matched stay visible through
+ * sg_subcommand_result_t.matched_policies, and the diagnostic of a discouraged
+ * subcommand through its reject_reason.
+ *
+ * A verdict is what the policies decided. What must hold for the input to run
+ * as analyzed is separate: the `requirements` of a result, which Shellsplit
+ * states and the gate passes on unchanged. A verdict never absorbs them. */
 typedef enum {
   SG_VERDICT_ALLOW = 0,
   SG_VERDICT_DENY = 1,
   SG_VERDICT_REJECT = 2,
   SG_VERDICT_UNDETERMINED = 3,
+  SG_VERDICT_REVIEW = 4,
+  SG_VERDICT_AUDIT = 5,
+  SG_VERDICT_NEEDS_REASON = 6,
+  SG_VERDICT_DISCOURAGE = 7,
+  SG_VERDICT_DENY_ESCALATE = 8,
 } sg_verdict_t;
 
 typedef enum {
   SG_STOP_FIRST_FAIL = 0,
-  SG_STOP_FIRST_PASS =
-      1, /* stops after first subcommand matching any policy (allow or deny) */
+  SG_STOP_FIRST_PASS = 1, /* stops after first subcommand matching any policy */
   SG_STOP_FIRST_ALLOW = 2, /* stops after first ALLOW verdict */
   SG_STOP_FIRST_DENY = 3,  /* stops after first DENY verdict */
-  SG_EVAL_ALL = 4,
+  /* Stops after the first subcommand whose verdict equals the outcome chosen
+   * with sg_gate_set_stop_outcome() (default ALLOW). */
+  SG_STOP_FIRST_OUTCOME = 4,
+  SG_EVAL_ALL = 5,
 } sg_stop_mode_t;
 
 /* Per-subcommand result: lightweight, pointers into output buffer. */
 typedef struct {
+  /* True when at least one installed policy matched this subcommand. */
   bool matches;
   sg_verdict_t verdict;
+  /* Bit i is set when the policy at index i (see sg_gate_policy_at) matched,
+   * so `matches` is `matched_policies != 0`. Every installed policy is
+   * evaluated: an earlier match never hides a later one. Indexes are stable
+   * until sg_gate_remove_policy. If a policy cannot be evaluated the call
+   * reports the error and the subcommand keeps its most restrictive known
+   * outcome, but never one weaker than UNDETERMINED; when that leaves it
+   * UNDETERMINED it reports no matches. */
+  uint32_t matched_policies;
   /* Readable diagnostic display only. It is lossy and must never be parsed. */
   const char *display_command;
   /* Canonical argv used for policy evaluation and all programmatic handling.
@@ -312,6 +359,49 @@ const st_policy_t *sg_gate_allow_policy_borrowed(const sg_gate_t *gate)
     SHELL_NONNULL(1);
 const st_policy_t *sg_gate_deny_policy_borrowed(const sg_gate_t *gate)
     SHELL_NONNULL(1);
+
+/* --- POLICY LIST --- */
+
+/* A gate holds an ordered list of policies, each installed with an outcome.
+ * Index 0 is the allow policy and index 1 the deny policy: they always exist,
+ * carry outcomes ALLOW and DENY, and are the ones replaced by the setters
+ * above. Policies added below follow from index 2 in installation order.
+ * Every policy is evaluated against every subcommand. Suggestions come from
+ * indexes 0 and 1 only. A policy may be installed in several gates by
+ * borrowing it, and the same policy may appear more than once.
+ *
+ * Ownership and lifetime follow the rules above: an owned policy is
+ * exclusively the gate's and is freed with it or on removal; a borrowed one
+ * must outlive every gate and reader that uses it and is never mutated while
+ * installed. Neither is checked at runtime.
+ *
+ * outcome must be one of ALLOW, AUDIT, DISCOURAGE, REVIEW, NEEDS_REASON,
+ * DENY, DENY_ESCALATE; any other value is SG_ERR_INVALID. A gate holds at
+ * most SG_MAX_POLICIES; adding beyond that is SG_ERR_INVALID. On any error the
+ * gate is unchanged and the caller still owns an owned policy. */
+#define SG_MAX_POLICIES 16
+
+sg_error_t sg_gate_add_policy_owned(sg_gate_t *gate, st_policy_t *policy,
+                                    sg_verdict_t outcome) SHELL_NONNULL(1, 2);
+sg_error_t sg_gate_add_policy_borrowed(sg_gate_t *gate,
+                                       const st_policy_t *policy,
+                                       sg_verdict_t outcome)
+    SHELL_NONNULL(1, 2);
+
+/* Remove the policy at index, which must satisfy 2 <= index < count: the allow
+ * and deny policies are replaced, not removed. Later policies move down one
+ * index, so matched_policies bits of earlier results no longer name them.
+ * An owned policy is freed. Serialize against evaluation of this gate. */
+void sg_gate_remove_policy(sg_gate_t *gate, uint32_t index) SHELL_NONNULL(1);
+
+uint32_t sg_gate_policy_count(const sg_gate_t *gate) SHELL_NONNULL(1);
+
+/* The installed policy at index, which must be < sg_gate_policy_count(). Never
+ * mutate or free it. `outcome` is optional and receives the installed outcome.
+ * The policy's user pointer (st_policy_user_data) is the application's link
+ * from a matched index to its own data. */
+const st_policy_t *sg_gate_policy_at(const sg_gate_t *gate, uint32_t index,
+                                     sg_verdict_t *outcome) SHELL_NONNULL(1);
 
 /* --- ANOMALY DETECTION CONFIGURATION --- */
 
@@ -556,6 +646,10 @@ sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd)
 sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask)
     SHELL_NONNULL(1);
 sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode)
+    SHELL_NONNULL(1);
+/* The outcome SG_STOP_FIRST_OUTCOME stops on; a policy outcome as above, else
+ * SG_ERR_INVALID and no change. */
+sg_error_t sg_gate_set_stop_outcome(sg_gate_t *gate, sg_verdict_t outcome)
     SHELL_NONNULL(1);
 sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled)
     SHELL_NONNULL(1);

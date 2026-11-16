@@ -114,9 +114,12 @@ int main(void) {
   CHECK(pthread_barrier_destroy(&barrier) == 0);
   st_policy_stats_t stats;
   st_policy_get_stats(allow, &stats);
-  CHECK(stats.eval_count == 48 && st_policy_rule_count(allow) == 1);
+  /* Every policy is evaluated for every subcommand, so a match in one never
+   * skips another: readers x repetitions x cases evaluations for each. */
+  const size_t evaluations = READER_COUNT * CASE_REPETITIONS * CASE_COUNT;
+  CHECK(stats.eval_count == evaluations && st_policy_rule_count(allow) == 1);
   st_policy_get_stats(deny, &stats);
-  CHECK(stats.eval_count == 72 && st_policy_rule_count(deny) == 1);
+  CHECK(stats.eval_count == evaluations && st_policy_rule_count(deny) == 1);
   st_policy_free(allow);
   st_policy_free(deny);
   puts("shared policy gate readers passed");

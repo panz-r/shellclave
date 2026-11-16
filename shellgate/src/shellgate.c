@@ -271,11 +271,20 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
 
 /* --- GATE STATE --- */
 
-struct sg_gate {
+typedef struct {
   const st_policy_t *policy;
-  const st_policy_t *deny_policy;
-  bool owns_policy;
-  bool owns_deny_policy;
+  sg_verdict_t outcome;
+  bool owned;
+} sg_policy_entry_t;
+
+/* Index 0 is the allow policy and index 1 the deny policy; both exist from
+ * construction, so policy_count >= 2. */
+enum { SG_ALLOW_SLOT = 0, SG_DENY_SLOT = 1 };
+
+struct sg_gate {
+  sg_policy_entry_t policies[SG_MAX_POLICIES];
+  uint32_t policy_count;
+  sg_verdict_t stop_outcome;
 
   char cwd[512];
   uint32_t reject_mask;
@@ -353,8 +362,12 @@ sg_gate_t *sg_gate_new_with_policies_borrowed(const st_policy_t *allow,
   if (!g)
     return NULL;
 
-  g->policy = allow;
-  g->deny_policy = deny;
+  g->policies[SG_ALLOW_SLOT] =
+      (sg_policy_entry_t){.policy = allow, .outcome = SG_VERDICT_ALLOW};
+  g->policies[SG_DENY_SLOT] =
+      (sg_policy_entry_t){.policy = deny, .outcome = SG_VERDICT_DENY};
+  g->policy_count = 2;
+  g->stop_outcome = SG_VERDICT_ALLOW;
 
   g->cwd[0] = '.'; /* calloc left the terminator in place */
   g->reject_mask = SG_REJECT_MASK_DEFAULT;
@@ -376,8 +389,8 @@ sg_gate_t *sg_gate_new_with_policies_owned(st_policy_t *allow,
                                            st_policy_t *deny) {
   sg_gate_t *gate = sg_gate_new_with_policies_borrowed(allow, deny);
   if (gate) {
-    gate->owns_policy = true;
-    gate->owns_deny_policy = true;
+    gate->policies[SG_ALLOW_SLOT].owned = true;
+    gate->policies[SG_DENY_SLOT].owned = true;
   }
   return gate;
 }
@@ -411,10 +424,9 @@ void sg_gate_free(sg_gate_t *gate) {
   free(gate->anomaly_score_buf);
   type_cache_free(&gate->anomaly_type_cache);
   cdf_free(gate);
-  if (gate->owns_policy)
-    st_policy_free((st_policy_t *)gate->policy);
-  if (gate->owns_deny_policy)
-    st_policy_free((st_policy_t *)gate->deny_policy);
+  for (uint32_t i = 0; i < gate->policy_count; i++)
+    if (gate->policies[i].owned)
+      st_policy_free((st_policy_t *)gate->policies[i].policy);
   free(gate);
 }
 
@@ -430,6 +442,52 @@ sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd) {
 
 sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask) {
   gate->reject_mask = mask;
+  return SG_OK;
+}
+
+static bool sg_outcome_is_policy_outcome(sg_verdict_t outcome);
+
+/* Position in the documented order, larger being more restrictive. `verdict`
+ * is one of the sg_verdict_t values. */
+static int sg_verdict_rank(sg_verdict_t verdict) {
+  static const int ranks[] = {
+      [SG_VERDICT_ALLOW] = 0,      [SG_VERDICT_AUDIT] = 1,
+      [SG_VERDICT_DISCOURAGE] = 2, [SG_VERDICT_UNDETERMINED] = 3,
+      [SG_VERDICT_REVIEW] = 4,     [SG_VERDICT_NEEDS_REASON] = 5,
+      [SG_VERDICT_DENY] = 6,       [SG_VERDICT_DENY_ESCALATE] = 7,
+      [SG_VERDICT_REJECT] = 8,
+  };
+  return ranks[verdict];
+}
+
+/* Verdicts that stop a command from proceeding as it is, and so carry the
+ * command's deny_reason. A permitting outcome, however weak, is not one. */
+static bool sg_verdict_needs_attention(sg_verdict_t verdict) {
+  return sg_verdict_rank(verdict) > sg_verdict_rank(SG_VERDICT_UNDETERMINED);
+}
+
+/* The diagnostic recorded for a subcommand a policy outcome applies to. */
+static const char *sg_outcome_reason(sg_verdict_t outcome) {
+  switch (outcome) {
+  case SG_VERDICT_DENY:
+    return "deny policy match";
+  case SG_VERDICT_DENY_ESCALATE:
+    return "deny-escalate policy match";
+  case SG_VERDICT_NEEDS_REASON:
+    return "needs-reason policy match";
+  case SG_VERDICT_REVIEW:
+    return "review policy match";
+  case SG_VERDICT_DISCOURAGE:
+    return "discourage policy match";
+  default:
+    return NULL;
+  }
+}
+
+sg_error_t sg_gate_set_stop_outcome(sg_gate_t *gate, sg_verdict_t outcome) {
+  if (!sg_outcome_is_policy_outcome(outcome))
+    return SG_ERR_INVALID;
+  gate->stop_outcome = outcome;
   return SG_OK;
 }
 
@@ -1113,42 +1171,98 @@ sg_gate_anomaly_type_model_borrowed(const sg_gate_t *gate) {
 /* Policies are stable installed objects; these operations change ownership,
  * not policy contents. Required pointers and lifetime relationships are caller
  * preconditions, including detaching borrowers before owned retirement. */
+/* Replace the policy in one slot. The retired policy is freed only if the gate
+ * owned it. */
+static void sg_gate_replace_slot(sg_gate_t *gate, uint32_t slot,
+                                 const st_policy_t *policy, bool owned) {
+  if (gate->policies[slot].owned)
+    st_policy_free((st_policy_t *)gate->policies[slot].policy);
+  gate->policies[slot].policy = policy;
+  gate->policies[slot].owned = owned;
+}
+
 void sg_gate_set_allow_policy_owned(sg_gate_t *gate, st_policy_t *policy) {
-  if (gate->owns_policy)
-    st_policy_free((st_policy_t *)gate->policy);
-  gate->policy = policy;
-  gate->owns_policy = true;
+  sg_gate_replace_slot(gate, SG_ALLOW_SLOT, policy, true);
 }
 
 void sg_gate_set_deny_policy_owned(sg_gate_t *gate, st_policy_t *policy) {
-  if (gate->owns_deny_policy)
-    st_policy_free((st_policy_t *)gate->deny_policy);
-  gate->deny_policy = policy;
-  gate->owns_deny_policy = true;
+  sg_gate_replace_slot(gate, SG_DENY_SLOT, policy, true);
 }
 
 void sg_gate_set_allow_policy_borrowed(sg_gate_t *gate,
                                        const st_policy_t *policy) {
-  if (gate->owns_policy)
-    st_policy_free((st_policy_t *)gate->policy);
-  gate->policy = policy;
-  gate->owns_policy = false;
+  sg_gate_replace_slot(gate, SG_ALLOW_SLOT, policy, false);
 }
 
 void sg_gate_set_deny_policy_borrowed(sg_gate_t *gate,
                                       const st_policy_t *policy) {
-  if (gate->owns_deny_policy)
-    st_policy_free((st_policy_t *)gate->deny_policy);
-  gate->deny_policy = policy;
-  gate->owns_deny_policy = false;
+  sg_gate_replace_slot(gate, SG_DENY_SLOT, policy, false);
 }
 
 const st_policy_t *sg_gate_allow_policy_borrowed(const sg_gate_t *gate) {
-  return gate->policy;
+  return gate->policies[SG_ALLOW_SLOT].policy;
 }
 
 const st_policy_t *sg_gate_deny_policy_borrowed(const sg_gate_t *gate) {
-  return gate->deny_policy;
+  return gate->policies[SG_DENY_SLOT].policy;
+}
+
+/* The outcomes a policy may be installed with. */
+static bool sg_outcome_is_policy_outcome(sg_verdict_t outcome) {
+  switch (outcome) {
+  case SG_VERDICT_ALLOW:
+  case SG_VERDICT_AUDIT:
+  case SG_VERDICT_DISCOURAGE:
+  case SG_VERDICT_REVIEW:
+  case SG_VERDICT_NEEDS_REASON:
+  case SG_VERDICT_DENY:
+  case SG_VERDICT_DENY_ESCALATE:
+    return true;
+  case SG_VERDICT_REJECT:
+  case SG_VERDICT_UNDETERMINED:
+    break;
+  }
+  return false;
+}
+
+static sg_error_t sg_gate_add_policy(sg_gate_t *gate, const st_policy_t *policy,
+                                     sg_verdict_t outcome, bool owned) {
+  if (!sg_outcome_is_policy_outcome(outcome) ||
+      gate->policy_count == SG_MAX_POLICIES)
+    return SG_ERR_INVALID;
+  gate->policies[gate->policy_count++] =
+      (sg_policy_entry_t){.policy = policy, .outcome = outcome, .owned = owned};
+  return SG_OK;
+}
+
+sg_error_t sg_gate_add_policy_owned(sg_gate_t *gate, st_policy_t *policy,
+                                    sg_verdict_t outcome) {
+  return sg_gate_add_policy(gate, policy, outcome, true);
+}
+
+sg_error_t sg_gate_add_policy_borrowed(sg_gate_t *gate,
+                                       const st_policy_t *policy,
+                                       sg_verdict_t outcome) {
+  return sg_gate_add_policy(gate, policy, outcome, false);
+}
+
+void sg_gate_remove_policy(sg_gate_t *gate, uint32_t index) {
+  if (gate->policies[index].owned)
+    st_policy_free((st_policy_t *)gate->policies[index].policy);
+  memmove(&gate->policies[index], &gate->policies[index + 1],
+          (gate->policy_count - index - 1) * sizeof(gate->policies[0]));
+  gate->policy_count--;
+}
+
+uint32_t sg_gate_policy_count(const sg_gate_t *gate) {
+  return gate->policy_count;
+}
+
+const st_policy_t *sg_gate_policy_at(const sg_gate_t *gate, uint32_t index,
+                                     sg_verdict_t *outcome) {
+  if (outcome)
+    *outcome = gate->policies[index].outcome;
+  return gate->policies[index].policy;
 }
 
 /* --- INTERNAL: TOKEN EXPANSION HELPERS --- */
@@ -2342,95 +2456,108 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     sr->write_count += graph_index->group_writes[ni];
     sr->read_count += graph_index->group_reads[ni];
 
-    /* Check deny policy first. The match-only path avoids constructing
-     * suggestions when the caller has disabled their display. */
-    st_eval_result_t deny_eval = {0};
-    bool deny_matches = false;
-    st_error_t deny_err =
-        gate->suggestions
-            ? st_policy_eval_view(gate->deny_policy, policy_netargv_view,
-                                  &deny_eval)
-            : st_policy_match_view(gate->deny_policy, policy_netargv_view,
-                                   &deny_matches);
-    if (gate->suggestions) {
-      deny_matches = deny_eval.matches;
-      /* A suggestion can exceed its bounded display buffer without making
-       * policy matching invalid. Allocation failure is different: preserve
-       * the fail-closed contract for work Shellgate requested. */
-      if (deny_err == ST_OK && deny_eval.suggestion_error == ST_ERR_MEMORY)
-        deny_err = deny_eval.suggestion_error;
-    }
-    if (deny_err != ST_OK) {
-      sr->matches = false;
-      sr->verdict = SG_VERDICT_UNDETERMINED;
-      sr->reject_reason = bw_copy(&bw, "deny policy evaluation failed", 29);
-      evaluation_error =
-          deny_err == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
-    } else if (deny_matches) {
-      sr->matches = true;
-      sr->verdict = SG_VERDICT_DENY;
-      sr->reject_reason = bw_copy(&bw, "deny policy match", 17);
-    } else {
-      /* Check allow policy with the same optional suggestion work. */
-      st_eval_result_t eval = {0};
-      bool allow_matches = false;
-      st_error_t eval_err =
-          gate->suggestions
-              ? st_policy_eval_view(gate->policy, policy_netargv_view, &eval)
-              : st_policy_match_view(gate->policy, policy_netargv_view,
-                                     &allow_matches);
-      if (gate->suggestions) {
-        allow_matches = eval.matches;
-        if (eval_err == ST_OK && eval.suggestion_error == ST_ERR_MEMORY)
-          eval_err = eval.suggestion_error;
+    /* Evaluate every installed policy, so no match hides another. The
+     * allow and deny slots build suggestions when the caller wants them; the
+     * match-only path avoids constructing any. The verdict is the most
+     * restrictive outcome among the matches. */
+    st_eval_result_t slot_eval[2] = {{0}, {0}};
+    uint32_t matched_mask = 0;
+    sg_verdict_t best = SG_VERDICT_UNDETERMINED;
+    bool matched_any = false;
+    bool policy_failed = false, failed_memory = false, deny_slot_failed = false;
+    for (uint32_t pi = 0; pi < gate->policy_count; pi++) {
+      const sg_policy_entry_t *entry = &gate->policies[pi];
+      st_eval_result_t *eval =
+          pi < 2 && gate->suggestions ? &slot_eval[pi] : NULL;
+      bool matches = false;
+      st_error_t err =
+          eval ? st_policy_eval_view(entry->policy, policy_netargv_view, eval)
+               : st_policy_match_view(entry->policy, policy_netargv_view,
+                                      &matches);
+      if (eval) {
+        matches = eval->matches;
+        /* A suggestion can exceed its bounded display buffer without making
+         * policy matching invalid. Allocation failure is different: preserve
+         * the fail-closed contract for work Shellgate requested. */
+        if (err == ST_OK && eval->suggestion_error == ST_ERR_MEMORY)
+          err = eval->suggestion_error;
       }
-      if (eval_err != ST_OK) {
+      if (err != ST_OK) {
+        policy_failed = true;
+        failed_memory = failed_memory || err == ST_ERR_MEMORY;
+        deny_slot_failed = deny_slot_failed || pi == SG_DENY_SLOT;
+        continue;
+      }
+      if (!matches)
+        continue;
+      matched_mask |= UINT32_C(1) << pi;
+      if (!matched_any ||
+          sg_verdict_rank(entry->outcome) > sg_verdict_rank(best))
+        best = entry->outcome;
+      matched_any = true;
+    }
+    sr->matched_policies = matched_mask;
+    sr->matches = matched_any;
+    if (policy_failed) {
+      /* An unevaluated policy might have matched something more restrictive:
+       * nothing weaker than UNDETERMINED survives, and a stricter known
+       * outcome is kept. The failure is still reported. */
+      evaluation_error = failed_memory ? SG_ERR_MEMORY : SG_ERR_PARSE;
+      if (!matched_any ||
+          sg_verdict_rank(best) <= sg_verdict_rank(SG_VERDICT_UNDETERMINED)) {
         sr->matches = false;
+        sr->matched_policies = 0;
         sr->verdict = SG_VERDICT_UNDETERMINED;
-        evaluation_error =
-            eval_err == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
-      } else if (allow_matches) {
-        sr->matches = true;
-        sr->verdict = SG_VERDICT_ALLOW;
+        sr->reject_reason =
+            deny_slot_failed ? bw_copy(&bw, "deny policy evaluation failed", 29)
+                             : bw_copy(&bw, "policy evaluation failed", 24);
       } else {
-        sr->matches = false;
-        sr->verdict = SG_VERDICT_UNDETERMINED;
-
-        if (gate->suggestions) {
-          sg_error_t added = bw_add_policy_suggestions(
-              &bw, eval.suggestions, eval.suggestion_count, out->suggestions,
-              &out->suggestion_count);
-          if (added == SG_ERR_TRUNC) {
-            out->truncated = true;
-            out->verdict = SG_VERDICT_UNDETERMINED;
-            free(owned_cmd_seq);
-            free(owned_type_seq);
-            return SG_ERR_TRUNC;
-          }
-          if (added != SG_OK && evaluation_error == SG_OK)
-            evaluation_error = added;
-        }
+        sr->verdict = best;
+        const char *reason = sg_outcome_reason(best);
+        sr->reject_reason =
+            reason ? bw_copy(&bw, reason, strlen(reason)) : NULL;
       }
-
+    } else if (matched_any) {
+      sr->verdict = best;
+      const char *reason = sg_outcome_reason(best);
+      sr->reject_reason = reason ? bw_copy(&bw, reason, strlen(reason)) : NULL;
+    } else {
+      sr->verdict = SG_VERDICT_UNDETERMINED;
       if (gate->suggestions) {
-        /* Generate deny suggestions from deny policy */
-        if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
-          sg_error_t added = bw_add_policy_suggestions(
-              &bw, deny_eval.suggestions, deny_eval.suggestion_count,
-              out->deny_suggestions, &out->deny_suggestion_count);
-          if (added == SG_ERR_TRUNC) {
-            out->truncated = true;
-            out->verdict = SG_VERDICT_UNDETERMINED;
-            free(owned_cmd_seq);
-            free(owned_type_seq);
-            return SG_ERR_TRUNC;
-          }
-          if (added != SG_OK && evaluation_error == SG_OK)
-            evaluation_error = added;
+        sg_error_t added =
+            bw_add_policy_suggestions(&bw, slot_eval[SG_ALLOW_SLOT].suggestions,
+                                      slot_eval[SG_ALLOW_SLOT].suggestion_count,
+                                      out->suggestions, &out->suggestion_count);
+        if (added == SG_ERR_TRUNC) {
+          out->truncated = true;
+          out->verdict = SG_VERDICT_UNDETERMINED;
+          free(owned_cmd_seq);
+          free(owned_type_seq);
+          return SG_ERR_TRUNC;
         }
+        if (added != SG_OK && evaluation_error == SG_OK)
+          evaluation_error = added;
       }
     }
-    if (sr->verdict == SG_VERDICT_REJECT || sr->verdict == SG_VERDICT_DENY) {
+    if (gate->suggestions && !policy_failed &&
+        !(matched_mask & (UINT32_C(1) << SG_DENY_SLOT)) &&
+        out->deny_suggestion_count == 0) {
+      /* Deny suggestions come from the deny policy when it did not match. */
+      sg_error_t added = bw_add_policy_suggestions(
+          &bw, slot_eval[SG_DENY_SLOT].suggestions,
+          slot_eval[SG_DENY_SLOT].suggestion_count, out->deny_suggestions,
+          &out->deny_suggestion_count);
+      if (added == SG_ERR_TRUNC) {
+        out->truncated = true;
+        out->verdict = SG_VERDICT_UNDETERMINED;
+        free(owned_cmd_seq);
+        free(owned_type_seq);
+        return SG_ERR_TRUNC;
+      }
+      if (added != SG_OK && evaluation_error == SG_OK)
+        evaluation_error = added;
+    }
+    if (sg_verdict_needs_attention(sr->verdict)) {
       if (out->deny_reason == NULL) {
         out->deny_reason =
             sr->reject_reason ? sr->reject_reason : sr->display_command;
@@ -2453,6 +2580,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     }
     if (sr->verdict == SG_VERDICT_DENY &&
         gate->stop_mode == SG_STOP_FIRST_DENY) {
+      stopped_early = true;
+      break;
+    }
+    if (sr->verdict == gate->stop_outcome &&
+        gate->stop_mode == SG_STOP_FIRST_OUTCOME) {
       stopped_early = true;
       break;
     }
@@ -2532,37 +2664,27 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     return SG_OK;
   }
 
-  bool all_allow = true;
-  bool any_reject = false;
-  bool any_deny = false;
+  /* The command's verdict is its most restrictive subcommand. An argv-less
+   * redirect and unresolved arithmetic are UNDETERMINED: they must not mask a
+   * stricter verdict from another simple command in the same list. */
+  sg_verdict_t worst = SG_VERDICT_ALLOW;
   for (uint32_t i = 0; i < out->subcommand_count; i++) {
-    if (out->subcommands[i].verdict != SG_VERDICT_ALLOW)
-      all_allow = false;
-    if (out->subcommands[i].verdict == SG_VERDICT_REJECT)
-      any_reject = true;
-    if (out->subcommands[i].verdict == SG_VERDICT_DENY)
-      any_deny = true;
+    sg_verdict_t verdict = out->subcommands[i].verdict;
+    if (sg_verdict_rank(verdict) > sg_verdict_rank(worst))
+      worst = verdict;
   }
-
-  if (any_reject)
-    out->verdict = SG_VERDICT_REJECT;
-  else if (any_deny)
-    out->verdict = SG_VERDICT_DENY;
-  else if (has_unpolicyable_io_only_command) {
-    /* An argv-less redirect is not policy-evaluable, but it must not mask a
-     * definite DENY or REJECT from another simple command in the same list. */
-    out->verdict = SG_VERDICT_UNDETERMINED;
+  if (has_unpolicyable_io_only_command &&
+      sg_verdict_rank(worst) <= sg_verdict_rank(SG_VERDICT_UNDETERMINED)) {
+    worst = SG_VERDICT_UNDETERMINED;
     if (!out->deny_reason)
       out->deny_reason = bw_copy(
           &bw, "redirect-only shell operation is not argv-policy-evaluable",
           58);
-  } else if (out->unresolved_expansion_flags &
-             SG_EXPANSION_UNRESOLVED_ARITHMETIC)
-    out->verdict = SG_VERDICT_UNDETERMINED;
-  else if (all_allow)
-    out->verdict = SG_VERDICT_ALLOW;
-  else
-    out->verdict = SG_VERDICT_UNDETERMINED;
+  }
+  if ((out->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARITHMETIC) &&
+      sg_verdict_rank(worst) < sg_verdict_rank(SG_VERDICT_UNDETERMINED))
+    worst = SG_VERDICT_UNDETERMINED;
+  out->verdict = worst;
 
   /* Rendering is part of evaluation success. A caller that receives a
    * truncated result will normally retry with a larger buffer, so no learning
@@ -2676,6 +2798,16 @@ const char *sg_verdict_name(sg_verdict_t v) {
     return "REJECT";
   case SG_VERDICT_UNDETERMINED:
     return "UNDETERMINED";
+  case SG_VERDICT_REVIEW:
+    return "REVIEW";
+  case SG_VERDICT_AUDIT:
+    return "AUDIT";
+  case SG_VERDICT_NEEDS_REASON:
+    return "NEEDS_REASON";
+  case SG_VERDICT_DISCOURAGE:
+    return "DISCOURAGE";
+  case SG_VERDICT_DENY_ESCALATE:
+    return "DENY_ESCALATE";
   }
   return "UNKNOWN";
 }

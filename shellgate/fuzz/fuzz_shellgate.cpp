@@ -176,6 +176,11 @@ bool valid_verdict(sg_verdict_t verdict) {
   case SG_VERDICT_DENY:
   case SG_VERDICT_REJECT:
   case SG_VERDICT_UNDETERMINED:
+  case SG_VERDICT_REVIEW:
+  case SG_VERDICT_AUDIT:
+  case SG_VERDICT_NEEDS_REASON:
+  case SG_VERDICT_DISCOURAGE:
+  case SG_VERDICT_DENY_ESCALATE:
     return true;
   }
   return false;
@@ -226,6 +231,8 @@ void validate_result(const sg_result_t *result, sg_error_t error,
                                   nullptr) != SHELL_NETSTRING_OK) ||
         !valid_verdict(subcommand->verdict))
       invariant_failure("subcommand string outside the output buffer");
+    if (subcommand->matches != (subcommand->matched_policies != 0))
+      invariant_failure("subcommand match flag disagrees with matched bits");
     if (((subcommand->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
          0) &&
         !((result->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0))
@@ -299,6 +306,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
     const sg_subcommand_result_t &a = left.subcommands[i];
     const sg_subcommand_result_t &b = right.subcommands[i];
     if (a.matches != b.matches || a.verdict != b.verdict ||
+        a.matched_policies != b.matched_policies ||
         !equal_string(a.display_command, b.display_command) ||
         !equal_string(a.reject_reason, b.reject_reason) ||
         a.netargv_length != b.netargv_length ||
