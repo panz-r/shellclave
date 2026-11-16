@@ -76,7 +76,40 @@ set(removed_identifiers
   st_policy_visit_matches
   st_policy_simulate_add_netpattern
   sg_cpl_token_variants_at
+  SG_MAX_VIOLATIONS
+  SG_SEVERITY_CRITICAL
+  SG_SEVERITY_HIGH
+  SG_SEVERITY_INFO
+  SG_SEVERITY_LOW
+  SG_SEVERITY_MEDIUM
+  SG_VIOL_CAT_EXFIL
+  SG_VIOL_CAT_FILESYSTEM
+  SG_VIOL_CAT_NETWORK
+  SG_VIOL_CAT_PRIVILEGE
+  SG_VIOL_ENV_PRIVILEGED
+  SG_VIOL_GIT_DESTRUCTIVE
+  SG_VIOL_MAX_NAMES
+  SG_VIOL_MAX_PATHS
+  SG_VIOL_NET_DOWNLOAD_EXEC
+  SG_VIOL_NET_LISTENER
+  SG_VIOL_NET_UPLOAD
+  SG_VIOL_PERM_SYSTEM
+  SG_VIOL_PERSISTENCE
+  SG_VIOL_READ_SECRETS
+  SG_VIOL_REDIRECT_FANOUT
+  SG_VIOL_REMOVE_SYSTEM
+  SG_VIOL_SHELL_ESCALATION
+  SG_VIOL_SHELL_OBFUSCATION
+  SG_VIOL_SUBST_SENSITIVE
+  SG_VIOL_SUDO_REDIRECT
+  SG_VIOL_WRITE_SENSITIVE
+  SG_VIOL_WRITE_THEN_READ
+  sg_gate_set_violation_config
+  sg_gate_set_violation_config_borrowed
   sg_result_violation_dropped
+  sg_violation_config_default
+  sg_violation_config_t
+  sg_violation_t
   shell_transformed_command_get_display_text
   shell_transformed_command_has_transformations
   shell_env_screener_combined_score
@@ -107,7 +140,6 @@ set(removed_identifiers
   sg_eval_size_hint
   SG_VERDICT_ALLOW_CONDITIONAL
   requires_substitution_evaluation
-  sg_gate_set_violation_config
   sg_subcmd_result_t
   sg_gate_set_anomaly_update_on_non_anomaly
   sg_gate_add_rule

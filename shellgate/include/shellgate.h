@@ -64,46 +64,6 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
  * sg_gate_evaluate_size_hint() to size ordinary evaluation buffers. */
 #define SG_DIAGNOSTIC_BUF_MIN 8192
 
-/* --- VIOLATION FLAGS --- */
-
-#define SG_VIOL_CAT_FILESYSTEM (1u << 16)
-#define SG_VIOL_CAT_PRIVILEGE (1u << 17)
-#define SG_VIOL_CAT_EXFIL (1u << 18)
-#define SG_VIOL_CAT_NETWORK (1u << 19)
-
-/* Filesystem Integrity */
-#define SG_VIOL_WRITE_SENSITIVE (1u << 0)
-#define SG_VIOL_REMOVE_SYSTEM (1u << 1)
-#define SG_VIOL_PERM_SYSTEM (1u << 2)
-#define SG_VIOL_GIT_DESTRUCTIVE (1u << 3)
-
-/* Privilege Escalation */
-#define SG_VIOL_ENV_PRIVILEGED (1u << 4)
-#define SG_VIOL_SHELL_ESCALATION (1u << 5)
-#define SG_VIOL_SUDO_REDIRECT (1u << 6)
-#define SG_VIOL_PERSISTENCE (1u << 7)
-
-/* Data Exfiltration */
-#define SG_VIOL_WRITE_THEN_READ (1u << 8)
-#define SG_VIOL_SUBST_SENSITIVE (1u << 9)
-#define SG_VIOL_REDIRECT_FANOUT (1u << 10)
-#define SG_VIOL_READ_SECRETS (1u << 11)
-#define SG_VIOL_SHELL_OBFUSCATION (1u << 12)
-
-/* Network */
-#define SG_VIOL_NET_DOWNLOAD_EXEC (1u << 13)
-#define SG_VIOL_NET_UPLOAD (1u << 14)
-#define SG_VIOL_NET_LISTENER (1u << 15)
-
-#define SG_MAX_VIOLATIONS 16
-
-/* Severity levels for violations (0-100). */
-#define SG_SEVERITY_INFO 30
-#define SG_SEVERITY_LOW 50
-#define SG_SEVERITY_MEDIUM 70
-#define SG_SEVERITY_HIGH 85
-#define SG_SEVERITY_CRITICAL 95
-
 /* --- TYPES --- */
 
 typedef enum {
@@ -186,26 +146,7 @@ typedef struct {
   /* Structural relationships, group membership, background execution, and
    * pipeline timing belong to Shellsplit's dependency graph, not this policy
    * result. Applications needing topology use Shellsplit directly. */
-  uint32_t violation_category_flags;
-  uint32_t violation_type_flags;
 } sg_subcommand_result_t;
-
-/* Single detected violation.  Strings point into output buffer. */
-typedef struct {
-  uint32_t type;
-  uint32_t category_flags;
-  uint32_t severity;
-  /* Index of the dependency-graph execution endpoint responsible for this
-   * violation. It is a CMD node in the usual case and may be a GROUP node
-   * when the relevant stream is owned by a compound command. */
-  uint32_t command_node_index;
-  const char *description;
-  /* Owned by the caller's output buffer, including any copied callback data.
-   * Resolved FILE details use: resolved "<value>" (source "<spelling>").
-   * Quotes/backslashes are escaped; control/non-ASCII bytes use \xHH.
-   * Source-only FILE details retain their original source spelling. */
-  const char *detail;
-} sg_violation_t;
 
 /* Outcome of the deferred anomaly-model update for one completed evaluation.
  * SG_OK describes evaluation and policy handling; inspect this field when a
@@ -223,12 +164,6 @@ typedef enum {
 } sg_anomaly_update_t;
 
 /* Top-level evaluation result: metadata + pointer array into buffer.
- *
- * Violation fields (violations[], violation_count, violation_category_flags,
- * violation_type_flags,
- * violation_dropped_count, has_violations) are always populated from
- * the dependency graph scan, regardless of the overall verdict.
- * They reflect what the graph observed, not what the policy decided.
  */
 typedef struct {
   sg_verdict_t verdict;
@@ -246,16 +181,11 @@ typedef struct {
   uint32_t attention_index;
   bool truncated;
   bool subcommand_truncated;
-  bool violation_truncated;
   /* True when the configured stop mode deliberately left parsed
    * subcommands unevaluated. The verdict then describes only the evaluated
    * prefix; this is distinct from capacity or output truncation. */
   bool short_circuited;
 
-  sg_violation_t violations[SG_MAX_VIOLATIONS];
-  uint32_t violation_count;
-  uint32_t violation_category_flags;
-  uint32_t violation_type_flags;
   /* What Shellsplit states must hold for the input to run as analyzed, passed
    * on unchanged from the dependency graph and not recomputed here: the union
    * over all its edges of SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD (runtime-
@@ -272,7 +202,6 @@ typedef struct {
    * endpoint was not retained in the bounded result prefix. This is not a risk
    * classification. */
   bool has_dynamic_substitution_io;
-  uint32_t violation_dropped_count;
   /* Aggregate unresolved argv/path/conditional/arithmetic information over the
    * retained constructed graph, including group-owned I/O and commands omitted
    * by policy early-stop or output truncation, including nested pathname
@@ -281,7 +210,6 @@ typedef struct {
    * failures before graph construction completes do not provide complete
    * expansion information. */
   uint32_t unresolved_expansion_flags;
-  bool has_violations;
 
   /* Anomaly detection */
   /*
@@ -319,85 +247,6 @@ typedef struct {
 } sg_result_t;
 
 typedef struct sg_gate sg_gate_t;
-
-/* --- VIOLATION CONFIGURATION --- */
-
-#define SG_VIOL_MAX_PATHS 32
-#define SG_VIOL_MAX_NAMES 16
-
-/**
- * Violation detection configuration.
- *
- * Path and name arrays are scanned linearly (arrays are small, <=32 elements).
- * Order does not matter for correctness.
- * Absolute path-prefix entries match a static FILE document's lexical
- * identity, including its recorded execution CWD. Relative prefix entries
- * match its decoded source spelling. Secret/profile path lists are substring
- * fragments and can also match the known identity's CWD components. When a
- * static identity cannot be formed, only the decoded-spelling heuristic is
- * available: no CWD is invented for dynamic paths or unknown relative CWDs.
- * Identity normalization removes redundant separators and single-dot
- * components, but does not collapse parent components or resolve symlinks.
- * Configure prefixes in this same lexical form. These signals do not prove
- * filesystem identity or determine the policy verdict.
- *
- * Violation fields in sg_result_t (violations[], violation_count,
- * violation_category_flags, violation_type_flags, violation_dropped_count,
- * has_violations) are
- * always populated from the dependency graph scan, regardless of
- * the overall verdict.  They reflect what the graph observed,
- * not what the policy decided.
- */
-typedef struct {
-  /* Filesystem Integrity */
-  const char *sensitive_write_paths[SG_VIOL_MAX_PATHS];
-  uint32_t sensitive_write_path_count;
-  const char *sensitive_dirs[SG_VIOL_MAX_PATHS];
-  uint32_t sensitive_dir_count;
-
-  /* Privilege Escalation */
-  const char *sensitive_env_names[SG_VIOL_MAX_NAMES];
-  uint32_t sensitive_env_name_count;
-  const char *sensitive_cmd_names[SG_VIOL_MAX_NAMES];
-  uint32_t sensitive_cmd_name_count;
-
-  /* Data Exfiltration */
-  const char *sensitive_read_paths[SG_VIOL_MAX_PATHS];
-  uint32_t sensitive_read_path_count;
-  uint32_t redirect_fanout_threshold;
-
-  /* Network */
-  const char *download_cmds[SG_VIOL_MAX_NAMES];
-  uint32_t download_cmd_count;
-
-  /* Shell spawn commands */
-  const char *shell_spawn_cmds[SG_VIOL_MAX_NAMES];
-  uint32_t shell_spawn_cmd_count;
-
-  /* Permission modification commands */
-  const char *perm_mod_cmds[SG_VIOL_MAX_NAMES];
-  uint32_t perm_mod_cmd_count;
-
-  /* Secret file paths (credential/key files) */
-  const char *sensitive_secret_paths[SG_VIOL_MAX_PATHS];
-  uint32_t sensitive_secret_path_count;
-  const char *file_reading_cmds[SG_VIOL_MAX_NAMES];
-  uint32_t file_reading_cmd_count;
-
-  /* Upload commands */
-  const char *upload_cmds[SG_VIOL_MAX_NAMES];
-  uint32_t upload_cmd_count;
-
-  /* Listener commands */
-  const char *listener_cmds[SG_VIOL_MAX_NAMES];
-  uint32_t listener_cmd_count;
-
-  /* Shell profile paths */
-  const char *shell_profile_paths[SG_VIOL_MAX_PATHS];
-  uint32_t shell_profile_path_count;
-} sg_violation_config_t;
-
-void sg_violation_config_default(sg_violation_config_t *cfg) SHELL_NONNULL(1);
 
 enum {
   SG_EXPANSION_UNRESOLVED_ARGV = 1u << 0,
@@ -721,19 +570,6 @@ sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
                                            shell_expand_word_netargv_fn fn,
                                            void *user_ctx) SHELL_NONNULL(1);
 
-/*
- * Stores a shallow copy of `config`. Later edits to the caller's structure
- * take effect only after another successful call, which rebuilds the matchers.
- * All strings referenced by its arrays must remain valid and unchanged until
- * the gate is destroyed or another violation configuration is installed.
- * Validates array counts and entries, and precomputes fragment matchers.
- * SG_ERR_INVALID (invalid arrays) and SG_ERR_MEMORY (matcher allocation or
- * size overflow) leave the installed configuration unchanged. Empty path
- * entries match nothing. Evaluation does not allocate matcher tables.
- */
-sg_error_t sg_gate_set_violation_config_borrowed(
-    sg_gate_t *gate, const sg_violation_config_t *config) SHELL_NONNULL(1, 2);
-
 /* --- EVALUATION --- */
 
 /*
@@ -797,12 +633,12 @@ sg_error_t sg_gate_set_violation_config_borrowed(
  * with SG_ERR_EXPAND when its failure diagnostic cannot fit, or SG_ERR_MEMORY
  * when even the workspace-unavailable diagnostic cannot fit. SG_ERR_TRUNC
  * always sets `truncated`. Inspect `truncated`,
- * `subcommand_truncated`, and `violation_truncated` to identify the truncated
- * result category. Any truncated result leaves the verdict
- * SG_VERDICT_UNDETERMINED rather than authorizing incomplete output or an
- * evaluated prefix. It also leaves anomaly-model learning and adaptive/CDF
- * calibration unchanged, so a caller may grow its buffer and retry the same
- * evaluation without counting that source record twice.
+ * and `subcommand_truncated` to identify the truncated result category. Any
+ * truncated result leaves the verdict SG_VERDICT_UNDETERMINED rather than
+ * authorizing incomplete output or an evaluated prefix. It also leaves
+ * anomaly-model learning and adaptive/CDF calibration unchanged, so a caller
+ * may grow its buffer and retry the same evaluation without counting that
+ * source record twice.
  *
  * After argument validation initializes `out`, any fatal operational failure
  * also leaves its verdict SG_VERDICT_UNDETERMINED; this includes workspace,
@@ -828,8 +664,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
  * identity comparison scratch, and source scratch for anomaly analysis.
  * Retained names stay valid while subsequent analysis reuses graph storage.
  * Expansion callbacks can require additional workspace for resolved path bytes
- * as well as result-prefix space; violation details can also require more
- * result space.
+ * as well as result-prefix space.
  */
 size_t sg_gate_evaluate_size_hint(size_t cmd_len);
 

@@ -31,14 +31,6 @@ bool shell_dep_doc_file_identity_from_decoded(
     const char *decoded, size_t length, char *destination, size_t capacity,
     shell_dep_file_identity_t *identity) SHELL_NONNULL(1, 2, 3, 5, 7);
 
-/* Normalize one decoded, nonempty, NUL-free lexical path in place. path has
- * length + 1 writable bytes and length <= UINT32_MAX. Removes single-dot and
- * redundant separator components, preserving parent components and symlinks.
- * Returns the length excluding its appended NUL. The input is prechecked;
- * this helper does not decode, classify or validate caller storage. */
-size_t shell_dep_file_path_normalize(char *path, size_t length)
-    SHELL_NONNULL(1);
-
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 /* Exercise the private append-only AVL contract at full capacity. Existing
  * keys remain discoverable; absent insertions leave every link and height

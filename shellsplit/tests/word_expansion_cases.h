@@ -282,23 +282,21 @@ static const struct {
 
 /* Redirect expansion must not alias its source spelling to a static path.
  * The callback resolves dynamic operands to the stated record; quoted/literal
- * controls never call it. Shared by Shellgate tests and fixed fuzz oracles. */
+ * controls never call it. */
 static const struct {
   const char *source, *word, *record;
-  bool dynamic, resolved_alias;
+  bool dynamic;
 } shellsplit_test_tilde_path_aliases[] = {
-    {"curl >x=~; sh <\"x=~\"", "x=~", "10:x=/example,", true, false},
-    {"curl >x+=~; sh <\"x+=~\"", "x+=~", "11:x+=/example,", true, false},
-    {"curl >x=y:~; sh <\"x=y:~\"", "x=y:~", "12:x=y:/example,", true, false},
-    {"curl >x\\\n=\\\n~; sh <\"x=~\"", "x\\\n=\\\n~", "10:x=/example,", true,
-     false},
-    {"curl >~/path; sh <\"~/path\"", "~/path", "13:/example/path,", true,
-     false},
-    {"curl >\"$OUT\"; sh <\"$OUT\"", "\"$OUT\"", "10:x=/example,", true, true},
-    {"curl >x=~; sh <x=/example", "x=~", "10:x=/example,", true, true},
-    {"curl >'x=~'; sh <\"x=~\"", "'x=~'", NULL, false, true},
-    {"curl >x=~\"\"; sh <\"x=~\"", "x=~\"\"", NULL, false, true},
-    {"curl >~\"\"/path; sh <\"~/path\"", "~\"\"/path", NULL, false, true},
+    {"curl >x=~; sh <\"x=~\"", "x=~", "10:x=/example,", true},
+    {"curl >x+=~; sh <\"x+=~\"", "x+=~", "11:x+=/example,", true},
+    {"curl >x=y:~; sh <\"x=y:~\"", "x=y:~", "12:x=y:/example,", true},
+    {"curl >x\\\n=\\\n~; sh <\"x=~\"", "x\\\n=\\\n~", "10:x=/example,", true},
+    {"curl >~/path; sh <\"~/path\"", "~/path", "13:/example/path,", true},
+    {"curl >\"$OUT\"; sh <\"$OUT\"", "\"$OUT\"", "10:x=/example,", true},
+    {"curl >x=~; sh <x=/example", "x=~", "10:x=/example,", true},
+    {"curl >'x=~'; sh <\"x=~\"", "'x=~'", NULL, false},
+    {"curl >x=~\"\"; sh <\"x=~\"", "x=~\"\"", NULL, false},
+    {"curl >~\"\"/path; sh <\"~/path\"", "~\"\"/path", NULL, false},
 };
 
 /* One pathname placeholder per source. Shared by graph, gate and fixed fuzz

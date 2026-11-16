@@ -29,7 +29,7 @@ For example, with an allow rule `git status --short` and a deny rule
 
 Shellsplit analyzes the source and constructs command and I/O relationships.
 Shelltype matches argument sequences against policy rules. Shellgate combines
-these operations with advisory violation findings and optional anomaly scoring.
+these operations with optional anomaly scoring.
 
 ## Security model and limitations
 
@@ -159,15 +159,15 @@ those facts consistent with policy evaluation. The
 [graph guide](shellsplit/README.md#graph-io-and-state-facts) distinguishes byte
 routes from setup effects, including overwritten redirects.
 
-Violation findings are advisory signals that the application can incorporate
-into its decision. Anomaly scores measure how unusual an execution-stage
+Anomaly scores measure how unusual an execution-stage
 sequence is relative to the learned model. Its entries include simple commands
 in lists and nested substitutions, plus redirect-only operations, arithmetic
 and conditional commands, and empty timed pipelines. This analysis sequence
 differs from runtime scheduling and from the
 commands eligible for argv-policy evaluation. Applications can use higher scores
-to prioritize additional risk analysis. These signals have separate meanings
-from the policy verdict.
+to prioritize additional risk analysis. This signal has a separate meaning
+from the policy verdict. Which commands or paths are dangerous is application
+policy, decided with the graph and argument rules.
 
 Execution must use the pinned Bash version with the documented startup state.
 The [security model](SECURITY.md) defines executor preparation, substitution

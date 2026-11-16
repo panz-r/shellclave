@@ -46,8 +46,8 @@ source, can return `ALLOW` with zero policy-evaluable commands.
 
 For a full-input decision, use `SG_EVAL_ALL` and require `truncated == false`
 and `short_circuited == false`. Early-stop modes report their evaluated prefix.
-The `subcommand_truncated` and `violation_truncated` fields identify affected
-result categories. A truncated graph covers only retained metadata.
+The `truncated` and `subcommand_truncated` fields identify affected result
+categories. A truncated graph covers only retained metadata.
 
 `SG_ERR_MEMORY` can mean evaluation workspace is insufficient; the size hint
 is an initial estimate. Resolved values and diagnostic text may require more
@@ -102,7 +102,7 @@ are listed in the [shell reference](docs/shell-model.md).
 | Program behavior | Select trusted executables and enforce program-specific argument and access policies |
 | File access | Check graph I/O effects, filesystem identities, symlinks, permissions, and races as required |
 | Resource control | Set time, memory, process, filesystem, and network limits for execution |
-| Additional findings | Decide how advisory violations and anomaly observations affect review or enforcement |
+| Risk classification | Decide which commands, paths, and options are dangerous, using the graph and argument rules; decide how anomaly observations affect review or enforcement |
 
 Argument rules authorize command shapes. For example, both `git status --short`
 and `git status --short >report.txt` can match the same argv rule. The second
@@ -110,8 +110,8 @@ command also performs output setup, available through Shellsplit's graph.
 Known lexical path identities support analysis; filesystem coherence checks
 must use the application's actual access boundary.
 
-Violation findings summarize configured heuristics and observed graph facts.
-Anomaly scores measure unusualness. Applications may spend more effort on risk
+Shellgate does not classify commands as dangerous: such rules are application
+policy. Anomaly scores measure unusualness. Applications may spend more effort on risk
 estimation for unusual commands while keeping those concepts separate.
 
 ### Executor startup

@@ -191,7 +191,6 @@ void validate_result(const sg_result_t *result, sg_error_t error,
                      const char *buffer, size_t buffer_size) {
   if (!valid_verdict(result->verdict) ||
       result->subcommand_count > SG_MAX_SUBCOMMAND_RESULTS ||
-      result->violation_count > SG_MAX_VIOLATIONS ||
       result->suggestion_count > 2 || result->deny_suggestion_count > 2 ||
       (result->unresolved_expansion_flags &
        ~(SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH |
@@ -199,16 +198,15 @@ void validate_result(const sg_result_t *result, sg_error_t error,
          SG_EXPANSION_UNRESOLVED_ARITHMETIC)) != 0 ||
       (error == SG_ERR_TRUNC && !result->truncated) ||
       (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
-      (error == SG_ERR_TRUNC && result->verdict == SG_VERDICT_ALLOW) ||
-      result->has_violations != (result->violation_count != 0) ||
+      (error == SG_ERR_TRUNC && (result->verdict == SG_VERDICT_ALLOW ||
+                                 result->verdict == SG_VERDICT_ALLOW)) ||
       !valid_buffer_string(result->deny_reason, buffer, buffer_size)) {
     fprintf(stderr,
             "result fields: error=%d verdict=%d truncated=%d subcommands=%u "
-            "violations=%u suggestions=%u/%u unresolved=%u has_violations=%d\n",
+            "suggestions=%u/%u unresolved=%u\n",
             error, result->verdict, result->truncated, result->subcommand_count,
-            result->violation_count, result->suggestion_count,
-            result->deny_suggestion_count, result->unresolved_expansion_flags,
-            result->has_violations);
+            result->suggestion_count, result->deny_suggestion_count,
+            result->unresolved_expansion_flags);
     invariant_failure("result field outside its documented bounds");
   }
 
@@ -242,11 +240,6 @@ void validate_result(const sg_result_t *result, sg_error_t error,
   for (uint32_t i = 0; i < result->deny_suggestion_count; i++)
     if (!valid_buffer_string(result->deny_suggestions[i], buffer, buffer_size))
       invariant_failure("deny suggestion outside the output buffer");
-  for (uint32_t i = 0; i < result->violation_count; i++)
-    if (!valid_buffer_string(result->violations[i].description, buffer,
-                             buffer_size) ||
-        !valid_buffer_string(result->violations[i].detail, buffer, buffer_size))
-      invariant_failure("violation string outside the output buffer");
 
   /* Requirements are Shellsplit's edge flags passed on: nothing else, and a
    * subcommand carries only what a route delivers to it. */
@@ -292,16 +285,10 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       left.attention_index != right.attention_index ||
       left.truncated != right.truncated ||
       left.subcommand_truncated != right.subcommand_truncated ||
-      left.violation_truncated != right.violation_truncated ||
       left.short_circuited != right.short_circuited ||
-      left.violation_count != right.violation_count ||
-      left.violation_category_flags != right.violation_category_flags ||
-      left.violation_type_flags != right.violation_type_flags ||
       left.requirements != right.requirements ||
       left.has_dynamic_substitution_io != right.has_dynamic_substitution_io ||
       left.unresolved_expansion_flags != right.unresolved_expansion_flags ||
-      left.violation_dropped_count != right.violation_dropped_count ||
-      left.has_violations != right.has_violations ||
       left.anomaly_detected != right.anomaly_detected ||
       left.anomaly_score != right.anomaly_score ||
       left.anomaly_score_raw != right.anomaly_score_raw ||
@@ -320,9 +307,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
         a.write_count != b.write_count || a.read_count != b.read_count ||
         a.env_count != b.env_count || a.requirements != b.requirements ||
         a.has_dynamic_substitution_io != b.has_dynamic_substitution_io ||
-        a.unresolved_expansion_flags != b.unresolved_expansion_flags ||
-        a.violation_category_flags != b.violation_category_flags ||
-        a.violation_type_flags != b.violation_type_flags)
+        a.unresolved_expansion_flags != b.unresolved_expansion_flags)
       return false;
   }
   for (uint32_t i = 0; i < left.suggestion_count; i++)
@@ -331,16 +316,6 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
   for (uint32_t i = 0; i < left.deny_suggestion_count; i++)
     if (!equal_string(left.deny_suggestions[i], right.deny_suggestions[i]))
       return false;
-  for (uint32_t i = 0; i < left.violation_count; i++) {
-    const sg_violation_t &a = left.violations[i];
-    const sg_violation_t &b = right.violations[i];
-    if (a.type != b.type || a.category_flags != b.category_flags ||
-        a.severity != b.severity ||
-        a.command_node_index != b.command_node_index ||
-        !equal_string(a.description, b.description) ||
-        !equal_string(a.detail, b.detail))
-      return false;
-  }
   return true;
 }
 
@@ -460,57 +435,27 @@ void run_expansion_query_oracles() {
       invariant_failure("tilde CWD callback contract");
     }
   }
-  sg_violation_config_t config;
-  sg_violation_config_default(&config);
-  if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK ||
-      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
+  if (sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
     invariant_failure("resolved expansion oracle configuration");
-  for (const auto &fixture : shellsplit_test_tilde_path_aliases) {
-    for (unsigned mode = 0; mode < 3; mode++) {
-      state = {fixture.dynamic ? fixture.word : nullptr, 0, fixture.record};
-      state.unresolved = mode != 2;
-      if (sg_gate_set_expand_word_netargv(
-              gate, mode ? oracle_expand_word : nullptr, &state) != SG_OK)
-        invariant_failure("tilde identity oracle configuration");
-      size_t length = strlen(fixture.source);
-      if (!buffer.reset_for(length))
-        invariant_failure("tilde identity oracle buffer allocation");
-      sg_result_t result = {};
-      size_t calls = fixture.dynamic && mode
-                         ? (strcmp(fixture.word, "\"$OUT\"") == 0 ? 2u : 1u)
-                         : 0;
-      bool alias = (!fixture.dynamic || mode == 2) && fixture.resolved_alias;
-      if (sg_gate_evaluate(gate, fixture.source, length, buffer.data(),
-                           buffer.size(), &result) != SG_OK ||
-          state.calls != calls || result.subcommand_count != 2 ||
-          result.unresolved_expansion_flags !=
-              (fixture.dynamic && mode != 2 ? SG_EXPANSION_UNRESOLVED_PATH
-                                            : 0) ||
-          !!(result.violation_type_flags & SG_VIOL_WRITE_THEN_READ) != alias)
-        invariant_failure("tilde path identity alias contract");
-    }
-  }
   if (sg_gate_set_expand_word_netargv(gate, oracle_expand_word, &state) !=
       SG_OK)
     invariant_failure("restore expansion oracle callback");
   static const struct {
     const char *command, *word, *records;
-    uint32_t violation;
     bool inspection, dynamic;
   } resolved[] = {
-      {"curl $OPTION", "$OPTION", "2:-T,", SG_VIOL_NET_UPLOAD, false, false},
-      {"base64 $OPTION | sh", "$OPTION", "2:-d,", SG_VIOL_SHELL_OBFUSCATION,
-       false, false},
-      {"base64 $OPTION | sh", "$OPTION", "4:'-d',", 0, false, false},
+      {"curl $OPTION", "$OPTION", "2:-T,", false, false},
+      {"base64 $OPTION | sh", "$OPTION", "2:-d,", false, false},
+      {"base64 $OPTION | sh", "$OPTION", "4:'-d',", false, false},
       {"cat \"$(printf file)\"", "\"$(printf file)\"", "13:/root/.ssh/id,",
-       SG_VIOL_READ_SECRETS, true, true},
+       true, true},
       {"echo >\"$(cat /root/.ssh/id)\"", "\"$(cat /root/.ssh/id)\"",
-       "8:/tmp/out,", SG_VIOL_SUBST_SENSITIVE, false, true},
+       "8:/tmp/out,", false, true},
       {"true {fd}>\"$(cat /root/.ssh/id)\"", "\"$(cat /root/.ssh/id)\"", "0:,",
-       0, false, false},
-      {"exec {fd}>\"$FAIL\"", "\"$FAIL\"", "0:,", 0, false, false},
-      {"echo >\"$FAIL\" {fd}>/etc/later", "\"$FAIL\"", "0:,", 0, false, false},
-      {"{ echo hi; } >\"$FAIL\" {fd}>/etc/later", "\"$FAIL\"", "0:,", 0, false,
+       false, false},
+      {"exec {fd}>\"$FAIL\"", "\"$FAIL\"", "0:,", false, false},
+      {"echo >\"$FAIL\" {fd}>/etc/later", "\"$FAIL\"", "0:,", false, false},
+      {"{ echo hi; } >\"$FAIL\" {fd}>/etc/later", "\"$FAIL\"", "0:,", false,
        false},
   };
   for (const auto &fixture : resolved) {
@@ -540,25 +485,16 @@ void run_expansion_query_oracles() {
               fixture.command, error, state.calls);
       invariant_failure("resolved expansion topology or callback contract");
     }
-    uint32_t flags = fixture.violation == SG_VIOL_SHELL_OBFUSCATION
-                         ? result.violation_type_flags
-                         : result.subcommands[0].violation_type_flags;
-    if (fixture.violation ? (flags & fixture.violation) == 0 : flags != 0)
-      invariant_failure("resolved expansion violation contract");
   }
   static const struct {
     const char *source, *records;
-    uint32_t violation;
+    bool rsync;
   } equivalents[] = {
-      {"rsync /tmp/x remote$'\\x3a'out", "6:/tmp/x,10:remote:out,",
-       SG_VIOL_NET_UPLOAD},
-      {"rsync /tmp/x remote\\:out", "6:/tmp/x,10:remote:out,",
-       SG_VIOL_NET_UPLOAD},
-      {"socat TCP-LI\"ST\"EN:8000 STDIO", "15:TCP-LISTEN:8000,5:STDIO,",
-       SG_VIOL_NET_LISTENER},
-      {"socat TCP-li\"st\"en:8000 STDIO", "15:TCP-listen:8000,5:STDIO,",
-       SG_VIOL_NET_LISTENER},
-      {"socat TCP-LiStEn:8000 STDIO", "15:TCP-LiStEn:8000,5:STDIO,", 0},
+      {"rsync /tmp/x remote$'\\x3a'out", "6:/tmp/x,10:remote:out,", true},
+      {"rsync /tmp/x remote\\:out", "6:/tmp/x,10:remote:out,", true},
+      {"socat TCP-LI\"ST\"EN:8000 STDIO", "15:TCP-LISTEN:8000,5:STDIO,", false},
+      {"socat TCP-li\"st\"en:8000 STDIO", "15:TCP-listen:8000,5:STDIO,", false},
+      {"socat TCP-LiStEn:8000 STDIO", "15:TCP-LiStEn:8000,5:STDIO,", false},
   };
   for (const auto &fixture : equivalents) {
     sg_gate_set_expand_word_netargv(gate, nullptr, nullptr);
@@ -567,14 +503,11 @@ void run_expansion_query_oracles() {
     sg_result_t literal = {};
     if (sg_gate_evaluate(gate, fixture.source, length, buffer.data(),
                          buffer.size(), &literal) != SG_OK ||
-        literal.subcommand_count != 1 ||
-        literal.violation_type_flags != fixture.violation)
+        literal.subcommand_count != 1)
       invariant_failure("static decoded substring oracle");
     std::string argv(literal.subcommands[0].netargv,
                      literal.subcommands[0].netargv_length);
-    const char *source = fixture.violation == SG_VIOL_NET_UPLOAD
-                             ? "rsync $OPTION"
-                             : "socat $OPTION";
+    const char *source = fixture.rsync ? "rsync $OPTION" : "socat $OPTION";
     state = {"$OPTION", 0, fixture.records};
     sg_gate_set_expand_word_netargv(gate, oracle_expand_word, &state);
     length = strlen(source);
@@ -583,7 +516,6 @@ void run_expansion_query_oracles() {
     if (sg_gate_evaluate(gate, source, length, buffer.data(), buffer.size(),
                          &expanded) != SG_OK ||
         state.calls != 1 || expanded.subcommand_count != 1 ||
-        expanded.violation_type_flags != literal.violation_type_flags ||
         expanded.verdict != literal.verdict ||
         argv.size() != expanded.subcommands[0].netargv_length ||
         memcmp(argv.data(), expanded.subcommands[0].netargv, argv.size()) != 0)
@@ -1078,13 +1010,6 @@ void run_semantic_reference_oracles() {
   if (!option_gate || sg_gate_set_reject_mask(option_gate, 0) != SG_OK ||
       sg_gate_set_stop_mode(option_gate, SG_EVAL_ALL) != SG_OK)
     invariant_failure("builtin option oracle gate setup failed");
-  sg_violation_config_t expansion_config = {};
-  expansion_config.redirect_fanout_threshold = UINT32_MAX;
-  expansion_config.sensitive_write_path_count = 1;
-  expansion_config.sensitive_write_paths[0] = "out";
-  if (sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
-      SG_OK)
-    invariant_failure("expansion control violation configuration failed");
   /* Conditions have no argv-policy subjects, but their unresolved string
    * operands still contribute aggregate flags accepted by validate_result. */
   for (const char *source :
@@ -1267,12 +1192,8 @@ void run_semantic_reference_oracles() {
       sg_error_t error =
           sg_gate_evaluate(option_gate, source.data(), source.size(),
                            buffer.data(), buffer.size(), &result);
-      bool reached =
-          (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-      if (fixture.unmodeled
-              ? error != SG_ERR_UNMODELED
-              : error != SG_OK || result.truncated ||
-                    reached != (success ? fixture.succeeds : fixture.fails))
+      if (fixture.unmodeled ? error != SG_ERR_UNMODELED
+                            : error != SG_OK || result.truncated)
         invariant_failure("substitution outcome reachability mismatch");
       validate_result(&result, error, buffer.data(), buffer.size());
     }
@@ -1316,9 +1237,8 @@ void run_semantic_reference_oracles() {
     bool named_write = false;
     for (uint32_t c = 0; c < result.subcommand_count; c++) {
       const auto &command = result.subcommands[c];
-      named_write |=
-          std::strcmp(command.netargv, "6:printf,7:payload,") == 0 &&
-          (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+      named_write |= std::strcmp(command.netargv, "6:printf,7:payload,") == 0 &&
+                     command.write_count != 0;
     }
     if (error != SG_OK || result.truncated ||
         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
@@ -1335,34 +1255,23 @@ void run_semantic_reference_oracles() {
       invariant_failure("expansion control timing contract mismatch");
     }
   }
-  for (bool redirect : {false, true}) {
-    expansion_config.sensitive_write_paths[0] =
-        redirect ? "redirect-out" : "argv-out";
-    if (sg_gate_set_cwd(option_gate, "/workspace") != SG_OK ||
-        sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
-            SG_OK)
-      invariant_failure("expansion setup violation configuration failed");
-    for (const auto &fixture : shellsplit_test_expansion_setup) {
-      size_t length = std::strlen(fixture.source);
-      auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
-      sg_result_t result = {};
-      sg_error_t error =
-          sg_gate_evaluate(option_gate, fixture.source, length, buffer.data(),
-                           buffer.size(), &result);
-      validate_result(&result, error, buffer.data(), buffer.size());
-      bool inspection = fixture.active && fixture.shell_word;
-      bool writer =
-          fixture.active && (redirect ? fixture.redirect : fixture.writer);
-      if (error != SG_OK || result.truncated ||
-          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
-              inspection ||
-          (inspection && !result.has_dynamic_substitution_io) ||
-          (!fixture.active && result.has_dynamic_substitution_io) ||
-          ((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) !=
-              writer) {
-        std::fprintf(stderr, "expansion setup oracle: %s\n", fixture.source);
-        invariant_failure("expansion phase eligibility contract mismatch");
-      }
+  if (sg_gate_set_cwd(option_gate, "/workspace") != SG_OK)
+    invariant_failure("expansion setup oracle configuration failed");
+  for (const auto &fixture : shellsplit_test_expansion_setup) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool inspection = fixture.active && fixture.shell_word;
+    if (error != SG_OK || result.truncated ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            inspection ||
+        (inspection && !result.has_dynamic_substitution_io) ||
+        (!fixture.active && result.has_dynamic_substitution_io)) {
+      std::fprintf(stderr, "expansion setup oracle: %s\n", fixture.source);
+      invariant_failure("expansion phase eligibility contract mismatch");
     }
   }
   for (const auto &fixture : shellsplit_test_builtin_options) {
@@ -1395,14 +1304,8 @@ void run_semantic_reference_oracles() {
       invariant_failure("builtin operand routing contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
-  sg_violation_config_t outcome_config;
-  sg_violation_config_default(&outcome_config);
-  outcome_config.sensitive_write_paths[0] = "out";
-  outcome_config.sensitive_write_path_count = 1;
-  if (sg_gate_set_cwd(option_gate, "/workspace") != SG_OK ||
-      sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
-          SG_OK)
-    invariant_failure("scope outcome violation configuration failed");
+  if (sg_gate_set_cwd(option_gate, "/workspace") != SG_OK)
+    invariant_failure("scope outcome configuration failed");
   for (const auto &fixture : shellsplit_test_ifs_routes) {
     size_t length = std::strlen(fixture.source);
     auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
@@ -1428,10 +1331,6 @@ void run_semantic_reference_oracles() {
       if (std::strcmp(command.netargv, "6:printf,7:payload,"))
         continue;
       found = true;
-      bool writes =
-          (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-      if (writes != fixture.writes)
-        invariant_failure("IFS sensitive-write route mismatch");
     }
     if (!found)
       invariant_failure("IFS route lost its printf command");
@@ -1449,85 +1348,79 @@ void run_semantic_reference_oracles() {
   }
   static const struct {
     const char *source;
-    bool sensitive;
     uint32_t write_count;
   } moves[] = {
       {"exec 4>out 10>base || exit; exec 11>&- 12>&-; "
        "printf payload 10>&4- >&12",
-       true, 1},
+       1},
       {"exec 4>out 10>base || exit; exec 11>&- 12>&- 13>&- 14>&-; "
        "{ printf payload >&14; } 10>&4- 14>&12-",
-       true, 1},
+       1},
       {"exec 3>out 4>base || exit; exec 10>&- 11>&- 12>&-; "
        ": 4>&- 10>&3-; printf payload >&3",
-       true, 1},
+       1},
       {"exec 3>out || exit; exec 10>&- 11>&-; "
        "exec {fd}>&3 {fd}>&3; printf payload >&10",
-       true, 1},
+       1},
       {"exec 3>out || exit; exec 10>&- 11>&-; "
        ": {fd}>&3 10>&-; printf payload >&\"$fd\"",
-       true, 1},
+       1},
       {"exec 3>out || exit; exec 10>&- 11>&-; "
        "{ :; } {fd}>&3 10>&3-; printf payload >&10",
-       true, 1},
+       1},
       {"exec 3>out || exit; builtin command /bin/true {fd}>&3; "
        "printf payload >&\"$fd\"",
-       true, 1},
+       1},
       {"exec 3>out 4>base || exit; exec 10>&- 11>&-; "
        "exec {fd}>&3 {fd}>&4; echo \"$(printf payload >&10)\"",
-       true, 1},
+       1},
       {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
        "exec {pad}>out {fd}>two; } && "
        "{ exec 10>&${fd}-; printf payload >&10; }",
-       false, 2},
+       2},
       {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
        "exec {pad}>out {fd}>two; } && "
        "{ exec 4>&${fd}-; printf payload >&4; }",
-       false, 2},
+       2},
       {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
        "exec {pad}>out {fd}>two; } && "
        "echo \"$(exec 4>&${fd}-; printf payload >&4)\"",
-       false, 2},
+       2},
       {"exec 1>out || exit; exec 10>&-; exec 10>&10-; exec {fd}>&1; "
        "printf payload >&10",
-       true, 1},
+       1},
       {"exec 1>out || exit; exec 10>&-; { :; } 10>&10; exec {fd}>&1; "
        "printf payload >&10",
-       true, 1},
+       1},
       {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
        ": {out}>&${fd}-; printf payload >&\"$out\"",
-       true, 1},
+       1},
       {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
        "{ :; } {out}>&${fd}-; printf payload >&\"$out\"",
-       true, 1},
+       1},
       {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
        "exec {out}>&${fd}-; printf payload",
-       false, 0},
+       0},
       {"exec 3>out 4>base || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- {fd}>&4; printf payload >&10",
-       true, 1},
+       1},
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- {fd}>&-; printf payload >&10",
-       true, 1},
+       1},
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- 11>&3-; printf payload >&10",
-       true, 1},
-      {"exec 4>&-; exec 3>out || exit; { :; } 4>&3- || printf payload >&3",
-       false, 0},
+       1},
+      {"exec 4>&-; exec 3>out || exit; { :; } 4>&3- || printf payload >&3", 0},
       {"exec 3>base 20>out || exit; exec 10>&- 11>&- 21>&- 22>&-; "
        "{ printf payload >&10; } 3>&20-",
-       true, 1},
+       1},
       {"exec 3>out 4>base || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- {fd}>&4; echo \"$(printf payload >&10)\"",
-       true, 1},
+       1},
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "exec {fd}>&3; : 3>&${fd}- {fd}>&-; cat < <(printf payload >&10)",
-       true, 1},
+       1},
   };
-  outcome_config.sensitive_write_paths[0] = "out";
-  if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
-      SG_OK)
-    invariant_failure("move outcome configuration failed");
   /* Reference Bash reports a descriptor error for each: a move or copy leaves
    * the used descriptor closed, or a persistent close destroys a save. */
   static const char *const unmodeled_moves[] = {
@@ -1570,10 +1463,7 @@ void run_semantic_reference_oracles() {
       if (std::strcmp(command.netargv, "6:printf,7:payload,"))
         continue;
       found = true;
-      bool sensitive =
-          (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-      if (sensitive != fixture.sensitive ||
-          command.write_count != fixture.write_count)
+      if (command.write_count != fixture.write_count)
         invariant_failure("move outcome consumer routes mismatch");
     }
     if (!found)
@@ -1581,27 +1471,26 @@ void run_semantic_reference_oracles() {
   }
   static const struct {
     const char *source, *netargv;
-    bool sensitive;
     uint32_t writes;
   } dispatch[] = {
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "\"$cmd\" payload 1>&3 {fd}>&3 1>&10",
-       "4:$cmd,7:payload,", true, 1},
+       "4:$cmd,7:payload,", 1},
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "command \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
-       "7:command,4:$cmd,7:payload,", true, 1},
+       "7:command,4:$cmd,7:payload,", 1},
       {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
        "builtin \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
-       "7:builtin,4:$cmd,7:payload,", false, 0},
+       "7:builtin,4:$cmd,7:payload,", 0},
       {"exec 1>original || exit; exec 9>&- 10>&- 11>&- 12>&-; "
        "{ echo \"$(exec 10>out; printf payload >&10)\"; } 1>temporary",
-       "6:printf,7:payload,", false, 1},
+       "6:printf,7:payload,", 1},
       {"exec 1>out || exit; exec 9>&- 10>&- 11>&- 12>&-; "
        "{ cat < <(exec 10>original; printf payload >&10); } 1>temporary",
-       "6:printf,7:payload,", true, 1},
+       "6:printf,7:payload,", 1},
       {"exec 1>original || exit; exec 9>&- 10>&- 11>&- 12>&-; "
        "{ : > >(exec 10>&-; exec 10>out; printf payload >&10); } 1>temporary",
-       "6:printf,7:payload,", true, 1},
+       "6:printf,7:payload,", 1},
   };
   /* Reference Bash reports a descriptor error for each: a copy from a closed
    * descriptor, or a move that leaves its used source closed. */
@@ -1640,9 +1529,7 @@ void run_semantic_reference_oracles() {
       if (std::strcmp(command.netargv, fixture.netargv))
         continue;
       found = true;
-      if (!!(command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
-              fixture.sensitive ||
-          command.write_count != fixture.writes)
+      if (command.write_count != fixture.writes)
         invariant_failure("dispatch consumer routes mismatch");
     }
     if (!found)
@@ -1661,48 +1548,35 @@ void run_semantic_reference_oracles() {
     invariant_failure("untracked IFS move outcome mismatch");
   validate_result(&untracked_result, untracked_error, untracked_buffer.data(),
                   untracked_buffer.size());
-  for (const char *path : {"base", "one", "two"}) {
-    for (const auto &fixture : shellsplit_test_named_cleanup) {
-      outcome_config.sensitive_write_paths[0] = path;
-      if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
-          SG_OK)
-        invariant_failure("named cleanup violation configuration failed");
-      size_t length = std::strlen(fixture.source);
-      auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
-      sg_result_t result = {};
-      sg_error_t error =
-          sg_gate_evaluate(option_gate, fixture.source, length, buffer.data(),
-                           buffer.size(), &result);
-      if (error != SG_OK || result.truncated)
-        invariant_failure("named cleanup evaluation failed");
-      validate_result(&result, error, buffer.data(), buffer.size());
-      char netargv[80];
-      if (fixture.read)
-        std::snprintf(netargv, sizeof(netargv), "3:cat,");
-      else if (fixture.timer)
-        std::snprintf(netargv, sizeof(netargv), "4:exec,");
-      else
-        std::snprintf(netargv, sizeof(netargv), "6:printf,%zu:%s,",
-                      std::strlen(fixture.argument), fixture.argument);
-      bool found = false;
-      for (uint32_t c = 0; c < result.subcommand_count; c++) {
-        const auto &command = result.subcommands[c];
-        if (std::strcmp(command.netargv, netargv))
-          continue;
-        found = true;
-        bool sensitive =
-            (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-        bool expected = std::strcmp(path, fixture.file) == 0 ||
-                        (fixture.alternative_file &&
-                         std::strcmp(path, fixture.alternative_file) == 0);
-        if (fixture.read ? command.read_count !=
-                               1u + (fixture.alternative_file != nullptr)
-                         : !fixture.timer && sensitive != expected)
-          invariant_failure("named cleanup consumer route mismatch");
-      }
-      if (!found)
-        invariant_failure("named cleanup consumer missing");
+  for (const auto &fixture : shellsplit_test_named_cleanup) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated)
+      invariant_failure("named cleanup evaluation failed");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    char netargv[80];
+    if (fixture.read)
+      std::snprintf(netargv, sizeof(netargv), "3:cat,");
+    else if (fixture.timer)
+      std::snprintf(netargv, sizeof(netargv), "4:exec,");
+    else
+      std::snprintf(netargv, sizeof(netargv), "6:printf,%zu:%s,",
+                    std::strlen(fixture.argument), fixture.argument);
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const auto &command = result.subcommands[c];
+      if (std::strcmp(command.netargv, netargv))
+        continue;
+      found = true;
+      if (fixture.read &&
+          command.read_count != 1u + (fixture.alternative_file != nullptr))
+        invariant_failure("named cleanup consumer route mismatch");
     }
+    if (!found)
+      invariant_failure("named cleanup consumer missing");
   }
   for (const char *source : shellsplit_test_invalidated_reallocation) {
     size_t length = std::strlen(source);
@@ -1714,41 +1588,23 @@ void run_semantic_reference_oracles() {
       invariant_failure("invalidated reallocation proof was revived");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
-  for (bool base : {false, true}) {
-    outcome_config.sensitive_write_paths[0] = base ? "base" : "out";
-    if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
-        SG_OK)
-      invariant_failure("descriptor outcome configuration failed");
-    for (const auto &fixture : shellsplit_test_descriptor_outcomes) {
-      size_t length = std::strlen(fixture.source);
-      auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
-      sg_result_t result = {};
-      sg_error_t error =
-          sg_gate_evaluate(option_gate, fixture.source, length, buffer.data(),
-                           buffer.size(), &result);
-      if (error != SG_OK || result.truncated ||
-          result.verdict == SG_VERDICT_REJECT)
-        invariant_failure("descriptor outcome evaluation mismatch");
-      validate_result(&result, error, buffer.data(), buffer.size());
-      bool found = false;
-      for (uint32_t c = 0; c < result.subcommand_count; c++) {
-        const auto &item = result.subcommands[c];
-        if (std::strcmp(item.netargv, "6:printf,7:payload,"))
-          continue;
-        found = true;
-        bool writes =
-            (item.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-        if (writes != (base ? fixture.base : fixture.out))
-          invariant_failure("descriptor outcome writer effect mismatch");
-      }
-      if (!found)
-        invariant_failure("descriptor outcome writer missing");
-    }
+  for (const auto &fixture : shellsplit_test_descriptor_outcomes) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated ||
+        result.verdict == SG_VERDICT_REJECT)
+      invariant_failure("descriptor outcome evaluation mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++)
+      found |= std::strcmp(result.subcommands[c].netargv,
+                           "6:printf,7:payload,") == 0;
+    if (!found)
+      invariant_failure("descriptor outcome writer missing");
   }
-  outcome_config.sensitive_write_paths[0] = "out";
-  if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
-      SG_OK)
-    invariant_failure("scope outcome configuration failed");
   for (const auto &fixture : shellsplit_test_scope_outcomes) {
     size_t length = std::strlen(fixture.source);
     reusable_eval_buffer &buffer =
@@ -1765,9 +1621,6 @@ void run_semantic_reference_oracles() {
       if (std::strcmp(item.netargv, "6:printf,7:payload,") != 0)
         continue;
       found = true;
-      bool writes = (item.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
-      if (writes != fixture.writes_to_out)
-        invariant_failure("scope outcome writer effect mismatch");
     }
     if (!found)
       invariant_failure("scope outcome writer syntax missing");
@@ -1785,38 +1638,6 @@ void run_semantic_reference_oracles() {
       invariant_failure("assignment value snapshot contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
-  outcome_config.sensitive_write_paths[0] = "/workspace/out";
-  if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
-      SG_OK)
-    invariant_failure("CWD outcome violation configuration failed");
-  for (const auto &fixture : shellsplit_test_cwd_reachability) {
-    if (std::strcmp(fixture.file, "out") ||
-        !std::strstr(fixture.source, "printf payload"))
-      continue;
-    size_t length = std::strlen(fixture.source);
-    reusable_eval_buffer &buffer =
-        eval_buffer_for(g_eval_buffers.result, length);
-    sg_result_t result = {};
-    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
-                                        buffer.data(), buffer.size(), &result);
-    if (error != SG_OK)
-      invariant_failure("CWD outcome evaluation failed");
-    validate_result(&result, error, buffer.data(), buffer.size());
-    bool expected =
-        fixture.identity && !std::strcmp(fixture.identity, "/workspace/out");
-    bool found = false;
-    for (uint32_t c = 0; c < result.subcommand_count; c++) {
-      const auto &item = result.subcommands[c];
-      if (std::strcmp(item.netargv, "6:printf,7:payload,"))
-        continue;
-      found = true;
-      if (((item.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) !=
-          expected)
-        invariant_failure("CWD outcome writer identity mismatch");
-    }
-    if (!found)
-      invariant_failure("CWD outcome writer missing");
-  }
   for (const auto &fixture : shellsplit_test_skipped_dup_operands) {
     size_t length = std::strlen(fixture.source);
     reusable_eval_buffer &buffer =
@@ -1827,8 +1648,6 @@ void run_semantic_reference_oracles() {
     if (error != SG_OK || result.subcommand_count != fixture.commands)
       invariant_failure("skipped duplication syntax missing");
     validate_result(&result, error, buffer.data(), buffer.size());
-    if (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE)
-      invariant_failure("skipped duplication has an output effect");
   }
   sg_gate_free(option_gate);
   struct oracle_case {
@@ -2529,75 +2348,6 @@ void run_semantic_reference_oracles() {
   sg_gate_free(read_gate);
 }
 
-/* Graph paths preserve source spelling, so quote and escape fragments must not
- * evade literal path rules. Exercise the allocation-free decoded-word scans
- * through the public violation result rather than duplicating their lexer. */
-void run_decoded_path_oracles() {
-  struct oracle_case {
-    const char *input;
-    uint32_t expected_flag;
-    bool expected;
-  };
-  static const oracle_case cases[] = {
-      {"cat ~/.s\"sh\"/id_rsa", SG_VIOL_READ_SECRETS, true},
-      {"cat ~/.s\\sh/id_rsa", SG_VIOL_READ_SECRETS, true},
-      {"echo payload >> ~/.b\"ashrc\"", SG_VIOL_PERSISTENCE, true},
-      {"echo payload >> ~/.b\\ashrc", SG_VIOL_PERSISTENCE, true},
-      {"printf x >/etc/replaced >/tmp/out", SG_VIOL_WRITE_SENSITIVE, true},
-      {"echo payload >> ~/.bashrc >/tmp/out", SG_VIOL_PERSISTENCE, true},
-      {"cat ~/.s\"sh-backup\"/id_rsa", SG_VIOL_READ_SECRETS, false},
-      {"echo payload >> ~/.b\"ash-profile\"", SG_VIOL_PERSISTENCE, false},
-  };
-
-  sg_gate_t *gate = sg_gate_new();
-  if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
-      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK ||
-      test_policy_replace_cpl(gate, false, "cat *", false) != ST_OK ||
-      test_policy_replace_cpl(gate, false, "echo *", false) != ST_OK ||
-      test_policy_replace_cpl(gate, false, "printf *", false) != ST_OK)
-    invariant_failure("decoded path oracle gate setup failed");
-  sg_violation_config_t config;
-  sg_violation_config_default(&config);
-  if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK)
-    invariant_failure("decoded path oracle configuration failed");
-
-  for (const oracle_case &item : cases) {
-    reusable_eval_buffer &buffer =
-        eval_buffer_for(g_eval_buffers.result, std::strlen(item.input));
-    sg_result_t result = {};
-    sg_error_t error =
-        sg_gate_evaluate(gate, item.input, std::strlen(item.input),
-                         buffer.data(), buffer.size(), &result);
-    if (error != SG_OK ||
-        (!!(result.violation_type_flags & item.expected_flag) != item.expected))
-      invariant_failure("decoded path oracle violation mismatch");
-    validate_result(&result, error, buffer.data(), buffer.size());
-  }
-
-  static const char dynamic_setup[] =
-      "{ printf x; } >\"$(cat /etc/shadow)\" >/tmp/out";
-  reusable_eval_buffer &dynamic_buffer =
-      eval_buffer_for(g_eval_buffers.result, sizeof(dynamic_setup) - 1);
-  sg_result_t dynamic_result = {};
-  sg_error_t dynamic_error = sg_gate_evaluate(
-      gate, dynamic_setup, sizeof(dynamic_setup) - 1, dynamic_buffer.data(),
-      dynamic_buffer.size(), &dynamic_result);
-  bool dynamic_owner = false;
-  for (uint32_t i = 0; i < dynamic_result.subcommand_count; i++)
-    dynamic_owner |=
-        dynamic_result.subcommands[i].has_dynamic_substitution_io &&
-        (dynamic_result.subcommands[i].violation_type_flags &
-         SG_VIOL_SUBST_SENSITIVE) != 0;
-  if (dynamic_error != SG_OK || !dynamic_result.has_dynamic_substitution_io ||
-      ((dynamic_result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
-       0) ||
-      !(dynamic_result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) ||
-      !dynamic_owner) {
-    invariant_failure("FD_OPEN dynamic-path oracle mismatch");
-  }
-  sg_gate_free(gate);
-}
-
 void run_brace_group_oracles() {
   static const char *const rules[] = {"echo *", "cat", "printf *"};
   const char *input =
@@ -2689,12 +2439,6 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
   if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
       sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
     invariant_failure("generated brace gate setup failed");
-  sg_violation_config_t config;
-  sg_violation_config_default(&config);
-  config.sensitive_write_paths[0] = "/tmp/brace-sensitive";
-  config.sensitive_write_path_count = 1;
-  if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK)
-    invariant_failure("generated brace violation setup failed");
 
   reusable_eval_buffer &buffer =
       eval_buffer_for(g_eval_buffers.result, item.command.size());
@@ -2766,18 +2510,13 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
       uint32_t expected_writes =
           item.base_write_count +
           nested_layers * item.nested_write_count_per_layer;
-      if (uniform_group_io &&
-          (command->read_count != item.base_read_count ||
-           command->write_count != expected_writes ||
-           (!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
-            item.sensitive_write))) {
+      if (uniform_group_io && (command->read_count != item.base_read_count ||
+                               command->write_count != expected_writes)) {
         fprintf(stderr,
                 "generated brace I/O: %s\ncommand %u depth %u: read %u/%u "
-                "write %u/%u sensitive %u/%u\n",
+                "write %u/%u\n",
                 item.command.c_str(), i, depth, command->read_count,
-                item.base_read_count, command->write_count, expected_writes,
-                !!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE),
-                item.sensitive_write);
+                item.base_read_count, command->write_count, expected_writes);
         invariant_failure("generated brace inherited I/O context mismatch");
       }
       group_commands_checked++;
@@ -2794,11 +2533,8 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
     const sg_subcommand_result_t *command = &result.subcommands[i];
     if (graph.nodes[command_nodes[i]].cmd.group_depth != deepest_group)
       continue;
-    if (uniform_group_io &&
-        (command->read_count != item.read_count ||
-         command->write_count != item.write_count ||
-         (!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
-          item.sensitive_write)))
+    if (uniform_group_io && (command->read_count != item.read_count ||
+                             command->write_count != item.write_count))
       invariant_failure("generated brace group I/O context mismatch");
     group_commands_checked++;
   }
@@ -2812,9 +2548,6 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
   if (item.has_background_sibling && item.group_count > 2 &&
       group_commands_checked != item.deepest_command_count)
     invariant_failure("generated brace group membership mismatch");
-  if ((!!(result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
-       item.sensitive_write))
-    invariant_failure("generated brace violation propagation mismatch");
   sg_gate_free(gate);
 }
 
@@ -3186,7 +2919,6 @@ static void run_fixed_oracles() {
   }
   run_evaluation_buffer_contract_oracle();
   run_semantic_reference_oracles();
-  run_decoded_path_oracles();
   run_brace_group_oracles();
   for (uint8_t selector = 0;
        selector < SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT; selector++)
@@ -3322,17 +3054,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       validate_known_graph_result_prefix(&result, err, result_buf, buf_size,
                                          cmd.size());
     if (succeeded && (large_err != err || !results_equal(result, large))) {
-      std::fprintf(
-          stderr,
-          "buffer mismatch: small=%zu large=%zu errors=%d/%d "
-          "verdicts=%d/%d subcommands=%u/%u violations=%u/%u "
-          "suggestions=%u/%u deny-suggestions=%u/%u\n",
-          buf_size, large_size, static_cast<int>(err),
-          static_cast<int>(large_err), static_cast<int>(result.verdict),
-          static_cast<int>(large.verdict), result.subcommand_count,
-          large.subcommand_count, result.violation_count, large.violation_count,
-          result.suggestion_count, large.suggestion_count,
-          result.deny_suggestion_count, large.deny_suggestion_count);
+      std::fprintf(stderr,
+                   "buffer mismatch: small=%zu large=%zu errors=%d/%d "
+                   "verdicts=%d/%d subcommands=%u/%u "
+                   "suggestions=%u/%u deny-suggestions=%u/%u\n",
+                   buf_size, large_size, static_cast<int>(err),
+                   static_cast<int>(large_err),
+                   static_cast<int>(result.verdict),
+                   static_cast<int>(large.verdict), result.subcommand_count,
+                   large.subcommand_count, result.suggestion_count,
+                   large.suggestion_count, result.deny_suggestion_count,
+                   large.deny_suggestion_count);
       invariant_failure("successful result changed with a larger buffer");
     }
   }

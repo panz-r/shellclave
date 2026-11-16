@@ -301,10 +301,6 @@ static size_t dep_normalize_path(char *path, uint32_t len,
   return w;
 }
 
-size_t shell_dep_file_path_normalize(char *path, size_t length) {
-  return dep_normalize_path(path, (uint32_t)length, false);
-}
-
 typedef struct {
   unsigned char first;
 } dep_file_identity_measure_t;

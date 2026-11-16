@@ -40,17 +40,6 @@ void sg_test_anomaly_work_reset(void);
 size_t sg_test_anomaly_work_count(void);
 void sg_test_anomaly_work_charge(void);
 
-/* Actual matcher comparisons/transitions and decoded path bytes, independent of
- * allocator faults. Used to assert linear work rather than wall-clock time. */
-void sg_test_path_work_reset(void);
-size_t sg_test_path_work_count(void);
-void sg_test_path_work_charge(void);
-size_t sg_test_path_decoded_count(void);
-void sg_test_path_decoded_charge(void);
-/* Bytes measured, copied, or compared by canonical-identity construction. */
-size_t sg_test_path_identity_count(void);
-void sg_test_path_identity_charge(size_t bytes);
-
 /* One-shot model-result failures for evaluator error-contract tests.  These
  * are deliberately separate from the table-operation failure counter above:
  * callers use that counter to exercise best-effort allocation degradation. */

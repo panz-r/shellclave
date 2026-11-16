@@ -8,9 +8,6 @@ static size_t alloc_count;
 static size_t anomaly_fail_index;
 static size_t anomaly_count;
 static size_t anomaly_work;
-static size_t path_work;
-static size_t path_decoded;
-static size_t path_identity;
 static sg_anomaly_status_t anomaly_score_failure;
 static sg_anomaly_status_t anomaly_update_failure;
 static size_t io_fail_index;
@@ -76,16 +73,6 @@ bool sg_test_anomaly_op_should_fail(void) {
 void sg_test_anomaly_work_reset(void) { anomaly_work = 0; }
 size_t sg_test_anomaly_work_count(void) { return anomaly_work; }
 void sg_test_anomaly_work_charge(void) { anomaly_work++; }
-
-void sg_test_path_work_reset(void) {
-  path_work = path_decoded = path_identity = 0;
-}
-size_t sg_test_path_work_count(void) { return path_work; }
-void sg_test_path_work_charge(void) { path_work++; }
-size_t sg_test_path_decoded_count(void) { return path_decoded; }
-void sg_test_path_decoded_charge(void) { path_decoded++; }
-size_t sg_test_path_identity_count(void) { return path_identity; }
-void sg_test_path_identity_charge(size_t bytes) { path_identity += bytes; }
 
 void sg_test_anomaly_score_fail_with(sg_anomaly_status_t status) {
   anomaly_score_failure = status;
