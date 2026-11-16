@@ -158,10 +158,10 @@ int main(void) {
   free(arithmetic_buffer);
   CHECK(sg_gate_set_reject_mask(gate, SG_REJECT_MASK_DEFAULT) == SG_OK);
   static const char word_conditions[] =
-      "argv policy ALLOW_CONDITIONAL; substitution inspection required; "
+      "argv policy ALLOW; substitution inspection required; "
       "unresolved argv; dynamic substitution I/O present\n";
   static const char combined_conditions[] =
-      "argv policy ALLOW_CONDITIONAL; substitution inspection required; "
+      "argv policy ALLOW; substitution inspection required; "
       "unresolved argv; unresolved pathname; dynamic substitution I/O "
       "present\n";
   static const struct {
@@ -218,16 +218,16 @@ int main(void) {
        "argv policy REJECT\n"},
       {"case x in x) :;; esac", SG_VERDICT_REJECT, 1, 0, false, false,
        "argv policy REJECT\n"},
-      {"echo \"$(whoami)\"", SG_VERDICT_ALLOW_CONDITIONAL, 2,
-       SG_EXPANSION_UNRESOLVED_ARGV, true, true, word_conditions},
-      {"echo \"`whoami`\"", SG_VERDICT_ALLOW_CONDITIONAL, 2,
-       SG_EXPANSION_UNRESOLVED_ARGV, true, true, word_conditions},
-      {"echo \"$(whoami)\" >\"$OUT\"", SG_VERDICT_ALLOW_CONDITIONAL, 2,
+      {"echo \"$(whoami)\"", SG_VERDICT_ALLOW, 2, SG_EXPANSION_UNRESOLVED_ARGV,
+       true, true, word_conditions},
+      {"echo \"`whoami`\"", SG_VERDICT_ALLOW, 2, SG_EXPANSION_UNRESOLVED_ARGV,
+       true, true, word_conditions},
+      {"echo \"$(whoami)\" >\"$OUT\"", SG_VERDICT_ALLOW, 2,
        SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH, true, true,
        combined_conditions},
       {"echo ok < <(whoami)", SG_VERDICT_ALLOW, 2, 0, false, true,
        "argv policy ALLOW; dynamic substitution I/O present\n"},
-      {"echo \"$(<report.txt)\"", SG_VERDICT_ALLOW_CONDITIONAL, 1,
+      {"echo \"$(<report.txt)\"", SG_VERDICT_ALLOW, 1,
        SG_EXPANSION_UNRESOLVED_ARGV, true, true, word_conditions},
       {"echo \"$VALUE\"", SG_VERDICT_ALLOW, 1, SG_EXPANSION_UNRESOLVED_ARGV,
        false, false, "argv policy ALLOW; unresolved argv\n"},
@@ -272,17 +272,20 @@ int main(void) {
           result.verdict == cases[i].verdict);
     if (result.subcommand_count != cases[i].commands ||
         result.unresolved_expansion_flags != cases[i].unresolved ||
-        result.requires_substitution_evaluation != cases[i].inspect ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            cases[i].inspect ||
         result.has_dynamic_substitution_io != cases[i].dynamic_io)
-      fprintf(stderr,
-              "source: %s; commands=%u unresolved=%u inspect=%d dynamic=%d\n",
-              cases[i].source, result.subcommand_count,
-              result.unresolved_expansion_flags,
-              result.requires_substitution_evaluation,
-              result.has_dynamic_substitution_io);
+      fprintf(
+          stderr,
+          "source: %s; commands=%u unresolved=%u inspect=%d dynamic=%d\n",
+          cases[i].source, result.subcommand_count,
+          result.unresolved_expansion_flags,
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0),
+          result.has_dynamic_substitution_io);
     CHECK(result.subcommand_count == cases[i].commands &&
           result.unresolved_expansion_flags == cases[i].unresolved &&
-          result.requires_substitution_evaluation == cases[i].inspect &&
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ==
+              cases[i].inspect &&
           result.has_dynamic_substitution_io == cases[i].dynamic_io);
     CHECK(!result.truncated && !result.short_circuited);
     CHECK(report_is(cases[i].source, error, &result, cases[i].report));

@@ -4090,12 +4090,8 @@ static void sg_mark_group_substitution_consumers(
       sg_subcommand_result_t *result =
           &out->subcommands[node_result_index[node]];
       result->has_dynamic_substitution_io = true;
-      bool shell_word = (index->group_substitution[node] & 2) != 0;
-      if (shell_word) {
-        result->requires_substitution_evaluation = true;
-      }
-      if (shell_word && result->verdict == SG_VERDICT_ALLOW)
-        result->verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+      if (index->group_substitution[node] & 2)
+        result->requirements |= SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD;
     }
   }
 }
@@ -4280,13 +4276,16 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
   /* This is graph-level information, not a property of whichever command
    * results fit in the caller's display buffer. Preserve it before any later
-   * diagnostic rendering can return SG_ERR_TRUNC. */
-  for (uint32_t ei = 0; ei < graph.edge_count; ei++)
-    if (sg_edge_is_dynamic_substitution_route(&graph, &graph.edges[ei])) {
+   * diagnostic rendering can return SG_ERR_TRUNC. The requirements are the
+   * graph's own, passed on as its edge flags state them. */
+  for (uint32_t ei = 0; ei < graph.edge_count; ei++) {
+    const shell_dep_edge_t *edge = &graph.edges[ei];
+    out->requirements |= edge->flags & SHELL_DEP_EDGE_FLAG_REQUIRED;
+    if (sg_edge_is_dynamic_substitution_route(&graph, edge)) {
       out->has_dynamic_substitution_io = true;
-      if (graph.edges[ei].flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)
-        out->requires_substitution_evaluation = true;
+      out->requirements |= edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD;
     }
+  }
 
   dep_workspace_size = workspace_layout.reusable;
   /* Graph state is retired; its source arena and expansion cache remain live.
@@ -4680,16 +4679,12 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
    * exact descriptor use. Resolve owners after all command nodes have been
    * visited. A group-owned stream is marked on every contained simple command
    * because any can consume its inherited descriptor. Only a flagged
-   * shell-word edge requests another Shellgate inspection or changes an ALLOW
-   * verdict to conditional. */
+   * shell-word edge states a requirement on the commands it reaches. */
   for (uint32_t ei = 0; ei < graph.edge_count; ei++) {
     const shell_dep_edge_t *edge = &graph.edges[ei];
     if (!sg_edge_is_dynamic_substitution_route(&graph, edge))
       continue;
     bool shell_word = (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0;
-    out->has_dynamic_substitution_io = true;
-    if (shell_word)
-      out->requires_substitution_evaluation = true;
     uint32_t consumer_nodes[SHELL_DEP_MAX_NODES];
     uint32_t consumer_count = sg_dynamic_substitution_route_consumers(
         &graph, graph_index, edge, consumer_nodes);
@@ -4705,10 +4700,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         continue;
       out->subcommands[result_index].has_dynamic_substitution_io = true;
       if (shell_word)
-        out->subcommands[result_index].requires_substitution_evaluation = true;
-      if (shell_word &&
-          out->subcommands[result_index].verdict == SG_VERDICT_ALLOW)
-        out->subcommands[result_index].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+        out->subcommands[result_index].requirements |=
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD;
     }
   }
 
@@ -4753,15 +4746,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   }
 
   bool all_allow = true;
-  bool any_conditional = false;
   bool any_reject = false;
   bool any_deny = false;
   for (uint32_t i = 0; i < out->subcommand_count; i++) {
-    if (out->subcommands[i].verdict != SG_VERDICT_ALLOW &&
-        out->subcommands[i].verdict != SG_VERDICT_ALLOW_CONDITIONAL)
+    if (out->subcommands[i].verdict != SG_VERDICT_ALLOW)
       all_allow = false;
-    if (out->subcommands[i].verdict == SG_VERDICT_ALLOW_CONDITIONAL)
-      any_conditional = true;
     if (out->subcommands[i].verdict == SG_VERDICT_REJECT)
       any_reject = true;
     if (out->subcommands[i].verdict == SG_VERDICT_DENY)
@@ -4784,9 +4773,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
              SG_EXPANSION_UNRESOLVED_ARITHMETIC)
     out->verdict = SG_VERDICT_UNDETERMINED;
   else if (all_allow)
-    out->verdict = (out->requires_substitution_evaluation || any_conditional)
-                       ? SG_VERDICT_ALLOW_CONDITIONAL
-                       : SG_VERDICT_ALLOW;
+    out->verdict = SG_VERDICT_ALLOW;
   else
     out->verdict = SG_VERDICT_UNDETERMINED;
 
@@ -4810,8 +4797,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       should_update = !out->anomaly_detected || !gate->anomaly_skip_on_detected;
       if (!should_update)
         out->anomaly_update = SG_ANOMALY_UPDATE_SKIPPED_DETECTED;
-    } else if (out->verdict == SG_VERDICT_ALLOW) {
-      /* Only update on ALLOW verdict */
+    } else if (out->verdict == SG_VERDICT_ALLOW && out->requirements == 0) {
+      /* Only update on an ALLOW with nothing outstanding to inspect */
       should_update = !out->anomaly_detected || !gate->anomaly_skip_on_detected;
       if (!should_update)
         out->anomaly_update = SG_ANOMALY_UPDATE_SKIPPED_DETECTED;
@@ -4902,8 +4889,6 @@ const char *sg_verdict_name(sg_verdict_t v) {
     return "REJECT";
   case SG_VERDICT_UNDETERMINED:
     return "UNDETERMINED";
-  case SG_VERDICT_ALLOW_CONDITIONAL:
-    return "ALLOW_CONDITIONAL";
   }
   return "UNKNOWN";
 }

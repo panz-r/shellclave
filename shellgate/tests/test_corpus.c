@@ -1,6 +1,7 @@
 /* End-to-end regression coverage for the anonymous coding-agent command set.
  * Fixture commands are data only: this test never executes them. */
 
+#include "shell_depgraph.h"
 #include "shell_netstring.h"
 #include "shellclave_command_corpus_fixtures.h"
 #include "shellgate.h"
@@ -199,7 +200,8 @@ static uint64_t hash_u32(uint64_t hash, uint32_t value) {
 static uint64_t fingerprint_result(uint64_t hash, const sg_result_t *result) {
   hash = hash_u32(hash, (uint32_t)result->verdict);
   hash = hash_u32(hash, result->subcommand_count);
-  hash = hash_u32(hash, result->requires_substitution_evaluation);
+  hash = hash_u32(hash, ((result->requirements &
+                          SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   hash = hash_u32(hash, result->has_dynamic_substitution_io);
   hash = hash_u32(hash, result->violation_category_flags);
   return hash_u32(hash, result->violation_type_flags);
@@ -237,7 +239,7 @@ TEST(policy_and_canonical_results) {
     CHECK(result.subcommand_count > 0);
     if (result.subcommand_count > 1)
       multi_stage++;
-    if (result.requires_substitution_evaluation)
+    if (((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0))
       shell_word_substitutions++;
     if (result.has_dynamic_substitution_io)
       dynamic_substitution_io++;
@@ -299,7 +301,7 @@ TEST(policy_and_canonical_results) {
   CHECK(evaluate(gate, unknown, &result) == SG_OK &&
         result.verdict == SG_VERDICT_UNDETERMINED);
   CHECK(evaluate(gate, process_substitution, &result) == SG_OK &&
-        !result.requires_substitution_evaluation &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
         result.has_dynamic_substitution_io);
   sg_gate_free(gate);
   return true;

@@ -1,3 +1,4 @@
+#include <shell_depgraph.h>
 #include <shellgate.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,8 +21,10 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
   if (result->truncated || result->short_circuited)
     fputs("incomplete evaluation; reported ", output);
   fprintf(output, "argv policy %s", sg_verdict_name(result->verdict));
-  if (result->requires_substitution_evaluation)
+  if (result->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)
     fputs("; substitution inspection required", output);
+  if (result->requirements & SHELL_DEP_EDGE_FLAG_REQUIRED)
+    fputs("; redirection open required", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV)
     fputs("; unresolved argv", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH)

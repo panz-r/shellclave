@@ -128,7 +128,6 @@ typedef enum {
   SG_VERDICT_DENY = 1,
   SG_VERDICT_REJECT = 2,
   SG_VERDICT_UNDETERMINED = 3,
-  SG_VERDICT_ALLOW_CONDITIONAL = 4,
 } sg_verdict_t;
 
 typedef enum {
@@ -167,18 +166,22 @@ typedef struct {
   uint32_t write_count;
   uint32_t read_count;
   uint32_t env_count;
-  /* True when a SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD route delivers
-   * runtime-generated word content directly to this command or to an
-   * enclosing compound group that it may inherit. A dynamic FILE-name route
-   * alone selects I/O topology and does not set this field. */
-  bool requires_substitution_evaluation;
+  /* What Shellsplit states must hold for this command to run as analyzed,
+   * passed on unchanged: the union of the edge flags
+   * SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD (a route delivers runtime-generated
+   * word content directly to this command or to an enclosing compound group
+   * that it may inherit; the content must be inspected in its receiving role)
+   * and SHELL_DEP_EDGE_FLAG_REQUIRED, which a subcommand does not carry: see
+   * sg_result_t.requirements. A dynamic FILE-name route alone selects I/O
+   * topology and sets nothing. Empty when nothing is outstanding. */
+  uint32_t requirements;
   /* True when any represented dynamic substitution route reaches this command
    * or an enclosing compound group. This includes dynamic FILE names, ordinary
    * process-substitution I/O, and setup-only input redirects such as
    * `exec {fd}< <(producer)` or `< <(producer)`. Output setup is source-only
    * and marks its downstream substitution consumer instead. Setup is topology
-   * only: it does not by itself set requires_substitution_evaluation or claim
-   * code execution or risk. */
+   * only: it does not by itself state a requirement or claim code execution or
+   * risk. */
   bool has_dynamic_substitution_io;
   /* Structural relationships, group membership, background execution, and
    * pipeline timing belong to Shellsplit's dependency graph, not this policy
@@ -253,10 +256,17 @@ typedef struct {
   uint32_t violation_count;
   uint32_t violation_category_flags;
   uint32_t violation_type_flags;
-  /* True when a SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD route supplies
-   * runtime-generated word content, including one whose producer or consumer
-   * was not retained in the bounded result prefix. */
-  bool requires_substitution_evaluation;
+  /* What Shellsplit states must hold for the input to run as analyzed, passed
+   * on unchanged from the dependency graph and not recomputed here: the union
+   * over all its edges of SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD (runtime-
+   * generated word content, to be inspected in its receiving role) and
+   * SHELL_DEP_EDGE_FLAG_REQUIRED (a redirection open that must succeed, which
+   * the application checks or provides before running). It covers edges whose
+   * endpoints were not retained in the bounded result prefix. The routes and
+   * edges behind each flag are in Shellsplit's graph; applications read them
+   * there. Empty when nothing is outstanding. A verdict holds only while these
+   * are satisfied: the gate never folds them into it. */
+  uint32_t requirements;
   /* True when any represented dynamic substitution I/O path exists, including
    * dynamic FILE names and process-substitution descriptor setup/routes whose
    * endpoint was not retained in the bounded result prefix. This is not a risk
@@ -479,7 +489,9 @@ void sg_gate_disable_anomaly(sg_gate_t *gate) SHELL_NONNULL(1);
  * Set update mode for anomaly learning.
  *
  * If `update_only_on_allow` is true, the model is only updated when
- * the overall verdict is SG_VERDICT_ALLOW (not on deny/reject).
+ * the overall verdict is SG_VERDICT_ALLOW and the result states no
+ * `requirements`: a command with something still to inspect or provide is not
+ * yet approved (not on deny/reject, nor on a pending requirement).
  * Default: false (model is updated on every sg_gate_evaluate call
  * regardless of verdict, as long as anomaly_detected is false).
  */
@@ -754,10 +766,11 @@ sg_error_t sg_gate_set_violation_config_borrowed(
  * LC_ALL fixed to C/POSIX or UTF-8 and made readonly, and no
  * imported/shadowing functions, startup aliases or traps.
  * The library does not execute commands or choose the application's executor.
- * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
- * dependency: the caller must satisfy its dynamic-content inspection and
- * evaluation obligations before execution under that same model. Conditional
- * allowance is not unconditional authorization of the substituted content.
+ * A result with a nonzero `requirements` carries what Shellsplit says must
+ * hold: the caller must satisfy each, such as the dynamic-content inspection
+ * of a substitution, before execution under that same model. An allowing
+ * verdict is not authorization of runtime-generated content or of an open that
+ * has yet to succeed.
  *
  * A syntactically valid redirect-only command, such as `>output`, has no argv
  * and therefore cannot be evaluated by the argv policy model. It returns

@@ -861,8 +861,7 @@ TEST(conditional_substitution_matrix) {
     uint32_t reject_mask;
     bool deny_inner;
   } cases[] = {
-      {"echo $(whoami)", "echo *", "whoami", SG_VERDICT_ALLOW_CONDITIONAL, true,
-       0, false},
+      {"echo $(whoami)", "echo *", "whoami", SG_VERDICT_ALLOW, true, 0, false},
       {"cat <(whoami)", "cat *", "whoami", SG_VERDICT_ALLOW, false, 0, false},
       {"echo $(whoami)", "echo *", NULL, SG_VERDICT_UNDETERMINED, true, 0,
        false},
@@ -891,15 +890,16 @@ TEST(conditional_substitution_matrix) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(g, cases[i].command, &result));
     ASSERT(result.verdict == cases[i].expected);
-    ASSERT(result.requires_substitution_evaluation == cases[i].conditional);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].conditional);
     if (cases[i].reject_mask == 0)
       ASSERT(result.has_dynamic_substitution_io);
     if (cases[i].conditional) {
       ASSERT(result.subcommand_count >= 2);
       bool dynamic_consumer = false;
       for (uint32_t j = 0; j < result.subcommand_count; j++)
-        dynamic_consumer |=
-            result.subcommands[j].requires_substitution_evaluation;
+        dynamic_consumer |= ((result.subcommands[j].requirements &
+                              SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0);
       ASSERT(dynamic_consumer);
     }
     sg_gate_free(g);
@@ -952,7 +952,8 @@ TEST(named_fd_process_substitution_policy_contract) {
     ASSERT(result.verdict == SG_VERDICT_ALLOW);
     ASSERT(result.subcommand_count == 3);
     ASSERT(result.has_dynamic_substitution_io);
-    ASSERT(!result.requires_substitution_evaluation);
+    ASSERT(
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(!result.subcommands[0].has_dynamic_substitution_io);
     ASSERT(result.subcommands[1].has_dynamic_substitution_io);
     ASSERT(!result.subcommands[2].has_dynamic_substitution_io);
@@ -972,7 +973,7 @@ TEST(named_fd_process_substitution_policy_contract) {
       eval_cmd(gate, "exec {source}< <(producer); printf payload", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
          result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   bool source_setup_owner = false;
   bool source_producer = false;
   bool source_payload = false;
@@ -982,7 +983,8 @@ TEST(named_fd_process_substitution_policy_contract) {
       continue;
     if (strcmp(subcommand->display_command, "exec") == 0)
       source_setup_owner = subcommand->has_dynamic_substitution_io &&
-                           !subcommand->requires_substitution_evaluation;
+                           !((subcommand->requirements &
+                              SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0);
     else if (strcmp(subcommand->display_command, "producer") == 0)
       source_producer = !subcommand->has_dynamic_substitution_io;
     else if (strncmp(subcommand->display_command, "printf", 6) == 0)
@@ -999,7 +1001,7 @@ TEST(named_fd_process_substitution_policy_contract) {
                         &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 4 &&
          result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   uint32_t redirected_producers = 0;
   bool unconnected_source_setup = false;
   bool unconnected_source_consumer = false;
@@ -1028,7 +1030,7 @@ TEST(named_fd_process_substitution_policy_contract) {
                         &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
          result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   for (uint32_t i = 0; i < result.subcommand_count; i++)
     ASSERT(!result.subcommands[i].has_dynamic_substitution_io);
 
@@ -1037,10 +1039,10 @@ TEST(named_fd_process_substitution_policy_contract) {
   ASSERT_SG_OK(
       eval_cmd(gate, "exec {source}</tmp/input; printf payload", &result));
   ASSERT(!result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT_SG_OK(eval_cmd(gate, "exec {source}<&0; printf payload", &result));
   ASSERT(!result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* The group body's exec allocation is visible when a later word starts a
    * nested shell. It must reach policy evaluation, not fail graph parsing. */
@@ -1050,7 +1052,7 @@ TEST(named_fd_process_substitution_policy_contract) {
                         &result));
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
          result.subcommand_count == 3 &&
-         result.requires_substitution_evaluation);
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* A comment after the group's redirects cannot make its descriptor state
    * conditional merely by containing connector punctuation. The group's own
@@ -1067,12 +1069,12 @@ TEST(named_fd_process_substitution_policy_contract) {
        i++) {
     ASSERT_SG_OK(eval_cmd(gate, commented_connectors[i], &result));
     ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
-           result.requires_substitution_evaluation);
+           ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
   ASSERT_SG_OK(
       eval_cmd(gate, "echo `printf x; printf y`; printf done", &result));
   ASSERT(result.subcommand_count >= 3 &&
-         result.requires_substitution_evaluation);
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT(sg_gate_evaluate(gate, "printf payload >&\"$missing\"",
                           strlen("printf payload >&\"$missing\""), eval_buf,
@@ -1213,8 +1215,9 @@ TEST(named_fd_process_substitution_policy_contract) {
     ASSERT_STR(result.subcommands[1].netargv, "4:exec,");
     ASSERT_STR(result.subcommands[2].netargv,
                i % 2 ? "3:cat," : "6:printf,7:payload,");
-    ASSERT(!result.requires_substitution_evaluation &&
-           !result.has_dynamic_substitution_io);
+    ASSERT(
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        !result.has_dynamic_substitution_io);
   }
 
   /* Descriptor identity erases backslash-LF, so a binding and its later
@@ -1602,7 +1605,7 @@ TEST(composition_verdict_matrix) {
        NULL,
        0,
        "echo $(whoami)",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        2,
        true},
       {{"echo *", "pwd"},
@@ -1631,7 +1634,8 @@ TEST(composition_verdict_matrix) {
               i, result.subcommand_count, cases[i].subcommands);
       fail_count++;
     }
-    ASSERT(result.requires_substitution_evaluation == cases[i].conditional);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].conditional);
     ASSERT(!result.short_circuited && !result.truncated);
     sg_gate_free(gate);
   }
@@ -1741,7 +1745,7 @@ TEST(compound_status_named_fd_continuation) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     sg_verdict_t expected =
-        cases[i].inspection ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW;
+        cases[i].inspection ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW;
     if (result.verdict != expected || result.truncated) {
       fprintf(stderr,
               "compound gate: source=%s verdict=%d truncated=%d reason=%s\n",
@@ -1751,7 +1755,8 @@ TEST(compound_status_named_fd_continuation) {
         fprintf(stderr, "netargv=%s\n", result.subcommands[command].netargv);
     }
     ASSERT(result.verdict == expected && !result.truncated);
-    ASSERT(result.requires_substitution_evaluation == cases[i].inspection);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspection);
     ASSERT_STR(result.subcommands[0].netargv, i == 2 ? "4:true," : "5:false,");
     ASSERT_STR(result.subcommands[1].netargv, "4:exec,");
   }
@@ -1858,10 +1863,11 @@ TEST(inherited_boundary_context_contract) {
   for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, sources[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-           !result.requires_substitution_evaluation &&
-           !result.has_dynamic_substitution_io &&
-           !(result.violation_type_flags & SG_VIOL_REDIRECT_FANOUT));
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        !result.has_dynamic_substitution_io &&
+        !(result.violation_type_flags & SG_VIOL_REDIRECT_FANOUT));
     for (uint32_t command = 0; command < result.subcommand_count; command++)
       ASSERT(result.subcommands[command].read_count == 0 &&
              result.subcommands[command].write_count == 0);
@@ -1899,9 +1905,10 @@ TEST(setup_diagnostic_substitution_contract) {
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(!result.truncated);
     ASSERT(result.has_dynamic_substitution_io == cases[i].inspection);
-    ASSERT(result.requires_substitution_evaluation == cases[i].inspection);
-    ASSERT(result.verdict == (cases[i].inspection ? SG_VERDICT_ALLOW_CONDITIONAL
-                                                  : SG_VERDICT_ALLOW));
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspection);
+    ASSERT(result.verdict ==
+           (cases[i].inspection ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
   }
   sg_gate_free(gate);
 }
@@ -1944,11 +1951,13 @@ TEST(expansion_diagnostic_substitution_contract) {
     if (result.has_dynamic_substitution_io != cases[i].inspection)
       printf("\n    diagnostic inspection: %s\n", cases[i].source);
     ASSERT(result.has_dynamic_substitution_io == cases[i].inspection);
-    ASSERT(result.requires_substitution_evaluation == cases[i].inspection);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspection);
     ASSERT(result.subcommand_count != 0 &&
            result.subcommands[0].netargv_length >= 5 &&
            memcmp(result.subcommands[0].netargv, "2:sh,", 5) == 0);
-    ASSERT(result.subcommands[0].requires_substitution_evaluation ==
+    ASSERT(((result.subcommands[0].requirements &
+             SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ==
            cases[i].inspection);
   }
   sg_gate_free(gate);
@@ -1979,9 +1988,10 @@ TEST(cd_command_and_capture_contract) {
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(!result.truncated);
     ASSERT(result.has_dynamic_substitution_io == cases[i].inspect &&
-           result.requires_substitution_evaluation == cases[i].inspect);
-    ASSERT(result.verdict == (cases[i].inspect ? SG_VERDICT_ALLOW_CONDITIONAL
-                                               : SG_VERDICT_ALLOW));
+           ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspect);
+    ASSERT(result.verdict ==
+           (cases[i].inspect ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
   }
   sg_gate_free(gate);
 
@@ -2030,8 +2040,10 @@ TEST(assignment_stream_and_diagnostic_contract) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(!result.truncated && result.subcommand_count > 0);
-    ASSERT(result.requires_substitution_evaluation == cases[i].inspect);
-    ASSERT(result.subcommands[0].requires_substitution_evaluation ==
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspect);
+    ASSERT(((result.subcommands[0].requirements &
+             SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ==
            cases[i].outer_inspect);
     if (cases[i].inspect)
       ASSERT(result.has_dynamic_substitution_io);
@@ -2039,8 +2051,9 @@ TEST(assignment_stream_and_diagnostic_contract) {
   for (unsigned input = 0; input < 2; input++) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, input ? "< <(true)" : "> >(true)", &result));
-    ASSERT(!result.truncated && result.has_dynamic_substitution_io &&
-           !result.requires_substitution_evaluation);
+    ASSERT(
+        !result.truncated && result.has_dynamic_substitution_io &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
   }
   sg_gate_free(gate);
@@ -2114,7 +2127,8 @@ TEST(rejected_assignment_effect_contract) {
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     ASSERT(!result.truncated && result.subcommand_count > 0);
     ASSERT(result.subcommands[0].env_count == cases[i].environments);
-    ASSERT(result.requires_substitution_evaluation == cases[i].inspect);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspect);
     ASSERT(((result.violation_type_flags & SG_VIOL_ENV_PRIVILEGED) != 0) ==
            cases[i].privileged);
   }
@@ -2122,12 +2136,12 @@ TEST(rejected_assignment_effect_contract) {
   sg_result_t result = {0};
   ASSERT_SG_OK(eval_cmd(gate, "UID=$(printf forbidden) $maybe", &result));
   ASSERT(result.verdict == SG_VERDICT_DENY &&
-         result.requires_substitution_evaluation &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommand_count == 2);
   ASSERT(result.subcommands[1].verdict == SG_VERDICT_DENY);
   ASSERT_SG_OK(eval_cmd(gate, "UID=$(printf forbidden >&2) $maybe", &result));
   ASSERT(result.verdict == SG_VERDICT_DENY && result.subcommand_count == 2 &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   static const char *const guaranteed[] = {
       "UID=$(printf forbidden) $maybe true",
       "UID=$(printf forbidden) \"${!prefix*}\"",
@@ -2139,13 +2153,14 @@ TEST(rejected_assignment_effect_contract) {
   };
   for (size_t i = 0; i < sizeof(guaranteed) / sizeof(guaranteed[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, guaranteed[i], &result));
-    ASSERT(result.subcommand_count == 1 && result.verdict != SG_VERDICT_DENY &&
-           !result.requires_substitution_evaluation);
+    ASSERT(
+        result.subcommand_count == 1 && result.verdict != SG_VERDICT_DENY &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
   ASSERT_SG_OK(
       eval_cmd(gate, "UID=$(printf forbidden) \"${!prefix@}\"", &result));
   ASSERT(result.subcommand_count == 2 && result.verdict == SG_VERDICT_DENY &&
-         result.requires_substitution_evaluation);
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   sg_gate_free(gate);
 }
 
@@ -2245,7 +2260,7 @@ TEST(background_compound_completion_contract) {
       {"time { false & } || printf bad >/etc/completion-out", false,
        SG_VERDICT_ALLOW},
       {"echo \"$( { false & } || printf bad >/etc/completion-out )\"", false,
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW},
       {"{ false; } || printf good >/etc/completion-out", true,
        SG_VERDICT_ALLOW},
       {"{ true & false; } || printf good >/etc/completion-out", true,
@@ -2353,18 +2368,17 @@ TEST(bash_pipeline_time_policy_contract) {
   ASSERT(result.subcommands[1].write_count == 0);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo \"$(exec 2>&1; time true)\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
          result.has_dynamic_substitution_io &&
-         result.requires_substitution_evaluation);
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <(exec 2>&1; time true)", &result));
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
          result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "exec 0</tmp/input; echo \"$(cat)\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 3);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3);
   ASSERT_STR(result.subcommands[2].netargv, "3:cat,");
   ASSERT(result.subcommands[2].read_count == 1);
 
@@ -2387,7 +2401,8 @@ TEST(bash_pipeline_time_policy_contract) {
     ASSERT_SG_OK(eval_cmd(gate, self_duplication[i], &result));
     ASSERT(result.subcommand_count == (i < 3 ? 3u : 2u));
     ASSERT(result.has_dynamic_substitution_io);
-    ASSERT(result.requires_substitution_evaluation == (i != 3));
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == (i != 3));
   }
 
   ASSERT_SG_OK(eval_cmd(gate, "{ time true; } |& cat 3<&0", &result));
@@ -2505,9 +2520,8 @@ TEST(timed_pipeline_ordinary_time_policy_contract) {
     ASSERT_STR(result.subcommands[1].netargv, cases[i].netargv);
   }
   ASSERT_SG_OK(eval_cmd(gate, "echo \"$(time true | time)\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 3 &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io);
   ASSERT_STR(result.subcommands[2].netargv, "4:time,");
 
@@ -2550,8 +2564,8 @@ TEST(timed_pipeline_ordinary_time_policy_contract) {
            document_prefixes[i].reads);
   }
   ASSERT_SG_OK(eval_cmd(gate, "echo \"$(time <<<body cat)\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 2 && result.subcommands[1].read_count == 1);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+         result.subcommands[1].read_count == 1);
   ASSERT_SG_OK(eval_cmd(gate, "time true | { time -p; }", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
          result.deny_reason == NULL);
@@ -2656,14 +2670,15 @@ TEST(empty_timing_substitution_policy_contract) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     if (result.verdict !=
-        (cases[i].inspection ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW))
+        (cases[i].inspection ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW))
       printf("\n    empty timing result: %s verdict=%d reason=%s\n",
              cases[i].source, result.verdict,
              result.deny_reason ? result.deny_reason : "none");
-    ASSERT(result.verdict == (cases[i].inspection ? SG_VERDICT_ALLOW_CONDITIONAL
-                                                  : SG_VERDICT_ALLOW));
+    ASSERT(result.verdict ==
+           (cases[i].inspection ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
     ASSERT(result.subcommand_count == cases[i].count && !result.truncated);
-    ASSERT(result.requires_substitution_evaluation == cases[i].inspection);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].inspection);
     ASSERT(result.has_dynamic_substitution_io == cases[i].dynamic);
     ASSERT(result.deny_reason == NULL);
   }
@@ -2976,9 +2991,10 @@ TEST(canonical_heredoc_delimiter_contract) {
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, commands[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
-           !result.requires_substitution_evaluation &&
-           !result.has_dynamic_substitution_io);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        !result.has_dynamic_substitution_io);
     ASSERT_STR(result.subcommands[0].netargv, "3:cat,");
     ASSERT_STR(result.subcommands[1].netargv, "6:printf,5:after,");
   }
@@ -3021,42 +3037,41 @@ TEST(nested_composition_matrix) {
        3,
        NULL,
        "echo $(printf x $(whoami))",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW_CONDITIONAL,
-        SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"multiple substitutions share parent",
        {"echo *", "id", "pwd"},
        3,
        NULL,
        "echo $(id) $(pwd)",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"adjacent substitutions share parent",
        {"echo *", "id", "pwd"},
        3,
        NULL,
        "echo $(id)$(pwd)",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"embedded adjacent substitutions",
        {"echo *", "id", "pwd"},
        3,
        NULL,
        "echo prefix$(id)suffix$(pwd)",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"mixed substitution forms",
        {"echo *", "id", "pwd"},
        3,
        NULL,
        "echo $(id)`pwd`",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"process substitution feeds pipeline",
        {"cat *", "printf x", "sort"},
        3,
@@ -3086,17 +3101,17 @@ TEST(nested_composition_matrix) {
        3,
        NULL,
        "echo $(id) && pwd",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"pipeline inside substitution",
        {"echo *", "cat #path", "sort"},
        3,
        NULL,
        "echo $(cat /tmp/a | sort)",
-       SG_VERDICT_ALLOW_CONDITIONAL,
+       SG_VERDICT_ALLOW,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"unmatched nested pipeline stage",
        {"echo *", "cat #path"},
        2,
@@ -3104,8 +3119,7 @@ TEST(nested_composition_matrix) {
        "echo $(cat /tmp/a | sort)",
        SG_VERDICT_UNDETERMINED,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW,
-        SG_VERDICT_UNDETERMINED}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_UNDETERMINED}},
       {"denied nested pipeline stage",
        {"echo *", "cat #path", "sort"},
        3,
@@ -3113,7 +3127,7 @@ TEST(nested_composition_matrix) {
        "echo $(cat /tmp/a | sort)",
        SG_VERDICT_DENY,
        3,
-       {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_DENY}},
+       {SG_VERDICT_ALLOW, SG_VERDICT_ALLOW, SG_VERDICT_DENY}},
       {"nested process substitutions",
        {"cat *", "sort *", "cat #path"},
        3,
@@ -3285,10 +3299,11 @@ TEST(completion_and_readline_reject_before_policy_and_learning) {
   sg_result_t result = {0};
   for (size_t i = 0; i < sizeof(positive) / sizeof(positive[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, positive[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
-           !result.requires_substitution_evaluation &&
-           !result.has_dynamic_substitution_io &&
-           result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        !result.has_dynamic_substitution_io &&
+        result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
   }
   shell_netstring_buffer_t raw = {0}, type = {0};
   size_t count = 0;
@@ -3358,9 +3373,10 @@ TEST(variable_predicates_reject_before_policy_and_learning) {
   sg_result_t result = {0};
   for (size_t i = 0; i < sizeof(positive) / sizeof(positive[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, positive[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-           !result.requires_substitution_evaluation &&
-           result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
   }
   shell_netstring_buffer_t raw = {0}, type = {0};
   size_t stages = 0;
@@ -3570,9 +3586,8 @@ TEST(locale_quote_scope_policy_contract) {
   ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 1e300, NULL));
   sg_result_t result;
   ASSERT_SG_OK(eval_cmd(gate, "echo \"`printf '\"$\"literal\"'`\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 2 &&
-         result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   size_t vocabulary = test_anomaly_vocabulary(gate);
   static const char *const rejected[] = {
       "echo `printf x # note` $\"translated\"",
@@ -3640,8 +3655,8 @@ TEST(scoped_heredoc_semantic_contract) {
     if (result.subcommand_count + fixture->file_stages != fixture->stages)
       fprintf(stderr, "scoped command-count mismatch: %s\n", fixture->source);
     ASSERT(result.subcommand_count + fixture->file_stages == fixture->stages);
-    ASSERT(result.requires_substitution_evaluation ==
-           ((fixture->features & SHELL_FEAT_SUBSHELL) != 0));
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == ((fixture->features & SHELL_FEAT_SUBSHELL) != 0));
     const uint32_t masks[] = {SHELL_FEAT_VARS,         SHELL_FEAT_SUBSHELL,
                               SHELL_FEAT_ARITH,        SHELL_FEAT_ARRAY,
                               SHELL_FEAT_PROCESS_SUB,  SHELL_FEAT_ANSI_C_QUOTE,
@@ -3794,15 +3809,14 @@ TEST(variable_presence_contract) {
   ASSERT_SG_OK(eval_cmd(gate, "[[ -v CONFIG ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
          !result.unresolved_expansion_flags &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT_SG_OK(eval_cmd(gate, "test -v CONFIG", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   ASSERT_SG_OK(eval_cmd(gate, "[ -v CONFIG -o ! -v OTHER ]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   ASSERT_SG_OK(eval_cmd(gate, "test x -o -n \"$(printf marker)\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 2 &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io);
   ASSERT(eval_cmd(gate, "[[ -v \"$name\" ]]", &result) == SG_ERR_PARSE);
   ASSERT(eval_cmd(gate, "[[ -v 'a[$(printf marker)]' ]]", &result) ==
@@ -4077,7 +4091,7 @@ TEST(conditional_string_contract) {
          !result.unresolved_expansion_flags);
   ASSERT_SG_OK(eval_cmd(gate, "[[ x || -n $(printf skipped) ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io);
   static const char *const invalid_boundaries[] = {
       "[[ x == \"x\" ]", "[[ -n x ]",  "[[ x !",       "[[ x =\\",
@@ -4149,18 +4163,18 @@ TEST(conditional_string_contract) {
            !result.unresolved_expansion_flags);
   }
   ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(printf value)\" ]]", &result));
-  ASSERT(
-      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-      result.subcommand_count == 1 && result.requires_substitution_evaluation &&
-      result.has_dynamic_substitution_io &&
-      result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         result.has_dynamic_substitution_io &&
+         result.unresolved_expansion_flags ==
+             SG_EXPANSION_UNRESOLVED_CONDITION);
   ASSERT_SG_OK(
       eval_cmd(gate, "[[ x == pre\"$(printf value)\"post ]]", &result));
-  ASSERT(
-      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-      result.subcommand_count == 1 && result.requires_substitution_evaluation &&
-      result.has_dynamic_substitution_io &&
-      result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         result.has_dynamic_substitution_io &&
+         result.unresolved_expansion_flags ==
+             SG_EXPANSION_UNRESOLVED_CONDITION);
   ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(cat)\" ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
          result.subcommand_count == 1);
@@ -4184,15 +4198,16 @@ TEST(conditional_string_contract) {
   for (size_t i = 0; i < sizeof(commented) / sizeof(commented[0]); ++i) {
     ASSERT_SG_OK(eval_cmd(gate, commented[i], &result));
     ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
-    ASSERT(!result.has_dynamic_substitution_io &&
-           !result.requires_substitution_evaluation &&
-           !result.unresolved_expansion_flags);
+    ASSERT(
+        !result.has_dynamic_substitution_io &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        !result.unresolved_expansion_flags);
   }
   ASSERT_SG_OK(
       eval_cmd(gate, "[[ # ' comment\n-n $(printf value) # $(|)\n]]", &result));
   ASSERT(
-      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-      result.subcommand_count == 1 && result.requires_substitution_evaluation &&
+      result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
+      ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       result.has_dynamic_substitution_io &&
       (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION));
   ASSERT(eval_cmd(gate, "[[ # ignored\n-n $(|) ]]", &result) == SG_ERR_PARSE);
@@ -4201,15 +4216,14 @@ TEST(conditional_string_contract) {
   ASSERT(result.unresolved_expansion_flags ==
          SG_EXPANSION_UNRESOLVED_CONDITION);
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n $(printf value) ]]", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 1);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   ASSERT(result.has_dynamic_substitution_io &&
-         result.requires_substitution_evaluation);
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION);
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n <(printf value) ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   ASSERT(result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n x ]] >report", &result));
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.subcommand_count);
   ASSERT_SG_OK(eval_cmd(gate, "[[ -n $(printf value) ]] >report", &result));
@@ -4233,8 +4247,8 @@ TEST(conditional_string_contract) {
            !result.unresolved_expansion_flags);
   }
   ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"$(printf x)\" ]]", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io &&
          !result.unresolved_expansion_flags);
 
@@ -4366,7 +4380,7 @@ TEST(continued_expansion_policy_contract) {
     bool requires_evaluation;
     int32_t consumer;
   } cases[] = {
-      {"echo $\\\n(printf child)", SG_VERDICT_ALLOW_CONDITIONAL, true, 0},
+      {"echo $\\\n(printf child)", SG_VERDICT_ALLOW, true, 0},
       {"cat <\\\n(printf input)", SG_VERDICT_ALLOW, false, 0},
       {"printf bytes > \\\n>(cat)", SG_VERDICT_ALLOW, false, -1},
   };
@@ -4375,8 +4389,8 @@ TEST(continued_expansion_policy_contract) {
     ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
     ASSERT(result.verdict == cases[i].verdict && result.subcommand_count == 2 &&
            result.has_dynamic_substitution_io &&
-           result.requires_substitution_evaluation ==
-               cases[i].requires_evaluation);
+           ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].requires_evaluation);
   }
   sg_gate_free(gate);
 }
@@ -4441,141 +4455,159 @@ TEST(dynamic_substitution_flow_contract) {
   sg_result_t result;
   ASSERT_SG_OK(
       eval_cmd(gate, "echo $( { sleep 2; printf q; } | ./clock )", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 4);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* A syntactic substitution is not automatically a live dynamic I/O flow:
    * descriptor closes and diversions can disconnect it before its bytes reach
    * a shell word or process-substitution consumer. */
   ASSERT_SG_OK(eval_cmd(gate, "echo $(printf x >&-)", &result));
-  ASSERT(!result.requires_substitution_evaluation &&
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(printf x 1>&2)", &result));
-  ASSERT(!result.requires_substitution_evaluation &&
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(printf x 2>&1 1>&2)", &result));
-  ASSERT(result.requires_substitution_evaluation &&
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "printf x > >(sh 0<&-)", &result));
-  ASSERT(!result.requires_substitution_evaluation &&
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "printf x > >(sh 0<&0)", &result));
-  ASSERT(!result.requires_substitution_evaluation &&
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(printf first; printf second)", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 3);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(<\"/etc/shadow\")", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 1);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT(result.subcommands[0].read_count == 0);
   ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(</etc/shadow)", &result));
-  ASSERT(result.requires_substitution_evaluation);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(</etc/sha\\dow)", &result));
-  ASSERT(result.requires_substitution_evaluation);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(<\"$dynamic_path\")", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(!(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(</tmp/direct)$(id)", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 2);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(< <(printf q))", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         ((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* The nested printf selects a pathname, while the selected file's contents
    * are what later enter echo's shell word. Do not make the filename producer
    * itself a second-inspection consumer. */
   ASSERT_SG_OK(eval_cmd(gate, "echo $(<$(printf /tmp/dynamic-name))", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         ((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "{ echo $(</tmp/group-input); }", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 1);
 
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(
       eval_cmd(gate, "echo $( { printf $(</tmp/nested-input); } )", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 2);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
-  ASSERT(result.subcommands[1].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[1].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "printf value 2> >(cat)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  ASSERT(!result.requires_substitution_evaluation);
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.has_dynamic_substitution_io);
   ASSERT(result.subcommand_count == 2);
-  ASSERT(!result.subcommands[0].requires_substitution_evaluation);
-  ASSERT(!result.subcommands[1].requires_substitution_evaluation);
+  ASSERT(!((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(!((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommands[1].has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <(cat <<EOF\n)\nEOF\n)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
          result.subcommands[0].has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(cat <<EOF\n)\nEOF\n)", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         result.subcommands[0].requires_substitution_evaluation);
+         ((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* Arithmetic shifts are not heredocs, while their enclosing substitution
    * still carries the correct shell-word or dynamic-descriptor semantics. */
   ASSERT_SG_OK(eval_cmd(gate, "echo $(printf '%s' $((1 << 2)))", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommand_count == 2 &&
-         result.subcommands[0].requires_substitution_evaluation);
+         ((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <(printf '%s' $((1 << 2)))", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
          result.subcommands[0].has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "{ echo $((1 << 2)); }", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommand_count == 1);
 
   /* A substitution in a redirect selects an I/O pathname. It remains visible
@@ -4583,22 +4615,26 @@ TEST(dynamic_substitution_flow_contract) {
    */
   ASSERT_SG_OK(eval_cmd(gate, "cat >$(id)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2);
   ASSERT(result.subcommands[0].has_dynamic_substitution_io &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.subcommands[1].has_dynamic_substitution_io &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(
       eval_cmd(gate, "{ echo ok; } >prefix$(printf /tmp/out)suffix", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2);
   ASSERT(!result.subcommands[0].has_dynamic_substitution_io &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommands[1].has_dynamic_substitution_io &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* Literal braces do not quote their contents. The substitution computes an
    * I/O pathname, so it remains visible as dynamic I/O but never becomes data
@@ -4607,77 +4643,89 @@ TEST(dynamic_substitution_flow_contract) {
   ASSERT_SG_OK(
       eval_cmd(gate, "printf value >{$(printf /tmp/brace-output)}", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2);
   ASSERT(result.subcommands[0].has_dynamic_substitution_io &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.subcommands[1].has_dynamic_substitution_io &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(
       gate, "printf value >&path-$(printf /tmp/brace-combined)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2);
   ASSERT(result.subcommands[0].has_dynamic_substitution_io &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.subcommands[1].has_dynamic_substitution_io &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $( { cat /etc/shadow; } )", &result));
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <<EOF\n$(id)\nEOF", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 2);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <<-EOF\r\n\t$(id)\r\n\tEOF\r\n", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 2);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <<'EOF'\n$(id)\nEOF", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  ASSERT(!result.requires_substitution_evaluation);
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 1);
-  ASSERT(!result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(!((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <<\\EOF\n$(id)\nEOF", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  ASSERT(!result.requires_substitution_evaluation);
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 1);
-  ASSERT(!result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(!((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <<EOF </dev/null\n$(id)\nEOF", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 2);
-  ASSERT(!result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(!((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(
       eval_cmd(gate, "cat <<A <<-B\n$(id)\nA\n\t$(pwd)\n\tB\n", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 3);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   /* The later heredoc's substitution inherits the first document on stdin. */
 
   ASSERT_SG_OK(
       eval_cmd(gate, "cat <<EOF\n$(printf one; printf two)\nEOF", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 3);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <<EOF\n$(</etc/shadow)\nEOF", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 1);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
   ASSERT(result.subcommands[0].violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
   bool heredoc_sensitive_owner = false;
@@ -4694,25 +4742,30 @@ TEST(dynamic_substitution_flow_contract) {
   ASSERT_SG_OK(
       eval_cmd(gate, "{ cat; cat; } <<EOF\n$(</etc/shadow)\nEOF", &result));
   ASSERT(
-      result.requires_substitution_evaluation && result.subcommand_count == 2 &&
+      ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+      result.subcommand_count == 2 &&
       (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       (result.subcommands[0].violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       (result.subcommands[1].violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
   ASSERT_SG_OK(eval_cmd(gate, "{ cat; cat; } <<EOF\n$(id)\nEOF", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 3);
-  ASSERT(!result.subcommands[0].requires_substitution_evaluation);
-  ASSERT(result.subcommands[1].requires_substitution_evaluation);
-  ASSERT(result.subcommands[2].requires_substitution_evaluation);
+  ASSERT(!((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[1].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[2].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(
       gate, "cat <<EOF\n$( { sleep 2; printf q; } | ./clock )\nEOF", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count == 4);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   sg_gate_free(gate);
 }
@@ -4731,22 +4784,25 @@ TEST(herestring_and_transformed_substitution_provenance) {
   sg_result_t result;
   ASSERT_SG_OK(eval_cmd(gate, "sh <<< \"$(cat /etc/shadow)\"", &result));
   ASSERT(
-      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-      result.requires_substitution_evaluation &&
+      result.verdict == SG_VERDICT_ALLOW &&
+      ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       result.subcommand_count == 2 &&
-      result.subcommands[0].requires_substitution_evaluation &&
+      ((result.subcommands[0].requirements &
+        SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       (result.subcommands[0].violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
   /* Group-owned here-string data reaches its real GROUP owner, then each
    * member receives that inherited inspection and violation context. */
   ASSERT_SG_OK(eval_cmd(gate, "{ sh; cat; } <<< \"$(</etc/shadow)\"", &result));
   ASSERT(
-      result.requires_substitution_evaluation &&
+      ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       result.subcommand_count == 2 &&
-      result.subcommands[0].requires_substitution_evaluation &&
-      result.subcommands[1].requires_substitution_evaluation &&
+      ((result.subcommands[0].requirements &
+        SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+      ((result.subcommands[1].requirements &
+        SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       (result.subcommands[0].violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       (result.subcommands[1].violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
@@ -4756,12 +4812,14 @@ TEST(herestring_and_transformed_substitution_provenance) {
   ASSERT_SG_OK(eval_cmd(
       gate, "{ sh; cat; } 3>&1 <<< stale 0<<< \"$(</etc/shadow)\"", &result));
   ASSERT(
-      result.requires_substitution_evaluation &&
+      ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       result.has_dynamic_substitution_io &&
       (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       result.subcommand_count == 2 &&
-      result.subcommands[0].requires_substitution_evaluation &&
-      result.subcommands[1].requires_substitution_evaluation &&
+      ((result.subcommands[0].requirements &
+        SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+      ((result.subcommands[1].requirements &
+        SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
       (result.subcommands[0].violation_type_flags & SG_VIOL_SUBST_SENSITIVE) &&
       (result.subcommands[1].violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
@@ -4770,27 +4828,30 @@ TEST(herestring_and_transformed_substitution_provenance) {
    * receives its bytes as requiring shell-word inspection. */
   ASSERT_SG_OK(
       eval_cmd(gate, "{ sh; } > >(cat) <<< \"$(printf payload)\"", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.requires_substitution_evaluation &&
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 3 &&
-         result.subcommands[2].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation &&
-         !result.subcommands[0].requires_substitution_evaluation);
+         ((result.subcommands[2].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* Risk provenance follows real dynamic-byte transforms, rather than
    * assuming that only a direct file-reading producer can be sensitive. */
   ASSERT_SG_OK(eval_cmd(gate, "echo $(cat /etc/shadow | sed s/a/b/)", &result));
-  ASSERT(result.requires_substitution_evaluation &&
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
   ASSERT_SG_OK(
       eval_cmd(gate, "echo $(printf '%s' $(cat /etc/shadow))", &result));
-  ASSERT(result.requires_substitution_evaluation &&
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
 
   ASSERT_SG_OK(
       eval_cmd(gate, "echo $(cat /tmp/ordinary | sed s/a/b/)", &result));
-  ASSERT(result.requires_substitution_evaluation &&
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
   sg_gate_free(gate);
 }
@@ -4827,7 +4888,9 @@ TEST(substitution_sensitive_alias_worklist) {
       ASSERT(used < sizeof(command));
       sg_result_t result;
       ASSERT_SG_OK(eval_cmd(gate, command, &result));
-      ASSERT(!result.truncated && result.requires_substitution_evaluation);
+      ASSERT(
+          !result.truncated &&
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
       ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
     }
   }
@@ -4837,7 +4900,8 @@ TEST(substitution_sensitive_alias_worklist) {
   sg_result_t result;
   ASSERT_SG_OK(
       eval_cmd(gate, "echo \"$(cat /etc/shadow 0<> >(cat))\"", &result));
-  ASSERT(!result.truncated && result.requires_substitution_evaluation);
+  ASSERT(!result.truncated &&
+         ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE);
   sg_gate_free(gate);
 }
@@ -4871,19 +4935,20 @@ TEST(brace_group_process_substitution_result_contract) {
   for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
-    ASSERT(result.verdict == (cases[i].dynamic_count
-                                  ? SG_VERDICT_ALLOW_CONDITIONAL
-                                  : SG_VERDICT_ALLOW) &&
-           result.requires_substitution_evaluation ==
-               (cases[i].dynamic_count != 0) &&
+    ASSERT(result.verdict ==
+               (cases[i].dynamic_count ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW) &&
+           ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == (cases[i].dynamic_count != 0) &&
            result.has_dynamic_substitution_io &&
            result.subcommand_count == cases[i].command_count);
     uint32_t dynamic_count = 0;
     for (uint32_t command = 0; command < result.subcommand_count; command++) {
       const sg_subcommand_result_t *subcommand = &result.subcommands[command];
-      dynamic_count += subcommand->requires_substitution_evaluation;
-      ASSERT(subcommand->requires_substitution_evaluation ==
-             cases[i].dynamic[command]);
+      dynamic_count += ((subcommand->requirements &
+                         SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0);
+      ASSERT(
+          ((subcommand->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+           0) == cases[i].dynamic[command]);
     }
     ASSERT(dynamic_count == cases[i].dynamic_count);
   }
@@ -4919,12 +4984,14 @@ TEST(group_process_substitution_dynamic_consumer_contract) {
   for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-           !result.requires_substitution_evaluation &&
-           result.has_dynamic_substitution_io &&
-           result.subcommand_count == cases[i].command_count);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.has_dynamic_substitution_io &&
+        result.subcommand_count == cases[i].command_count);
     for (uint32_t command = 0; command < result.subcommand_count; command++) {
-      ASSERT(!result.subcommands[command].requires_substitution_evaluation);
+      ASSERT(!((result.subcommands[command].requirements &
+                SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
       ASSERT(result.subcommands[command].has_dynamic_substitution_io ==
              cases[i].dynamic[command]);
     }
@@ -4937,7 +5004,7 @@ TEST(group_process_substitution_dynamic_consumer_contract) {
   ASSERT_SG_OK(
       eval_cmd(gate, "{ cat < <(printf inner); } < <(printf outer)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 3 &&
          !result.subcommands[0].has_dynamic_substitution_io &&
          result.subcommands[1].has_dynamic_substitution_io &&
@@ -4974,22 +5041,20 @@ TEST(substitution_stream_resource_contract) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
     if (result.subcommand_count != cases[i].count ||
-        result.verdict != (cases[i].inspection_mask
-                               ? SG_VERDICT_ALLOW_CONDITIONAL
-                               : SG_VERDICT_ALLOW))
+        result.verdict !=
+            (cases[i].inspection_mask ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW))
       printf("\n    stream result: %s verdict=%d commands=%u\n",
              cases[i].source, result.verdict, result.subcommand_count);
     ASSERT(result.subcommand_count == cases[i].count && !result.truncated);
-    ASSERT(result.verdict == (cases[i].inspection_mask
-                                  ? SG_VERDICT_ALLOW_CONDITIONAL
-                                  : SG_VERDICT_ALLOW));
-    ASSERT(result.requires_substitution_evaluation ==
-           (cases[i].inspection_mask != 0));
+    ASSERT(result.verdict ==
+           (cases[i].inspection_mask ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == (cases[i].inspection_mask != 0));
     ASSERT(result.has_dynamic_substitution_io == (cases[i].dynamic_mask != 0));
     for (uint32_t command = 0; command < result.subcommand_count; command++) {
       const sg_subcommand_result_t *item = &result.subcommands[command];
-      ASSERT(item->requires_substitution_evaluation ==
-             ((cases[i].inspection_mask & (1u << command)) != 0));
+      ASSERT(((item->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+              0) == ((cases[i].inspection_mask & (1u << command)) != 0));
       ASSERT(item->has_dynamic_substitution_io ==
              ((cases[i].dynamic_mask & (1u << command)) != 0));
     }
@@ -5029,15 +5094,16 @@ TEST(substitution_source_word_contract) {
        i++) {
     ASSERT_SG_OK(eval_cmd(gate, parameter_cases[i].source, &result));
     ASSERT(result.subcommand_count == (parameter_cases[i].executes ? 2u : 1u));
-    ASSERT(result.requires_substitution_evaluation ==
-           parameter_cases[i].executes);
-    ASSERT(result.subcommands[0].requires_substitution_evaluation ==
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == parameter_cases[i].executes);
+    ASSERT(((result.subcommands[0].requirements &
+             SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ==
            parameter_cases[i].executes);
   }
 
   ASSERT_SG_OK(eval_cmd(gate, "echo \"${x/a/<(printf hi)}\"", &result));
   ASSERT(result.subcommand_count == 2 && result.has_dynamic_substitution_io &&
-         !result.requires_substitution_evaluation);
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT(eval_cmd(gate, "echo \"${x:-$'\\x24(printf hi)'}\"", &result) ==
          SG_ERR_PARSE);
@@ -5056,13 +5122,13 @@ TEST(substitution_source_word_contract) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,9:<(cat)foo,");
   ASSERT(!result.has_dynamic_substitution_io);
-  ASSERT(!result.requires_substitution_evaluation);
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "echo <(cat)foo", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,9:<(cat)foo,");
   ASSERT(result.has_dynamic_substitution_io);
-  ASSERT(!result.requires_substitution_evaluation);
+  ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* ShellGate builds its policy netargv directly from graph words. It must
    * retain the same escaped process-substitution spelling as Shellsplit's
@@ -5072,11 +5138,10 @@ TEST(substitution_source_word_contract) {
   ASSERT_STR(result.subcommands[0].netargv, "3:cat,12:<(printf \\)),");
 
   ASSERT_SG_OK(eval_cmd(gate, "echo foo$(cat)bar", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-         result.subcommand_count == 2);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,12:foo$(cat)bar,");
   ASSERT(result.has_dynamic_substitution_io);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   sg_gate_free(gate);
 }
 
@@ -5090,34 +5155,38 @@ TEST(process_substitution_interpreter_input_contract) {
   sg_result_t result;
   ASSERT_SG_OK(eval_cmd(gate, "sh < <(printf 'echo nested')", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
          result.subcommands[0].has_dynamic_substitution_io &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   /* The output form reports dynamic descriptor I/O, not a generic request to
    * inspect shell-word content. Exact routes belong to Shellsplit's graph. */
   ASSERT_SG_OK(eval_cmd(gate, "cat log > >(sh)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommands[1].has_dynamic_substitution_io);
 
   /* The raw redirect token retains this physical continuation, but it still
    * owns the output process-substitution operand after lexical removal. */
   ASSERT_SG_OK(eval_cmd(gate, "cat log >\\\n >(sh)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommands[1].has_dynamic_substitution_io);
 
   ASSERT_SG_OK(eval_cmd(gate, "cat log 2>> >(sh)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.subcommands[1].has_dynamic_substitution_io);
 
   /* A later output redirect or close supersedes the earlier process
@@ -5125,25 +5194,31 @@ TEST(process_substitution_interpreter_input_contract) {
    * but Shellgate must not request inspection for an unfed stale endpoint. */
   ASSERT_SG_OK(eval_cmd(gate, "cat log > >(sh) > /tmp/final.out", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cat log > >(sh) 1>&-", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(
       eval_cmd(gate, "{ printf payload; } > >(sh) > /tmp/final.out", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          !result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   sg_gate_free(gate);
 }
 
@@ -5162,11 +5237,14 @@ TEST(process_substitution_direction_contract) {
   };
   for (uint32_t i = 0; i < sizeof(unrouted) / sizeof(unrouted[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, unrouted[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-           !result.requires_substitution_evaluation &&
-           result.subcommand_count == 2 &&
-           !result.subcommands[0].requires_substitution_evaluation &&
-           !result.subcommands[1].requires_substitution_evaluation);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.subcommand_count == 2 &&
+        !((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        !((result.subcommands[1].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
 
   /* An explicit read/write redirect with an input process substitution feeds
@@ -5177,11 +5255,13 @@ TEST(process_substitution_direction_contract) {
   };
   for (uint32_t i = 0; i < sizeof(routed) / sizeof(routed[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, routed[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-           !result.requires_substitution_evaluation &&
-           result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-           result.subcommands[0].has_dynamic_substitution_io &&
-           !result.subcommands[1].requires_substitution_evaluation);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
+        result.subcommands[0].has_dynamic_substitution_io &&
+        !((result.subcommands[1].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
 
   /* `<> >(consumer)` has the same known write route as `> >(consumer)`: the
@@ -5195,19 +5275,23 @@ TEST(process_substitution_direction_contract) {
   for (uint32_t i = 0;
        i < sizeof(read_write_output) / sizeof(read_write_output[0]); i++) {
     ASSERT_SG_OK(eval_cmd(gate, read_write_output[i], &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-           !result.requires_substitution_evaluation &&
-           result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-           !result.subcommands[0].requires_substitution_evaluation &&
-           result.subcommands[1].has_dynamic_substitution_io);
+    ASSERT(
+        result.verdict == SG_VERDICT_ALLOW &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
+        !((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.subcommands[1].has_dynamic_substitution_io);
   }
 
   ASSERT_SG_OK(eval_cmd(gate, "cat <> >(sh) 0> /tmp/final.out", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
-         !result.requires_substitution_evaluation &&
+         !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
-         !result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].requires_substitution_evaluation);
+         !((result.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+         !((result.subcommands[1].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   sg_gate_free(gate);
 }
 
@@ -5245,7 +5329,8 @@ TEST(expansion_phases_survive_failed_setup) {
                         (redirect ? fixture->redirect : fixture->writer);
           bool expected =
               error == SG_OK && !result.truncated &&
-              result.requires_substitution_evaluation == inspection &&
+              ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+               0) == inspection &&
               (!inspection || result.has_dynamic_substitution_io) &&
               (fixture->active || !result.has_dynamic_substitution_io) &&
               ((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
@@ -5254,7 +5339,8 @@ TEST(expansion_phases_survive_failed_setup) {
             printf("\n    expansion setup gate: %s (error %d, inspection %d, "
                    "dynamic %d, writes %d, anomaly %u)\n",
                    fixture->source, error,
-                   result.requires_substitution_evaluation,
+                   ((result.requirements &
+                     SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0),
                    result.has_dynamic_substitution_io,
                    (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0,
                    anomaly);
@@ -5301,7 +5387,8 @@ TEST(expansion_control_effects_require_reachable_setup) {
         bool expected =
             error == SG_OK && !result.truncated &&
             result.verdict != SG_VERDICT_REJECT &&
-            result.requires_substitution_evaluation == fixture->subst_eval &&
+            ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+             0) == fixture->subst_eval &&
             result.has_dynamic_substitution_io == fixture->dynamic_io;
         bool named_write = false;
         for (uint32_t c = 0; c < result.subcommand_count; c++) {
@@ -5315,8 +5402,10 @@ TEST(expansion_control_effects_require_reachable_setup) {
           printf("\n    expansion control gate: %s (error %d, "
                  "named write %d, anomaly %u, reqsubst %d/%d, dynio %d/%d)\n",
                  fixture->source, error, named_write, anomaly,
-                 result.requires_substitution_evaluation, fixture->subst_eval,
-                 result.has_dynamic_substitution_io, fixture->dynamic_io);
+                 ((result.requirements &
+                   SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0),
+                 fixture->subst_eval, result.has_dynamic_substitution_io,
+                 fixture->dynamic_io);
           valid = false;
         }
       }
@@ -5351,12 +5440,14 @@ TEST(process_pipe_descriptor_policy_contract) {
     /* Only the final case embeds shell-word substitution. Pipe-path use and
      * aliasing alone must never request data-as-code inspection. */
     bool shell_word = i + 1 == sizeof(cases) / sizeof(cases[0]);
-    ASSERT(result.requires_substitution_evaluation == shell_word);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == shell_word);
     ASSERT(result.verdict ==
-           (shell_word ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW));
+           (shell_word ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
     for (uint32_t command = 0; command < result.subcommand_count; command++) {
       ASSERT(result.subcommands[command].matches);
-      ASSERT(result.subcommands[command].requires_substitution_evaluation ==
+      ASSERT(((result.subcommands[command].requirements &
+               SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ==
              (shell_word && command == 2));
     }
   }
@@ -5377,8 +5468,9 @@ TEST(process_substitution_operand_syntax_contract) {
   for (uint32_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     sg_result_t result = {0};
     ASSERT(eval_cmd(gate, invalid[i], &result) == SG_ERR_PARSE);
-    ASSERT(result.verdict == SG_VERDICT_REJECT &&
-           !result.requires_substitution_evaluation);
+    ASSERT(
+        result.verdict == SG_VERDICT_REJECT &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
   sg_gate_free(gate);
 }
@@ -5402,9 +5494,10 @@ TEST(composite_process_substitution_contract) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, cases[i].input, &result));
     ASSERT(result.subcommand_count == 2);
-    ASSERT(result.verdict == (cases[i].shell_word ? SG_VERDICT_ALLOW_CONDITIONAL
-                                                  : SG_VERDICT_ALLOW));
-    ASSERT(result.requires_substitution_evaluation == cases[i].shell_word);
+    ASSERT(result.verdict ==
+           (cases[i].shell_word ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].shell_word);
     ASSERT(result.has_dynamic_substitution_io == cases[i].shell_word);
   }
   ASSERT_ST_OK(test_policy_replace_cpl(gate, true, "printf *", false));
@@ -5470,8 +5563,9 @@ TEST(composite_redirect_anomaly_cache_equivalence) {
         ASSERT(uncached.verdict == SG_VERDICT_UNDETERMINED &&
                cached.verdict == SG_VERDICT_UNDETERMINED);
       ASSERT(uncached.verdict == cached.verdict &&
-             uncached.requires_substitution_evaluation ==
-                 cached.requires_substitution_evaluation &&
+             ((uncached.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+              0) == ((cached.requirements &
+                      SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
              uncached.anomaly_score == cached.anomaly_score &&
              uncached.anomaly_score_raw == cached.anomaly_score_raw &&
              uncached.anomaly_score_type == cached.anomaly_score_type &&
@@ -5538,8 +5632,9 @@ TEST(command_position_group_syntax_contract) {
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     sg_result_t result = {0};
     ASSERT(eval_cmd(gate, invalid[i], &result) == SG_ERR_PARSE);
-    ASSERT(result.verdict == SG_VERDICT_REJECT &&
-           !result.requires_substitution_evaluation);
+    ASSERT(
+        result.verdict == SG_VERDICT_REJECT &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
   sg_gate_free(gate);
 }
@@ -5585,15 +5680,16 @@ TEST(substitution_comment_and_heredoc_capacity_contract) {
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     sg_result_t result = {0};
     ASSERT(eval_cmd(gate, invalid[i], &result) == SG_ERR_PARSE);
-    ASSERT(result.verdict == SG_VERDICT_REJECT &&
-           !result.requires_substitution_evaluation);
+    ASSERT(
+        result.verdict == SG_VERDICT_REJECT &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
 
   sg_result_t result = {0};
   ASSERT_SG_OK(
       eval_cmd(gate, "echo $(printf value # )\nprintf done)", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(result.subcommand_count >= 2);
 
   for (int process_substitution = 0; process_substitution <= 1;
@@ -5605,7 +5701,7 @@ TEST(substitution_comment_and_heredoc_capacity_contract) {
     ASSERT(eval_cmd(gate, command, &result) == SG_ERR_TRUNC);
     ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
            result.verdict != SG_VERDICT_ALLOW &&
-           result.verdict != SG_VERDICT_ALLOW_CONDITIONAL);
+           result.verdict != SG_VERDICT_ALLOW);
   }
   sg_gate_free(gate);
 }
@@ -5638,8 +5734,8 @@ TEST(compound_heredoc_substitution_cross_product_contract) {
   for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, cases[ci].command, &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-    ASSERT(result.requires_substitution_evaluation);
+    ASSERT(result.verdict == SG_VERDICT_ALLOW);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(result.subcommand_count == cases[ci].subcommand_count);
     uint32_t dynamic_consumers = 0;
     for (uint32_t i = 0; i < result.subcommand_count; i++) {
@@ -5664,7 +5760,7 @@ TEST(compound_heredoc_substitution_cross_product_contract) {
   ASSERT(eval_cmd(gate, overflow, &result) == SG_ERR_TRUNC);
   ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
   ASSERT(result.verdict != SG_VERDICT_ALLOW &&
-         result.verdict != SG_VERDICT_ALLOW_CONDITIONAL);
+         result.verdict != SG_VERDICT_ALLOW);
   sg_gate_free(gate);
 }
 
@@ -5688,8 +5784,8 @@ TEST(compound_brace_substitution_boundary_contract) {
        ci++) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, dynamic_cases[ci].command, &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-    ASSERT(result.requires_substitution_evaluation);
+    ASSERT(result.verdict == SG_VERDICT_ALLOW);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(result.subcommand_count == dynamic_cases[ci].command_count);
     uint32_t consumers = 0;
     for (uint32_t i = 0; i < result.subcommand_count; i++) {
@@ -5701,9 +5797,46 @@ TEST(compound_brace_substitution_boundary_contract) {
   sg_result_t literal;
   ASSERT_SG_OK(eval_cmd(gate, "{ cat <<'EOF'\n$( { id; } )\nEOF\n}", &literal));
   ASSERT(literal.verdict == SG_VERDICT_ALLOW);
-  ASSERT(!literal.requires_substitution_evaluation);
+  ASSERT(!((literal.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(literal.subcommand_count == 1);
-  ASSERT(!literal.subcommands[0].requires_substitution_evaluation);
+  ASSERT(!((literal.subcommands[0].requirements &
+            SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  sg_gate_free(gate);
+}
+
+TEST(requirements_pass_on_what_shellsplit_states) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"exec *", "read *", "echo *"}, 3);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result = {0};
+
+  /* Nothing is outstanding for a plain command. */
+  ASSERT_SG_OK(eval_cmd(gate, "read value", &result));
+  ASSERT(result.requirements == 0);
+
+  /* A redirection open that a later descriptor use depends on is required:
+   * Shellsplit flags the edge, and the result carries the flag unchanged. */
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "exec {a}<<<first; exec {b}<&\"$a\"; exec {a}<&-; "
+                        "read -u\"$b\" value",
+                        &result));
+  ASSERT(result.requirements == SHELL_DEP_EDGE_FLAG_REQUIRED);
+
+  /* A substitution is the other kind, and the verdict stays what the policy
+   * decided: ALLOW, with the requirement beside it. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo \"$(echo x)\"", &result));
+  ASSERT(result.requirements == SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+
+  /* Both can stand together, each as Shellsplit flagged it. */
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "exec {a}<<<first; exec {b}<&\"$a\"; exec {a}<&-; "
+                        "read -u\"$b\" value; echo \"$(echo x)\"",
+                        &result));
+  ASSERT(result.requirements ==
+         (SHELL_DEP_EDGE_FLAG_REQUIRED | SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD));
   sg_gate_free(gate);
 }
 
@@ -5719,12 +5852,15 @@ TEST(anomaly_group_heredoc_substitution_contract) {
   sg_result_t result;
   for (size_t pass = 0; pass < 6; pass++) {
     ASSERT_SG_OK(eval_cmd(gate, command, &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-    ASSERT(result.requires_substitution_evaluation);
+    ASSERT(result.verdict == SG_VERDICT_ALLOW);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(result.subcommand_count == 3);
-    ASSERT(result.subcommands[0].requires_substitution_evaluation);
-    ASSERT(!result.subcommands[1].requires_substitution_evaluation);
-    ASSERT(!result.subcommands[2].requires_substitution_evaluation);
+    ASSERT(((result.subcommands[0].requirements &
+             SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+    ASSERT(!((result.subcommands[1].requirements &
+              SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+    ASSERT(!((result.subcommands[2].requirements &
+              SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     /* All three executable stages now reach the anomaly model. The first
      * observation necessarily has an unknown-model score; deferred learning
      * makes subsequent equivalent observations score normally. */
@@ -5778,7 +5914,7 @@ TEST(anomaly_large_quoted_delimiter_workspace) {
       sg_result_t result;
       ASSERT_SG_OK(eval_cmd(gate, variant ? nested : command, &result));
       ASSERT(result.verdict ==
-                 (variant ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW) &&
+                 (variant ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW) &&
              !result.truncated);
       ASSERT(result.subcommand_count == (variant ? 2 : 1));
       ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
@@ -5805,8 +5941,7 @@ TEST(anomaly_large_quoted_delimiter_workspace) {
   for (unsigned variant = 0; variant < 2; variant++) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, variant ? nested : command, &result));
-    ASSERT(result.verdict ==
-               (variant ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW) &&
+    ASSERT(result.verdict == (variant ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW) &&
            !result.truncated);
     ASSERT(result.subcommand_count == (variant ? 2 : 1));
     ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
@@ -5865,8 +6000,8 @@ TEST(anomaly_mixed_heredoc_substitution_contract) {
   sg_result_t result;
   for (size_t pass = 0; pass < 6; pass++) {
     ASSERT_SG_OK(eval_cmd(gate, command, &result));
-    ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-    ASSERT(result.requires_substitution_evaluation);
+    ASSERT(result.verdict == SG_VERDICT_ALLOW);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(result.subcommand_count == 4);
     /* Five nested execution stages are scoreable from the first complete
      * learned observation onward; the empty model correctly reports unknown
@@ -6516,7 +6651,8 @@ TEST(comment_only_source_does_not_trigger_feature_rejection) {
     ASSERT(eval_cmd(gate, cases[i], &result) == SG_BLANK);
     ASSERT(result.verdict == SG_VERDICT_ALLOW);
     ASSERT(result.subcommand_count == 0);
-    ASSERT(!result.requires_substitution_evaluation);
+    ASSERT(
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT(!result.has_dynamic_substitution_io);
     ASSERT(!result.truncated);
   }
@@ -6661,20 +6797,22 @@ TEST(stop_mode_substitution_prefix) {
 
   sg_result_t result;
   ASSERT_SG_OK(eval_cmd(gate, "echo $(whoami) ; rm -rf /", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT(result.short_circuited);
   ASSERT(result.subcommand_count == 1);
   ASSERT_STR(result.subcommands[0].display_command, "echo $(whoami)");
-  ASSERT(result.requires_substitution_evaluation);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(!result.truncated);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $(</tmp/direct) ; rm -rf /", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT(result.short_circuited);
   ASSERT(result.subcommand_count == 1);
-  ASSERT(result.requires_substitution_evaluation);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT(!result.truncated);
 
@@ -6682,11 +6820,12 @@ TEST(stop_mode_substitution_prefix) {
    * the materialized results, but it must not omit the root dynamic-content
    * requirement carried by an expandable heredoc. */
   ASSERT_SG_OK(eval_cmd(gate, "cat <<EOF\n$(id)\nEOF\nrm -rf /", &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT(result.short_circuited);
   ASSERT(result.subcommand_count == 1);
-  ASSERT(result.requires_substitution_evaluation);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
+  ASSERT(((result.subcommands[0].requirements &
+           SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   ASSERT(!result.truncated);
   sg_gate_free(gate);
 }
@@ -7064,7 +7203,8 @@ TEST(nested_ansi_escape_policy) {
            result.subcommand_count == 1 + children &&
            (result.verdict == SG_VERDICT_DENY) == (children != 0) &&
            result.has_dynamic_substitution_io == dynamic_io &&
-           result.requires_substitution_evaluation == dynamic_io);
+           ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == dynamic_io);
   }
   for (size_t c = 0; c < sizeof(shellsplit_test_ansi_phase_cases) /
                              sizeof(shellsplit_test_ansi_phase_cases[0]);
@@ -7078,8 +7218,8 @@ TEST(nested_ansi_escape_policy) {
            result.subcommand_count == 1 + children &&
            (result.verdict == SG_VERDICT_DENY) == (children != 0) &&
            result.has_dynamic_substitution_io == stream &&
-           result.requires_substitution_evaluation ==
-               (stream && shellsplit_test_ansi_phase_cases[c].kind != '<'));
+           ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == (stream && shellsplit_test_ansi_phase_cases[c].kind != '<'));
   }
   for (size_t c = 0;
        c < sizeof(shellsplit_test_ansi_translated_children) /
@@ -7858,7 +7998,6 @@ TEST(helper_contracts) {
                   {SG_VERDICT_DENY, "DENY"},
                   {SG_VERDICT_REJECT, "REJECT"},
                   {SG_VERDICT_UNDETERMINED, "UNDETERMINED"},
-                  {SG_VERDICT_ALLOW_CONDITIONAL, "ALLOW_CONDITIONAL"},
                   {(sg_verdict_t)-1, "UNKNOWN"}};
   for (size_t i = 0; i < sizeof(verdicts) / sizeof(verdicts[0]); i++)
     ASSERT_STR(sg_verdict_name(verdicts[i].verdict), verdicts[i].name);
@@ -9205,15 +9344,15 @@ TEST(resolved_substitution_argument_file_relations) {
     ASSERT(result.has_dynamic_substitution_io &&
            result.subcommands[0].has_dynamic_substitution_io);
     bool inspection = i != 3;
-    ASSERT(result.requires_substitution_evaluation == inspection &&
-           result.subcommands[0].requires_substitution_evaluation ==
-               inspection);
-    if (result.verdict !=
-        (inspection ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW))
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == inspection &&
+           ((result.subcommands[0].requirements &
+             SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) == inspection);
+    if (result.verdict != (inspection ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW))
       printf("\n    substitution case %zu verdict=%d commands=%u\n", i,
              result.verdict, result.subcommand_count);
     ASSERT(result.verdict ==
-           (inspection ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW));
+           (inspection ? SG_VERDICT_ALLOW : SG_VERDICT_ALLOW));
     ASSERT(result.unresolved_expansion_flags == 0);
   }
   sg_gate_free(gate);
@@ -9264,15 +9403,17 @@ TEST(resolved_filename_substitution_consumer_contract) {
     unsigned owners = 0;
     for (uint32_t j = 0; j < result.subcommand_count; j++) {
       const sg_subcommand_result_t *command = &result.subcommands[j];
-      ASSERT(!command->requires_substitution_evaluation);
+      ASSERT(!((command->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+               0));
       if (!command->has_dynamic_substitution_io)
         continue;
       owners++;
       ASSERT((command->violation_type_flags & SG_VIOL_SUBST_SENSITIVE) != 0);
     }
-    ASSERT(owners == cases[i].owners && result.has_dynamic_substitution_io &&
-           !result.requires_substitution_evaluation &&
-           result.unresolved_expansion_flags == 0);
+    ASSERT(
+        owners == cases[i].owners && result.has_dynamic_substitution_io &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        result.unresolved_expansion_flags == 0);
     if (cases[i].failed)
       ASSERT(result.subcommands[0].write_count == 0);
   }
@@ -10216,14 +10357,16 @@ TEST(file_substitution_diagnostic_receiver) {
     const sg_subcommand_result_t *outer = &result.subcommands[0];
     ASSERT(outer->netargv_length >= 5 &&
            memcmp(outer->netargv, "2:sh,", 5) == 0);
-    if (outer->requires_substitution_evaluation != cases[i].outer_inspection)
+    if (((outer->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+        cases[i].outer_inspection)
       printf("\n    file diagnostic consumer: %s\n", cases[i].source);
-    ASSERT(outer->requires_substitution_evaluation ==
-           cases[i].outer_inspection);
+    ASSERT(((outer->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].outer_inspection);
     ASSERT(outer->has_dynamic_substitution_io == cases[i].outer_inspection);
     if (cases[i].outer_inspection)
-      ASSERT(result.requires_substitution_evaluation &&
-             result.has_dynamic_substitution_io);
+      ASSERT(
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+          result.has_dynamic_substitution_io);
   }
   sg_gate_free(gate);
 }
@@ -10326,8 +10469,8 @@ TEST(empty_path_static_resolved_equivalence) {
              reads == shellsplit_test_empty_paths[i].reads);
       ASSERT(((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
              (expected != 0));
-      ASSERT(result.requires_substitution_evaluation ==
-             shellsplit_test_empty_paths[i].shell_word);
+      ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+              0) == shellsplit_test_empty_paths[i].shell_word);
       ASSERT(!result.truncated &&
              calls == (spelling == spellings &&
                        shellsplit_test_empty_paths[i].reached));
@@ -10737,10 +10880,9 @@ TEST(truncation_cross_product_matrix) {
     uint32_t expected_count;
     bool expects_dynamic_content;
   } cases[] = {
-      {"echo $(id)$(pwd)", 4096, SG_OK, SG_VERDICT_ALLOW_CONDITIONAL, 3, true},
+      {"echo $(id)$(pwd)", 4096, SG_OK, SG_VERDICT_ALLOW, 3, true},
       {"echo $(id)$(pwd)", 16, SG_ERR_TRUNC, SG_VERDICT_UNDETERMINED, 1, true},
-      {"cat /etc/passwd ; echo $(id)", 4096, SG_OK,
-       SG_VERDICT_ALLOW_CONDITIONAL, 3, true},
+      {"cat /etc/passwd ; echo $(id)", 4096, SG_OK, SG_VERDICT_ALLOW, 3, true},
       {"cat /etc/passwd ; echo $(id)", 12, SG_ERR_TRUNC,
        SG_VERDICT_UNDETERMINED, 1, true},
       {"echo $(</tmp/direct)", 16, SG_ERR_TRUNC, SG_VERDICT_UNDETERMINED, 1,
@@ -10756,11 +10898,11 @@ TEST(truncation_cross_product_matrix) {
     ASSERT(result.verdict == cases[i].expected_verdict);
     ASSERT(result.subcommand_count == cases[i].expected_count);
     ASSERT(result.truncated == (error == SG_ERR_TRUNC));
-    ASSERT(result.requires_substitution_evaluation ==
-           cases[i].expects_dynamic_content);
+    ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+            0) == cases[i].expects_dynamic_content);
     if (error == SG_ERR_TRUNC)
       ASSERT(result.verdict != SG_VERDICT_ALLOW &&
-             result.verdict != SG_VERDICT_ALLOW_CONDITIONAL);
+             result.verdict != SG_VERDICT_ALLOW);
   }
 
   ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_failed, NULL));
@@ -11641,11 +11783,13 @@ TEST(exit_outcome_evaluation) {
       fprintf(stderr, "exit evaluation: %s (verdict=%d)\n", unreachable[i],
               result.verdict);
     ASSERT_EQ_INT(result.verdict, SG_VERDICT_ALLOW);
-    ASSERT(!result.has_dynamic_substitution_io &&
-           !result.requires_substitution_evaluation);
+    ASSERT(
+        !result.has_dynamic_substitution_io &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     for (uint32_t command = 0; command < result.subcommand_count; command++)
       ASSERT(result.subcommands[command].write_count == 0 &&
-             !result.subcommands[command].requires_substitution_evaluation);
+             !((result.subcommands[command].requirements &
+                SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
   }
   static const struct {
     const char *prefix;
@@ -11653,10 +11797,8 @@ TEST(exit_outcome_evaluation) {
   } retained[] = {
       {"(false; exit) &&", SG_VERDICT_ALLOW},
       {"(true; exit) ||", SG_VERDICT_ALLOW},
-      {"(false; exit <<< <(printf '%s' \"$(true)\")) &&",
-       SG_VERDICT_ALLOW_CONDITIONAL},
-      {"(true; exit <<< <(printf '%s' \"$(false)\")) ||",
-       SG_VERDICT_ALLOW_CONDITIONAL},
+      {"(false; exit <<< <(printf '%s' \"$(true)\")) &&", SG_VERDICT_ALLOW},
+      {"(true; exit <<< <(printf '%s' \"$(false)\")) ||", SG_VERDICT_ALLOW},
       {"(probe && exit; true) ||", SG_VERDICT_ALLOW},
       {"(probe || exit; false) &&", SG_VERDICT_ALLOW},
       {"(exit -- 256) ||", SG_VERDICT_ALLOW},
@@ -11670,8 +11812,10 @@ TEST(exit_outcome_evaluation) {
     sg_result_t result;
     ASSERT_SG_OK(eval_cmd(gate, source, &result));
     if (result.verdict != retained[i].verdict)
-      fprintf(stderr, "exit route verdict: %s (verdict=%d inspection=%d)\n",
-              source, result.verdict, result.requires_substitution_evaluation);
+      fprintf(
+          stderr, "exit route verdict: %s (verdict=%d inspection=%d)\n", source,
+          result.verdict,
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
     ASSERT_EQ_INT(result.verdict, retained[i].verdict);
     if (!result.subcommand_count ||
         result.subcommands[result.subcommand_count - 1].write_count != 1) {
@@ -12562,7 +12706,7 @@ TEST(current_shell_builtin_graph_effects) {
       (result.subcommands[0].violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
 
   ASSERT_SG_OK(eval_cmd(gate, "cd \"$(printf /tmp)\"", &result));
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0));
 
   ASSERT_SG_OK(eval_cmd(gate, "cd /tmp >\"$(cat /etc/shadow)\"", &result));
   ASSERT(result.has_dynamic_substitution_io &&
@@ -12588,9 +12732,10 @@ TEST(fd_open_dynamic_filename_consumer_contract) {
   for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
     sg_result_t result = {0};
     ASSERT_SG_OK(eval_cmd(gate, inputs[i], &result));
-    ASSERT(result.has_dynamic_substitution_io &&
-           !result.requires_substitution_evaluation &&
-           (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
+    ASSERT(
+        result.has_dynamic_substitution_io &&
+        !((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) &&
+        (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
     uint32_t dynamic_consumers = 0;
     uint32_t sensitive_consumers = 0;
     bool named_input_owner = false;
@@ -14846,12 +14991,11 @@ TEST(contextual_read_anomaly_contract) {
       {"read -- pre\"$unknown\"- value <<<payload", SG_VERDICT_REJECT},
       {"unset fd; read -p\"$fd\" -e value <<<payload", SG_VERDICT_ALLOW},
       {"unset fd; echo \"$(read -p\"$fd\" -e value <<<payload)\"",
-       SG_VERDICT_ALLOW_CONDITIONAL},
-      {"unset RANDOM; echo \"$(read -r RANDOM <<<payload)\"",
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW},
+      {"unset RANDOM; echo \"$(read -r RANDOM <<<payload)\"", SG_VERDICT_ALLOW},
       {"unset RANDOM; echo <(read -r RANDOM <<<payload)", SG_VERDICT_ALLOW},
       {"unset RANDOM; echo \"$(read -p\"$RANDOM\" -e value <<<payload)\"",
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW},
       {"unset fd; read -n\"$fd\" -a value <<<payload", SG_VERDICT_REJECT},
       {"read -t0.0000000\"$unknown\" value <<<payload", SG_VERDICT_ALLOW},
       {"unset empty; read -- $empty~ value <<<payload", SG_VERDICT_REJECT},
@@ -14868,7 +15012,7 @@ TEST(contextual_read_anomaly_contract) {
       {"exec {fd}<<<payload && { read -p\"$fd\" -u \"$fd\" value; }",
        SG_VERDICT_ALLOW},
       {"exec {fd}<<<payload && echo \"$(read -p\"$fd\" -u \"$fd\" value)\"",
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW},
       {"exec {fd}<<<payload && echo <(read -p\"$fd\" -u \"$fd\" value)",
        SG_VERDICT_ALLOW},
   };
@@ -16297,7 +16441,8 @@ TEST(forward_literal_word_policy_contract) {
         ASSERT_SG_OK(eval_cmd(gate, source, &result));
         ASSERT(result.verdict == SG_VERDICT_ALLOW &&
                result.subcommand_count == 1);
-        ASSERT(!result.requires_substitution_evaluation);
+        ASSERT(!((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+                 0));
         ASSERT(!result.has_dynamic_substitution_io);
         shell_netstring_iter_t args;
         shell_netstring_view_t arg;
@@ -16422,6 +16567,7 @@ int main(int argc, char **argv) {
   RUN(substitution_comment_and_heredoc_capacity_contract);
   RUN(compound_heredoc_substitution_cross_product_contract);
   RUN(compound_brace_substitution_boundary_contract);
+  RUN(requirements_pass_on_what_shellsplit_states);
   RUN(anomaly_group_heredoc_substitution_contract);
   RUN(anomaly_large_quoted_delimiter_workspace);
   RUN(heredoc_phase_policy_boundary);

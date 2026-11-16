@@ -176,7 +176,6 @@ bool valid_verdict(sg_verdict_t verdict) {
   case SG_VERDICT_DENY:
   case SG_VERDICT_REJECT:
   case SG_VERDICT_UNDETERMINED:
-  case SG_VERDICT_ALLOW_CONDITIONAL:
     return true;
   }
   return false;
@@ -200,9 +199,7 @@ void validate_result(const sg_result_t *result, sg_error_t error,
          SG_EXPANSION_UNRESOLVED_ARITHMETIC)) != 0 ||
       (error == SG_ERR_TRUNC && !result->truncated) ||
       (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
-      (error == SG_ERR_TRUNC &&
-       (result->verdict == SG_VERDICT_ALLOW ||
-        result->verdict == SG_VERDICT_ALLOW_CONDITIONAL)) ||
+      (error == SG_ERR_TRUNC && result->verdict == SG_VERDICT_ALLOW) ||
       result->has_violations != (result->violation_count != 0) ||
       !valid_buffer_string(result->deny_reason, buffer, buffer_size)) {
     fprintf(stderr,
@@ -231,8 +228,9 @@ void validate_result(const sg_result_t *result, sg_error_t error,
                                   nullptr) != SHELL_NETSTRING_OK) ||
         !valid_verdict(subcommand->verdict))
       invariant_failure("subcommand string outside the output buffer");
-    if (subcommand->requires_substitution_evaluation &&
-        !result->requires_substitution_evaluation)
+    if (((subcommand->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+         0) &&
+        !((result->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0))
       invariant_failure("subcommand dynamic-content flag lacks top-level flag");
     if (subcommand->has_dynamic_substitution_io &&
         !result->has_dynamic_substitution_io)
@@ -250,11 +248,17 @@ void validate_result(const sg_result_t *result, sg_error_t error,
         !valid_buffer_string(result->violations[i].detail, buffer, buffer_size))
       invariant_failure("violation string outside the output buffer");
 
-  if (result->verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-      !result->requires_substitution_evaluation)
-    invariant_failure("conditional allowance lacks a substitution dependency");
-  /* A conditional result can describe a dynamic route outside the evaluated
-   * prefix: short-circuiting need not publish the consumer as a result row. */
+  /* Requirements are Shellsplit's edge flags passed on: nothing else, and a
+   * subcommand carries only what a route delivers to it. */
+  if ((result->requirements & ~(SHELL_DEP_EDGE_FLAG_REQUIRED |
+                                SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)) != 0)
+    invariant_failure("result states a requirement Shellsplit does not");
+  for (uint32_t i = 0; i < result->subcommand_count; i++)
+    if ((result->subcommands[i].requirements &
+         ~SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0)
+      invariant_failure("subcommand states a requirement it cannot carry");
+  /* A requirement can describe a dynamic route outside the evaluated prefix:
+   * short-circuiting need not publish the consumer as a result row. */
   if (result->short_circuited && result->subcommand_count == 0)
     invariant_failure("short-circuit result has no evaluated prefix");
 }
@@ -293,8 +297,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       left.violation_count != right.violation_count ||
       left.violation_category_flags != right.violation_category_flags ||
       left.violation_type_flags != right.violation_type_flags ||
-      left.requires_substitution_evaluation !=
-          right.requires_substitution_evaluation ||
+      left.requirements != right.requirements ||
       left.has_dynamic_substitution_io != right.has_dynamic_substitution_io ||
       left.unresolved_expansion_flags != right.unresolved_expansion_flags ||
       left.violation_dropped_count != right.violation_dropped_count ||
@@ -315,9 +318,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
         (a.netargv_length != 0 &&
          memcmp(a.netargv, b.netargv, a.netargv_length) != 0) ||
         a.write_count != b.write_count || a.read_count != b.read_count ||
-        a.env_count != b.env_count ||
-        a.requires_substitution_evaluation !=
-            b.requires_substitution_evaluation ||
+        a.env_count != b.env_count || a.requirements != b.requirements ||
         a.has_dynamic_substitution_io != b.has_dynamic_substitution_io ||
         a.unresolved_expansion_flags != b.unresolved_expansion_flags ||
         a.violation_category_flags != b.violation_category_flags ||
@@ -532,7 +533,8 @@ void run_expansion_query_oracles() {
     }
     if (error != SG_OK || state.calls != 1 || result.subcommand_count == 0 ||
         result.unresolved_expansion_flags != 0 ||
-        result.requires_substitution_evaluation != fixture.inspection ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            fixture.inspection ||
         result.subcommands[0].has_dynamic_substitution_io != fixture.dynamic) {
       fprintf(stderr, "resolved expansion fixture: %s (error %d, calls %zu)\n",
               fixture.command, error, state.calls);
@@ -1106,7 +1108,7 @@ void run_semantic_reference_oracles() {
     sg_error_t error = sg_gate_evaluate(option_gate, source, strlen(source),
                                         buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.truncated ||
-        result.requires_substitution_evaluation ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ||
         result.has_dynamic_substitution_io)
       invariant_failure(
           "inherited boundary changed shell evaluation semantics");
@@ -1127,7 +1129,7 @@ void run_semantic_reference_oracles() {
     sg_error_t error = sg_gate_evaluate(option_gate, source, strlen(source),
                                         buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.truncated || result.subcommand_count != 1 ||
-        result.requires_substitution_evaluation ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) ||
         result.has_dynamic_substitution_io)
       invariant_failure("literal delimiter introduced executable children");
     validate_result(&result, error, buffer.data(), buffer.size());
@@ -1151,7 +1153,8 @@ void run_semantic_reference_oracles() {
                          buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.truncated ||
         result.has_dynamic_substitution_io != fixture.capture ||
-        result.requires_substitution_evaluation != fixture.capture)
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            fixture.capture)
       invariant_failure("cd command output/capture contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
@@ -1192,9 +1195,10 @@ void run_semantic_reference_oracles() {
         sg_gate_evaluate(option_gate, fixture.source, strlen(fixture.source),
                          buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.truncated || result.subcommand_count == 0 ||
-        result.requires_substitution_evaluation != fixture.capture ||
-        result.subcommands[0].requires_substitution_evaluation !=
-            fixture.capture)
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            fixture.capture ||
+        ((result.subcommands[0].requirements &
+          SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) != fixture.capture)
       invariant_failure("assignment diagnostic capture contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
@@ -1249,7 +1253,8 @@ void run_semantic_reference_oracles() {
                          buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.truncated || result.subcommand_count == 0 ||
         result.subcommands[0].env_count != fixture.environments ||
-        result.requires_substitution_evaluation != fixture.inspect)
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            fixture.inspect)
       invariant_failure("rejected assignment ENV effect mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
@@ -1286,12 +1291,13 @@ void run_semantic_reference_oracles() {
       writes += result.subcommands[command].write_count;
       reads += result.subcommands[command].read_count;
     }
-    if (fixture.reached
-            ? error != SG_ERR_UNMODELED
-            : error != SG_OK || result.truncated ||
-                  writes != fixture.opens + fixture.writes ||
-                  reads != fixture.reads ||
-                  result.requires_substitution_evaluation != fixture.shell_word)
+    if (fixture.reached ? error != SG_ERR_UNMODELED
+                        : error != SG_OK || result.truncated ||
+                              writes != fixture.opens + fixture.writes ||
+                              reads != fixture.reads ||
+                              ((result.requirements &
+                                SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+                                  fixture.shell_word)
       invariant_failure("static empty pathname setup contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
@@ -1315,14 +1321,17 @@ void run_semantic_reference_oracles() {
           (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
     }
     if (error != SG_OK || result.truncated ||
-        result.requires_substitution_evaluation != fixture.subst_eval ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            fixture.subst_eval ||
         result.has_dynamic_substitution_io != fixture.dynamic_io ||
         named_write != fixture.named_write) {
-      fprintf(stderr,
-              "expansion control fixture: %s (error %d, inspect %d, dynamic "
-              "%d, named write %d)\n",
-              fixture.source, error, result.requires_substitution_evaluation,
-              result.has_dynamic_substitution_io, named_write);
+      fprintf(
+          stderr,
+          "expansion control fixture: %s (error %d, inspect %d, dynamic "
+          "%d, named write %d)\n",
+          fixture.source, error,
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0),
+          result.has_dynamic_substitution_io, named_write);
       invariant_failure("expansion control timing contract mismatch");
     }
   }
@@ -1345,7 +1354,8 @@ void run_semantic_reference_oracles() {
       bool writer =
           fixture.active && (redirect ? fixture.redirect : fixture.writer);
       if (error != SG_OK || result.truncated ||
-          result.requires_substitution_evaluation != inspection ||
+          ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+              inspection ||
           (inspection && !result.has_dynamic_substitution_io) ||
           (!fixture.active && result.has_dynamic_substitution_io) ||
           ((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) !=
@@ -1871,7 +1881,7 @@ void run_semantic_reference_oracles() {
       {"time true | { time -p; }", timed_executables, 5, 1, SG_VERDICT_ALLOW,
        false, false},
       {"echo \"$(time true | time)\"", timed_executables, 5, 3,
-       SG_VERDICT_ALLOW_CONDITIONAL, true, true},
+       SG_VERDICT_ALLOW, true, true},
       {"cat && time", redirect_rules, 2, 1, SG_VERDICT_ALLOW, false, false},
       {"cat || time", redirect_rules, 2, 1, SG_VERDICT_ALLOW, false, false},
       {"cat && time; time", redirect_rules, 2, 1, SG_VERDICT_ALLOW, false,
@@ -1888,16 +1898,12 @@ void run_semantic_reference_oracles() {
       {"cat 0<<EOF\nwhile true; do :; done\nEOF\n", redirect_rules, 2, 1,
        SG_VERDICT_ALLOW, false, false},
       {"echo < prefix<(id)", composite, 3, 2, SG_VERDICT_ALLOW, false, false},
-      {"echo $(<prefix<(id))", composite, 3, 2, SG_VERDICT_ALLOW_CONDITIONAL,
-       true, true},
-      {"echo $(id)$(pwd)", echo_id_pwd, 3, 3, SG_VERDICT_ALLOW_CONDITIONAL,
-       true, true},
-      {"echo $(printf x $(id))", nested, 4, 3, SG_VERDICT_ALLOW_CONDITIONAL,
-       true, true},
+      {"echo $(<prefix<(id))", composite, 3, 2, SG_VERDICT_ALLOW, true, true},
+      {"echo $(id)$(pwd)", echo_id_pwd, 3, 3, SG_VERDICT_ALLOW, true, true},
+      {"echo $(printf x $(id))", nested, 4, 3, SG_VERDICT_ALLOW, true, true},
       {"cat <(sort <(cat /tmp/a))", process, 4, 3, SG_VERDICT_ALLOW, false,
        true},
-      {"echo \"$(id)\"", quoted, 2, 2, SG_VERDICT_ALLOW_CONDITIONAL, true,
-       true},
+      {"echo \"$(id)\"", quoted, 2, 2, SG_VERDICT_ALLOW, true, true},
   };
 
   for (const oracle_case &item : cases) {
@@ -1917,7 +1923,7 @@ void run_semantic_reference_oracles() {
                          buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.verdict != item.verdict ||
         result.subcommand_count != item.command_count ||
-        result.requires_substitution_evaluation !=
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
             item.requires_shell_word_evaluation ||
         result.has_dynamic_substitution_io !=
             item.has_dynamic_substitution_io) {
@@ -2089,7 +2095,8 @@ void run_semantic_reference_oracles() {
       named_fd_result.verdict != SG_VERDICT_ALLOW ||
       named_fd_result.subcommand_count != 3 ||
       !named_fd_result.has_dynamic_substitution_io ||
-      named_fd_result.requires_substitution_evaluation)
+      ((named_fd_result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+       0))
     invariant_failure("named-fd process-substitution topology oracle mismatch");
   sg_gate_free(named_fd_prefix_gate);
 
@@ -2232,10 +2239,10 @@ void run_semantic_reference_oracles() {
     sg_result_t result = {};
     if (sg_gate_evaluate(timed_gate, item.input, std::strlen(item.input),
                          buffer.data(), buffer.size(), &result) != SG_OK ||
-        result.verdict != (item.inspection ? SG_VERDICT_ALLOW_CONDITIONAL
-                                           : SG_VERDICT_ALLOW) ||
+        result.verdict != SG_VERDICT_ALLOW ||
         result.subcommand_count != item.count || result.truncated ||
-        result.requires_substitution_evaluation != item.inspection ||
+        ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
+            item.inspection ||
         result.has_dynamic_substitution_io != item.dynamic)
       invariant_failure("timing-stream semantic oracle mismatch");
     if (std::strstr(item.input, "/tmp/skipped") &&
@@ -2582,7 +2589,8 @@ void run_decoded_path_oracles() {
         (dynamic_result.subcommands[i].violation_type_flags &
          SG_VIOL_SUBST_SENSITIVE) != 0;
   if (dynamic_error != SG_OK || !dynamic_result.has_dynamic_substitution_io ||
-      dynamic_result.requires_substitution_evaluation ||
+      ((dynamic_result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) !=
+       0) ||
       !(dynamic_result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) ||
       !dynamic_owner) {
     invariant_failure("FD_OPEN dynamic-path oracle mismatch");
@@ -2854,8 +2862,7 @@ void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
   }
   if (item.depgraph_truncated) {
     if (error != SG_ERR_TRUNC || !result.truncated ||
-        result.verdict == SG_VERDICT_ALLOW ||
-        result.verdict == SG_VERDICT_ALLOW_CONDITIONAL)
+        result.verdict == SG_VERDICT_ALLOW)
       invariant_failure("generated substitution truncation contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
     sg_gate_free(gate);
@@ -2866,14 +2873,12 @@ void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
   for (uint32_t i = 0; i < result.subcommand_count; i++) {
     const sg_subcommand_result_t *subcommand = &result.subcommands[i];
     dynamic_consumers += subcommand->has_dynamic_substitution_io;
-    shell_word_consumers += subcommand->requires_substitution_evaluation;
+    shell_word_consumers += ((subcommand->requirements &
+                              SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0);
   }
-  sg_verdict_t expected_verdict = item.requires_substitution_evaluation
-                                      ? SG_VERDICT_ALLOW_CONDITIONAL
-                                      : SG_VERDICT_ALLOW;
-  if (error != SG_OK || result.verdict != expected_verdict ||
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != item.command_count ||
-      result.requires_substitution_evaluation !=
+      ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0) !=
           item.requires_substitution_evaluation ||
       result.has_dynamic_substitution_io !=
           (item.substitution_edge_count != 0) ||
@@ -2882,9 +2887,9 @@ void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
             "generated substitution result mismatch: %s (error=%d "
             "verdict=%d/%d commands=%u/%u shell-word=%d/%d dynamic=%d/%d "
             "consumers=%u/%u shell-word-consumers=%u)\n",
-            item.command.c_str(), error, result.verdict, expected_verdict,
+            item.command.c_str(), error, result.verdict, SG_VERDICT_ALLOW,
             result.subcommand_count, item.command_count,
-            result.requires_substitution_evaluation,
+            ((result.requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0),
             item.requires_substitution_evaluation,
             result.has_dynamic_substitution_io,
             item.substitution_edge_count != 0, dynamic_consumers,

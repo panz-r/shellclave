@@ -40,14 +40,16 @@ participate. The fields below identify incomplete coverage and unresolved
 argument, pathname or conditional-string expansions.
 
 First check the return code and completeness flags. Then interpret the verdict
-and any unresolved-expansion or substitution-inspection requirements. These
-conditions can occur together. Verdict names here abbreviate the public
+and any `requirements`, which Shellsplit states and the gate passes on
+unchanged, or unresolved-expansion information. These conditions can occur
+together; a verdict never absorbs them. Verdict names here abbreviate the public
 `SG_VERDICT_*` constants.
 
 A shell word is a syntactic unit whose expansion can produce zero or more
 arguments. Substitution inspection concerns bytes supplied by substitution
-routes and incorporated into a shell word. The flag
-`requires_substitution_evaluation` identifies that requirement. The broader
+routes and incorporated into a shell word. The `requirements` bit
+`SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD` identifies that requirement, and
+`SHELL_DEP_EDGE_FLAG_REQUIRED` a redirection open that must succeed. The broader
 `has_dynamic_substitution_io` flag also covers process-substitution streams and
 dynamic filenames. Those I/O roles are distinct from shell-word inspection;
 the receiving role determines how the application must inspect the data.
@@ -55,7 +57,7 @@ the receiving role determines how the application must inspect the data.
 | Result or condition | Application action |
 |---|---|
 | `SG_OK` and `ALLOW` | Check completeness, unresolved values, and application-specific requirements |
-| `ALLOW_CONDITIONAL` | Inspect generated shell-word content in its receiving context before deciding whether to execute; use Shellsplit's graph to locate the substitution routes |
+| Nonzero `requirements` | Satisfy each before executing: inspect generated shell-word content in its receiving context, and check or provide a required open. Use Shellsplit's graph to locate the routes and edges |
 | `DENY` | Refuse according to the explicit deny-policy match |
 | `REJECT` | Refuse execution because the source is malformed, uses unsupported semantics, or contains a feature prohibited by the gate configuration |
 | `UNDETERMINED` | Keep the execution decision pending until the reason for the indeterminate result has been resolved |
@@ -297,8 +299,10 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
   if (result->truncated || result->short_circuited)
     fputs("incomplete evaluation; reported ", output);
   fprintf(output, "argv policy %s", sg_verdict_name(result->verdict));
-  if (result->requires_substitution_evaluation)
+  if (result->requirements & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)
     fputs("; substitution inspection required", output);
+  if (result->requirements & SHELL_DEP_EDGE_FLAG_REQUIRED)
+    fputs("; redirection open required", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV)
     fputs("; unresolved argv", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH)
@@ -321,11 +325,11 @@ git status --short: argv policy ALLOW
 git reset --hard: argv policy DENY
 git log --oneline: argv policy UNDETERMINED
 if true; then :; fi: argv policy REJECT
-echo "$(whoami)": argv policy ALLOW_CONDITIONAL; substitution inspection required; unresolved argv; dynamic substitution I/O present
+echo "$(whoami)": argv policy ALLOW; substitution inspection required; unresolved argv; dynamic substitution I/O present
 echo "$VALUE": argv policy ALLOW; unresolved argv
 echo ok >"$OUT": argv policy ALLOW; unresolved pathname
 git status --short >report.txt: argv policy ALLOW
-echo "$(whoami)" >"$OUT": argv policy ALLOW_CONDITIONAL; substitution inspection required; unresolved argv; unresolved pathname; dynamic substitution I/O present
+echo "$(whoami)" >"$OUT": argv policy ALLOW; substitution inspection required; unresolved argv; unresolved pathname; dynamic substitution I/O present
 echo ok < <(whoami): argv policy ALLOW; dynamic substitution I/O present
 ```
 

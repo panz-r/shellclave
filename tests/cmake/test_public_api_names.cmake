@@ -105,6 +105,8 @@ set(removed_identifiers
   st_validate_netpattern
   sg_eval
   sg_eval_size_hint
+  SG_VERDICT_ALLOW_CONDITIONAL
+  requires_substitution_evaluation
   sg_gate_set_violation_config
   sg_subcmd_result_t
   sg_gate_set_anomaly_update_on_non_anomaly

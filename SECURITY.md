@@ -32,7 +32,6 @@ canonical-format, parse, and truncation failures.
 | Verdict | Meaning |
 |---|---|
 | `ALLOW` | Evaluated policy-evaluable commands match the allow policy, with no deny match |
-| `ALLOW_CONDITIONAL` | Policy matches carry an outstanding shell-word substitution inspection requirement |
 | `DENY` | At least one evaluated command matches the deny policy |
 | `REJECT` | Source is rejected by syntax, supported semantics, or the configured feature mask |
 | `UNDETERMINED` | Policy coverage or evaluation information is insufficient |
@@ -74,9 +73,13 @@ Applications requiring that certainty inspect Shellsplit's conditional truth
 and conservative continuations. A clean set of expansion flags establishes
 only that those expansion categories contain no reported unresolved values.
 
-`requires_substitution_evaluation` identifies runtime-generated shell-word
-content requiring inspection and evaluation in its receiving role. Resolve that
-obligation before treating a conditional match as executable authorization.
+`requirements` carries Shellsplit's edge flags unchanged. Its
+`SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD` bit identifies runtime-generated
+shell-word content requiring inspection and evaluation in its receiving role,
+and `SHELL_DEP_EDGE_FLAG_REQUIRED` a redirection open that must succeed, which
+the application checks or provides. A verdict holds only while these are
+satisfied, so an `ALLOW` with a nonzero `requirements` is not yet authorization.
+Resolve each requirement before treating a match as executable authorization.
 Keep the decision pending or request review when the required content and
 execution context cannot be established. Applications obtain
 the detailed routes directly from Shellsplit's dependency graph. A filename
