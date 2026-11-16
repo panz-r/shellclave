@@ -4129,7 +4129,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   if (cmd_len == 0 || memchr(cmd, '\0', cmd_len) != NULL)
     return SG_ERR_INVALID;
   memset(out, 0, sizeof(*out));
-  out->verdict = SG_VERDICT_ALLOW;
+  /* A result no exit has decided is not an authorization. */
+  out->verdict = SG_VERDICT_UNDETERMINED;
 
   buf_writer_t bw;
   bw_init(&bw, buf, buf_size);
@@ -4512,6 +4513,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     }
 
     sg_subcommand_result_t *sr = &out->subcommands[out->subcommand_count++];
+    /* The row is reached before its policies run, and a failure in between
+     * returns with it as is: it must not read as the zero value, ALLOW. */
+    sr->verdict = SG_VERDICT_UNDETERMINED;
     node_result_index[ni] = out->subcommand_count - 1;
     sr->unresolved_expansion_flags =
         node_expansion_flags[ni] | graph_index->group_expansions[ni];

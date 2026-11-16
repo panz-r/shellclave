@@ -7988,6 +7988,38 @@ expand_invalid_canonical(const shell_expand_word_request_t *request,
   return (shell_expand_status_t)2;
 }
 
+TEST(unevaluated_subcommand_row_authorizes_nothing) {
+  /* A word that expands to far more than its source outgrows the buffer sized
+   * from the source, after the first command has been evaluated. */
+  static char expansion[1600];
+  int used = snprintf(expansion, sizeof(expansion), "1500:");
+  memset(expansion + used, 'a', 1500);
+  memcpy(expansion + used + 1500, ",", 2);
+  sg_gate_t *gate = gate_with_rules((const char *[]){"echo *"}, 1);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_canonical_cstr, expansion));
+  static const char cmd[] = "echo ok; echo $LONG";
+  size_t hint = sg_gate_evaluate_size_hint(sizeof(cmd) - 1);
+  char *buffer = malloc(hint);
+  ASSERT_NOT_NULL(buffer);
+  sg_result_t result;
+  sg_error_t error =
+      sg_gate_evaluate(gate, cmd, sizeof(cmd) - 1, buffer, hint, &result);
+  ASSERT(error == SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
+  /* The first command was evaluated; the second was reached and cut short, so
+   * it must not read as allowed. */
+  ASSERT(result.subcommand_count == 2);
+  ASSERT(result.subcommands[0].matches &&
+         result.subcommands[0].verdict == SG_VERDICT_ALLOW);
+  ASSERT(!result.subcommands[1].matches);
+  ASSERT(result.subcommands[1].verdict == SG_VERDICT_UNDETERMINED);
+  free(buffer);
+  sg_gate_free(gate);
+}
+
 TEST(expansion_callback_matrix) {
   enum expansion_kind { EXPAND_NONE, EXPAND_VARIABLE, EXPAND_GLOB };
   static char home_context[] = "13:/context/home,";
@@ -16454,6 +16486,7 @@ int main(int argc, char **argv) {
   RUN(suggestion_streaming_buffer_contract);
 
   printf("\nExpansion callbacks:\n");
+  RUN(unevaluated_subcommand_row_authorizes_nothing);
   RUN(expansion_callback_matrix);
   RUN(expansion_query_semantics);
   RUN(expansion_rejection_precedes_callback);
