@@ -498,6 +498,18 @@ st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx) SHELL_NONNULL(1);
 st_policy_t *st_policy_new(st_policy_ctx_t *ctx) SHELL_NONNULL(1);
 void st_policy_free(st_policy_t *policy);
 
+/* One caller-owned pointer associated with the policy object itself, so an
+ * application can link a policy to its own record without a side table. It
+ * starts NULL, is never interpreted, dereferenced, freed or serialized
+ * (save, load, merge, diff and clear leave it alone), and does not follow a
+ * policy copied by any means. Setting it changes the object, so it needs the
+ * same caller synchronization as replacing an installed policy: set it
+ * before installing the policy, or while no gate or reader uses it. Evaluation
+ * never changes it. */
+void st_policy_set_user_data(st_policy_t *policy, void *user_data)
+    SHELL_NONNULL(1);
+void *st_policy_user_data(const st_policy_t *policy) SHELL_NONNULL(1);
+
 /* --- Pattern management --- */
 
 /* Convert between human CPL and canonical nested tagged netpatterns. CPL

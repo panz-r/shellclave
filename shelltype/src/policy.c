@@ -463,6 +463,7 @@ struct st_policy {
   size_t pattern_count;
   size_t children_count;
   policy_atomic_stats_t stats; /* Atomic runtime statistics */
+  void *user_data;             /* Caller's association; never interpreted */
 };
 
 /* --- RUNTIME MATCH MASK ---
@@ -1180,6 +1181,14 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx) {
   st_policy_ctx_retain(ctx);
 
   return policy;
+}
+
+void st_policy_set_user_data(st_policy_t *policy, void *user_data) {
+  policy->user_data = user_data;
+}
+
+void *st_policy_user_data(const st_policy_t *policy) {
+  return policy->user_data;
 }
 
 void st_policy_free(st_policy_t *policy) {
