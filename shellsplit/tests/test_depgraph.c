@@ -12868,7 +12868,6 @@ TEST(dialect_boundary_matrix) {
       "case value in x) echo x ;; esac",
       "for ((i=0; i<2; i++)); do echo $i; done",
       "for value in one two; do echo $value; done",
-      "if test -f file; then echo yes; else echo no; fi",
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
@@ -12908,9 +12907,165 @@ TEST(dialect_boundary_matrix) {
   pass_count++;
 }
 
+/* The lists of an `if` are alternatives. `then` runs on the condition's
+ * success and `else` on its failure, so the graph relates each list to the
+ * condition, never one list to the other. */
+TEST(if_lists_are_alternatives_of_the_condition) {
+  shell_dep_graph_t graph;
+  ASSERT(parse("if test -f file; then echo yes; else echo no; fi", &graph) ==
+         SHELL_DEP_OK);
+  ASSERT(graph.status == SHELL_DEP_STATUS_OK &&
+         shell_dep_graph_validate(&graph).valid);
+  int group = find_group(&graph, SHELL_GROUP_IF, UINT32_MAX);
+  int condition = find_cmd_tokens(&graph, "test", "-f");
+  int yes = find_cmd_tokens(&graph, "echo", "yes");
+  int no = find_cmd_tokens(&graph, "echo", "no");
+  ASSERT(group >= 0 && condition >= 0 && yes >= 0 && no >= 0);
+  ASSERT(has_edge(&graph, SHELL_EDGE_AND, (uint32_t)condition, (uint32_t)yes));
+  ASSERT(has_edge(&graph, SHELL_EDGE_OR, (uint32_t)condition, (uint32_t)no));
+  for (shell_dep_edge_type_t type = SHELL_EDGE_SEQ; type <= SHELL_EDGE_OR;
+       type++)
+    ASSERT(!has_edge(&graph, type, (uint32_t)yes, (uint32_t)no) &&
+           !has_edge(&graph, type, (uint32_t)no, (uint32_t)yes));
+
+  /* An `elif` condition runs on the failure of the one before it. */
+  ASSERT(parse("if a; then b; elif c; then d; else e; fi", &graph) ==
+         SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+  int a = find_cmd_tokens(&graph, "a", NULL),
+      b = find_cmd_tokens(&graph, "b", NULL),
+      c = find_cmd_tokens(&graph, "c", NULL),
+      d = find_cmd_tokens(&graph, "d", NULL),
+      e = find_cmd_tokens(&graph, "e", NULL);
+  ASSERT(a >= 0 && b >= 0 && c >= 0 && d >= 0 && e >= 0);
+  ASSERT(has_edge(&graph, SHELL_EDGE_AND, (uint32_t)a, (uint32_t)b));
+  ASSERT(has_edge(&graph, SHELL_EDGE_OR, (uint32_t)a, (uint32_t)c));
+  ASSERT(has_edge(&graph, SHELL_EDGE_AND, (uint32_t)c, (uint32_t)d));
+  ASSERT(has_edge(&graph, SHELL_EDGE_OR, (uint32_t)c, (uint32_t)e));
+  ASSERT(!has_edge(&graph, SHELL_EDGE_OR, (uint32_t)b, (uint32_t)c));
+
+  static const char *const accepted[] = {
+      "if true; then :; elif false; then :; fi",
+      "{ if test -f file; then echo yes; fi; }",
+      "echo ok; if true; then :; fi; echo after",
+      "if a; then if b; then c; else d; fi; else e; fi",
+      "if a | b; then c; fi | d",
+      "if a; then b; fi > out",
+      "! if a; then b; fi",
+  };
+  for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+    ASSERT(parse(accepted[i], &graph) == SHELL_DEP_OK);
+    ASSERT(graph.status == SHELL_DEP_STATUS_OK &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
+/* A descriptor the condition opened exists in the `then` list only: the
+ * failed condition did not open it. */
+TEST(if_lists_start_from_the_condition_outcomes) {
+  shell_dep_graph_t graph;
+  ASSERT(parse("if exec 3<file; then cat <&3; else cat <&3; fi", &graph) ==
+         SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+  uint32_t reads_then = 0, reads_else = 0;
+  int first = -1, second = -1;
+  for (uint32_t i = 0; i < graph.node_count; i++)
+    if (cmd_token_eq(&graph.nodes[i], 0, "cat")) {
+      if (first < 0)
+        first = (int)i;
+      else
+        second = (int)i;
+    }
+  ASSERT(first >= 0 && second >= 0);
+  for (uint32_t i = 0; i < graph.edge_count; i++) {
+    if (graph.edges[i].type != SHELL_EDGE_READ)
+      continue;
+    if (graph.nodes[graph.edges[i].from].type != SHELL_NODE_DOC)
+      continue;
+    reads_then += graph.edges[i].to == (uint32_t)first;
+    reads_else += graph.edges[i].to == (uint32_t)second;
+  }
+  ASSERT(reads_then == 1 && reads_else == 0);
+  pass_count++;
+}
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+/* The union memo may be too small for a source. The analysis then fails closed
+ * as truncation, like an exhausted pool, and never decides differently: a
+ * source with a smaller memo gets the answer of the full memo or ETRUNC. In
+ * particular it is never admitted where the full memo refuses it. The last
+ * two sources read fd 11 after seven opens and a named allocation: keeping
+ * the exhausted merges' versions apart would admit them (soundly, and
+ * correctly for Bash, given the opens succeed), which the full memo's merged
+ * version refuses. */
+TEST(union_memo_exhaustion_fails_closed) {
+  static const char *const sources[] = {
+      "if test -n \"$a\"; then exec 3<f; else exec 4<g; fi; cat <&3",
+      "if exec 3<a; then if exec 4<b; then cat <&4; fi; cat <&3; fi",
+      "exec 3<a; { exec 4<b; cat <&3; } || { exec 4<c; cat <&4; }",
+      "exec 3<>/dev/null 4<>/dev/null 5<>/dev/null 6<>/dev/null 7<>/dev/null "
+      "8<>/dev/null 9<>/dev/null 10<&- 11<&-; read -u11 value {fd}</dev/null",
+      "exec 3<>/dev/null 4<>/dev/null 5<>/dev/null 6<>/dev/null 7<>/dev/null "
+      "8<>/dev/null 9<>/dev/null 10<&- 11<&-; : {fd}<<<payload; read -u11 v",
+      /* Named descriptors: the merge compares maps of overrides. */
+      "if test -n \"$c\"; then exec {a}>f; else exec {b}>g; fi; cat <&$a",
+      "if test -n \"$c\"; then exec {a}>f {b}>g; else exec {b}>h; fi; cat <&$b",
+      "exec {a}>f; if test -n \"$c\"; then exec {b}>g; fi; exec {c}>h; cat "
+      "<&$a",
+  };
+  static const uint32_t sizes[] = {2, 3, 8, 16, 64, 256, 1024};
+  bool refused = false;
+  for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+    static shell_dep_graph_t full, small;
+    shellsplit_test_set_union_memo_limit(0);
+    shell_dep_error_t expected = parse(sources[i], &full);
+    for (size_t j = 0; j < sizeof(sizes) / sizeof(sizes[0]); j++) {
+      shellsplit_test_set_union_memo_limit(sizes[j]);
+      shell_dep_error_t got = parse(sources[i], &small);
+      shellsplit_test_set_union_memo_limit(0);
+      ASSERT(got == expected || got == SHELL_DEP_ETRUNC);
+      refused |= got != expected;
+      if (got != expected || got != SHELL_DEP_OK)
+        continue;
+      ASSERT(small.node_count == full.node_count &&
+             small.edge_count == full.edge_count);
+      for (uint32_t e = 0; e < full.edge_count; e++)
+        ASSERT(small.edges[e].from == full.edges[e].from &&
+               small.edges[e].to == full.edges[e].to &&
+               small.edges[e].type == full.edges[e].type &&
+               small.edges[e].flags == full.edges[e].flags &&
+               small.edges[e].source_fd == full.edges[e].source_fd &&
+               small.edges[e].target_fd == full.edges[e].target_fd);
+    }
+  }
+  /* The sizes include ones no analysis fits in. */
+  ASSERT(refused);
+  pass_count++;
+}
+#endif
+
+/* A source with more compounds than the parser keeps ranges for cannot be
+ * given a graph: the parser disables the compounds it cut off, and each needs
+ * an endpoint. It reports truncation, as it does for too many commands. */
+TEST(compounds_past_the_parser_capacity_truncate) {
+  static const char *const forms[] = {"{ c%u; echo a; }; ",
+                                      "if c%u; then echo a; else echo b; fi; "};
+  for (size_t form = 0; form < sizeof(forms) / sizeof(forms[0]); form++) {
+    char source[8192];
+    size_t length = 0;
+    for (unsigned i = 0; i < 100; i++)
+      length += (size_t)snprintf(source + length, sizeof(source) - length,
+                                 forms[form], i);
+    shell_dep_graph_t graph;
+    ASSERT(parse(source, &graph) == SHELL_DEP_ETRUNC);
+    ASSERT(graph.status & SHELL_DEP_STATUS_TRUNCATED);
+  }
+  pass_count++;
+}
+
 TEST(nested_parse_error_matrix) {
   static const char *cases[] = {
-      "{ if test -f file; then echo yes; fi; }",
       "( while read line; do echo $line; done )",
       "echo $(until test -f file; do sleep 1; done)",
       "cat <(for value in one; do echo $value; done)",
@@ -15352,10 +15507,10 @@ TEST(unreachable_stage_effects_and_syntax) {
            shellsplit_test_graph_equal(&supplied, &graph));
   }
   static const char *const invalid[] = {
-      "false && echo $(if true; then echo bad; fi)",
+      "false && echo $(while true; do echo bad; done)",
       "false && : > >(while true; do echo bad; done)",
       "false && { echo $(echo unfinished; }",
-      "false && : <<EOF\n$(if true; then echo bad; fi)\nEOF\n",
+      "false && : <<EOF\n$(while true; do echo bad; done)\nEOF\n",
   };
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     shell_dep_graph_t graph = {0};
@@ -15891,7 +16046,7 @@ TEST(skipped_duplication_operand_syntax) {
   }
   static const char *const invalid[] = {
       "false && : >&$(echo \"unfinished)",
-      "false && { :; } 2>&$(if true; then echo bad; fi)",
+      "false && { :; } 2>&$(while true; do echo bad; done)",
       ": >&$(printf 1)",
       "{ :; } 2>&$(printf 1)",
   };
@@ -19650,6 +19805,12 @@ int main(int argc, char **argv) {
   RUN(parse_error);
   RUN(ansi_nul_source_boundary);
   RUN(dialect_boundary_matrix);
+  RUN(if_lists_are_alternatives_of_the_condition);
+  RUN(if_lists_start_from_the_condition_outcomes);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  RUN(union_memo_exhaustion_fails_closed);
+#endif
+  RUN(compounds_past_the_parser_capacity_truncate);
   RUN(nested_parse_error_matrix);
   RUN(limit_matrix);
   RUN(nested_limit_cross_product);

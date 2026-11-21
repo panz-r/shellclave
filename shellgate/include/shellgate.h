@@ -57,6 +57,8 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 8)) != 0,
                  "CONDITIONALS bit mismatch");
 SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
                  "CASE bit mismatch");
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 19)) == 0,
+                 "IF is modeled and allowed by default");
 #undef SG_STATIC_ASSERT
 
 /* Baseline capacity for diagnostic-only buffers. A successful evaluation also

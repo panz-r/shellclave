@@ -30,6 +30,26 @@
  * its storage. Interning is expected O(1): node contents are mixed with a
  * 64-bit finalizer before linear probing.
  *
+ * Union. union() combines two maps key by key through a caller function and
+ * is memoized on node-id pairs. It reads only node ids and key/value pairs, so
+ * the combination of two subtrees cannot depend on anything around them. Each
+ * result r = a ⊔ b also records r ⊔ a = r and r ⊔ b = r (absorption), the
+ * memo being keyed on the ordered pair, since the join need not commute, so
+ * joining an operand into a result that already contains it costs O(1) at the
+ * highest node where that holds. Over a sequence of unions the number of
+ * fresh node pairs, each costing O(1), is what the cost proofs count. The
+ * memo only reuses work: within one union a node pair occurs at most once,
+ * since nodes carry absolute key prefixes, so a union without it costs the
+ * node pairs on which the operands differ, which is the cost of walking their
+ * differing keys. When the table is full it is cleared and filling resumes. A
+ * clear costs O(size) after at least size / 2 insertions, so O(1) amortized,
+ * and it changes no result; the worst case is that diff cost. sweep() and
+ * rollback() clear it too, since both recycle ids. The memo is keyed on node
+ * ids alone, so every union on one pool must use, for one tag, the same
+ * combining function. A function whose result depends on a small amount of
+ * context beyond the two subtrees takes that context as its tag; unions with
+ * different tags share the table without ever sharing an entry.
+ *
  * Failure. An operation that would exceed capacity returns false and leaves
  * every published root valid; nodes it already created stay interned and are
  * reclaimed by rollback() or a collection. Callers that must not fail
@@ -39,6 +59,13 @@
 /* Tests may count structural steps to check the cost bounds above. */
 #ifndef SHELL_PMAP_WORK
 #define SHELL_PMAP_WORK() ((void)0)
+#endif
+/* A union step that computed a node pair, and one answered from the memo. */
+#ifndef SHELL_PMAP_FRESH
+#define SHELL_PMAP_FRESH() ((void)0)
+#endif
+#ifndef SHELL_PMAP_MEMO_HIT
+#define SHELL_PMAP_MEMO_HIT() ((void)0)
 #endif
 
 enum {
@@ -66,8 +93,28 @@ typedef struct {
 _Static_assert(sizeof(shell_pmap_node_t) == 14,
                "trie nodes carry no alignment padding");
 
+/* One memoized union: the unordered pair {low, high}, the combining
+ * function's tag and its result. A slot is used when its epoch is the pool's;
+ * low is 0 for a union with the empty map. */
+typedef struct {
+  uint16_t low, high, result;
+  uint8_t tag;
+} shell_pmap_memo_entry_t;
+/* The memo is divided into blocks of this many entries. A directory holds one
+ * epoch byte per block: a block whose byte is not the pool's memo epoch is
+ * empty, whatever its memory holds, and is zeroed when first written. So a
+ * memo needs no initialization of its table, and clearing it is an epoch
+ * change. */
+enum { SHELL_PMAP_MEMO_BLOCK = 128 };
+
 typedef struct {
   shell_pmap_node_t *nodes;
+  /* Memo of unions, or NULL when none is attached; see shell_pmap_attach_memo.
+   * Cleared by every sweep and rollback. */
+  shell_pmap_memo_entry_t *memo;
+  uint8_t *memo_blocks;
+  uint32_t memo_size, memo_used;
+  uint8_t memo_epoch;
   /* Intern table: node ids, 0 for an empty slot. Its size is a power of two
    * at least twice capacity, so probes stay short and always terminate. */
   uint16_t *table;
@@ -94,6 +141,45 @@ static SHELL_NONNULL(1, 2, 3, 4) inline void shell_pmap_init(
                               .table_mask = table_size - 1,
                               .reuse = true};
   memset(table, 0, table_size * sizeof(*table));
+}
+
+static SHELL_NONNULL(1) inline void shell_pmap_memo_clear(
+    shell_pmap_pool_t *pool) {
+  if (pool->memo && ++pool->memo_epoch == 0) {
+    /* The epoch wrapped: blocks of 255 clears ago look current again. */
+    memset(pool->memo_blocks, 0,
+           (size_t)((pool->memo_size + SHELL_PMAP_MEMO_BLOCK - 1) /
+                    SHELL_PMAP_MEMO_BLOCK));
+    pool->memo_epoch = 1;
+  }
+  pool->memo_used = 0;
+}
+
+/* Give the pool a union memo of size entries, any size, with a directory of
+ * (size + SHELL_PMAP_MEMO_BLOCK - 1) / SHELL_PMAP_MEMO_BLOCK bytes. Only the
+ * directory is initialized; size is at least 2. Every union and fold on the
+ * pool shares the memo. It holds at most size / 2 entries and is cleared only
+ * by a sweep or rollback. A union or fold that needs an entry once it is full
+ * fails, like one that needs a node once the pool is full, so the pairs
+ * computed between two clears, and with them the work, never exceed size / 2
+ * however the unions are chosen. How much a sequence of unions needs is a
+ * property of its callers: size is the largest sequence that is answered. */
+static SHELL_NONNULL(1, 2, 4) inline void shell_pmap_attach_memo(
+    shell_pmap_pool_t *pool, shell_pmap_memo_entry_t *entries, uint32_t size,
+    uint8_t *blocks) {
+  pool->memo = entries;
+  pool->memo_blocks = blocks;
+  pool->memo_size = size;
+  memset(blocks, 0,
+         (size_t)((size + SHELL_PMAP_MEMO_BLOCK - 1) / SHELL_PMAP_MEMO_BLOCK));
+  pool->memo_epoch = 1;
+  pool->memo_used = 0;
+}
+
+/* Whether the memo slot is in a block written since the last clear. */
+static inline bool shell_pmap_memo_block_live(const shell_pmap_pool_t *pool,
+                                              uint32_t slot) {
+  return pool->memo_blocks[slot / SHELL_PMAP_MEMO_BLOCK] == pool->memo_epoch;
 }
 
 static SHELL_NONNULL(1) inline uint32_t
@@ -525,6 +611,7 @@ static SHELL_NONNULL(1) inline void shell_pmap_sweep(shell_pmap_pool_t *pool) {
       pool->free_count++;
     }
   pool->allocations = 0;
+  shell_pmap_memo_clear(pool);
 }
 
 /* Release every node above count. Requires reuse disabled since count was
@@ -536,6 +623,317 @@ static SHELL_NONNULL(1) inline void shell_pmap_rollback(shell_pmap_pool_t *pool,
       shell_pmap_unintern(pool, pool->count);
     pool->count--;
   }
+  shell_pmap_memo_clear(pool);
+}
+
+/* Union of two maps. fn(context, key, left, right) gives the value of key in
+ * the result, 0 for no entry; left or right is 0 where that map has no entry
+ * for key. The result is the left map's, extended: fn need not be symmetric,
+ * so a representation the left operand chooses is kept. It must be
+ * associative and idempotent, with fn(k, v, v) == v, and absorbing, so that
+ * with r = fn(k, a, b) both fn(k, r, a) and fn(k, r, b) equal r. Both maps
+ * must carry summary 0 (results do). If absent_neutral, fn(k, v, 0) == v, so a
+ * subtree present on one side only is shared unchanged instead of visited.
+ * Needs a memo. Returns false when the pool or the memo is full; published
+ * roots stay valid. tag names the combining function's context: results are
+ * shared between unions only under the same tag. */
+typedef uint32_t (*shell_pmap_union_fn)(void *context, uint64_t key,
+                                        uint32_t left, uint32_t right);
+
+typedef struct {
+  shell_pmap_pool_t *pool;
+  shell_pmap_union_fn fn;
+  void *context;
+  bool absent_neutral;
+  /* A fold: fn gives bits for each key the maps differ at, and the result is
+   * their OR over all such keys, 0 where the maps agree. No node is made. */
+  bool bits;
+  /* Without the memo every pair is computed, so fn may depend on more than its
+   * arguments for the one call. */
+  bool nomemo;
+  uint8_t tag;
+} shell_pmap_union_t;
+
+/* The home slot of a pair: the mixed key scaled into the table, so a table
+ * may have any size. */
+static inline uint32_t shell_pmap_memo_home(const shell_pmap_pool_t *pool,
+                                            uint32_t low, uint32_t high,
+                                            uint8_t tag) {
+  uint32_t mixed = (uint32_t)shell_pmap_mix((uint64_t)tag << 32 |
+                                            (uint64_t)low << 16 | high);
+  return (uint32_t)(((uint64_t)mixed * pool->memo_size) >> 32);
+}
+
+static inline uint32_t shell_pmap_memo_next(const shell_pmap_pool_t *pool,
+                                            uint32_t slot) {
+  return slot + 1 == pool->memo_size ? 0 : slot + 1;
+}
+
+/* The memo is keyed on the ordered pair: orientation is the top bit of the
+ * entry's tag, so tags are below 0x80. */
+static SHELL_NONNULL(1, 5) inline bool shell_pmap_memo_find(
+    const shell_pmap_pool_t *pool, uint32_t a, uint32_t b, uint8_t tag,
+    uint32_t *result) {
+  uint32_t low = a < b ? a : b, high = a < b ? b : a;
+  if (a > b)
+    tag |= 0x80;
+  uint32_t slot = shell_pmap_memo_home(pool, low, high, tag);
+  for (const shell_pmap_memo_entry_t *entry;
+       shell_pmap_memo_block_live(pool, slot) &&
+       (entry = &pool->memo[slot])->high;
+       slot = shell_pmap_memo_next(pool, slot))
+    if (entry->low == low && entry->high == high && entry->tag == tag) {
+      *result = entry->result;
+      return true;
+    }
+  return false;
+}
+
+/* Record a result. False when the memo is full: it is cleared only by a
+ * sweep or rollback, so the unions between two of them compute at most
+ * memo_size / 2 pairs, and a union that would compute more fails. */
+static SHELL_NONNULL(1) inline bool shell_pmap_memo_put(shell_pmap_pool_t *pool,
+                                                        uint32_t a, uint32_t b,
+                                                        uint8_t tag,
+                                                        uint32_t result) {
+  uint32_t low = a < b ? a : b, high = a < b ? b : a;
+  if (a > b)
+    tag |= 0x80;
+  uint32_t home = shell_pmap_memo_home(pool, low, high, tag);
+  uint32_t slot = home;
+  for (const shell_pmap_memo_entry_t *entry;
+       shell_pmap_memo_block_live(pool, slot) &&
+       (entry = &pool->memo[slot])->high;
+       slot = shell_pmap_memo_next(pool, slot))
+    if (entry->low == low && entry->high == high && entry->tag == tag)
+      return true;
+  if ((pool->memo_used + 1) * 2 > pool->memo_size) {
+    return false;
+  }
+  if (!shell_pmap_memo_block_live(pool, slot)) {
+    uint32_t block = slot / SHELL_PMAP_MEMO_BLOCK;
+    uint32_t end = (block + 1) * SHELL_PMAP_MEMO_BLOCK;
+    memset(&pool->memo[block * SHELL_PMAP_MEMO_BLOCK], 0,
+           (size_t)((end < pool->memo_size ? end : pool->memo_size) -
+                    block * SHELL_PMAP_MEMO_BLOCK) *
+               sizeof(*pool->memo));
+    pool->memo_blocks[block] = pool->memo_epoch;
+  }
+  pool->memo[slot] = (shell_pmap_memo_entry_t){(uint16_t)low, (uint16_t)high,
+                                               (uint16_t)result, tag};
+  pool->memo_used++;
+  return true;
+}
+
+static SHELL_NONNULL(1, 4) bool shell_pmap_union_pair(
+    const shell_pmap_union_t *u, uint32_t left, uint32_t right, uint32_t *out);
+
+static inline bool shell_pmap_union_find(const shell_pmap_union_t *u,
+                                         uint32_t left, uint32_t right,
+                                         uint32_t *result) {
+  return !u->nomemo &&
+         shell_pmap_memo_find(u->pool, left, right, u->tag, result);
+}
+
+static inline bool shell_pmap_union_put(const shell_pmap_union_t *u,
+                                        uint32_t left, uint32_t right,
+                                        uint32_t result) {
+  return u->nomemo || shell_pmap_memo_put(u->pool, left, right, u->tag, result);
+}
+
+/* A trie only one side has: its keys joined with the absent side, which is the
+ * right operand when the trie is the left one. */
+static SHELL_NONNULL(1,
+                     4) bool shell_pmap_union_side(const shell_pmap_union_t *u,
+                                                   uint32_t id, bool on_left,
+                                                   uint32_t *out) {
+  SHELL_PMAP_WORK();
+  shell_pmap_pool_t *pool = u->pool;
+  if (!id || u->absent_neutral) {
+    *out = id;
+    return true;
+  }
+  uint32_t cached;
+  if (shell_pmap_union_find(u, on_left ? id : 0, on_left ? 0 : id, &cached)) {
+    SHELL_PMAP_MEMO_HIT();
+    *out = cached;
+    return true;
+  }
+  SHELL_PMAP_FRESH();
+  shell_pmap_node_t node = *shell_pmap_node(pool, id);
+  uint32_t result;
+  if (node.bit == SHELL_PMAP_LEAF) {
+    uint32_t value = on_left ? u->fn(u->context, node.key, node.u.value, 0)
+                             : u->fn(u->context, node.key, 0, node.u.value);
+    result = u->bits ? value
+             : value ? shell_pmap_leaf(pool, node.key, value, 0)
+                     : 0;
+    if (!u->bits && value && !result)
+      return false;
+  } else {
+    uint32_t left, right;
+    if (!shell_pmap_union_side(u, node.u.child.left, on_left, &left) ||
+        !shell_pmap_union_side(u, node.u.child.right, on_left, &right))
+      return false;
+    result = u->bits ? left | right
+                     : shell_pmap_branch(pool, node.key, node.bit, left, right);
+    if (!u->bits && left && right && !result)
+      return false;
+  }
+  /* The result absorbs the trie, and, joined with an absent side again, is
+   * itself: (x ⊔ absent) ⊔ absent = x ⊔ absent. */
+  if (!shell_pmap_union_put(u, on_left ? id : 0, on_left ? 0 : id, result))
+    return false;
+  if (!u->bits && result && result != id &&
+      !(shell_pmap_union_put(u, result, id, result) &&
+        shell_pmap_union_put(u, on_left ? result : 0, on_left ? 0 : result,
+                             result)))
+    return false;
+  *out = result;
+  return true;
+}
+
+static SHELL_NONNULL(1, 4) bool shell_pmap_union_pair(
+    const shell_pmap_union_t *u, uint32_t left, uint32_t right, uint32_t *out) {
+  SHELL_PMAP_WORK();
+  shell_pmap_pool_t *pool = u->pool;
+  if (left == right) {
+    *out = u->bits ? 0 : left;
+    return true;
+  }
+  if (!left)
+    return shell_pmap_union_side(u, right, false, out);
+  if (!right)
+    return shell_pmap_union_side(u, left, true, out);
+  uint32_t cached;
+  if (shell_pmap_union_find(u, left, right, &cached)) {
+    SHELL_PMAP_MEMO_HIT();
+    *out = cached;
+    return true;
+  }
+  SHELL_PMAP_FRESH();
+  uint64_t lp, rp;
+  int lb = shell_pmap_span(pool, left, &lp);
+  int rb = shell_pmap_span(pool, right, &rp);
+  shell_pmap_node_t ln = *shell_pmap_node(pool, left);
+  shell_pmap_node_t rn = *shell_pmap_node(pool, right);
+  uint32_t result, one, other;
+  bool built = true;
+  if (lb < 0 && rb < 0 && lp == rp) {
+    uint32_t value = u->fn(u->context, lp, ln.u.value, rn.u.value);
+    result = u->bits ? value : value ? shell_pmap_leaf(pool, lp, value, 0) : 0;
+    built = u->bits || !value || result;
+  } else if (lb == rb && lp == rp) {
+    if (!shell_pmap_union_pair(u, ln.u.child.left, rn.u.child.left, &one) ||
+        !shell_pmap_union_pair(u, ln.u.child.right, rn.u.child.right, &other))
+      return false;
+    result = u->bits ? one | other
+                     : shell_pmap_branch(pool, lp, (unsigned)lb, one, other);
+    built = u->bits || !(one && other) || result;
+  } else if (lb > rb && shell_pmap_mask(rp, (unsigned)lb) == lp) {
+    /* right lies within one child of left; left's other child is left only. */
+    bool within_right = (rp >> (unsigned)lb) & 1;
+    if (!shell_pmap_union_side(
+            u, within_right ? ln.u.child.left : ln.u.child.right, true, &one) ||
+        !shell_pmap_union_pair(
+            u, within_right ? ln.u.child.right : ln.u.child.left, right,
+            &other))
+      return false;
+    result = u->bits ? one | other
+             : within_right
+                 ? shell_pmap_branch(pool, lp, (unsigned)lb, one, other)
+                 : shell_pmap_branch(pool, lp, (unsigned)lb, other, one);
+    built = u->bits || !(one && other) || result;
+  } else if (rb > lb && shell_pmap_mask(lp, (unsigned)rb) == rp) {
+    bool within_right = (lp >> (unsigned)rb) & 1;
+    if (!shell_pmap_union_side(
+            u, within_right ? rn.u.child.left : rn.u.child.right, false,
+            &one) ||
+        !shell_pmap_union_pair(
+            u, left, within_right ? rn.u.child.right : rn.u.child.left, &other))
+      return false;
+    result = u->bits ? one | other
+             : within_right
+                 ? shell_pmap_branch(pool, rp, (unsigned)rb, one, other)
+                 : shell_pmap_branch(pool, rp, (unsigned)rb, other, one);
+    built = u->bits || !(one && other) || result;
+  } else {
+    /* Disjoint key ranges: each side's keys are joined with an absent side. */
+    if (!shell_pmap_union_side(u, left, true, &one) ||
+        !shell_pmap_union_side(u, right, false, &other))
+      return false;
+    if (u->bits) {
+      result = one | other;
+    } else if (!one || !other) {
+      result = one ? one : other;
+    } else {
+      uint64_t op, tp;
+      (void)shell_pmap_span(pool, one, &op);
+      (void)shell_pmap_span(pool, other, &tp);
+      result = shell_pmap_join(pool, op, one, tp, other);
+      built = result != 0;
+    }
+  }
+  if (!built)
+    return false;
+  /* The result absorbs both operands: r ⊔ a = r and r ⊔ b = r. */
+  if (!shell_pmap_union_put(u, left, right, result) ||
+      (!u->bits && result != left &&
+       !shell_pmap_union_put(u, result, left, result)) ||
+      (!u->bits && result != right &&
+       !shell_pmap_union_put(u, result, right, result)))
+    return false;
+  *out = result;
+  return true;
+}
+
+static SHELL_NONNULL(1, 4, 6) inline bool shell_pmap_union(
+    shell_pmap_pool_t *pool, uint32_t left, uint32_t right,
+    shell_pmap_union_fn fn, void *context, uint32_t *result,
+    bool absent_neutral, uint8_t tag) {
+  shell_pmap_union_t u = {pool, fn, context, absent_neutral, false, false, tag};
+  return shell_pmap_union_pair(&u, left, right, result);
+}
+
+/* The OR of fn(context, key, left, right) over the keys at which the two maps
+ * differ, with the same convention for a key one map lacks, and 0 where they
+ * agree. fn gives at most 16 bits, the width of a memoized result. Makes no
+ * node. With memoize, fn must be a function of its arguments alone for one
+ * tag, and the cost is that of a union: the node pairs on which the maps
+ * differ, less the pairs the memo already holds. Without it, fn may read
+ * whatever it needs and the cost is those node pairs. A fold creates no node;
+ * with memoize it fails, leaving *bits unspecified, when the memo is full. */
+static SHELL_NONNULL(1, 4, 6) inline bool shell_pmap_fold(
+    shell_pmap_pool_t *pool, uint32_t left, uint32_t right,
+    shell_pmap_union_fn fn, void *context, uint32_t *bits, bool memoize,
+    uint8_t tag) {
+  shell_pmap_union_t u = {pool, fn, context, false, true, !memoize, tag};
+  return shell_pmap_union_pair(&u, left, right, bits);
+}
+
+/* Whether left and right differ in at most limit keys; *count is the number
+ * seen, at most limit + 1, since the walk stops there. Costs
+ * O((limit + 1)·W), so candidates can be compared without paying for a long
+ * difference. */
+typedef struct {
+  uint32_t count, limit;
+} shell_pmap_bounded_t;
+
+static bool shell_pmap_bounded_visit(void *context, uint64_t key,
+                                     shell_pmap_sides_t present, uint32_t left,
+                                     uint32_t right) {
+  (void)key, (void)present, (void)left, (void)right;
+  shell_pmap_bounded_t *bounded = context;
+  return ++bounded->count <= bounded->limit;
+}
+
+static SHELL_NONNULL(1, 5) inline bool shell_pmap_diff_within(
+    const shell_pmap_pool_t *pool, uint32_t left, uint32_t right,
+    uint32_t limit, uint32_t *count) {
+  shell_pmap_bounded_t bounded = {0, limit};
+  (void)shell_pmap_diff(pool, left, right, shell_pmap_bounded_visit, &bounded);
+  *count = bounded.count;
+  return bounded.count <= limit;
 }
 
 #endif

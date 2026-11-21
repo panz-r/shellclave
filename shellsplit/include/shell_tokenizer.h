@@ -155,7 +155,20 @@ typedef enum {
   SHELL_GROUP_NONE = 0,
   SHELL_GROUP_BRACE = 1 << 0,
   SHELL_GROUP_SUBSHELL = 1 << 1,
+  /* `if` ... `fi`: its span is the whole construct, from the `if` word through
+   * the `fi` word. The keywords belong to no range. */
+  SHELL_GROUP_IF = 1 << 2,
 } shell_group_kind_t;
+
+/* The list of an `if` group that a range or a group belongs to, when that `if`
+ * is its immediately enclosing group. A range or group with another kind of
+ * group around it, or none, has no role. */
+typedef enum {
+  SHELL_RANGE_ROLE_NONE = 0,
+  SHELL_RANGE_ROLE_CONDITION, /* after `if` or `elif`: the list to test */
+  SHELL_RANGE_ROLE_THEN,      /* after `then`: runs when its condition held */
+  SHELL_RANGE_ROLE_ELSE,      /* after `else`: runs when no condition held */
+} shell_range_role_t;
 
 /**
  * Subcommand features - what's inside the subcommand.
@@ -184,7 +197,7 @@ typedef enum {
   SHELL_FEAT_HERESTRING = 1 << 5,       // <<< here-string (in subcommand)
   SHELL_FEAT_PROCESS_SUB = 1 << 6,      // <(cmd), >(cmd)
   SHELL_FEAT_LOOPS = 1 << 7,            // while, for, until loops
-  SHELL_FEAT_CONDITIONALS = 1 << 8,     // if/then/elif/else/fi and [[...]]
+  SHELL_FEAT_CONDITIONALS = 1 << 8,     // [[...]] conditional commands
   SHELL_FEAT_CASE = 1 << 9,             // case/esac statements
   SHELL_FEAT_SUBSHELL_FILE = 1 << 10,   // $(<file) - read from file
   SHELL_FEAT_PIPELINE = 1 << 11,        // literal | or |& pipeline construct
@@ -195,6 +208,7 @@ typedef enum {
   SHELL_FEAT_ARRAY = UINT32_C(1) << 16,    // Bash array assignment/reference
   SHELL_FEAT_NAMED_FD = UINT32_C(1) << 17, // Bash {name} redirect
   SHELL_FEAT_COMBINED_REDIRECT = UINT32_C(1) << 18, // Bash &>/&>>
+  SHELL_FEAT_IF = UINT32_C(1) << 19,                // if/then/elif/else/fi
 } shell_cmd_features_t;
 
 /**
@@ -261,6 +275,7 @@ typedef struct {
   bool has_process_sub;
   bool has_loops;
   bool has_conditionals;
+  bool has_if;
   bool has_case;
   bool has_subshell_file;
   bool has_pipeline;
@@ -308,6 +323,12 @@ typedef struct {
   uint32_t features;       // shell_cmd_features_t
   uint16_t group_depth;    // Enclosing command-group nesting depth
   uint8_t group_kinds;     // shell_group_kind_t bitset of enclosing groups
+  /* The list of the `if` group immediately enclosing this range
+   * (shell_range_role_t), and its arm: 0 for `if` ... `then`, 1 for the first
+   * `elif`, and so on. A `then` shares its condition's arm; `else` takes the
+   * next arm index. Both are 0 when no `if` group immediately encloses it. */
+  uint8_t role;
+  uint8_t arm;
 } shell_range_t;
 
 /** A complete compound-command half-open span [start, end), including the
@@ -325,7 +346,11 @@ typedef struct {
   uint16_t first_command;
   uint16_t command_count;
   uint16_t parent;
-  uint8_t kind;       // Exactly one shell_group_kind_t value
+  uint8_t kind; // Exactly one shell_group_kind_t value
+  /* The list and arm of the `if` group that is this group's parent, as for
+   * shell_range_t.role and .arm. */
+  uint8_t role;
+  uint8_t arm;
   uint16_t modifiers; // shell_cmd_modifier_t on this compound pipeline member
   uint32_t pipeline_negation_count;
   uint8_t pipeline_time_mode; // shell_pipeline_time_mode_t

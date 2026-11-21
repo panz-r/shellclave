@@ -67,7 +67,7 @@ static SHELL_NONNULL(1,
   dep_route_state_t result = {0};
   dep_route_iterator_t versions = dep_route_iterator(state);
   uint32_t root;
-  bool ready = false, split = false;
+  bool ready = false;
   while (dep_route_next(&versions, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
     dep_route_set_t marker = dep_variable_state(&one, journal);
@@ -85,7 +85,6 @@ static SHELL_NONNULL(1,
                 &selected, journal, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
                 DEP_FD_ACCESS_EFFECT_STATE, assumed))
           return false;
-        split = true;
       }
       if (!ready)
         result = selected;
@@ -95,7 +94,6 @@ static SHELL_NONNULL(1,
     }
   }
   dep_route_state_inherit(&result, state);
-  result.correlated |= split;
   *state = result;
   return true;
 }

@@ -4199,7 +4199,7 @@ static void test_public_source_validation_boundary(void) {
       "printf $(printf $(while true; do :; done))",
       "printf $(printf ok) >",
       "cat <<EOF\n$(printf $(select x; do :; done))\nEOF\n",
-      "printf $(printf $(printf '\\0')) ; if true; then :; fi",
+      "printf $(printf $(printf '\\0')) ; while true; do :; done",
   };
   for (size_t s = 0; s < sizeof(invalid_sources) / sizeof(invalid_sources[0]);
        s++) {

@@ -107,7 +107,6 @@ static SHELL_NONNULL(1, 2) bool dep_presence_put(dep_route_state_t *state,
       return false;
     ready = true;
   }
-  result.correlated |= state->correlated;
   result.truncated |= state->truncated;
   *state = result;
   return true;
@@ -231,7 +230,6 @@ static SHELL_NONNULL(1, 2, 4) bool dep_presence_clear(
       return false;
     ready = true;
   }
-  result.correlated |= state->correlated;
   result.truncated |= state->truncated;
   *state = result;
   return true;

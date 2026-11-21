@@ -272,6 +272,15 @@ static SHELL_NONNULL(1) void dep_route_arena_reset(dep_route_arena_t *arena) {
   shell_pmap_init(&arena->maps, arena->map_nodes, arena->map_table,
                   arena->map_marks, DEP_ROUTE_CHANGE_CAPACITY,
                   DEP_ROUTE_MAP_TABLE);
+  uint32_t memo = DEP_ROUTE_UNION_MEMO;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  /* Tests run the analysis with a smaller table: results must not change. */
+  if (shellsplit_test_union_memo_limit() &&
+      shellsplit_test_union_memo_limit() < memo)
+    memo = shellsplit_test_union_memo_limit();
+#endif
+  shell_pmap_attach_memo(&arena->maps, arena->map_memo, memo,
+                         arena->map_memo_blocks);
   arena->name_root = arena->name_count = 0;
   arena->snapshot_count = 0;
   arena->snapshot_allocations = 0;
@@ -507,8 +516,11 @@ static SHELL_NONNULL(1, 2, 3) void dep_route_domains_collect(
         &workspace->snapshot_frames[0].fd_stream;
     for (uint32_t i = 0; i < SHELL_MAX_GROUPS + 1; i++)
       dep_route_mark_flow(journal, &construction->scope[i]);
-    for (uint32_t i = 0; i < SHELL_MAX_GROUPS; i++)
+    for (uint32_t i = 0; i < SHELL_MAX_GROUPS; i++) {
       dep_route_mark_flow(journal, &construction->setup_failure[i]);
+      dep_route_mark_flow(journal, &construction->if_failure[i]);
+      dep_route_mark_flow(journal, &construction->if_exit[i]);
+    }
     for (uint32_t i = 0; i < DEP_EXECUTION_EVENT_CAPACITY; i++) {
       dep_route_mark_flow(journal, &construction->entry[i]);
       dep_route_mark_flow(journal, &construction->async_entry[i]);
@@ -531,8 +543,11 @@ static SHELL_NONNULL(1, 2, 3) void dep_route_domains_collect(
   const dep_fd_stream_t *stream = frame ? &frame->fd_stream : NULL;
   for (uint32_t i = 0; stream && i < SHELL_MAX_GROUPS + 1; i++)
     dep_route_mark_flow(journal, &stream->scope[i]);
-  for (uint32_t i = 0; stream && i < SHELL_MAX_GROUPS; i++)
+  for (uint32_t i = 0; stream && i < SHELL_MAX_GROUPS; i++) {
     dep_route_mark_flow(journal, &stream->setup_failure[i]);
+    dep_route_mark_flow(journal, &stream->if_failure[i]);
+    dep_route_mark_flow(journal, &stream->if_exit[i]);
+  }
   for (uint32_t i = 0; stream && i < DEP_EXECUTION_EVENT_CAPACITY; i++) {
     dep_route_mark_flow(journal, &stream->entry[i]);
     dep_route_mark_flow(journal, &stream->async_entry[i]);
@@ -1003,7 +1018,6 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_store_binding(
     }
   }
   updated.truncated = previous.truncated;
-  updated.correlated = previous.correlated;
   *state = updated;
   return true;
 }

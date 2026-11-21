@@ -14,7 +14,7 @@ static const struct {
   uint32_t range_control_features;
 } shellsplit_test_control_word_fragments[] = {
     {"fi$(printf x)", 1, 1, 0},
-    {"if$(printf x) then", 1, 1, SHELL_FEAT_CONDITIONALS},
+    {"if$(printf x) then", 1, 1, SHELL_FEAT_IF},
     {"then<(printf x)", 1, 1, 0},
     {"done>(printf x)", 1, 0, 0},
     {"esac`printf x`", 1, 1, 0},

@@ -263,7 +263,7 @@ static bool check_depgraph_workspace_api(void) {
       static const char quoted[] = "printf '%s' '日本'";
       static const char unquoted[] = "printf '%s' 日本";
       static const char ansi[] = "printf '%s' $'日本'";
-      static const char unsupported[] = "if true; then :; fi";
+      static const char unsupported[] = "while true; do :; done";
       static const char malformed[] = "cat <<\n";
       static const char nul[] = "echo\0x";
       static const char nul_word[] = "pre$'a\\0b'post";

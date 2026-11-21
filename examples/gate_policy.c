@@ -77,7 +77,7 @@ int main(void) {
   static const char *const commands[] = {"git status --short",
                                          "git reset --hard",
                                          "git log --oneline",
-                                         "if true; then :; fi",
+                                         "while true; do :; done",
                                          "echo \"$(whoami)\"",
                                          "echo \"$VALUE\"",
                                          "echo ok >\"$OUT\"",

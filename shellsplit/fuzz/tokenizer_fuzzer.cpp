@@ -47,6 +47,7 @@
 
 extern "C" {
 #include "../src/shell_depgraph_internal.h"
+#include "../src/shell_keywords_internal.h"
 #include "../src/shell_semantics_internal.h"
 #include "../src/shell_source_lexical_internal.h"
 #include "../src/shell_source_runtime_internal.h"
@@ -85,6 +86,34 @@ static bool token_logically_equals(const shell_token_t &token,
     expected++;
   }
   return spelling[expected] == '\0';
+}
+
+/* At command position the words of an `if` are structure the allocating
+ * tokenizer does not expose: `if` and `fi` as group delimiters, `then`, `elif`
+ * and `else` as list separators. Source-derived like the prefix exception
+ * above, never from the records under test. */
+static shell_keyword_kind_t tokenizer_if_keyword(const char *input,
+                                                 size_t length,
+                                                 const shell_token_t &token) {
+  size_t after = 0;
+  if (!(token.type == SHELL_TOKEN_COMMAND ||
+        token.type == SHELL_TOKEN_ARGUMENT) ||
+      token.position > length)
+    return SHELL_KEYWORD_NONE;
+  const shell_keyword_t *keyword =
+      shell_source_keyword(input, length, token.position, &after);
+  if (!keyword || after != token.position + token.length)
+    return SHELL_KEYWORD_NONE;
+  switch (keyword->kind) {
+  case SHELL_KEYWORD_IF:
+  case SHELL_KEYWORD_THEN:
+  case SHELL_KEYWORD_ELIF:
+  case SHELL_KEYWORD_ELSE:
+  case SHELL_KEYWORD_FI:
+    return keyword->kind;
+  default:
+    return SHELL_KEYWORD_NONE;
+  }
 }
 
 static bool tokenizer_semantic_type_matches(const shell_token_t &lexical,
@@ -497,7 +526,7 @@ static int validate_fast_result(const char *input, size_t length,
       SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
       SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND | SHELL_FEAT_EXTGLOB |
       SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY | SHELL_FEAT_NAMED_FD |
-      SHELL_FEAT_COMBINED_REDIRECT;
+      SHELL_FEAT_COMBINED_REDIRECT | SHELL_FEAT_IF;
   for (uint32_t i = 0; i < result->count; i++) {
     const shell_range_t *r = &result->cmds[i];
     bool known_type =
@@ -553,7 +582,8 @@ static int validate_fast_result(const char *input, size_t length,
         group->first_command > result->count ||
         group->command_count > result->count - group->first_command ||
         (group->kind != SHELL_GROUP_BRACE &&
-         group->kind != SHELL_GROUP_SUBSHELL) ||
+         group->kind != SHELL_GROUP_SUBSHELL &&
+         group->kind != SHELL_GROUP_IF) ||
         (group->modifiers &
          ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
         group->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
@@ -1516,7 +1546,7 @@ static int test_fixed_oracles(void) {
    * operators must remain visible to the diagnostic tokenizer. */
   static const char *const unsupported_surrounding[] = {
       "echo before; for item in one; do :; done; echo after | cat",
-      "echo before; if :; then :; fi; echo after | cat",
+      "echo before; while :; do :; done; echo after | cat",
       "echo before; case value in value) : ;; esac; echo after | cat",
       "echo before; items=(one); echo after | cat",
       "echo before; eval echo hidden; echo after | cat",
@@ -1640,8 +1670,6 @@ static int test_fixed_oracles(void) {
       {"cat <(id)", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
        SHELL_FEAT_PROCESS_SUB},
       {"while true", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE, SHELL_FEAT_LOOPS},
-      {"if true", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE,
-       SHELL_FEAT_CONDITIONALS},
       {"case value", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE, SHELL_FEAT_CASE},
       {"echo $(<file)", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
        SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE},
@@ -3762,7 +3790,7 @@ static int test_fixed_oracles(void) {
    * its ordinary spelling, rather than becoming an executable command. */
   static const char *const continued_control_cases[] = {
       "whi\\\nle true; do :; done",
-      "i\\\nf true; then :; fi",
+      "unt\\\nil true; do :; done",
       "ca\\\nse value in value) :;; esac",
   };
   for (const char *input : continued_control_cases) {
@@ -4553,11 +4581,13 @@ static int test_fixed_oracles(void) {
     bool loops;
     bool conditionals;
     bool case_stmt;
+    bool if_stmt;
   };
   static const full_feature_case full_cases[] = {
-      {"while true", true, false, false},
-      {"if true", false, true, false},
-      {"case value", false, false, true},
+      {"while true", true, false, false, false},
+      {"if true", false, false, false, true},
+      {"[[ -n x ]]", false, true, false, false},
+      {"case value", false, false, true, false},
   };
   for (const full_feature_case &item : full_cases) {
     shell_command_t *commands = NULL;
@@ -4566,7 +4596,8 @@ static int test_fixed_oracles(void) {
                                   &command_count) == SHELL_TOKENIZE_OK) ||
         command_count == 0 || commands[0].has_loops != item.loops ||
         commands[0].has_conditionals != item.conditionals ||
-        commands[0].has_case != item.case_stmt) {
+        commands[0].has_case != item.case_stmt ||
+        commands[0].has_if != item.if_stmt) {
       shell_commands_free(commands, command_count);
       return fixed_oracle_failure(__LINE__);
     }
@@ -5725,6 +5756,12 @@ static int test_tokenizer_state(const char *input, size_t length) {
     } else if (token.type == SHELL_TOKEN_GROUP_END) {
       /* A trailing group redirect remains owned by its compound record. */
       document_only = false;
+    } else if (expect_command && tokenizer_if_keyword(input, length, token) !=
+                                     SHELL_KEYWORD_NONE) {
+      /* Like the delimiters they stand for, these leave the command-position
+       * state alone, and a trailing group redirect stays with its record. */
+      if (tokenizer_if_keyword(input, length, token) == SHELL_KEYWORD_FI)
+        document_only = false;
     } else {
       if (!(expect_command && tokenizer_token_is_newline(token)))
         iterated.push_back(token);
@@ -5757,7 +5794,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
                           !state.in_conditional && !state.conditional_invalid &&
 
                           state.brace_depth == 0 && state.paren_depth == 0 &&
-                          state.brace_group_depth == 0 && !state.heredoc_error;
+                          state.if_depth == 0 && state.brace_group_depth == 0 &&
+                          !state.heredoc_error;
   shell_tokenize_status_t full_status =
       shell_tokenize_commands(input, length, &commands, &command_count);
   if (full_status != SHELL_TOKENIZE_OK) {
@@ -8773,7 +8811,8 @@ static void run_fixed_oracles() {
         {"printf '%s' '日本'", SHELL_SOURCE_COMPLETE},
         {"printf '%s' 日本", SHELL_SOURCE_COMPLETE},
         {"printf '%s' $'日本'", SHELL_SOURCE_COMPLETE},
-        {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
+        {"if true; then :; fi", SHELL_SOURCE_COMPLETE},
+        {"while true; do :; done", SHELL_SOURCE_UNSUPPORTED},
         {"foo.bar() { :; }", SHELL_SOURCE_UNSUPPORTED},
         {"echo $[1 + (2)]", SHELL_SOURCE_UNSUPPORTED},
         {"cat <<", SHELL_SOURCE_INCOMPLETE},
@@ -9747,12 +9786,12 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
            received->heredoc_count == 1 &&
            received->heredocs[0].confirmed_length == data.size();
   std::string continued_control =
-      "echo before; cat <<$(i\\\nf true; th\\\nen :; f\\\ni)\n";
+      "echo before; cat <<$(whi\\\nle true; d\\\no :; do\\\nne)\n";
   valid &=
       shell_parse_draft(continued_control.data(), continued_control.size(),
                         &source_limits, received) == SHELL_SOURCE_UNSUPPORTED;
   valid &= !received->prefix_length && !received->prefix.count;
-  static const char *const keywords[] = {"if", "function", "[[", "]]"};
+  static const char *const keywords[] = {"while", "function", "[[", "]]"};
   std::string keyword = keywords[selector % 4];
   std::string keyword_open = "echo before; " + keyword;
   valid &= shell_parse_draft(keyword_open.data(), keyword_open.size(), NULL,

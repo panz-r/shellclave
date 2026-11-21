@@ -1097,11 +1097,36 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
        * list validator retains its diagnostic control grammar separately;
        * this forward semantic pass only needs the command-position keyword
        * or function introducer, not another descendant walk. */
-      if (reserved_word_position &&
-          (shell_source_keyword(input, input_length, token.position, NULL) ||
-           control_token_starts_function_definition(&token, input,
-                                                    input_length)))
-        return true;
+      if (reserved_word_position) {
+        const shell_keyword_t *keyword =
+            shell_source_keyword(input, input_length, token.position, NULL);
+        /* The `if` family is supported: its introducers leave command
+         * position open as a brace does, and `fi` ends the compound as its
+         * closer does. The fast parser places each keyword in an `if` or
+         * rejects it. Every other reserved word, and a function definition,
+         * stays unsupported. */
+        if (keyword && (keyword->kind == SHELL_KEYWORD_IF ||
+                        keyword->kind == SHELL_KEYWORD_THEN ||
+                        keyword->kind == SHELL_KEYWORD_ELIF ||
+                        keyword->kind == SHELL_KEYWORD_ELSE)) {
+          command_start = true;
+          awaiting_command = false;
+          pipeline_prefix = semantic_pipeline_prefix_initial();
+          builtin = (semantic_builtin_state_t){0};
+          semantic_word_end = 0;
+          continue;
+        }
+        if (keyword && keyword->kind == SHELL_KEYWORD_FI) {
+          command_start = false;
+          awaiting_command = false;
+          builtin = (semantic_builtin_state_t){0};
+          semantic_word_end = 0;
+          continue;
+        }
+        if (keyword || control_token_starts_function_definition(&token, input,
+                                                                input_length))
+          return true;
+      }
       /* Scalar assignment prefixes do not consume the command-word position.
        * Keep looking so `VAR=x declare -a values` cannot evade the semantic
        * rejection. */

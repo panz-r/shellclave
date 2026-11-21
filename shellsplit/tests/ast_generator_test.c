@@ -446,9 +446,9 @@ int main(int argc, char **argv) {
     }
 
     bool expects_success = shell_ast_expects_parse_success(ast);
-    bool expects_canonical_success =
-        expects_success && !ast->has_case && !ast->has_loops &&
-        !ast->has_conditionals && !ast_has_dynamic_arithmetic(ast->root);
+    bool expects_canonical_success = expects_success && !ast->has_case &&
+                                     !ast->has_loops &&
+                                     !ast_has_dynamic_arithmetic(ast->root);
 
     int result = verify_command(buffer, cmd_len, expects_success,
                                 expects_canonical_success);

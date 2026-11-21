@@ -214,6 +214,9 @@ typedef struct {
   bool prefix_open;
   bool redirect_operand;
   bool token_array_assignment;
+  /* The reserved word the current token is at command position: `if`,
+   * `then`, `elif`, `else` or `fi`; SHELL_KEYWORD_NONE otherwise. */
+  shell_keyword_kind_t token_keyword;
 } fast_array_context_t;
 
 static bool fast_token_is_redirection(const shell_token_t *token) {
@@ -268,6 +271,7 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
     return false;
   context->ready = true;
   context->token_array_assignment = false;
+  context->token_keyword = SHELL_KEYWORD_NONE;
   context->before_prefix = context->prefix;
   context->before_prefix_open = context->prefix_open;
   context->before_syntax_end = context->syntax_end;
@@ -334,6 +338,35 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
   if (context->redirect_operand) {
     context->redirect_operand = false;
     return true;
+  }
+  /* The words that introduce another command, or end the compound, are
+   * structure at command position: `if` `then` `elif` `else` open a command
+   * list like a brace does, `fi` ends the compound like its closer. */
+  if (context->command_start && context->prefix_open) {
+    size_t after = 0;
+    const shell_keyword_t *keyword =
+        shell_source_keyword(context->state.input, context->state.length,
+                             context->token.position, &after);
+    if (keyword && after == context->token.position + context->token.length) {
+      switch (keyword->kind) {
+      case SHELL_KEYWORD_IF:
+      case SHELL_KEYWORD_THEN:
+      case SHELL_KEYWORD_ELIF:
+      case SHELL_KEYWORD_ELSE:
+        context->token_keyword = keyword->kind;
+        context->prefix = shell_pipeline_prefix_state_initial(true);
+        context->word_end = 0;
+        return true;
+      case SHELL_KEYWORD_FI:
+        context->token_keyword = keyword->kind;
+        context->command_start = false;
+        context->prefix_open = false;
+        context->word_end = 0;
+        return true;
+      default:
+        break;
+      }
+    }
   }
   if (context->command_start && context->prefix_open &&
       shell_pipeline_prefix_step(&context->prefix,
@@ -1370,6 +1403,25 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
   };
   shell_tokenizer_init_prechecked(&documents.state, cmd, cmd_len);
 
+  /* The `if` list being read: per group, the section its keywords moved it to.
+   * A range or group takes the section of its immediately enclosing group when
+   * that is an `if`. */
+  uint8_t if_role[SHELL_MAX_GROUPS] = {0};
+  uint8_t if_arm[SHELL_MAX_GROUPS] = {0};
+  uint16_t if_group_depth = 0;
+  uint16_t group_descriptor_depth = 0;
+  uint16_t group_descriptor_stack[SHELL_MAX_GROUPS];
+#define CURRENT_SECTION(role_out, arm_out)                                     \
+  do {                                                                         \
+    uint16_t _top = group_descriptor_depth                                     \
+                        ? group_descriptor_stack[group_descriptor_depth - 1]   \
+                        : UINT16_MAX;                                          \
+    bool _in_if =                                                              \
+        _top != UINT16_MAX && result->groups[_top].kind == SHELL_GROUP_IF;     \
+    (role_out) = _in_if ? if_role[_top] : SHELL_RANGE_ROLE_NONE;               \
+    (arm_out) = _in_if ? if_arm[_top] : 0;                                     \
+  } while (0)
+
   // Helper to trim outer whitespace and emit one parsed subcommand record.
 #define RECORD_SUBCMD(s, e, type_val)                                          \
   do {                                                                         \
@@ -1385,8 +1437,12 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].features = 0;                                   \
       result->cmds[subcmd_idx].group_depth = group_depth;                      \
       result->cmds[subcmd_idx].group_kinds = group_kinds;                      \
+      CURRENT_SECTION(result->cmds[subcmd_idx].role,                           \
+                      result->cmds[subcmd_idx].arm);                           \
       detect_features(cmd, _s, _e - _s, &result->cmds[subcmd_idx].features,    \
                       execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);    \
+      if (group_kinds & SHELL_GROUP_IF)                                        \
+        result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;                    \
       subcmd_idx++;                                                            \
     } else if (_s < _e && subcmd_idx >= max_cmds) {                            \
       result->status = SHELL_STATUS_TRUNCATED;                                 \
@@ -1413,6 +1469,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                          ? group_descriptor_stack[group_descriptor_depth - 1]  \
                          : UINT16_MAX;                                         \
     _group->kind = (kind_val);                                                 \
+    CURRENT_SECTION(_group->role, _group->arm);                                \
     _group->modifiers = (modifiers_val);                                       \
     _group->pipeline_negation_count = (negation_count_val);                    \
     _group->pipeline_time_mode = (uint8_t)(time_mode_val);                     \
@@ -1449,8 +1506,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
   uint16_t brace_group_depth = 0;
   uint8_t brace_group_stack[SHELL_MAX_SUBCOMMANDS];
   uint16_t brace_group_stack_depth = 0;
-  uint16_t group_descriptor_stack[SHELL_MAX_GROUPS];
-  uint16_t group_descriptor_depth = 0;
   uint32_t comment_start = UINT32_MAX;
   bool in_quotes = false;
   char quote_char = 0;
@@ -1713,6 +1768,111 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         current_type == SHELL_TYPE_PIPELINE && group_descriptor_depth != 0 &&
         result->groups[group_descriptor_stack[group_descriptor_depth - 1]]
                 .first_command == subcmd_idx;
+
+    /* `if` opens a group that runs to its `fi`; `then`, `elif` and `else`
+     * start its next list. The keywords are structure: they belong to no
+     * range, as the braces of a brace group do not. A keyword with no `if`
+     * around it stays an ordinary word here, for the grammar checks to
+     * reject. */
+    if (!in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
+        (c == 'i' || c == 't' || c == 'e' || c == 'f') &&
+        fast_lexical_token_at(&documents, pos) &&
+        documents.token_keyword != SHELL_KEYWORD_NONE &&
+        (documents.before_syntax_end <= subcmd_start ||
+         (execution_pipeline_start && documents.before_prefix_open))) {
+      shell_keyword_kind_t keyword = documents.token_keyword;
+      uint32_t keyword_end =
+          (uint32_t)(documents.token.position + documents.token.length);
+      uint16_t top = group_descriptor_depth
+                         ? group_descriptor_stack[group_descriptor_depth - 1]
+                         : UINT16_MAX;
+      bool in_if =
+          top != UINT16_MAX && result->groups[top].kind == SHELL_GROUP_IF;
+      if (keyword == SHELL_KEYWORD_IF) {
+        if (brace_group_stack_depth == SHELL_MAX_SUBCOMMANDS) {
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
+        brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_IF;
+        shell_pipeline_prefix_state_t group_prefix = documents.before_prefix;
+        if (group_prefix.has_modifier && current_type == SHELL_TYPE_PIPELINE &&
+            !inherited_group_pipeline) {
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
+        uint16_t group_modifiers = 0;
+        if (group_prefix.negation_count != 0)
+          group_modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+        if (group_prefix.time_mode != SHELL_PIPE_TIME_NONE)
+          group_modifiers |= SHELL_CMD_MOD_PIPE_TIMED;
+        OPEN_GROUP(SHELL_GROUP_IF, pos, group_modifiers,
+                   group_prefix.negation_count, group_prefix.time_mode);
+        uint16_t opened = group_descriptor_stack[group_descriptor_depth - 1];
+        if_role[opened] = SHELL_RANGE_ROLE_CONDITION;
+        if_arm[opened] = 0;
+        group_depth++;
+        group_kinds |= SHELL_GROUP_IF;
+        if_group_depth++;
+        subcmd_start = keyword_end;
+        execution_pipeline_start = true;
+        pos = keyword_end;
+        continue;
+      }
+      if (!in_if) {
+        /* `then`, `elif`, `else` and `fi` at command position without an `if`
+         * around them are a syntax error, not a command of that name. */
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
+      }
+      {
+        bool valid = false;
+        if (keyword == SHELL_KEYWORD_THEN &&
+            if_role[top] == SHELL_RANGE_ROLE_CONDITION) {
+          if_role[top] = SHELL_RANGE_ROLE_THEN;
+          valid = true;
+        } else if (keyword == SHELL_KEYWORD_ELIF &&
+                   if_role[top] == SHELL_RANGE_ROLE_THEN &&
+                   if_arm[top] != UINT8_MAX) {
+          if_role[top] = SHELL_RANGE_ROLE_CONDITION;
+          if_arm[top]++;
+          valid = true;
+        } else if (keyword == SHELL_KEYWORD_ELSE &&
+                   if_role[top] == SHELL_RANGE_ROLE_THEN &&
+                   if_arm[top] != UINT8_MAX) {
+          if_role[top] = SHELL_RANGE_ROLE_ELSE;
+          if_arm[top]++;
+          valid = true;
+        } else if (keyword == SHELL_KEYWORD_FI &&
+                   (if_role[top] == SHELL_RANGE_ROLE_THEN ||
+                    if_role[top] == SHELL_RANGE_ROLE_ELSE)) {
+          valid = true;
+        }
+        if (!valid) {
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
+        if (keyword == SHELL_KEYWORD_FI) {
+          brace_group_stack_depth--;
+          group_depth--;
+          CLOSE_GROUP(SHELL_GROUP_IF, keyword_end);
+          if (--if_group_depth == 0)
+            group_kinds &= (uint8_t)~SHELL_GROUP_IF;
+          last_closed_group_end = keyword_end;
+          pos = keyword_end;
+          subcmd_start = pos;
+          continue;
+        }
+        subcmd_start = keyword_end;
+        execution_pipeline_start = true;
+        current_type = SHELL_TYPE_SIMPLE;
+        pos = keyword_end;
+        continue;
+      }
+    }
 
     bool redirect_prefix =
         check_group_boundary && brace_open &&
@@ -2138,6 +2298,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].features = 0;
           result->cmds[subcmd_idx].group_depth = group_depth;
           result->cmds[subcmd_idx].group_kinds = group_kinds;
+          CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                          result->cmds[subcmd_idx].arm);
+          if (group_kinds & SHELL_GROUP_IF)
+            result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
           detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
                           execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);
           subcmd_idx++;
@@ -2188,6 +2352,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                                   &result->cmds[subcmd_idx].features, false);
         result->cmds[subcmd_idx].group_depth = group_depth;
         result->cmds[subcmd_idx].group_kinds = group_kinds;
+        CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                        result->cmds[subcmd_idx].arm);
+        if (group_kinds & SHELL_GROUP_IF)
+          result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
         result->cmds[subcmd_idx].modifiers =
             modified_document_stage && document_prefix.negation_count != 0
                 ? SHELL_CMD_MOD_PIPE_NEGATED
@@ -2266,6 +2434,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].features = 0;
           result->cmds[subcmd_idx].group_depth = group_depth;
           result->cmds[subcmd_idx].group_kinds = group_kinds;
+          CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                          result->cmds[subcmd_idx].arm);
+          if (group_kinds & SHELL_GROUP_IF)
+            result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
           detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
                           execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);
           subcmd_idx++;
@@ -2320,6 +2492,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         result->cmds[subcmd_idx].features = SHELL_FEAT_HEREDOC;
         result->cmds[subcmd_idx].group_depth = group_depth;
         result->cmds[subcmd_idx].group_kinds = group_kinds;
+        CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                        result->cmds[subcmd_idx].arm);
+        if (group_kinds & SHELL_GROUP_IF)
+          result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
         result->cmds[subcmd_idx].modifiers =
             modified_document_stage && document_prefix.negation_count != 0
                 ? SHELL_CMD_MOD_PIPE_NEGATED
@@ -2422,6 +2598,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
+            CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                            result->cmds[subcmd_idx].arm);
+            if (group_kinds & SHELL_GROUP_IF)
+              result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
             detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
                             execution_pipeline_start,
                             FAST_FEATURE_COMMAND_BODY);
@@ -2460,6 +2640,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
+            CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                            result->cmds[subcmd_idx].arm);
+            if (group_kinds & SHELL_GROUP_IF)
+              result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
             detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
                             execution_pipeline_start,
                             FAST_FEATURE_COMMAND_BODY);
@@ -2498,6 +2682,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
+            CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                            result->cmds[subcmd_idx].arm);
+            if (group_kinds & SHELL_GROUP_IF)
+              result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
             detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
                             execution_pipeline_start,
                             FAST_FEATURE_COMMAND_BODY);
@@ -2557,6 +2745,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
+            CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                            result->cmds[subcmd_idx].arm);
+            if (group_kinds & SHELL_GROUP_IF)
+              result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
             detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
                             execution_pipeline_start,
                             FAST_FEATURE_COMMAND_BODY);
@@ -2736,6 +2928,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].features = 0;
       result->cmds[subcmd_idx].group_depth = group_depth;
       result->cmds[subcmd_idx].group_kinds = group_kinds;
+      CURRENT_SECTION(result->cmds[subcmd_idx].role,
+                      result->cmds[subcmd_idx].arm);
+      if (group_kinds & SHELL_GROUP_IF)
+        result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;
       detect_features(cmd, start_pos, end_pos - start_pos,
                       &result->cmds[subcmd_idx].features,
                       execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);
@@ -2926,6 +3122,7 @@ void shell_feature_flags_from_bits(uint32_t features,
   flags->has_process_sub = (features & SHELL_FEAT_PROCESS_SUB) != 0;
   flags->has_loops = (features & SHELL_FEAT_LOOPS) != 0;
   flags->has_conditionals = (features & SHELL_FEAT_CONDITIONALS) != 0;
+  flags->has_if = (features & SHELL_FEAT_IF) != 0;
   flags->has_case = (features & SHELL_FEAT_CASE) != 0;
   flags->has_subshell_file = (features & SHELL_FEAT_SUBSHELL_FILE) != 0;
   flags->has_pipeline = (features & SHELL_FEAT_PIPELINE) != 0;

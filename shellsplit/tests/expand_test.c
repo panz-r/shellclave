@@ -296,7 +296,7 @@ int main(void) {
         SHELL_DEP_EUNMODELED); /* An empty redirect path certainly fails. */
   CHECK(graph->node_count == 0 && graph->edge_count == 0);
 
-  source = "echo \"$V\"; if true; then echo no; fi";
+  source = "echo \"$V\"; while true; do echo no; done";
   fixture = (fixture_t){.source = source, .status = SHELL_EXPAND_UNRESOLVED};
   CHECK(shell_dep_graph_parse_resolved(source, strlen(source), NULL, &limits,
                                        graph, expand_word, &fixture,

@@ -34,7 +34,7 @@ static void test(const char *name, int result) {
 
 static void test_range_eq(const char *name, const shell_parse_result_t *result,
                           uint32_t idx, uint32_t exp_start, uint32_t exp_len,
-                          uint16_t exp_type, uint16_t exp_features) {
+                          uint16_t exp_type, uint32_t exp_features) {
   test_count++;
   if (idx < result->count) {
     const shell_range_t *r = &result->cmds[idx];
@@ -183,8 +183,8 @@ static void test_control_word_boundaries(void) {
       "x.%s", "日本.%s",  "日本''%s", "%s.txt",   "'%s'", "\\%s",
       "%s''", "%s$EMPTY", "name=%s",  "${v:-%s}", ">%s",  "<<<%s",
   };
-  const uint32_t controls =
-      SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS | SHELL_FEAT_CASE;
+  const uint32_t controls = SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
+                            SHELL_FEAT_IF | SHELL_FEAT_CASE;
   bool valid = true;
   for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); ++k) {
     for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]); ++f) {
@@ -267,21 +267,21 @@ static void test_control_word_boundaries(void) {
     const char *source;
     uint32_t expected;
   } contexts[] = {
-      {"if true; then :; fi", SHELL_FEAT_CONDITIONALS},
+      {"if true; then :; fi", SHELL_FEAT_IF},
       {"while false; do :; done", SHELL_FEAT_LOOPS},
       {"case x in x) :;; esac", SHELL_FEAT_CASE},
-      {"printf %s if", SHELL_FEAT_CONDITIONALS},
-      {"printf %s then elif else", SHELL_FEAT_CONDITIONALS},
+      {"printf %s if", SHELL_FEAT_IF},
+      {"printf %s then elif else", SHELL_FEAT_IF},
       {"printf %s do done", 0},
       {"printf %s coproc function", 0},
       {"printf %s 'select' select\"\"", 0},
       {"printf %s whi\\\nle", SHELL_FEAT_LOOPS},
-      {"echo \"$(if true; then :; fi)\"", SHELL_FEAT_CONDITIONALS},
+      {"echo \"$(if true; then :; fi)\"", SHELL_FEAT_IF},
       {"echo ${v:-$(while false; do :; done)}", SHELL_FEAT_LOOPS},
-      {"cat <(if true; then :; fi)", SHELL_FEAT_CONDITIONALS},
-      {"echo `if true; then :; fi`", SHELL_FEAT_CONDITIONALS},
-      {"cat <<EOF\n$(if true; then :; fi)\nEOF\n", SHELL_FEAT_CONDITIONALS},
-      {"cat <<<$(if true; then :; fi)", SHELL_FEAT_CONDITIONALS},
+      {"cat <(if true; then :; fi)", SHELL_FEAT_IF},
+      {"echo `if true; then :; fi`", SHELL_FEAT_IF},
+      {"cat <<EOF\n$(if true; then :; fi)\nEOF\n", SHELL_FEAT_IF},
+      {"cat <<<$(if true; then :; fi)", SHELL_FEAT_IF},
       {"echo ok # if while case\n", 0},
       {"echo \"$(printf ok # if while case\n)\"", 0},
       {"cat <<'EOF'\nif while case\nEOF\n", 0},
@@ -356,7 +356,7 @@ static void test_control_word_boundaries(void) {
           shell_parse_fast(source, length, &limits, &parsed) == SHELL_OK &&
           parsed.count == 1 &&
           (parsed.cmds[0].features & controls) ==
-              (family == 2 ? SHELL_FEAT_CONDITIONALS : 0);
+              (family == 2 ? SHELL_FEAT_IF : 0);
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
       size_t work = shellsplit_test_source_scan_work();
       item &= work <= 128 * length + 1024 &&
@@ -450,10 +450,10 @@ static bool result_invariants(const char *input, size_t input_len,
       SHELL_FEAT_VARS | SHELL_FEAT_GLOBS | SHELL_FEAT_SUBSHELL |
       SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
-      SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
-      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND | SHELL_FEAT_EXTGLOB |
-      SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY | SHELL_FEAT_NAMED_FD |
-      SHELL_FEAT_COMBINED_REDIRECT;
+      SHELL_FEAT_IF | SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE |
+      SHELL_FEAT_PIPELINE | SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND |
+      SHELL_FEAT_EXTGLOB | SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY |
+      SHELL_FEAT_NAMED_FD | SHELL_FEAT_COMBINED_REDIRECT;
   if (!input || !result || result->count > SHELL_MAX_SUBCOMMANDS ||
       result->group_count > SHELL_MAX_GROUPS)
     return false;
@@ -497,7 +497,12 @@ static bool result_invariants(const char *input, size_t input_len,
         group->first_command > result->count ||
         group->command_count > result->count - group->first_command ||
         (group->kind != SHELL_GROUP_BRACE &&
-         group->kind != SHELL_GROUP_SUBSHELL) ||
+         group->kind != SHELL_GROUP_SUBSHELL &&
+         group->kind != SHELL_GROUP_IF) ||
+        group->role > SHELL_RANGE_ROLE_ELSE ||
+        (group->role != SHELL_RANGE_ROLE_NONE &&
+         (group->parent == UINT16_MAX ||
+          result->groups[group->parent].kind != SHELL_GROUP_IF)) ||
         (group->modifiers &
          ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
         group->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
@@ -925,8 +930,10 @@ static void test_feature_matrix(void) {
       {"escaped bracket pattern is not a glob", "echo \\[ab\\]", 1, NO_CHECK, 0,
        0, 0, SHELL_FEAT_GLOBS},
       {"loop feature", "while true", 1, NO_CHECK, 0, 0, SHELL_FEAT_LOOPS, 0},
-      {"conditional feature", "if true", 1, NO_CHECK, 0, 0,
+      {"conditional feature", "[[ true ]]", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_CONDITIONALS, 0},
+      {"if feature", "if true; then :; fi", 2, NO_CHECK, 0, 0, SHELL_FEAT_IF,
+       0},
       {"case feature", "case value", 1, NO_CHECK, 0, 0, SHELL_FEAT_CASE, 0},
       {"file command substitution", "echo $(<file)", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE, 0},
@@ -985,13 +992,13 @@ static void test_feature_matrix(void) {
        SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS, 0},
       {"nested backticks", "`echo \\`date\\` `", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_SUBSHELL, 0},
-      {"string conditional", "if [ \"$a\" = \"b\" ]; then echo yes; fi", 3,
+      {"string conditional", "if [ \"$a\" = \"b\" ]; then echo yes; fi", 2,
        NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
-      {"numeric conditional", "if [ $x -gt 0 ]; then echo positive; fi", 3,
+      {"numeric conditional", "if [ $x -gt 0 ]; then echo positive; fi", 2,
        NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
-      {"regex conditional", "if [[ $x =~ pattern ]]; then match; fi", 3,
+      {"regex conditional", "if [[ $x =~ pattern ]]; then match; fi", 2,
        NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
-      {"glob conditional", "if [[ $str == *.* ]]; then echo ext; fi", 3,
+      {"glob conditional", "if [[ $str == *.* ]]; then echo ext; fi", 2,
        NO_CHECK, 0, 0, SHELL_FEAT_VARS | SHELL_FEAT_GLOBS, 0},
   };
 
@@ -1138,7 +1145,7 @@ void test_layer1_error_handling(void) {
     const char *name;
     const char *input;
     uint16_t type;
-    uint16_t features;
+    uint32_t features;
   } truncation_cases[] = {
       {"pipeline truncation", "cmd1 | cmd2", SHELL_TYPE_SIMPLE,
        SHELL_FEAT_PIPELINE},
@@ -1151,7 +1158,7 @@ void test_layer1_error_handling(void) {
       {"loop truncation", "for x in a; do echo $x; done ; pwd",
        SHELL_TYPE_SIMPLE, SHELL_FEAT_LOOPS},
       {"conditional truncation", "if true; then echo yes; fi ; pwd",
-       SHELL_TYPE_SIMPLE, SHELL_FEAT_CONDITIONALS},
+       SHELL_TYPE_SIMPLE, SHELL_FEAT_IF},
       {"mixed composition truncation", "a && b || c | d ; e", SHELL_TYPE_SIMPLE,
        0},
   };
@@ -1479,7 +1486,7 @@ typedef struct {
   const char *input;
   uint32_t count;
   uint32_t feature_index;
-  uint16_t features;
+  uint32_t features;
 } complex_case_t;
 
 static void test_complex_case_matrix(void) {
@@ -1492,7 +1499,7 @@ static void test_complex_case_matrix(void) {
       {"conditional sequence",
        "if [ -f config ]; then source config && echo loaded; else echo "
        "missing; fi",
-       5, 0, 0},
+       4, 0, 0},
       {"substitution and boolean operators",
        "count=$(ls *.log 2>/dev/null | wc -l) && [ $count -gt 0 ] || echo "
        "'no files'",
@@ -1509,7 +1516,7 @@ static void test_complex_case_matrix(void) {
        "if [ -f ~/.bashrc ]; then source ~/.bashrc; fi && export "
        "PATH=\"$HOME/bin:$PATH\" && find . -name '*.c' -exec gcc -o {} {} "
        "\\; | grep -v 'Permission denied' || echo 'Build failed'",
-       7, 0, 0},
+       6, 0, 0},
       {"array loop and substitutions",
        "arr=($(ls *.txt | sort)) && for f in \"${arr[@]}\"; do count=$(wc -l "
        "< \"$f\"); echo \"$f: $count lines\"; done | tee report.txt",
@@ -2594,8 +2601,8 @@ static void test_fast_parser_limitations(void) {
        sizeof(arithmetic_high_byte), SHELL_STATUS_ERROR, 0},
       {"accept adjacent quoted and unquoted text", "\"text \"text",
        sizeof("\"text \"text") - 1, SHELL_STATUS_OK, 1},
-      {"accept keyword-shaped command fragments", "if if cmd",
-       sizeof("if if cmd") - 1, SHELL_STATUS_OK, 1},
+      {"accept keyword-shaped command fragments", "echo if if cmd",
+       sizeof("echo if if cmd") - 1, SHELL_STATUS_OK, 1},
       {"reject bare separator", "|", 1, SHELL_STATUS_ERROR, 0},
       {"accept trailing backslash", "cmd\\", sizeof("cmd\\") - 1,
        SHELL_STATUS_OK, 1},
@@ -4420,6 +4427,140 @@ static void test_prefix_scan_scaling(void) {
   test("Pipeline indexing scales with groups and ranges", valid);
 }
 
+/* `if` is a group from its `if` word through its `fi` word. The keywords belong
+ * to no range, and each range says which list of the `if` it is in. */
+static void test_if_structure(void) {
+  printf("\n--- If groups ---\n");
+  typedef struct {
+    const char *text;
+    uint8_t role, arm;
+  } expected_range_t;
+  static const struct {
+    const char *name;
+    const char *input;
+    uint32_t ranges, groups;
+    expected_range_t first[6];
+  } cases[] = {
+      {"if then fi",
+       "if a; then b; fi",
+       2,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0}, {"b", SHELL_RANGE_ROLE_THEN, 0}}},
+      {"if else",
+       "if a; then b; else c; fi",
+       3,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_THEN, 0},
+        {"c", SHELL_RANGE_ROLE_ELSE, 1}}},
+      {"elif chain",
+       "if a; then b; elif c; then d; elif e; then f; else g; fi",
+       7,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_THEN, 0},
+        {"c", SHELL_RANGE_ROLE_CONDITION, 1},
+        {"d", SHELL_RANGE_ROLE_THEN, 1},
+        {"e", SHELL_RANGE_ROLE_CONDITION, 2},
+        {"f", SHELL_RANGE_ROLE_THEN, 2}}},
+      {"newlines separate sections",
+       "if a\nthen\n  b\nelse\n  c\nfi",
+       3,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_THEN, 0},
+        {"c", SHELL_RANGE_ROLE_ELSE, 1}}},
+      {"a condition may be a list",
+       "if a && b; then c; fi",
+       3,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"c", SHELL_RANGE_ROLE_THEN, 0}}},
+      {"a nested group takes the role of its section",
+       "if a; then { b; }; else ( c ); fi",
+       3,
+       3,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_NONE, 0},
+        {"c", SHELL_RANGE_ROLE_NONE, 0}}},
+      {"a nested if has its own sections",
+       "if a; then if b; then c; fi; fi",
+       3,
+       2,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"c", SHELL_RANGE_ROLE_THEN, 0}}},
+      {"keyword words as arguments are ordinary",
+       "echo if then elif else fi",
+       1,
+       0,
+       {{"echo if then elif else fi", SHELL_RANGE_ROLE_NONE, 0}}},
+      {"a keyword after an assignment is not reserved",
+       "x=1 if",
+       1,
+       0,
+       {{"x=1 if", SHELL_RANGE_ROLE_NONE, 0}}},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = true;
+    shell_parse_result_t result;
+    bool ok = shell_parse_fast(cases[i].input, strlen(cases[i].input), &limits,
+                               &result) == SHELL_OK &&
+              result.count == cases[i].ranges &&
+              result.group_count == cases[i].groups;
+    for (uint32_t r = 0; ok && r < result.count && r < 6; r++) {
+      const shell_range_t *range = &result.cmds[r];
+      const expected_range_t *want = &cases[i].first[r];
+      ok = range->len == strlen(want->text) &&
+           memcmp(cases[i].input + range->start, want->text, range->len) == 0 &&
+           range->role == want->role && range->arm == want->arm;
+    }
+    test(cases[i].name, ok);
+  }
+
+  /* The group spans from `if` to the end of `fi`, and a nested group knows the
+   * section of the `if` it sits in. */
+  static const char nested[] = "if a; then { b; }; else ( c ); fi";
+  shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+  limits.strict_mode = true;
+  shell_parse_result_t result;
+  bool ok = shell_parse_fast(nested, sizeof(nested) - 1, &limits, &result) ==
+                SHELL_OK &&
+            result.group_count == 3 &&
+            result.groups[0].kind == SHELL_GROUP_IF &&
+            result.groups[0].start == 0 &&
+            result.groups[0].end == sizeof(nested) - 1 &&
+            result.groups[0].parent == UINT16_MAX &&
+            result.groups[1].kind == SHELL_GROUP_BRACE &&
+            result.groups[1].parent == 0 &&
+            result.groups[1].role == SHELL_RANGE_ROLE_THEN &&
+            result.groups[1].arm == 0 &&
+            result.groups[2].kind == SHELL_GROUP_SUBSHELL &&
+            result.groups[2].role == SHELL_RANGE_ROLE_ELSE &&
+            result.groups[2].arm == 1;
+  test("a nested group records its section", ok);
+
+  /* The keywords are structure only in order; anything else is rejected. */
+  static const char *const invalid[] = {
+      "if a; fi",
+      "if a; then b; else c; else d; fi",
+      "if a; then b; else c; elif d; then e; fi",
+      "if a; then b; fi; fi",
+      "if a; then b",
+      "{ if a; then b; }; fi",
+      "if a; then b; ) fi",
+  };
+  bool rejected = true;
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    shell_parse_result_t unused;
+    rejected = rejected && shell_parse_fast(invalid[i], strlen(invalid[i]),
+                                            &limits, &unused) != SHELL_OK;
+  }
+  test("out-of-order and unterminated if sources are rejected", rejected);
+}
+
 int main(void) {
   printf("=== FAST PARSER API TESTS ===\n");
   printf("Testing shell_parse_fast() and related functions\n\n");
@@ -4439,6 +4580,7 @@ int main(void) {
   test_dialect_oracle();
   test_layer1_edge_cases();
   test_layer1_type_values();
+  test_if_structure();
 
   printf("\n=== LAYER 2: INTERACTION TESTS (~100 tests) ===\n");
   test_layer2_complex_sequences();

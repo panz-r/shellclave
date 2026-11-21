@@ -1810,6 +1810,10 @@ int main(void) {
 #ifdef SHELLSPLIT_TEST_ALLOCATOR
   CHECK(shellsplit_test_route_collection_contract(limits.workspace));
   CHECK(shellsplit_test_process_fork_contract(limits.workspace));
+  CHECK(shellsplit_test_process_owned_join_contract(limits.workspace));
+  CHECK(shellsplit_test_domain_join_contract(limits.workspace));
+  CHECK(shellsplit_test_nested_join_contract(limits.workspace, 40));
+  CHECK(shellsplit_test_private_entry_join_contract(limits.workspace));
   for (uint32_t count = 8; count <= SHELL_DEP_MAX_NODES; count *= 2) {
     shellsplit_test_source_scan_reset();
     CHECK(shellsplit_test_route_state_contract(limits.workspace, count));

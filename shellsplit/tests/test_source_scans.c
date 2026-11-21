@@ -7,6 +7,7 @@ static _Thread_local uintptr_t watch_begin, watch_end;
 static _Thread_local size_t delimiter_work;
 static _Thread_local size_t metadata_work[SHELLSPLIT_TEST_WORK_COUNT];
 static _Thread_local size_t observation_order_errors;
+static _Thread_local uint32_t memo_limit;
 
 void shellsplit_test_source_scan_charge(size_t length) { scan_work += length; }
 void shellsplit_test_source_scan_reset(void) {
@@ -19,6 +20,10 @@ void shellsplit_test_source_scan_reset(void) {
     metadata_work[i] = 0;
 }
 size_t shellsplit_test_source_scan_work(void) { return scan_work; }
+void shellsplit_test_set_union_memo_limit(uint32_t entries) {
+  memo_limit = entries;
+}
+uint32_t shellsplit_test_union_memo_limit(void) { return memo_limit; }
 void shellsplit_test_line_scan_charge(size_t length) {
   line_work += length;
   scan_work += length;

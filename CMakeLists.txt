@@ -418,6 +418,10 @@ if(BUILD_TESTING)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_variable_presence.py"
         --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_presence_production_test>)
     set_tests_properties(shellsplit_bash_variable_presence PROPERTIES LABELS shellsplit TIMEOUT 60)
+    add_test(NAME shellsplit_bash_if_descriptors
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_if_descriptors.py"
+        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_if_graph_probe>)
+    set_tests_properties(shellsplit_bash_if_descriptors PROPERTIES LABELS shellsplit TIMEOUT 120)
     add_test(NAME shellsplit_bash_arithmetic_commands
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_arithmetic_commands.py"
         --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_arithmetic_production_test>)
@@ -476,6 +480,9 @@ if(BUILD_TESTING)
   shellclave_add_test(shellsplit_presence_test shellsplit/tests/presence_test.c shellsplit_test)
   set_property(TEST shellsplit_presence_test APPEND PROPERTY LABELS shellsplit)
   shellclave_add_production_test(shellsplit_presence_production_test shellsplit/tests/presence_test.c shellsplit)
+  add_executable(shellsplit_if_graph_probe shellsplit/tests/if_graph_probe.c)
+  target_link_libraries(shellsplit_if_graph_probe PRIVATE shellsplit)
+  shellclave_project_target(shellsplit_if_graph_probe)
   shellclave_add_test(shellsplit_conditional_test shellsplit/tests/conditional_test.c shellsplit_test)
   target_compile_definitions(shellsplit_conditional_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
   set_property(TEST shellsplit_conditional_test APPEND PROPERTY LABELS shellsplit)

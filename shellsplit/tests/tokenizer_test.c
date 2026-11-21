@@ -4578,6 +4578,7 @@ enum {
   EXPECT_LOOP = 1u << 4,
   EXPECT_CONDITIONAL = 1u << 5,
   EXPECT_CASE = 1u << 6,
+  EXPECT_IF = 1u << 7,
   EXPECT_SHELL_FEATURE =
       EXPECT_VARIABLE | EXPECT_GLOB | EXPECT_SUBSHELL | EXPECT_ARITHMETIC,
 };
@@ -4605,6 +4606,7 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
           (commands[j].has_arithmetic ? EXPECT_ARITHMETIC : 0) |
           (commands[j].has_loops ? EXPECT_LOOP : 0) |
           (commands[j].has_conditionals ? EXPECT_CONDITIONAL : 0) |
+          (commands[j].has_if ? EXPECT_IF : 0) |
           (commands[j].has_case ? EXPECT_CASE : 0);
       features |= command_features;
     }
@@ -5369,7 +5371,6 @@ static void test_canonical_control_compounds_rejected(void) {
       "for value in one two; do echo \"$value\"; done",
       "while read line; do echo \"$line\"; done",
       "until test -f file; do sleep 1; done",
-      "if test -f file; then echo yes; else echo no; fi",
       "case value in value) echo yes;; esac",
       "function example { echo yes; }",
       "example() { echo yes; }",
@@ -5380,15 +5381,12 @@ static void test_canonical_control_compounds_rejected(void) {
       "example\\\n() { echo yes; }",
       "function example () { echo yes; }",
       "function example ( ) ( echo yes )",
-      "{ if test -f file; then echo yes; fi; }",
-      "echo $(if test -f file; then echo yes; fi)",
       "cat <(while read line; do echo $line; done)",
       "echo prefix; do echo invalid; done",
       "whi\\\nle true; d\\\no :; do\\\nne",
       "unti\\\nl false; d\\\no :; do\\\nne",
       "f\\\nor item in one; d\\\no :; do\\\nne",
       "sele\\\nct item in one; d\\\no :; do\\\nne",
-      "i\\\nf true; th\\\nen :; el\\\nse :; f\\\ni",
       "ca\\\nse item i\\\nn item) :;; esa\\\nc",
       "cop\\\nroc :",
       "fun\\\nction example { :; }",
@@ -5440,6 +5438,38 @@ static void test_canonical_control_compounds_rejected(void) {
         paired_command.data == NULL && paired_type.data == NULL && count == 0;
   }
   test("Canonical APIs reject unsupported control compounds", valid);
+
+  /* A well-formed `if` is supported: the canonical APIs return its commands,
+   * without the keywords, and its group. */
+  static const char *const if_sources[] = {
+      "if test -f file; then echo yes; else echo no; fi",
+      "{ if test -f file; then echo yes; fi; }",
+      "echo $(if test -f file; then echo yes; fi)",
+      "i\\\nf true; th\\\nen :; el\\\nse :; f\\\ni",
+  };
+  bool if_valid = true;
+  for (size_t i = 0; i < sizeof(if_sources) / sizeof(if_sources[0]); i++) {
+    shell_processed_commands_t processed = {0};
+    shell_process_status_t error = shell_process_commands(
+        if_sources[i], strlen(if_sources[i]), NULL, &processed);
+    bool has_group = false;
+    for (size_t g = 0; g < processed.group_count; g++)
+      has_group = has_group || processed.groups[g].kind == SHELL_GROUP_IF;
+    bool accepted = error == SHELL_PROCESS_OK && processed.command_count >= 1 &&
+                    (has_group || i == 2);
+    for (size_t c = 0; accepted && c < processed.command_count; c++) {
+      const shell_command_info_t *info = &processed.commands[c];
+      if (info->command_token_count == 0)
+        continue;
+      const shell_token_t *first = &info->command_tokens[0];
+      accepted = !(first->length == 2 && !strncmp(first->start, "if", 2)) &&
+                 !(first->length == 4 && !strncmp(first->start, "then", 4)) &&
+                 !(first->length == 2 && !strncmp(first->start, "fi", 2));
+    }
+    if_valid = if_valid && accepted;
+    shell_processed_commands_free(&processed);
+  }
+  test("Canonical APIs accept a well-formed if without its keywords", if_valid);
 }
 
 static void test_unsupported_control_precedes_capacity(void) {
@@ -9896,15 +9926,17 @@ static void test_control_syntax_scope_contract(void) {
   } cases[] = {
       {NULL, SHELL_CONTROL_SYNTAX_NONE},
       {"", SHELL_CONTROL_SYNTAX_NONE},
-      {"if true; then echo ok; fi", SHELL_CONTROL_SYNTAX_COMPLETE},
-      {"if true; then echo ok", SHELL_CONTROL_SYNTAX_INCOMPLETE},
+      {"if true; then echo ok; fi", SHELL_CONTROL_SYNTAX_NONE},
+      {"if true; then echo ok", SHELL_CONTROL_SYNTAX_NONE},
+      {"if true; then while true; do :; done; fi",
+       SHELL_CONTROL_SYNTAX_COMPLETE},
       {"whi\\\nle true; do echo ok; done", SHELL_CONTROL_SYNTAX_COMPLETE},
       {"echo if while; printf '%s' done", SHELL_CONTROL_SYNTAX_NONE},
       {"'while' true; wh\\ile true", SHELL_CONTROL_SYNTAX_NONE},
       {"echo ok >while # if true", SHELL_CONTROL_SYNTAX_NONE},
       {"echo $(if true; then echo ok; fi)", SHELL_CONTROL_SYNTAX_NONE},
-      {"fi $(printf x)", SHELL_CONTROL_SYNTAX_INCOMPLETE},
-      {"if $(printf x)then; then :; fi", SHELL_CONTROL_SYNTAX_COMPLETE},
+      {"fi $(printf x)", SHELL_CONTROL_SYNTAX_NONE},
+      {"if $(printf x)then; then :; fi", SHELL_CONTROL_SYNTAX_NONE},
       {"case $(printf x)in in x) :;; esac", SHELL_CONTROL_SYNTAX_COMPLETE},
   };
   static const char enclosing[] = "enclosing lexical context";
@@ -10393,7 +10425,7 @@ int main(void) {
         "fi";
     check_tokenizer_case(
         "Extended tokenizer: preserve PIPESTATUS pipeline structure", input,
-        15);
+        13);
   }
 
   // Test 79: Database operations pipeline
@@ -10453,7 +10485,7 @@ int main(void) {
         "cat ${REPORT_DIR}/errors_${DATE}.txt | mail -s \"Error Report "
         "${DATE}\" ${ALERT_EMAIL}";
     check_tokenizer_case("Extended tokenizer: log aggregation and analysis",
-                         input, 17);
+                         input, 15);
   }
 
   // Test 82: File processing with subshells and globs
@@ -10514,7 +10546,7 @@ int main(void) {
         "  exit 1; "
         "fi";
     check_tokenizer_case("Extended tokenizer: preserve CI/CD structure", input,
-                         17);
+                         16);
   }
 
   printf("\n=== TRANSFORM TESTS ===\n\n");
@@ -11661,8 +11693,8 @@ int main(void) {
        EXPECT_VARIABLE | EXPECT_LOOP},
       {{"Edge: case statement", "case $var in a) echo a;; esac", 1},
        EXPECT_VARIABLE | EXPECT_CASE},
-      {{"Edge: conditional", "if [ -f file.txt ]; then echo exists; fi", 3},
-       EXPECT_CONDITIONAL},
+      {{"Edge: conditional", "if [ -f file.txt ]; then echo exists; fi", 2},
+       EXPECT_IF},
   };
   run_feature_cases(compound_syntax_cases,
                     sizeof(compound_syntax_cases) /
@@ -11856,7 +11888,7 @@ int main(void) {
   // parsing For fast tokenizer, we only detect at command start, nested is
   // flagged
   {
-    const char *input = "if true; then then cmd; fi";
+    const char *input = "while true; do do cmd; done";
     shell_command_t *cmds = NULL;
     size_t count = 0;
     int result = (shell_tokenize_commands(input, strlen(input), &cmds,

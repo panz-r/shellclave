@@ -10,8 +10,15 @@
     }                                                                          \
   } while (0)
 
+/* The default workspace must not grow past the size the fd engine redesign
+ * started from; today it is far below it. */
+#define WORKSPACE_CEILING ((size_t)23946576)
+
 int main(void) {
   shellsplit_graph_fixture_t fixture;
+  size_t workspace = 0;
+  CHECK(shell_dep_workspace_size(NULL, &workspace));
+  CHECK(workspace <= WORKSPACE_CEILING);
   size_t alignment = shell_dep_workspace_alignment();
   CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 64,
                                       2, true, alignment));

@@ -1105,6 +1105,49 @@ static void pending_pipeline_prefixes(void) {
   CHECK(!draft.prefix_length);
 }
 
+/* `if` is a compound command: complete only at its `fi`, incomplete while a
+ * list is missing, and invalid when a keyword is out of place. */
+static void if_classification(void) {
+  static const struct {
+    const char *source;
+    shell_source_status_t status;
+  } cases[] = {
+      {"if true; then :; fi ", SHELL_SOURCE_COMPLETE},
+      {"echo before; if true; then :; else :; fi ", SHELL_SOURCE_COMPLETE},
+      {"if a; then b; elif c; then d; else e; fi ", SHELL_SOURCE_COMPLETE},
+      {"if a; then if b; then c; fi; fi ", SHELL_SOURCE_COMPLETE},
+      {"! if a; then b; fi ", SHELL_SOURCE_COMPLETE},
+      {"if a; then b; fi > out", SHELL_SOURCE_COMPLETE},
+      {"if a; then b; fi | cat", SHELL_SOURCE_COMPLETE},
+      {"echo if then elif else fi ", SHELL_SOURCE_COMPLETE},
+      {"if true; then :; f", SHELL_SOURCE_INCOMPLETE},
+      {"if true", SHELL_SOURCE_INCOMPLETE},
+      {"if true; then", SHELL_SOURCE_INCOMPLETE},
+      {"if true; then :", SHELL_SOURCE_INCOMPLETE},
+      {"if true; then :; else", SHELL_SOURCE_INCOMPLETE},
+      {"echo before; if ", SHELL_SOURCE_INCOMPLETE},
+      {"if true; fi ", SHELL_SOURCE_INVALID},
+      {"if ; then :; fi ", SHELL_SOURCE_INVALID},
+      {"if true; then ; fi ", SHELL_SOURCE_INVALID},
+      {"if true; then :; else :; else :; fi ", SHELL_SOURCE_INVALID},
+      {"if true; then :; else :; elif a; then b; fi ", SHELL_SOURCE_INVALID},
+      {"then :", SHELL_SOURCE_INVALID},
+      {"fi ", SHELL_SOURCE_INVALID},
+      {"echo before; fi ", SHELL_SOURCE_INVALID},
+      {"{ if a; then b; }; fi ", SHELL_SOURCE_INVALID},
+      {"if a; then b; fi; fi ", SHELL_SOURCE_INVALID},
+      {"if a; then while b; do c; done; fi ", SHELL_SOURCE_UNSUPPORTED},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_source_status_t status = shell_parse_draft(
+        cases[i].source, strlen(cases[i].source), NULL, &draft);
+    if (status != cases[i].status)
+      fprintf(stderr, "if classification: %s -> %d, want %d\n", cases[i].source,
+              status, cases[i].status);
+    CHECK(status == cases[i].status);
+  }
+}
+
 static void keyword_recovery(void) {
   static const char *const words[] = {
       "if",     "then",   "else",     "elif", "fi",   "for",
@@ -1116,7 +1159,16 @@ static void keyword_recovery(void) {
                   {"time ", ""}, {"true | ", ""}, {"true && ", ""}};
   char source[256];
   for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
-    for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]); c++) {
+    /* The `if` family is modeled: once complete, `if` opens a list and the
+     * other four are structure or a syntax error, never unsupported. */
+    bool family = !strcmp(words[w], "if") || !strcmp(words[w], "then") ||
+                  !strcmp(words[w], "else") || !strcmp(words[w], "elif") ||
+                  !strcmp(words[w], "fi");
+    /* A `fi` ends a compound, so unlike a word that may still grow it is not
+     * a pending tail: without an `if` around it, it is a syntax error. */
+    bool settles = !strcmp(words[w], "fi");
+    for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]) && !settles;
+         c++) {
       for (unsigned continued = 0; continued < 2; continued++) {
         int length = snprintf(source, sizeof(source), "echo before; %s%s%s",
                               contexts[c].opening, words[w],
@@ -1154,7 +1206,7 @@ static void keyword_recovery(void) {
           CHECK(draft.prefix_length == strlen("echo before;"));
         } else
           CHECK(!draft.prefix_length && !draft.prefix.count);
-      } else {
+      } else if (!family) {
         CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
               SHELL_SOURCE_UNSUPPORTED);
         CHECK(!draft.prefix_length && !draft.tail_start && !draft.prefix.count);
@@ -1167,9 +1219,11 @@ static void keyword_recovery(void) {
       char word[128];
       snprintf(word, sizeof(word), closed[c], words[w]);
       snprintf(source, sizeof(source), "echo before; echo %s", word);
-      CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
-            SHELL_SOURCE_UNSUPPORTED);
-      CHECK(!draft.prefix_length && !draft.prefix.count);
+      if (!family) {
+        CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
+              SHELL_SOURCE_UNSUPPORTED);
+        CHECK(!draft.prefix_length && !draft.prefix.count);
+      }
       char suffixed[64];
       snprintf(suffixed, sizeof(suffixed), "%sx", words[w]);
       snprintf(word, sizeof(word), closed[c], suffixed);
@@ -1180,12 +1234,17 @@ static void keyword_recovery(void) {
     }
     snprintf(source, sizeof(source), "echo before; echo $(echo child; %s",
              words[w]);
-    CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
-          SHELL_SOURCE_INCOMPLETE);
-    CHECK(draft.prefix_length == strlen("echo before;"));
-    CHECK(draft.header_count == 4 && draft.headers[0].complete &&
-          !draft.headers[1].complete && draft.headers[2].complete &&
-          !draft.headers[3].complete);
+    if (settles) {
+      CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
+            SHELL_SOURCE_INVALID);
+    } else {
+      CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
+            SHELL_SOURCE_INCOMPLETE);
+      CHECK(draft.prefix_length == strlen("echo before;"));
+      CHECK(draft.header_count == 4 && draft.headers[0].complete &&
+            !draft.headers[1].complete && draft.headers[2].complete &&
+            !draft.headers[3].complete);
+    }
     static const char *const ordinary[] = {"echo %s", "cat >%s",   "'%s'",
                                            "%s\"\"",  "\\%s",      "%sx",
                                            "x=1 %s",  ">target %s"};
@@ -3109,7 +3168,7 @@ static void comment_byte_source(void) {
       {"# 日本\nprintf $'日'", SHELL_SOURCE_COMPLETE},
       {"# 日本\nprintf $((日))", SHELL_SOURCE_UNSUPPORTED},
       {"# 日本\nprintf ${日}", SHELL_SOURCE_UNSUPPORTED},
-      {"# 日本\nif true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
+      {"# 日本\nwhile true; do :; done", SHELL_SOURCE_UNSUPPORTED},
       {"echo \"$(printf ok # 日本\n", SHELL_SOURCE_INCOMPLETE},
       {"printf %s word#日本 \\#日本 '#日本' ${v#日本}", SHELL_SOURCE_COMPLETE},
       {"printf %s ''#日本 <()#日本", SHELL_SOURCE_COMPLETE},
@@ -6376,6 +6435,7 @@ int main(void) {
   lexical_command_roles();
   pending_pipeline_prefixes();
   keyword_recovery();
+  if_classification();
   keyword_word_fragments();
   prefixes();
   local_completeness();

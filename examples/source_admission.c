@@ -106,7 +106,7 @@ int main(void) {
       {"unquoted text", "printf '%s' 日本"},
       {"ANSI-C text", "printf '%s' $'日本'"},
       {"unsupported code bytes", "printf '%s' $((日本))"},
-      {"unsupported grammar", "if true; then :; fi"},
+      {"unsupported grammar", "while true; do :; done"},
       {"unsupported semantics", "eval 'printf ok'"},
       {"unfinished document", "cat <<EOF\npayload\n"},
   };

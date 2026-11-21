@@ -116,7 +116,8 @@ typedef struct {
   /* Lexical control metadata uses complete unquoted words outside redirect
    * operands. It does not establish supported control-flow semantics. */
   bool has_loops;        // Contains loop spellings (while, for, until, select)
-  bool has_conditionals; // Contains if/then/elif/else/fi or [[...]]
+  bool has_conditionals; // Contains [[...]]
+  bool has_if;           // Contains if/then/elif/else/fi
   bool has_case;         // Contains case statements
   bool has_groups;       // Contains command groups
   bool ends_group;     // Last command content closes a group (redirections may

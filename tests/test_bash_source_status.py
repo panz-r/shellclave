@@ -36,7 +36,7 @@ class SourceStatusContract(unittest.TestCase):
             ("printf '%s' '日本'".encode(), 0),
             ("printf '%s' 日本".encode(), 0),
             ("printf '%s' $'日本'".encode(), 0),
-            (b"if true; then :; fi", 4),
+            (b"if true; then :; fi", 0),
             (b"case x in x) :;; esac", 4),
             (b"f() { :; }", 4),
             (b"foo.bar() { :; }", 4),
@@ -89,6 +89,48 @@ class SourceStatusContract(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), expected)
+
+    def test_if_construct_matches_reference_bash(self):
+        # COMPLETE (0) sources must be accepted by Bash; INCOMPLETE (1) and
+        # INVALID (2) sources must not be. A keyword is structure only at
+        # command position and in order.
+        cases = [
+            (b"if true; then :; fi", 0),
+            (b"if a; then b; elif c; then d; else e; fi", 0),
+            (b"if a; then if b; then c; fi; fi", 0),
+            (b"if a && b; then c; fi", 0),
+            (b"! if a; then b; fi", 0),
+            (b"time if true; then :; fi", 0),
+            (b"if a; then b; fi > out", 0),
+            (b"if a; then b; fi | cat", 0),
+            (b"if a; then b; fi &", 0),
+            (b"if a; then b; fi; echo after", 0),
+            (b"echo before; if true; then :; else :; fi", 0),
+            (b"if { :; }; then ( : ); else ! :; fi", 0),
+            (b"if\ntrue\nthen\n:\nfi", 0),
+            (b"if a; then b; fi # then", 0),
+            (b"echo if then elif else fi", 0),
+            (b"if true", 1),
+            (b"if true; then", 1),
+            (b"if true; then :", 1),
+            (b"if true; then :; else", 1),
+            (b"if a; then b; elif", 1),
+            (b"if true; fi", 2),
+            (b"if ; then :; fi", 2),
+            (b"if true; then ; fi", 2),
+            (b"then :", 2),
+            (b"fi", 2),
+            (b"if true; then :; else :; else :; fi", 2),
+            (b"if true; then :; else :; elif a; then b; fi", 2),
+            (b"{ if a; then b; }; fi", 2),
+            (b"if a; then b; fi; fi", 2),
+            (b"( if a; then b; ) fi", 2),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.classify(source), expected)
+                accepted = self.syntax(source) == 0
+                self.assertEqual(accepted, expected == 0)
 
     def test_conditional_operator_positions(self):
         for source in (b"[[ x -nt y -ot z ]]", b"[[ -n x == y ]]",
@@ -238,7 +280,7 @@ class SourceStatusContract(unittest.TestCase):
             ("cat <<# 日本".encode(), 2),
             ("# 日本\nprintf $'日'".encode(), 0),
             ("# 日本\nprintf $((日))".encode(), 4),
-            ("# 日本\nif true; then :; fi".encode(), 4),
+            ("# 日本\nif true; then :; fi".encode(), 0),
             ("printf %s word#日本 \\#日本 '#日本' ${v#日本}".encode(), 0),
             (b"# \x80\x00", 5),
             (b"# \x80\x01", 4),
@@ -363,7 +405,7 @@ class SourceStatusContract(unittest.TestCase):
 
     def test_mixed_unknown_is_not_a_validity_claim(self):
         cases = ["printf '%s' $((日本))\ncat <<\n".encode(),
-                 b"if true; then :; fi\ncat <<\n"]
+                 b"while true; do :; done\ncat <<\n"]
         for source in cases:
             with self.subTest(source=source):
                 self.assertNotEqual(self.syntax(source), 0)

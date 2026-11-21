@@ -72,6 +72,22 @@ typedef struct {
   bool local_background[SHELL_MAX_SUBCOMMANDS];
 } shell_pipeline_index_t;
 
+/* The first command of a `then` list runs after its condition succeeded, and
+ * the first of an `elif` condition or `else` list after the previous condition
+ * failed: those are the AND and OR relations of the list grammar, so the index
+ * records them as the connector. held is the section this IF group's events
+ * last belonged to. */
+static inline uint16_t shell_pipeline_section_connector(uint16_t connector,
+                                                        uint8_t role,
+                                                        uint8_t arm,
+                                                        uint8_t held[2]) {
+  if (role == held[0] && arm == held[1])
+    return connector;
+  held[0] = role;
+  held[1] = arm;
+  return role == SHELL_RANGE_ROLE_THEN ? SHELL_TYPE_AND : SHELL_TYPE_OR;
+}
+
 /* Recover local list relationships in one lexical stream, not by restarting
  * at a physical line before every owner. Quotes, substitutions and deferred
  * document bodies are opaque to this iterator. Prefix words keep the pending
@@ -95,6 +111,8 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
   shell_token_t token;
   uint32_t range = 0, group = 0;
   uint16_t stack[SHELL_MAX_GROUPS];
+  /* Per open group: the section of an IF group's most recent event. */
+  uint8_t section[SHELL_MAX_GROUPS][2];
   uint32_t last_range = UINT32_MAX;
   uint32_t depth = 0;
   uint16_t closed = UINT16_MAX;
@@ -155,9 +173,29 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
       command_position = true;
       continue;
     }
-    if (token.type == SHELL_TOKEN_GROUP_START) {
+    /* `if` and `fi` are words that open and close a group. */
+    bool if_open = token.type != SHELL_TOKEN_GROUP_START &&
+                   group < parsed->group_count &&
+                   parsed->groups[group].kind == SHELL_GROUP_IF &&
+                   parsed->groups[group].start == token.position;
+    if (token.type != SHELL_TOKEN_GROUP_END && depth != 0 &&
+        parsed->groups[stack[depth - 1]].kind == SHELL_GROUP_IF &&
+        parsed->groups[stack[depth - 1]].end == token.position + token.length) {
+      closed = stack[--depth];
+      connector = SHELL_TYPE_SIMPLE;
+      command_position = false;
+      continue;
+    }
+    if (token.type == SHELL_TOKEN_GROUP_START || if_open) {
       if (group < parsed->group_count &&
           parsed->groups[group].start == token.position) {
+        if (depth != 0 &&
+            parsed->groups[stack[depth - 1]].kind == SHELL_GROUP_IF)
+          connector = shell_pipeline_section_connector(
+              connector, parsed->groups[group].role, parsed->groups[group].arm,
+              section[depth - 1]);
+        section[depth][0] = SHELL_RANGE_ROLE_CONDITION;
+        section[depth][1] = 0;
         index->group_connector[group] = connector;
         index->group_input_unit[group] = input_unit;
         index->group_connector_start[group] = connector_start;
@@ -181,6 +219,10 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
     }
     size_t end = token.position + token.length;
     while (range < parsed->count && parsed->cmds[range].start < end) {
+      if (depth != 0 && parsed->groups[stack[depth - 1]].kind == SHELL_GROUP_IF)
+        connector = shell_pipeline_section_connector(
+            connector, parsed->cmds[range].role, parsed->cmds[range].arm,
+            section[depth - 1]);
       index->range_connector[range] = connector;
       index->range_input_unit[range] = input_unit;
       if ((token.type == SHELL_TOKEN_HEREDOC ||

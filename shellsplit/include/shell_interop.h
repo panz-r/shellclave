@@ -37,7 +37,7 @@ void shell_interop_free(shell_interop_handle_t *handle);
  *   SHELL_FEAT_HERESTRING = 0x20  // <<< here-string
  *   SHELL_FEAT_PROCESS_SUB   = 0x040 // <(cmd), >(cmd)
  *   SHELL_FEAT_LOOPS         = 0x080 // for, while, until
- *   SHELL_FEAT_CONDITIONALS  = 0x100 // if/then/else/fi
+ *   SHELL_FEAT_CONDITIONALS  = 0x100 // [[ ... ]]
  *   SHELL_FEAT_CASE          = 0x200 // case/esac
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
  *   SHELL_FEAT_PIPELINE       = 0x800 // literal | or |& pipeline construct

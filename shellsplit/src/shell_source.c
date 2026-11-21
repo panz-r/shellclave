@@ -542,8 +542,21 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
     /* The grammar diagnoses this appendable tail. Project that same word
      * fact here while its owning header is available; closed child sources
      * will be declined by their grammar instead of claiming completeness. */
-    if (header->word_count == 0 && header->redirect_count == 0 &&
-        shell_source_keyword(source, length, start, NULL)) {
+    const shell_keyword_t *keyword =
+        header->word_count == 0 && header->redirect_count == 0
+            ? shell_source_keyword(source, length, start, NULL)
+            : NULL;
+    if (keyword) {
+      /* The `if` family is structure, not a word of any command: the grammar
+       * places it. Every other reserved word is unsupported once complete. */
+      if ((word_end != length && (keyword->kind == SHELL_KEYWORD_IF ||
+                                  keyword->kind == SHELL_KEYWORD_THEN ||
+                                  keyword->kind == SHELL_KEYWORD_ELIF ||
+                                  keyword->kind == SHELL_KEYWORD_ELSE)) ||
+          keyword->kind == SHELL_KEYWORD_FI) {
+        covered = word_end;
+        continue;
+      }
       if (word_end != length)
         return false;
       header->complete = false;

@@ -147,7 +147,7 @@ static bool check_depgraph_workspace_api() {
       constexpr char quoted[] = "printf '%s' '日本'";
       constexpr char unquoted[] = "printf '%s' 日本";
       constexpr char ansi[] = "printf '%s' $'日本'";
-      constexpr char unsupported[] = "if true; then :; fi";
+      constexpr char unsupported[] = "while true; do :; done";
       constexpr char malformed[] = "cat <<\n";
       constexpr char nul[] = "echo\0x";
       constexpr char nul_word[] = "pre$'a\\0b'post";

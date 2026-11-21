@@ -300,8 +300,6 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 8) bool dep_test_select_program(
       return false;
     *ready = true;
   }
-  output->correlated |= input->correlated;
-  output->correlated |= entries.correlated;
   output->truncated |= input->truncated;
   return true;
 }

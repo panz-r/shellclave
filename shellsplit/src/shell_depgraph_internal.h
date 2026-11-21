@@ -51,6 +51,22 @@ bool shellsplit_test_route_collection_contract(void *workspace)
  * ends survive in the child, are closed in the parent's view, and ownership
  * moves. workspace is as above and is overwritten. */
 bool shellsplit_test_process_fork_contract(void *workspace) SHELL_NONNULL(1);
+bool shellsplit_test_process_owned_join_contract(void *workspace)
+    SHELL_NONNULL(1);
+bool shellsplit_test_private_entry_join_contract(void *workspace)
+    SHELL_NONNULL(1);
+/* depth nested conditionals each writing a descriptor of their own: every
+ * join combines the version holding the writes inside it with the entry
+ * version. True when each descriptor ends joined with its default. */
+bool shellsplit_test_nested_join_contract(void *workspace, uint32_t depth)
+    SHELL_NONNULL(1);
+/* The same nesting through the exact merge: every level factors into one
+ * version. */
+bool shellsplit_test_nested_merge_contract(void *workspace, uint32_t depth)
+    SHELL_NONNULL(1);
+/* Joining a version that stores a binding for a descriptor below 64 with one
+ * whose occupancy decides its default. */
+bool shellsplit_test_domain_join_contract(void *workspace) SHELL_NONNULL(1);
 /* Test-only differential oracle: execute the ordered cleanup program without
  * segment-cache reuse. The setting is local to the calling test thread. */
 void shellsplit_test_failure_cleanup_reference(bool enabled);

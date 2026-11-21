@@ -15,6 +15,10 @@
 /* Count persistent-map structural steps (shell_pmap_internal.h). */
 #define SHELL_PMAP_WORK()                                                      \
   shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_MAP_STEPS)
+#define SHELL_PMAP_FRESH()                                                     \
+  shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_UNION_FRESH)
+#define SHELL_PMAP_MEMO_HIT()                                                  \
+  shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_UNION_MEMO_HITS)
 #endif
 #include "shell_arithmetic_internal.h"
 #include "shell_ascii.h"
@@ -2299,7 +2303,6 @@ typedef struct {
   /* Transforms preserve both flags even when filtering leaves one root.
    * Recursive imports use correlated to select distinct scalar/FD versions. */
   bool truncated;
-  bool correlated;
 } dep_route_state_t;
 
 /* What a nested parse inherits at its entry: its parent's execution
@@ -2784,6 +2787,10 @@ enum {
   DEP_EXPANSION_INCOMING = 1u << 7,
 };
 
+/* Values in an ownership set (DEP_FD_ACCESS_PROCESS_OWNED): sentinels, never
+ * snapshot ids. */
+enum { DEP_OWNED_CERTAIN = 1, DEP_OWNED_MAYBE = 2 };
+
 enum {
   DEP_UNDO_CHILD = 1u << 0,
   DEP_UNDO_COMMAND = 1u << 1,
@@ -3195,6 +3202,32 @@ _Static_assert(DEP_PRESENCE_WRITER_CAPACITY <= UINT16_MAX,
                "presence writer indexes fit private AVL links");
 
 enum { DEP_OPEN_CAUSE_CAPACITY = 2 * SHELL_DEP_MAX_EDGES };
+/* The one union memo of the analysis (shell_pmap_union, shell_pmap_fold): a
+ * cache shared by every union, fold and tag. It decides how much join work an
+ * analysis may do between two sweeps, not how large a script it may take: a
+ * union or fold that needs an entry once it is full fails, as one that needs
+ * a node once the pool is full, and the merge that asked fails closed as
+ * truncation. Nothing is then decided differently, so a size too small for a
+ * source refuses it and never admits what a larger one refuses; the work is
+ * bounded by the table whatever the source. It is a practical size: the
+ * harvested corpus of 22,276 scripts needs at most 6,314 of the 8,192 entries
+ * (half the table) this holds, and 99.9% of them under 1,700. */
+enum { DEP_ROUTE_UNION_MEMO = 16384 };
+
+/* Tags of the combining functions sharing the pool's union memo
+ * (shell_pmap_union): descriptor facts, the named-binding override maps
+ * under each fallback kind, and ownership sets. */
+enum {
+  DEP_UNION_FACTS,
+  DEP_UNION_NAMED_INHERITED,
+  DEP_UNION_NAMED_DYNAMIC,
+  DEP_UNION_OWNED,
+  /* Folds comparing versions for an exact join: the maps, and the override
+   * maps under each fallback kind. */
+  DEP_FOLD_FACTS,
+  DEP_FOLD_NAMED_INHERITED,
+  DEP_FOLD_NAMED_DYNAMIC
+};
 /* Immutable analysis values shared by every pass and recursion level of one
  * evaluation: descriptor maps, interned value snapshots, alternative lists and
  * descriptor names. A root published at any level stays valid until a
@@ -3209,6 +3242,11 @@ typedef struct dep_route_arena {
   shell_pmap_node_t map_nodes[DEP_ROUTE_CHANGE_CAPACITY];
   uint16_t map_table[DEP_ROUTE_MAP_TABLE];
   uint8_t map_marks[DEP_ROUTE_CHANGE_CAPACITY];
+  /* Memo of ownership-set unions (dep_owned_join): the one combining function
+   * ever used on the pool, as the memo requires. */
+  shell_pmap_memo_entry_t map_memo[DEP_ROUTE_UNION_MEMO];
+  uint8_t map_memo_blocks[(DEP_ROUTE_UNION_MEMO + SHELL_PMAP_MEMO_BLOCK - 1) /
+                          SHELL_PMAP_MEMO_BLOCK];
   /* Interned descriptor names, so map keys are integers. Names compare by
    * decoded spelling (dep_fd_ref_compare); ids are one-based. */
   dep_fd_ref_t names[DEP_ROUTE_NAME_CAPACITY];
@@ -3434,6 +3472,12 @@ static SHELL_NONNULL(1) uint32_t
   return (uint32_t)state->alternative_count + 1;
 }
 
+/* A state keeps alternatives apart exactly when it holds more than one
+ * version: their correlation with other facts is what it preserves. */
+static bool dep_route_state_correlated(const dep_route_state_t *state) {
+  return dep_route_state_count(state) > 1;
+}
+
 typedef struct {
   uint32_t primary, next;
   bool first;
@@ -3587,7 +3631,6 @@ static dep_route_state_t dep_route_state_single(uint32_t root) {
  * before a merge as well as when publishing a rebuilt state. */
 static SHELL_NONNULL(1, 2) void dep_route_state_inherit(
     dep_route_state_t *result, const dep_route_state_t *input) {
-  result->correlated |= input->correlated;
   result->truncated |= input->truncated;
 }
 
@@ -3755,6 +3798,13 @@ typedef struct {
   dep_fd_flow_t entry[DEP_EXECUTION_EVENT_CAPACITY];
   dep_route_state_t selected[DEP_EXECUTION_EVENT_CAPACITY];
   dep_fd_flow_t setup_failure[SHELL_MAX_GROUPS];
+  /* Per `if` group, while its lists are walked (dep_fd_if_enter): the failed
+   * outcome of the latest condition, parked for the list that runs on failure,
+   * and the outcomes of the `then` lists already finished. if_section is the
+   * list of its latest event, a shell_range_t role and arm. */
+  dep_fd_flow_t if_failure[SHELL_MAX_GROUPS];
+  dep_fd_flow_t if_exit[SHELL_MAX_GROUPS];
+  uint8_t if_section[SHELL_MAX_GROUPS][2];
   uint32_t pipeline_event[SHELL_MAX_GROUPS + 1];
   uint32_t input_unit;
   dep_fd_flow_t async_entry[DEP_EXECUTION_EVENT_CAPACITY];
@@ -3773,6 +3823,13 @@ typedef struct {
   uint32_t last[SHELL_MAX_GROUPS + 1];
   uint32_t group_event[SHELL_MAX_GROUPS];
   uint32_t active[SHELL_MAX_GROUPS];
+  /* Per `if` group: the statuses its finished `then` and `else` lists
+   * returned, the list its latest event is in (shell_range_role_t, arm), and
+   * one more than the index of the last event of its most recent condition.
+   * The group returns the union of the first, plus success when no list ran. */
+  uint8_t if_exit[SHELL_MAX_GROUPS];
+  uint8_t if_section[SHELL_MAX_GROUPS][2];
+  uint32_t if_condition[SHELL_MAX_GROUPS];
   uint32_t depth, cursor;
 } dep_control_stream_t;
 
@@ -3838,6 +3895,10 @@ struct dep_snapshot_frame {
   uint32_t cwd_groups[SHELL_MAX_GROUPS];
   uint32_t cwd_depth;
   dep_cwd_flow_t cwd_scope[SHELL_MAX_GROUPS + 1];
+  /* The working-directory counterpart of dep_fd_stream_t's `if` state. */
+  dep_cwd_flow_t cwd_if_failure[SHELL_MAX_GROUPS];
+  dep_cwd_flow_t cwd_if_exit[SHELL_MAX_GROUPS];
+  uint8_t cwd_if_section[SHELL_MAX_GROUPS][2];
   dep_cwd_flow_t cwd_entry[DEP_EXECUTION_EVENT_CAPACITY];
   dep_cwd_flow_t async_cwd_entry[DEP_EXECUTION_EVENT_CAPACITY];
   /* Biased source event of each scope's current pipeline entry. All stages
@@ -6969,7 +7030,6 @@ static SHELL_NONNULL(1, 2) bool dep_async_stdin(dep_route_state_t *state,
     if (!dep_route_state_add_root(&result, journal, one.root))
       return false;
   }
-  result.correlated = true;
   dep_route_state_inherit(&result, state);
   *state = result;
   return true;
@@ -9365,6 +9425,24 @@ static SHELL_NONNULL(1) int32_t
   return parent == UINT16_MAX ? -1 : (int32_t)parent;
 }
 
+/* Whether the event's scope is an `if`, and which of its lists the event is in:
+ * a shell_range_role_t and the arm of the `if`/`elif` it belongs to. Events of
+ * any other scope are in no section. */
+static bool dep_event_section(const dep_parse_context_t *context,
+                              uint32_t event, uint8_t *role, uint8_t *arm) {
+  int32_t scope = dep_snapshot_event_group(context, event);
+  if (scope < 0 || context->fast->groups[scope].kind != SHELL_GROUP_IF)
+    return false;
+  if (event < SHELL_MAX_GROUPS) {
+    *role = context->fast->groups[event].role;
+    *arm = context->fast->groups[event].arm;
+  } else {
+    *role = context->fast->cmds[event - SHELL_MAX_GROUPS].role;
+    *arm = context->fast->cmds[event - SHELL_MAX_GROUPS].arm;
+  }
+  return true;
+}
+
 /* A compound is an execution stage in its parent's list independently of its
  * retained body commands. Share this stage stream with snapshot
  * replay instead of recovering connectors from the last retained CMD.
@@ -9384,21 +9462,39 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_execution_events(
           SHELL_MAX_GROUPS + range, context->fast->cmds[range].start};
     }
   qsort(owners, *count, sizeof(*owners), dep_ordered_owner_compare);
-  uint32_t last[SHELL_MAX_GROUPS + 1];
+  /* An `else` list and an `elif` condition follow the previous condition, not
+   * the `then` list before them. cond[scope] is the last event of the most
+   * recent condition list of an `if` scope; section[scope] the list of its
+   * latest event. */
+  uint32_t last[SHELL_MAX_GROUPS + 1], cond[SHELL_MAX_GROUPS + 1];
+  uint8_t section[SHELL_MAX_GROUPS + 1][2] = {{0}};
   for (uint32_t i = 0; i <= SHELL_MAX_GROUPS; i++)
-    last[i] = UINT32_MAX;
+    last[i] = cond[i] = UINT32_MAX;
   for (uint32_t begin = 0; begin < *count;) {
     uint32_t end = begin + 1;
     while (end < *count && owners[end].start == owners[begin].start)
       end++;
     for (uint32_t i = begin; i < end; i++) {
       DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_CONTROL_ENDPOINTS);
-      previous[i] =
-          last[dep_snapshot_event_group(context, owners[i].owner) + 1];
+      uint32_t scope =
+          (uint32_t)(dep_snapshot_event_group(context, owners[i].owner) + 1);
+      uint8_t role, arm;
+      previous[i] = last[scope];
+      if (dep_event_section(context, owners[i].owner, &role, &arm) &&
+          (role != section[scope][0] || arm != section[scope][1]) &&
+          role != SHELL_RANGE_ROLE_THEN)
+        previous[i] = cond[scope];
     }
     for (uint32_t i = begin; i < end; i++) {
       uint32_t scope =
           (uint32_t)(dep_snapshot_event_group(context, owners[i].owner) + 1);
+      uint8_t role, arm;
+      if (dep_event_section(context, owners[i].owner, &role, &arm)) {
+        section[scope][0] = role;
+        section[scope][1] = arm;
+        if (role == SHELL_RANGE_ROLE_CONDITION)
+          cond[scope] = i;
+      }
       if (last[scope] == UINT32_MAX ||
           owners[last[scope]].start != owners[i].start)
         last[scope] = i;
@@ -9421,6 +9517,7 @@ static SHELL_NONNULL(1, 2) void dep_async_plan_build(
   uint32_t count = context->snapshot->owner_count;
   uint32_t first[SHELL_MAX_GROUPS + 1], prior[DEP_EXECUTION_EVENT_CAPACITY];
   bool and_or[SHELL_MAX_GROUPS + 1] = {0};
+  uint8_t section[SHELL_MAX_GROUPS + 1][2] = {{0}};
   for (uint32_t scope = 0; scope <= SHELL_MAX_GROUPS; scope++)
     first[scope] = UINT32_MAX;
   for (uint32_t i = 0; i < count; i++) {
@@ -9438,6 +9535,15 @@ static SHELL_NONNULL(1, 2) void dep_async_plan_build(
     bool continuation = connector == SHELL_TYPE_AND ||
                         connector == SHELL_TYPE_OR ||
                         connector == SHELL_TYPE_PIPELINE;
+    /* A list of an `if` starts a unit even though its connector relates it to
+     * a condition: `&` ends only the list that holds it. */
+    uint8_t role, arm;
+    if (dep_event_section(context, event, &role, &arm)) {
+      if (role != section[scope][0] || arm != section[scope][1])
+        continuation = false;
+      section[scope][0] = role;
+      section[scope][1] = arm;
+    }
     if (!continuation || first[scope] == UINT32_MAX) {
       first[scope] = event;
       and_or[scope] = false;
@@ -9535,6 +9641,18 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_control_stream_advance(
                          ? DEP_STATUS_EITHER
                          : dep_control_completed_status(
                                context, stream, events[last].owner, last);
+      if (last != UINT32_MAX &&
+          context->fast->groups[group].kind == SHELL_GROUP_IF) {
+        body |= stream->if_exit[group];
+        if (stream->if_section[group][0] == SHELL_RANGE_ROLE_THEN) {
+          /* No `else` ran: a failed last condition makes the `if` succeed. */
+          uint32_t condition = stream->if_condition[group] - 1;
+          if (dep_control_completed_status(context, stream,
+                                           events[condition].owner, condition) &
+              DEP_STATUS_MAY_FAIL)
+            body |= DEP_STATUS_MAY_SUCCEED;
+        }
+      }
       dep_group_completion_t completion = dep_group_completion(context, group);
       body = dep_group_completed_status(&completion, body);
       const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
@@ -9569,6 +9687,29 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_control_stream_advance(
       incoming = stream->incoming[scope] & run;
       if (incoming)
         incoming = dep_expansion_status(context, (uint32_t)scope, incoming);
+    }
+    /* The first command of a `then` list runs on the condition's success and
+     * that of an `else` list or `elif` condition on its failure. Terminating
+     * statuses pass either way. */
+    uint8_t role, arm;
+    if (dep_event_section(context, event, &role, &arm)) {
+      uint8_t *section = stream->if_section[scope];
+      if (previous[index] != UINT32_MAX &&
+          (role != section[0] || arm != section[1])) {
+        incoming &= (uint8_t)(DEP_STATUS_STOP | (role == SHELL_RANGE_ROLE_THEN
+                                                     ? DEP_STATUS_MAY_SUCCEED
+                                                     : DEP_STATUS_MAY_FAIL));
+        if (section[0] == SHELL_RANGE_ROLE_THEN &&
+            role != SHELL_RANGE_ROLE_THEN) {
+          uint32_t exit = stream->last[scope + 1];
+          stream->if_exit[scope] |= dep_control_completed_status(
+              context, stream, events[exit].owner, exit);
+        }
+      }
+      section[0] = role;
+      section[1] = arm;
+      if (role == SHELL_RANGE_ROLE_CONDITION)
+        stream->if_condition[scope] = index + 1;
     }
     /* Input-unit recovery applies to the returning parent status, after any
      * asynchronous unit restores its entry, even when no child was launched. */
@@ -9806,6 +9947,62 @@ static SHELL_NONNULL(1) uint8_t
                                       : DEP_STATUS_EITHER;
 }
 
+/* See dep_fd_if_enter: park the failed outcome of a condition while its `then`
+ * list runs, and bank the list's outcomes when an `else` or `elif` follows. */
+static SHELL_NONNULL(1) void dep_cwd_if_enter(
+    const dep_parse_context_t *context, uint32_t event) {
+  uint8_t role, arm;
+  if (!dep_event_section(context, event, &role, &arm))
+    return;
+  dep_snapshot_frame_t *frame = context->snapshot;
+  uint32_t group = (uint32_t)dep_snapshot_event_group(context, event);
+  uint8_t *section = frame->cwd_if_section[group];
+  if (role == section[0] && arm == section[1])
+    return;
+  dep_cwd_flow_t *flow = &frame->cwd_scope[group + 1];
+  if (section[0] != SHELL_RANGE_ROLE_NONE) {
+    if (role == SHELL_RANGE_ROLE_THEN) {
+      frame->cwd_if_failure[group] = (dep_cwd_flow_t){0};
+      if (flow->mask & DEP_STATUS_MAY_FAIL) {
+        frame->cwd_if_failure[group].mask = DEP_STATUS_MAY_FAIL;
+        frame->cwd_if_failure[group].state[1] = flow->state[1];
+        flow->mask &= (uint8_t)~DEP_STATUS_MAY_FAIL;
+      }
+    } else {
+      for (unsigned outcome = 0; outcome < 5; outcome++)
+        if (flow->mask & (1u << outcome))
+          dep_cwd_add(&frame->cwd_if_exit[group], outcome,
+                      flow->state[outcome]);
+      *flow = frame->cwd_if_failure[group];
+      frame->cwd_if_failure[group] = (dep_cwd_flow_t){0};
+    }
+  }
+  section[0] = role;
+  section[1] = arm;
+}
+
+/* The group's body flow becomes the outcomes of every list that ran; with no
+ * `else` the last condition failing returns success. */
+static SHELL_NONNULL(1) void dep_cwd_if_finish(
+    const dep_parse_context_t *context, uint32_t group) {
+  dep_snapshot_frame_t *frame = context->snapshot;
+  if (context->fast->groups[group].kind != SHELL_GROUP_IF ||
+      frame->cwd_if_section[group][0] == SHELL_RANGE_ROLE_NONE)
+    return;
+  dep_cwd_flow_t *flow = &frame->cwd_scope[group + 1];
+  dep_cwd_flow_t *exit = &frame->cwd_if_exit[group];
+  for (unsigned outcome = 0; outcome < 5; outcome++)
+    if (flow->mask & (1u << outcome))
+      dep_cwd_add(exit, outcome, flow->state[outcome]);
+  if (frame->cwd_if_section[group][0] == SHELL_RANGE_ROLE_THEN &&
+      (frame->cwd_if_failure[group].mask & DEP_STATUS_MAY_FAIL))
+    dep_cwd_add(exit, 0, frame->cwd_if_failure[group].state[1]);
+  *flow = *exit;
+  *exit = (dep_cwd_flow_t){0};
+  frame->cwd_if_failure[group] = (dep_cwd_flow_t){0};
+  frame->cwd_if_section[group][0] = frame->cwd_if_section[group][1] = 0;
+}
+
 /* Save the pre-command alternatives and select only paths that execute this
  * stage. Called once per source event, before its words or redirects expand. */
 static SHELL_NONNULL(1, 3, 4,
@@ -9821,6 +10018,7 @@ static SHELL_NONNULL(1, 3, 4,
     frame->cwd_scope[0].state[0] = frame->cwd_scope[0].state[1] = incoming;
     frame->cwd_initialized = true;
   }
+  dep_cwd_if_enter(context, event);
   dep_cwd_flow_t *flow = &frame->cwd_scope[scope];
   if (scope == 0) {
     const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
@@ -9950,6 +10148,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) void dep_complete_cwd_groups(
       break;
     frame->cwd_depth--;
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_GROUP_EVENTS);
+    dep_cwd_if_finish(context, group);
     dep_cwd_flow_t body = frame->cwd_scope[group + 1];
     dep_cwd_state_t entry = {groups[group].entry_cwd_offset,
                              groups[group].entry_cwd_known,
@@ -10498,8 +10697,7 @@ static SHELL_NONNULL(1, 3, 7, 9) shell_dep_error_t dep_snapshot_fd_imports(
       !dep_prefixes_resolve(&alternatives,
                             &assignment_source->prefix_assignments, changes))
     return SHELL_DEP_ETRUNC;
-  uint32_t base_paths =
-      alternatives.correlated ? dep_route_state_count(&alternatives) : 1;
+  uint32_t base_paths = dep_route_state_count(&alternatives);
   uint32_t variants = null_path && command_path ? 2 : 1;
   uint32_t paths = base_paths * variants;
   if (paths > SHELL_DEP_MAX_NODES)
@@ -11884,6 +12082,9 @@ static SHELL_NONNULL(1) bool dep_snapshot_complete_groups(
     frame->active_group_count--;
     workspace->journal.diagnostics = &frame->diagnostics;
     workspace->journal.diagnostic_owner = context->group_node[group];
+    if (!dep_fd_if_finish(context, &frame->fd_stream, group,
+                          &workspace->journal))
+      return false;
     frame->group_scope[group] = frame->fd_stream.scope[group + 1];
     frame->group_failure[group] = frame->fd_stream.setup_failure[group];
     if (!dep_fd_complete_group(context, &frame->fd_stream, group,
@@ -12442,6 +12643,28 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_retain_owner_io(
  * part of its stderr output. An unhandled one has no dependency model
  * (SHELL_DEP_EUNMODELED). A read error never stops execution, so handling
  * applies even to a certain one. */
+/* Whether the list of an `if` that holds the ranges up to last_range, in the
+ * section (role, arm), ends there: the next range is outside the group or in
+ * another section. */
+static SHELL_NONNULL(1) bool dep_if_list_ends_at(
+    const dep_parse_context_t *context, uint16_t group, uint8_t role,
+    uint8_t arm, uint32_t last_range) {
+  const shell_parse_result_t *fast = context->fast;
+  uint32_t next = last_range + 1;
+  if (next >= fast->count)
+    return true;
+  uint16_t at = context->execution->pipeline.containing_group[next];
+  uint8_t next_role = fast->cmds[next].role, next_arm = fast->cmds[next].arm;
+  while (at != group) {
+    if (at == UINT16_MAX)
+      return true;
+    next_role = fast->groups[at].role;
+    next_arm = fast->groups[at].arm;
+    at = fast->groups[at].parent;
+  }
+  return next_role != role || next_arm != arm;
+}
+
 static SHELL_NONNULL(1) bool dep_read_status_consumed(
     const dep_parse_context_t *context, uint32_t owner) {
   const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
@@ -12455,21 +12678,40 @@ static SHELL_NONNULL(1) bool dep_read_status_consumed(
   /* Ranges are lexical, and the read's own auxiliary ranges (such as a
    * here-string body) lie within its span. The read ends a group when the
    * group's last range does; an enclosing group's last range is then that
-   * same range or another within the read. */
+   * same range or another within the read. An `if` has no such last range
+   * for its condition: the read ends the list the `if` branches on when the
+   * next range is in another section, and then the `if` consumes its status.
+   * A read ending a `then` or `else` list ends the `if` instead. */
   const shell_range_t *read = &context->fast->cmds[range];
+  uint32_t last = range;
+  while (last + 1 < context->fast->count &&
+         context->fast->cmds[last + 1].start < read->start + read->len)
+    last++;
+  uint8_t role = read->role, arm = read->arm;
   for (uint16_t group = pipeline->containing_group[range]; group != UINT16_MAX;
        group = context->fast->groups[group].parent) {
     const shell_group_t *compound = &context->fast->groups[group];
-    uint32_t last =
+    uint32_t group_last =
         (uint32_t)compound->first_command + compound->command_count - 1u;
-    if (context->fast->cmds[last].start >= read->start + read->len)
+    if (compound->kind == SHELL_GROUP_IF) {
+      bool ends = dep_if_list_ends_at(context, group, role, arm, last);
+      if (role == SHELL_RANGE_ROLE_CONDITION)
+        return ends;
+      if (!ends)
+        return false;
+    } else if (context->fast->cmds[group_last].start >=
+               read->start + read->len) {
       return false;
+    }
     successor = pipeline->group_successor[group];
     if (successor == SHELL_TYPE_AND || successor == SHELL_TYPE_OR ||
         compound->pipeline_negation_count != 0)
       return true;
     if (successor != SHELL_TYPE_SIMPLE)
       return false;
+    role = compound->role;
+    arm = compound->arm;
+    last = group_last;
   }
   return false;
 }
@@ -15614,7 +15856,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 11) uint32_t
         (int32_t)group,
         single_stage && (descriptor->kind == SHELL_GROUP_SUBSHELL ||
                          group_exec[group].backgrounded),
-        single_stage && descriptor->kind == SHELL_GROUP_BRACE &&
+        single_stage && descriptor->kind != SHELL_GROUP_SUBSHELL &&
             !group_exec[group].backgrounded,
     };
   }
@@ -16163,13 +16405,16 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
   dep_process_route_map_t process_routes = {0};
   for (uint32_t i = 0; i < fast_result.group_count; i++) {
     const shell_group_t *group = &fast_result.groups[i];
+    /* The parser disables a group whose extent it cut off at a capacity.
+     * No node can stand for it, yet its events remain in the stream. */
     if (group->end <= group->start || group->end > cmd_len) {
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
-      continue;
+      return SHELL_DEP_ETRUNC;
     }
+    /* Every later pass needs an endpoint for each group. */
     if (out->node_count >= max_nodes) {
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
-      break;
+      return SHELL_DEP_ETRUNC;
     }
     uint32_t node_index = out->node_count++;
     group_node[i] = node_index;
@@ -19013,7 +19258,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
         continue;
       }
       if (n->group.kind != SHELL_GROUP_BRACE &&
-          n->group.kind != SHELL_GROUP_SUBSHELL) {
+          n->group.kind != SHELL_GROUP_SUBSHELL &&
+          n->group.kind != SHELL_GROUP_IF) {
         dep_validation_error(&r, "GROUP node %u: invalid kind %u", i,
                              n->group.kind);
         continue;

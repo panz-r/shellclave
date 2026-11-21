@@ -1308,6 +1308,21 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
   check_keyword(state, token);
   if (state->lexical_command_position) {
     size_t after = 0;
+    /* The words that introduce another command, `if`, `then`, `elif` and
+     * `else`, leave command position open: a brace group, subshell, `!` or
+     * `time` may follow them. Only a whole word at command position counts. */
+    const shell_keyword_t *introducer = shell_source_keyword(
+        state->input, state->length, token->position, &after);
+    if (introducer && after == token->position + token->length &&
+        (introducer->kind == SHELL_KEYWORD_IF ||
+         introducer->kind == SHELL_KEYWORD_THEN ||
+         introducer->kind == SHELL_KEYWORD_ELIF ||
+         introducer->kind == SHELL_KEYWORD_ELSE)) {
+      state->lexical_redirect_operand = false;
+      state->lexical_prefix = LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
+      return true;
+    }
+    after = 0;
     if (token->type == SHELL_TOKEN_PIPE_NEGATE) {
       state->lexical_prefix &=
           LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
@@ -1404,7 +1419,6 @@ static bool control_function_keyword_has_name(const shell_token_t *token,
 }
 
 typedef enum {
-  CONTROL_FRAME_IF,
   CONTROL_FRAME_LOOP,
   CONTROL_FRAME_CASE,
 } control_frame_t;
@@ -1512,6 +1526,18 @@ static SHELL_NONNULL(1) shell_control_syntax_t
       continue;
     }
 
+    /* `if` is modeled: its words are command-list structure checked by the
+     * list grammar, not control syntax. The introducers leave the next word
+     * at command position, and `fi` ends the compound. */
+    if (command_start &&
+        (keyword == SHELL_KEYWORD_IF || keyword == SHELL_KEYWORD_THEN ||
+         keyword == SHELL_KEYWORD_ELIF || keyword == SHELL_KEYWORD_ELSE))
+      continue;
+    if (command_start && keyword == SHELL_KEYWORD_FI) {
+      command_start = false;
+      continue;
+    }
+
     if (frame_count != 0) {
       control_frame_state_t *frame = &frames[frame_count - 1];
       if (frame->type == CONTROL_FRAME_CASE && !frame->body_started &&
@@ -1530,21 +1556,9 @@ static SHELL_NONNULL(1) shell_control_syntax_t
         continue;
       }
       if (!command_start) {
-        if (!frame->body_started &&
-            ((frame->type == CONTROL_FRAME_IF &&
-              (keyword == SHELL_KEYWORD_THEN || keyword == SHELL_KEYWORD_ELIF ||
-               keyword == SHELL_KEYWORD_ELSE)) ||
-             (frame->type == CONTROL_FRAME_LOOP &&
-              keyword == SHELL_KEYWORD_DO)))
+        if (!frame->body_started && frame->type == CONTROL_FRAME_LOOP &&
+            keyword == SHELL_KEYWORD_DO)
           frame->misplaced_marker = true;
-        continue;
-      }
-      if (frame->type == CONTROL_FRAME_IF &&
-          (keyword == SHELL_KEYWORD_THEN || keyword == SHELL_KEYWORD_ELIF ||
-           keyword == SHELL_KEYWORD_ELSE)) {
-        frame->body_started = true;
-        frame->misplaced_marker = false;
-        saw_control = true;
         continue;
       }
       if (frame->type == CONTROL_FRAME_LOOP && keyword == SHELL_KEYWORD_DO) {
@@ -1553,8 +1567,7 @@ static SHELL_NONNULL(1) shell_control_syntax_t
         saw_control = true;
         continue;
       }
-      if ((frame->type == CONTROL_FRAME_IF && keyword == SHELL_KEYWORD_FI) ||
-          (frame->type == CONTROL_FRAME_LOOP &&
+      if ((frame->type == CONTROL_FRAME_LOOP &&
            keyword == SHELL_KEYWORD_DONE) ||
           (frame->type == CONTROL_FRAME_CASE &&
            keyword == SHELL_KEYWORD_ESAC)) {
@@ -1573,12 +1586,8 @@ static SHELL_NONNULL(1) shell_control_syntax_t
 
     control_frame_t frame;
     bool push_frame = false;
-    if (keyword == SHELL_KEYWORD_IF) {
-      frame = CONTROL_FRAME_IF;
-      push_frame = true;
-    } else if (keyword == SHELL_KEYWORD_WHILE ||
-               keyword == SHELL_KEYWORD_UNTIL || keyword == SHELL_KEYWORD_FOR ||
-               keyword == SHELL_KEYWORD_SELECT) {
+    if (keyword == SHELL_KEYWORD_WHILE || keyword == SHELL_KEYWORD_UNTIL ||
+        keyword == SHELL_KEYWORD_FOR || keyword == SHELL_KEYWORD_SELECT) {
       frame = CONTROL_FRAME_LOOP;
       push_frame = true;
     } else if (keyword == SHELL_KEYWORD_COPROC) {
@@ -1590,9 +1599,7 @@ static SHELL_NONNULL(1) shell_control_syntax_t
     } else if (keyword == SHELL_KEYWORD_CASE) {
       frame = CONTROL_FRAME_CASE;
       push_frame = true;
-    } else if (keyword == SHELL_KEYWORD_THEN || keyword == SHELL_KEYWORD_ELIF ||
-               keyword == SHELL_KEYWORD_ELSE || keyword == SHELL_KEYWORD_FI ||
-               keyword == SHELL_KEYWORD_DO || keyword == SHELL_KEYWORD_DONE ||
+    } else if (keyword == SHELL_KEYWORD_DO || keyword == SHELL_KEYWORD_DONE ||
                keyword == SHELL_KEYWORD_IN || keyword == SHELL_KEYWORD_ESAC) {
       return SHELL_CONTROL_SYNTAX_INCOMPLETE;
     }
@@ -1757,7 +1764,31 @@ typedef struct {
   shell_list_state_t parent;
   shell_token_type_t opening_type;
   size_t opening_position;
+  /* Nonzero for an `if`: the list it is reading, a shell_range_role_t. */
+  uint8_t if_role;
 } shell_list_group_state_t;
+
+/* The state after a compound command ends: its trailing redirects, pipe or
+ * connector may follow, and no new word of the parent's command may start. */
+static shell_list_state_t
+shell_list_state_after_compound(const shell_list_state_t *parent) {
+  shell_list_state_t state = *parent;
+  state.needs_stage = false;
+  state.pipeline_start = false;
+  state.prefix = shell_pipeline_prefix_state_initial(false);
+  state.may_end = false;
+  state.redirect_operand = false;
+  state.redirect_operator_end = 0;
+  state.after_group = true;
+  state.group_redirect_operand = false;
+  state.group_redirect_word_open = false;
+  state.group_redirect_word_end = 0;
+  state.group_redirect_operator_end = 0;
+  state.assignment_prefix_open = false;
+  state.declaration_operands = false;
+  state.word_end = 0;
+  return state;
+}
 
 static shell_list_state_t shell_list_state_initial(void) {
   return (shell_list_state_t){
@@ -2476,6 +2507,8 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
                            token.type == SHELL_TOKEN_SUBSHELL_END)) {
       if (group_count == 0)
         return list_invalid_at(draft, token.position);
+      if (groups[group_count - 1].if_role)
+        return list_invalid_at(draft, token.position);
       shell_list_group_state_t group = groups[--group_count];
       if ((input[group.opening_position] == '(' && token.start[0] != ')') ||
           (input[group.opening_position] == '{' && token.start[0] != '}'))
@@ -2489,21 +2522,7 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
           !group.parent.needs_stage;
       if (state.needs_stage && !state.may_end && !empty_function_marker)
         return list_invalid_at(draft, token.position);
-      state = group.parent;
-      state.needs_stage = false;
-      state.pipeline_start = false;
-      state.prefix = shell_pipeline_prefix_state_initial(false);
-      state.may_end = false;
-      state.redirect_operand = false;
-      state.redirect_operator_end = 0;
-      state.after_group = true;
-      state.group_redirect_operand = false;
-      state.group_redirect_word_open = false;
-      state.group_redirect_word_end = 0;
-      state.group_redirect_operator_end = 0;
-      state.assignment_prefix_open = false;
-      state.declaration_operands = false;
-      state.word_end = 0;
+      state = shell_list_state_after_compound(&group.parent);
       continue;
     }
 
@@ -2600,6 +2619,66 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
       state.declaration_operands = false;
       state.word_end = 0;
       continue;
+    }
+
+    /* `if` opens a list that `then`, `elif` and `else` move to the next of, and
+     * `fi` closes. A word still open at the end of a received draft may yet
+     * grow into another word: leave it to the pending-word case below. */
+    if (!literal_token && state.needs_stage && control_token_is_word(&token)) {
+      size_t word_end;
+      const shell_keyword_t *keyword =
+          shell_source_keyword(input, input_length, token.position, &word_end);
+      /* `fi` ends the compound: it cannot be read as the start of a longer
+       * word that continues a command. The other keywords can. */
+      bool settled = !(draft && can_append && word_end == input_length) ||
+                     (keyword && keyword->kind == SHELL_KEYWORD_FI);
+      if (keyword && settled &&
+          (keyword->kind == SHELL_KEYWORD_IF ||
+           keyword->kind == SHELL_KEYWORD_THEN ||
+           keyword->kind == SHELL_KEYWORD_ELIF ||
+           keyword->kind == SHELL_KEYWORD_ELSE ||
+           keyword->kind == SHELL_KEYWORD_FI)) {
+        if (keyword->kind == SHELL_KEYWORD_IF) {
+          if (group_count == SHELL_MAX_GROUPS) {
+            if (draft)
+              draft->failure = SHELL_SOURCE_TRUNCATED;
+            return SHELL_ETRUNC;
+          }
+          groups[group_count++] = (shell_list_group_state_t){
+              .parent = state,
+              .opening_position = token.position,
+              .if_role = SHELL_RANGE_ROLE_CONDITION,
+          };
+          state = shell_list_state_initial();
+          continue;
+        }
+        /* The list before the keyword must hold a command. */
+        shell_list_group_state_t *frame =
+            group_count ? &groups[group_count - 1] : NULL;
+        bool valid =
+            frame && frame->if_role && !(state.needs_stage && !state.may_end);
+        if (valid && keyword->kind == SHELL_KEYWORD_THEN)
+          valid = frame->if_role == SHELL_RANGE_ROLE_CONDITION;
+        else if (valid && (keyword->kind == SHELL_KEYWORD_ELIF ||
+                           keyword->kind == SHELL_KEYWORD_ELSE))
+          valid = frame->if_role == SHELL_RANGE_ROLE_THEN;
+        else if (valid)
+          valid = frame->if_role == SHELL_RANGE_ROLE_THEN ||
+                  frame->if_role == SHELL_RANGE_ROLE_ELSE;
+        if (!valid)
+          return list_invalid_at(draft, token.position);
+        if (keyword->kind == SHELL_KEYWORD_FI) {
+          state =
+              shell_list_state_after_compound(&groups[--group_count].parent);
+          continue;
+        }
+        frame->if_role =
+            keyword->kind == SHELL_KEYWORD_THEN   ? SHELL_RANGE_ROLE_THEN
+            : keyword->kind == SHELL_KEYWORD_ELIF ? SHELL_RANGE_ROLE_CONDITION
+                                                  : SHELL_RANGE_ROLE_ELSE;
+        state = shell_list_state_initial();
+        continue;
+      }
     }
 
     if (draft && !literal_token && state.needs_stage &&
@@ -2918,6 +2997,38 @@ static SHELL_NONNULL(1,
   command->has_arithmetic |= scan.has_arithmetic;
 }
 
+/* At command position the words of an `if` are structure, not command words:
+ * `if` and `fi` open and close a group like `{` and `}`, and `then`, `elif`
+ * and `else` start the next list as a separator does. Rewrites such a token
+ * to the syntax it stands for (a group delimiter, or a separator already
+ * implied by the list before it) and returns whether it is one of those
+ * separator words, which the caller skips. */
+static SHELL_NONNULL(1, 3) bool full_if_keyword_syntax(const char *input,
+                                                       size_t input_length,
+                                                       shell_token_t *token) {
+  size_t after;
+  const shell_keyword_t *keyword;
+  if (!control_token_is_word(token) ||
+      !(keyword = shell_source_keyword(input, input_length, token->position,
+                                       &after)) ||
+      after != token->position + token->length)
+    return false;
+  switch (keyword->kind) {
+  case SHELL_KEYWORD_IF:
+    token->type = SHELL_TOKEN_GROUP_START;
+    return false;
+  case SHELL_KEYWORD_FI:
+    token->type = SHELL_TOKEN_GROUP_END;
+    return false;
+  case SHELL_KEYWORD_THEN:
+  case SHELL_KEYWORD_ELIF:
+  case SHELL_KEYWORD_ELSE:
+    return true;
+  default:
+    return false;
+  }
+}
+
 shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     const char *input, size_t input_length, bool allow_initial_time,
     shell_command_t **commands, size_t *command_count) {
@@ -2957,6 +3068,8 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
         continue;
     }
     visible = true;
+    if (expect_command && full_if_keyword_syntax(input, input_length, &token))
+      continue;
     if (pipeline_start) {
       shell_pipeline_prefix_step_t prefix_step = shell_pipeline_prefix_step(
           &pipeline_prefix,
@@ -3071,6 +3184,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
   current_cmd->has_arithmetic = false;
   current_cmd->has_loops = false;
   current_cmd->has_conditionals = false;
+  current_cmd->has_if = false;
   current_cmd->has_case = false;
   current_cmd->has_groups = false;
   current_cmd->ends_group = false;
@@ -3095,6 +3209,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
   size_t modifier_group_depth = 0;
   bool saw_loop = false;
   bool saw_conditional = false;
+  bool saw_if = false;
   bool saw_case = false;
   bool closed_group_at_end = false;
   bool group_tail_active = false;
@@ -3108,10 +3223,13 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
       if (pipeline_prefix.time_mode == SHELL_PIPE_TIME_NONE)
         continue;
     }
+    if (expect_command && full_if_keyword_syntax(input, input_length, &token))
+      continue;
     closed_group_at_end = token.type == SHELL_TOKEN_GROUP_END;
     saw_loop = saw_loop || state.loop_depth > 0;
-    saw_conditional = saw_conditional || state.if_depth > 0 ||
-                      token.type == SHELL_TOKEN_CONDITIONAL_COMMAND;
+    saw_if = saw_if || state.if_depth > 0;
+    saw_conditional =
+        saw_conditional || token.type == SHELL_TOKEN_CONDITIONAL_COMMAND;
     saw_case = saw_case || state.case_depth > 0;
     if (token.type == SHELL_TOKEN_GROUP_START ||
         token.type == SHELL_TOKEN_GROUP_END) {
@@ -3123,8 +3241,8 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
       if (group_starts_command) {
         current_cmd->end_pos = token.position;
         if (!full_commands_start_record(
-                commands, &count, &current_command, &state, token.position + 1,
-                pipeline_scope_negation_count,
+                commands, &count, &current_command, &state,
+                token.position + token.length, pipeline_scope_negation_count,
                 pipeline_scope_time_mode != SHELL_PIPE_TIME_NONE
                     ? pipeline_scope_time_mode
                     : inherited_time_mode)) {
@@ -3143,7 +3261,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
       current_cmd->group_kinds |= token.group_kinds;
       if (token.type == SHELL_TOKEN_GROUP_START &&
           current_cmd->token_count == 0) {
-        current_cmd->start_pos = token.position + 1;
+        current_cmd->start_pos = token.position + token.length;
       } else if (token.type == SHELL_TOKEN_GROUP_END) {
         current_cmd->end_pos = token.position;
         current_cmd->ends_group = true;
@@ -3174,7 +3292,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
         if (pipeline_modifier_token_count != 0 &&
             current_cmd->token_count == pipeline_modifier_token_count) {
           current_cmd->token_count = 0;
-          current_cmd->start_pos = token.position + 1;
+          current_cmd->start_pos = token.position + token.length;
           /* Negation belongs to the compound pipeline result, not to the first
            * simple command executed inside the compound. */
           current_cmd->pipeline_negation_count = 0;
@@ -3529,6 +3647,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     for (size_t i = 0; i < count; i++) {
       (*commands)[i].has_loops = saw_loop;
       (*commands)[i].has_conditionals = saw_conditional;
+      (*commands)[i].has_if = saw_if;
       (*commands)[i].has_case = saw_case;
       (*commands)[i].pipeline_negated =
           ((*commands)[i].pipeline_negation_count & UINT32_C(1)) != 0;

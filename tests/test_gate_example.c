@@ -212,7 +212,7 @@ int main(void) {
        "argv policy DENY\n"},
       {"git log --oneline", SG_VERDICT_UNDETERMINED, 1, 0, false, false,
        "argv policy UNDETERMINED\n"},
-      {"if true; then :; fi", SG_VERDICT_REJECT, 1, 0, false, false,
+      {"while true; do :; done", SG_VERDICT_REJECT, 1, 0, false, false,
        "argv policy REJECT\n"},
       {"while false; do :; done", SG_VERDICT_REJECT, 1, 0, false, false,
        "argv policy REJECT\n"},

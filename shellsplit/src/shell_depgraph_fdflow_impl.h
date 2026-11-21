@@ -105,7 +105,7 @@ static SHELL_NONNULL(1,
                                                    bool present) {
   uint32_t root = dep_process_owned_root(state, journal);
   if (!dep_route_map_put(journal, &root, fd, DEP_FD_ACCESS_PROCESS_OWNED,
-                         present ? 1 : 0))
+                         present ? DEP_OWNED_CERTAIN : 0))
     return false;
   dep_route_set_t owned = {.ready = true};
   if (root)
@@ -115,9 +115,32 @@ static SHELL_NONNULL(1,
                                       DEP_FD_ACCESS_PROCESS_OWNED, owned);
 }
 
+/* Join two ownership sets. An end owned in both is certainly owned; an end
+ * owned in only one of them, or maybe owned in either, is maybe owned. Branches
+ * that put one process-substitution end at different places own different
+ * descriptors, and the end is at exactly one of them. */
+static uint32_t dep_owned_join_value(void *context, uint64_t key, uint32_t left,
+                                     uint32_t right) {
+  (void)context;
+  (void)key;
+  return left == right ? left : DEP_OWNED_MAYBE;
+}
+
+/* The join reads node ids, keys and these flags only, so it is the union of
+ * the two sets (shell_pmap_union): its memo makes repeated joins of sets
+ * that share structure cost the fresh node pairs, not the sets' difference.
+ * False when the pool or the memo is full. */
+static SHELL_NONNULL(1, 2) bool dep_owned_join(dep_route_journal_t *journal,
+                                               uint32_t *left, uint32_t right) {
+  return shell_pmap_union(&journal->arena->maps, *left, right,
+                          dep_owned_join_value, NULL, left, false,
+                          DEP_UNION_OWNED);
+}
+
 /* Visit only live owned ends, not every descriptor or earlier source command.
  * The child keeps these FDs but clears its ownership set; the forking parent
- * closes exactly these original numbers, including an overwritten original.
+ * closes exactly these original numbers, including an overwritten original. A
+ * maybe-owned end may be somewhere else: it keeps what it held beside CLOSED.
  */
 typedef struct {
   dep_route_state_t *parent;
@@ -125,16 +148,21 @@ typedef struct {
 } dep_process_fork_t;
 
 static bool dep_process_fork_close(void *context, dep_fd_ref_t fd,
-                                   dep_fd_access_t access, uint32_t snapshot) {
-  (void)access, (void)snapshot;
+                                   dep_fd_access_t access, uint32_t owned) {
+  (void)access;
   dep_process_fork_t *fork = context;
-  dep_route_set_t closed = {0};
-  dep_route_set_set(&closed, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
   for (uint32_t facet = DEP_FD_ACCESS_READ; facet <= DEP_FD_ACCESS_BINDING;
-       facet <<= 1)
-    if (!dep_route_state_store_access(fork->parent, fork->journal, fd,
+       facet <<= 1) {
+    dep_route_set_t closed = owned == DEP_OWNED_MAYBE
+                                 ? dep_fd_raw_fact(fork->parent, fork->journal,
+                                                   fd, (dep_fd_access_t)facet)
+                                 : (dep_route_set_t){.ready = true};
+    if (!dep_route_set_add(&closed,
+                           (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX}) ||
+        !dep_route_state_store_access(fork->parent, fork->journal, fd,
                                       (dep_fd_access_t)facet, closed))
       return false;
+  }
   return true;
 }
 
@@ -198,7 +226,6 @@ static SHELL_NONNULL(1, 2) bool dep_setup_begin(dep_route_state_t *state,
         return false;
     }
   }
-  result.correlated = true;
   dep_route_state_inherit(&result, state);
   *state = result;
   return true;
@@ -444,7 +471,6 @@ static SHELL_NONNULL(1, 2) bool dep_import_route_alternatives(
       first = false;
     }
   }
-  result.correlated = paths > 1;
   *state = result;
   if (imports->observe_return && changes->read_observations.active) {
     dep_route_set_t marker = {0};
@@ -939,7 +965,6 @@ static SHELL_NONNULL(1, 2, 3) bool dep_process_guard_prepare(
         return false;
     }
   }
-  result.correlated = true;
   dep_route_state_inherit(&result, state);
   *state = result;
   return true;
@@ -1468,7 +1493,6 @@ static SHELL_NONNULL(1, 2,
           if (!dep_process_owned_set(&branch, journal, fd, true))
             return false;
         }
-        branch.correlated = state->correlated;
         if (!dep_route_state_join_choice(&joined[origin], &have_joined[origin],
                                          &branch, journal))
           return false;
@@ -1487,7 +1511,6 @@ static SHELL_NONNULL(1, 2,
         return false;
     }
   }
-  result.correlated = state->correlated || dep_route_state_count(&result) > 1;
   dep_route_state_inherit(&result, state);
   *state = result;
   return !first;
@@ -1903,7 +1926,6 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_prepare_numeric_undo_one(
       }
     }
   }
-  result.correlated = before.correlated;
   dep_route_state_inherit(&result, &before);
   *state = result;
   return have_result;
@@ -1953,7 +1975,6 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_prepare_numeric_undo(
         return false;
       }
     }
-    result.correlated |= one.correlated;
     result.truncated |= one.truncated;
   }
   dep_route_state_inherit(&result, &before);
@@ -2034,7 +2055,6 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_apply_one(
           return false;
         }
       }
-      result.correlated |= one.correlated;
       result.truncated |= one.truncated;
     }
     dep_route_state_inherit(&result, &before);
@@ -2637,16 +2657,17 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_apply(
         }
         /* A view has one low-interval case. With every low descriptor open,
          * the save's temporary resource open consumes the first high slot. */
-        uint32_t undo_rank =
-            effective.fd != SHELL_DEP_FD_NAMED && effective.resets_descriptor &&
-                    effective.undo_mode != DEP_UNDO_CHILD &&
-                    (effective.kind == DEP_FD_OP_DOCUMENT ||
-                     effective.kind == DEP_FD_OP_DYNAMIC) &&
-                    (effective.undo_observable || one.correlated) &&
-                    changes->observable_fd_count &&
-                    dep_fd_low_modes(&one, changes) == 2
-                ? 2
-                : 1;
+        uint32_t undo_rank = effective.fd != SHELL_DEP_FD_NAMED &&
+                                     effective.resets_descriptor &&
+                                     effective.undo_mode != DEP_UNDO_CHILD &&
+                                     (effective.kind == DEP_FD_OP_DOCUMENT ||
+                                      effective.kind == DEP_FD_OP_DYNAMIC) &&
+                                     (effective.undo_observable ||
+                                      dep_route_state_correlated(&current)) &&
+                                     changes->observable_fd_count &&
+                                     dep_fd_low_modes(&one, changes) == 2
+                                 ? 2
+                                 : 1;
         bool identity = effective.kind == DEP_FD_OP_IDENTITY;
         if (!identity && effective.fd != SHELL_DEP_FD_NAMED &&
             !dep_prepare_numeric_undo(&one, changes, &effective, op, undo_rank,
@@ -3130,10 +3151,11 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_publish_one(
               DEP_FD_ACCESS_SETUP_MODE, (dep_route_set_t){.ready = true}));
 }
 
-static SHELL_NONNULL(1,
-                     2) bool dep_fd_merge_root(dep_route_state_t *destination,
+static SHELL_NONNULL(1, 2,
+                     4) bool dep_fd_merge_root(dep_route_state_t *destination,
                                                dep_route_journal_t *journal,
-                                               uint32_t source_root);
+                                               uint32_t source_root,
+                                               bool *apart);
 
 static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_versions(
     dep_route_state_t *destination, const dep_route_state_t *source,
@@ -3157,9 +3179,10 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_versions(
       for (uint32_t i = 0; i < count; i++) {
         DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_ALTERNATIVES);
         dep_route_state_t candidate = dep_route_state_single(roots[i]);
-        if (!dep_fd_merge_root(&candidate, journal, root))
+        bool apart = false;
+        if (!dep_fd_merge_root(&candidate, journal, root, &apart))
           return false;
-        if (!candidate.correlated) {
+        if (!apart) {
           roots[i] = candidate.root;
           merged = true;
           break;
@@ -3176,7 +3199,6 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_versions(
   for (uint32_t i = 1; i < count; i++)
     if (!dep_route_state_add_root(&result, journal, roots[i]))
       return false;
-  result.correlated = count > 1;
   dep_route_state_inherit(&result, destination);
   dep_route_state_inherit(&result, source);
   *destination = result;
@@ -3233,7 +3255,8 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_publish(
       published = branch;
       have_published = true;
     } else {
-      if (entry.correlated || executed_state->correlated) {
+      if (dep_route_state_correlated(&entry) ||
+          dep_route_state_correlated(executed_state)) {
         if (!dep_route_state_add_root(&published, changes, branch.root))
           return false;
       } else if (!dep_fd_merge(&published, &branch, changes)) {
@@ -3311,6 +3334,65 @@ dep_time_report_for_fd2(const dep_route_state_t *state,
 }
 
 #include "shell_depgraph_presence_impl.h"
+
+/* The value of a key no version stores: the executor contract, a function of
+ * the key alone. proven_live is the one outside fact it takes, that the
+ * descriptor is proved occupied. */
+static dep_route_set_t
+dep_fd_default_fact(dep_fd_ref_t fd, dep_fd_access_t access, bool proven_live) {
+  if (access == DEP_FD_ACCESS_IFS || access == DEP_FD_ACCESS_STDIN_REDIR) {
+    dep_route_set_t result = {0};
+    dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_INHERITED, 0});
+    return result;
+  }
+  if (access == DEP_FD_ACCESS_AVAILABLE)
+    return (dep_route_set_t){.ready = true};
+  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE ||
+      access == DEP_FD_ACCESS_PRESENCE_MAP ||
+      access == DEP_FD_ACCESS_PROCESS_OWNED ||
+      access == DEP_FD_ACCESS_PRIVATE_SCOPE ||
+      access == DEP_FD_ACCESS_READ_ARGUMENT ||
+      access == DEP_FD_ACCESS_EFFECT_STATE ||
+      access == DEP_FD_ACCESS_SUBSTITUTION_STATUS ||
+      access == DEP_FD_ACCESS_PRIVATE_ENTRY || access == DEP_FD_ACCESS_SAVED ||
+      access == DEP_FD_ACCESS_SETUP_FRAME ||
+      access == DEP_FD_ACCESS_ALLOCATION_SLOTS ||
+      access == DEP_FD_ACCESS_UNDO_ENTRY ||
+      access == DEP_FD_ACCESS_UNDO_TARGET ||
+      access == DEP_FD_ACCESS_UNDO_EXEC || access == DEP_FD_ACCESS_SCRATCH ||
+      access == DEP_FD_ACCESS_SETUP_MODE ||
+      access == DEP_FD_ACCESS_PROCESS_SLOT ||
+      access == DEP_FD_ACCESS_PROCESS_BEFORE ||
+      access == DEP_FD_ACCESS_SELECTOR ||
+      access == DEP_FD_ACCESS_PROCESS_DOMAIN)
+    return (dep_route_set_t){.ready = true};
+  if (access == DEP_FD_ACCESS_ENTRY)
+    return (dep_route_set_t){.ready = true};
+  /* Executor contract (SHELL_DEP_EUNMODELED) for keys no version stores. */
+  dep_route_set_t result = {0};
+  if (fd.value > SHELL_DEP_FD_MAX && fd.value < SHELL_DEP_FD_NAMED) {
+    dep_route_set_set(&result, (dep_fd_route_t){access == DEP_FD_ACCESS_BINDING
+                                                    ? DEP_ROUTE_UNAVAILABLE
+                                                    : DEP_ROUTE_ABSENT,
+                                                UINT32_MAX});
+    return result;
+  }
+  /* The analyzed input starts with 0, 1 and 2 open and every other numeric
+   * descriptor closed. */
+  if (fd.value != SHELL_DEP_FD_NAMED && fd.value >= 3 && !proven_live) {
+    dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+    return result;
+  }
+  dep_fd_route_t route =
+      access == DEP_FD_ACCESS_BINDING
+          ? (dep_fd_route_t){proven_live || fd.value != SHELL_DEP_FD_NAMED
+                                 ? DEP_ROUTE_INHERITED
+                                 : DEP_ROUTE_UNSEEN,
+                             UINT32_MAX}
+          : (dep_fd_route_t){DEP_ROUTE_INHERITED, fd.value};
+  dep_route_set_set(&result, route);
+  return result;
+}
 
 /* A key no version stores has its executor-contract value. Binding visibility
  * is an explicit journal fact, not a table test. A single-root lookup preserves
@@ -3410,58 +3492,7 @@ static SHELL_NONNULL(2) dep_route_set_t
     dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
     return result;
   }
-  if (access == DEP_FD_ACCESS_IFS || access == DEP_FD_ACCESS_STDIN_REDIR) {
-    dep_route_set_t result = {0};
-    dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_INHERITED, 0});
-    return result;
-  }
-  if (access == DEP_FD_ACCESS_AVAILABLE)
-    return (dep_route_set_t){.ready = true};
-  if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE ||
-      access == DEP_FD_ACCESS_PRESENCE_MAP ||
-      access == DEP_FD_ACCESS_PROCESS_OWNED ||
-      access == DEP_FD_ACCESS_PRIVATE_SCOPE ||
-      access == DEP_FD_ACCESS_READ_ARGUMENT ||
-      access == DEP_FD_ACCESS_EFFECT_STATE ||
-      access == DEP_FD_ACCESS_SUBSTITUTION_STATUS ||
-      access == DEP_FD_ACCESS_PRIVATE_ENTRY || access == DEP_FD_ACCESS_SAVED ||
-      access == DEP_FD_ACCESS_SETUP_FRAME ||
-      access == DEP_FD_ACCESS_ALLOCATION_SLOTS ||
-      access == DEP_FD_ACCESS_UNDO_ENTRY ||
-      access == DEP_FD_ACCESS_UNDO_TARGET ||
-      access == DEP_FD_ACCESS_UNDO_EXEC || access == DEP_FD_ACCESS_SCRATCH ||
-      access == DEP_FD_ACCESS_SETUP_MODE ||
-      access == DEP_FD_ACCESS_PROCESS_SLOT ||
-      access == DEP_FD_ACCESS_PROCESS_BEFORE ||
-      access == DEP_FD_ACCESS_SELECTOR ||
-      access == DEP_FD_ACCESS_PROCESS_DOMAIN)
-    return (dep_route_set_t){.ready = true};
-  if (access == DEP_FD_ACCESS_ENTRY)
-    return (dep_route_set_t){.ready = true};
-  /* Executor contract (SHELL_DEP_EUNMODELED) for keys no version stores. */
-  dep_route_set_t result = {0};
-  if (fd.value > SHELL_DEP_FD_MAX && fd.value < SHELL_DEP_FD_NAMED) {
-    dep_route_set_set(&result, (dep_fd_route_t){access == DEP_FD_ACCESS_BINDING
-                                                    ? DEP_ROUTE_UNAVAILABLE
-                                                    : DEP_ROUTE_ABSENT,
-                                                UINT32_MAX});
-    return result;
-  }
-  /* The analyzed input starts with 0, 1 and 2 open and every other numeric
-   * descriptor closed. */
-  if (fd.value != SHELL_DEP_FD_NAMED && fd.value >= 3 && !proven_live) {
-    dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
-    return result;
-  }
-  dep_fd_route_t route =
-      access == DEP_FD_ACCESS_BINDING
-          ? (dep_fd_route_t){proven_live || fd.value != SHELL_DEP_FD_NAMED
-                                 ? DEP_ROUTE_INHERITED
-                                 : DEP_ROUTE_UNSEEN,
-                             UINT32_MAX}
-          : (dep_fd_route_t){DEP_ROUTE_INHERITED, fd.value};
-  dep_route_set_set(&result, route);
-  return result;
+  return dep_fd_default_fact(fd, access, proven_live);
 }
 
 /* Bash's temporary assignment environment is visible to ordinary argument
@@ -3727,70 +3758,394 @@ static SHELL_NONNULL(1) unsigned dep_read_binding_observation(
              : 0;
 }
 
+/* The forced join: one version over-approximating two, a union of their
+ * persistent maps (shell_pmap_union). The value of a key in the result is a
+ * function of the two values alone, so the union's memo makes joining
+ * versions that share structure cost the node pairs they do not share. The
+ * two kinds of key whose value is not a function of the key's two values
+ * alone are set apart and computed per version afterwards:
+ * - the occupancy of fds 0..63 (SHELL_FD_PARTS parts and their union), and
+ *   the binding, read and write facts of those descriptors, whose default
+ *   when a version does not store one is decided by its occupancy;
+ * - nothing else: a named binding's default depends on the fallback kind of
+ *   its override map, which is the union's tag, and a presence entry's on a
+ *   generation that the joined epoch invalidates.
+ * Marks of a save held at another descriptor are read when the descriptor is
+ * read, so a joined version keeps them and reads the same facts. */
 typedef struct {
-  /* A forced join never keeps two versions: every fact becomes the union of
-   * both sides, which over-approximates each of them. */
-  bool force;
-  /* Join versions whose inherited low-interval cases differ when nothing
-   * else keeps them apart. */
-  bool origins;
-} dep_fd_merge_relation_t;
+  dep_route_journal_t *journal;
+  /* Fallback kind of the override map being joined: INHERITED or DYNAMIC. */
+  dep_route_kind_t fallback;
+  bool failed;
+} dep_fd_union_t;
 
-static SHELL_NONNULL(1, 2, 7) bool dep_fd_merge_maps(
-    dep_route_state_t *result, dep_route_journal_t *journal, uint32_t left_root,
-    uint32_t right_root, uint32_t left_map, uint32_t right_map,
-    dep_fd_merge_relation_t *relation);
+static bool dep_route_sets_equal(const dep_route_set_t *a,
+                                 const dep_route_set_t *b) {
+  if (a->count != b->count)
+    return false;
+  for (uint32_t i = 0; i < a->count; i++)
+    if (a->routes[i].kind != b->routes[i].kind ||
+        a->routes[i].value != b->routes[i].value)
+      return false;
+  return true;
+}
 
-static SHELL_NONNULL(1, 2, 9) bool dep_fd_merge_key(
-    dep_route_state_t *result, dep_route_journal_t *journal, uint32_t left_root,
-    uint32_t right_root, dep_fd_ref_t fd, dep_fd_access_t access,
-    uint32_t left_snapshot, uint32_t right_snapshot,
-    dep_fd_merge_relation_t *relation) {
-  dep_route_set_t routes =
-      left_snapshot ? journal->arena->snapshots[left_snapshot - 1]
-                    : dep_fd_raw_root_fact(left_root, journal, fd, access);
-  dep_route_set_t additional =
-      right_snapshot ? journal->arena->snapshots[right_snapshot - 1]
-                     : dep_fd_raw_root_fact(right_root, journal, fd, access);
-  bool equal = routes.count == additional.count;
-  for (uint32_t i = 0; equal && i < routes.count; i++)
-    equal = routes.routes[i].kind == additional.routes[i].kind &&
-            routes.routes[i].value == additional.routes[i].value;
+static bool dep_fd_union_roots(dep_route_journal_t *journal, uint32_t left,
+                               uint32_t right, uint8_t tag, uint32_t *out);
+static bool dep_fd_force_join_roots(dep_route_journal_t *journal, uint32_t left,
+                                    uint32_t right, uint32_t *out);
+
+/* Whether the key's join is decided per version (see above). */
+static bool dep_fd_union_context_key(dep_fd_ref_t fd, dep_fd_access_t access) {
+  return access == DEP_FD_ACCESS_PROCESS_DOMAIN ||
+         (fd.value < 64 &&
+          (access == DEP_FD_ACCESS_READ || access == DEP_FD_ACCESS_WRITE ||
+           access == DEP_FD_ACCESS_BINDING));
+}
+
+/* The join of one key's two facts into *out; an empty fact in *out is no
+ * entry. routes and additional are the facts of the two versions, a default
+ * where one stores none. Symmetric: operands are ordered by the caller. */
+static bool dep_fd_force_fact(dep_fd_union_t *u, dep_fd_ref_t fd,
+                              dep_fd_access_t access,
+                              const dep_route_set_t *left,
+                              const dep_route_set_t *right,
+                              dep_route_set_t *out) {
+  dep_route_set_t routes = *left, additional = *right;
+  bool equal = dep_route_sets_equal(&routes, &additional);
+  *out = routes;
   if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
-    dep_fd_route_t left = dep_named_bindings(left_root, journal);
-    dep_fd_route_t right = dep_named_bindings(right_root, journal);
-    if (left.kind != right.kind) {
-      if (!relation->force) {
-        result->correlated = true;
-        return true;
-      }
+    dep_fd_route_t a = routes.count ? routes.routes[0]
+                                    : (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+    dep_fd_route_t b = additional.count
+                           ? additional.routes[0]
+                           : (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+    if (a.kind != b.kind) {
       /* Bindings established on one side only are not proven on the other:
        * every name is unknown, with an empty override map. */
-      dep_route_set_t unknown = {0};
-      dep_route_set_set(&unknown, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, 0});
-      return dep_route_state_append_one(result, journal, fd, access, unknown);
+      dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, 0});
+      return true;
     }
-    return dep_fd_merge_maps(result, journal, left_root, right_root, left.value,
-                             right.value, relation);
+    uint32_t map;
+    if (!dep_fd_union_roots(u->journal, a.value, b.value,
+                            a.kind == DEP_ROUTE_DYNAMIC
+                                ? DEP_UNION_NAMED_DYNAMIC
+                                : DEP_UNION_NAMED_INHERITED,
+                            &map))
+      return false;
+    dep_route_set_set(out, (dep_fd_route_t){a.kind, map});
+    return true;
   }
-  if (relation->force && !equal && access == DEP_FD_ACCESS_PRESENCE_MAP) {
+  if (!equal && access == DEP_FD_ACCESS_PRESENCE_MAP) {
     /* Presence facts live in a sub-map whose root is this fact: join it
      * name by name rather than keeping either root. */
-    uint32_t left_map = routes.count ? routes.routes[0].value : 0;
-    uint32_t right_map = additional.count ? additional.routes[0].value : 0;
-    return dep_fd_merge_maps(result, journal, left_root, right_root, left_map,
-                             right_map, relation);
+    uint32_t map;
+    if (!dep_fd_union_roots(u->journal,
+                            routes.count ? routes.routes[0].value : 0,
+                            additional.count ? additional.routes[0].value : 0,
+                            DEP_UNION_FACTS, &map))
+      return false;
+    dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_INHERITED, map});
+    return true;
   }
-  if (relation->force && !equal && access == DEP_FD_ACCESS_VARIABLE_PRESENCE) {
+  if (!equal && access == DEP_FD_ACCESS_VARIABLE_PRESENCE) {
     /* A presence read takes one fact, so a joined name is unknown. Differing
      * epochs (key 0) take a generation no entry carries, which reads every
      * name without an agreeing entry as unknown too. */
-    dep_route_set_t unknown = {0};
-    dep_route_set_set(&unknown,
-                      (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
-    return dep_route_state_append_one(result, journal, fd, access, unknown);
+    dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+    return true;
   }
+  if (!equal && access == DEP_FD_ACCESS_PRIVATE_ENTRY &&
+      fd.value != DEP_SCALAR_IMPORT_EVENT && routes.count == 1 &&
+      additional.count == 1) {
+    /* The fact holds the parent's state at the fork. Two versions forked from
+     * different parents return to the join of both, not to the first. */
+    uint32_t origin;
+    if (!dep_fd_force_join_roots(u->journal, routes.routes[0].value,
+                                 additional.routes[0].value, &origin))
+      return false;
+    dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_INHERITED, origin});
+    out->ready = true;
+    return true;
+  }
+  if (!equal && access == DEP_FD_ACCESS_PROCESS_OWNED) {
+    /* The fact holds the root of an ownership set; join the sets, not two
+     * roots, of which a reader takes the first. */
+    uint32_t joined = routes.count ? routes.routes[0].value : 0;
+    if (!dep_owned_join(u->journal, &joined,
+                        additional.count ? additional.routes[0].value : 0))
+      return false;
+    *out = (dep_route_set_t){.ready = true};
+    if (joined)
+      dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_INHERITED, joined});
+    out->ready = true;
+    return true;
+  }
+  if (access == DEP_FD_ACCESS_SELECTOR && !equal) {
+    /* One allocation identity, placed on either side's places. */
+    if (!routes.count || !additional.count) {
+      *out = routes.count ? routes : additional;
+      return true;
+    }
+    shell_fd_allocation_t places = dep_slot_places(&routes);
+    shell_fd_allocation_t other = dep_slot_places(&additional);
+    places.candidates |= other.candidates;
+    places.tail |= other.tail;
+    *out = dep_slot_places_fact(routes.routes[0].value, places);
+    return true;
+  }
+  if (access == DEP_FD_ACCESS_IFS) {
+    uint32_t value =
+        dep_ifs_join(routes.routes[0].value, additional.routes[0].value);
+    if (value != routes.routes[0].value)
+      dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_INHERITED, value});
+    return true;
+  }
+  if (access == DEP_FD_ACCESS_BINDING) {
+    /* A read's operand value, descriptor existence and byte route are one
+     * execution alternative. Do not manufacture a closed binding with a live
+     * capability. */
+    bool unknown = false, unseen = false, live = false;
+    for (unsigned side = 0; side < 2; side++) {
+      const dep_route_set_t *facts = side ? &additional : &routes;
+      for (uint32_t i = 0; i < facts->count; i++) {
+        unknown |= facts->routes[i].kind == DEP_ROUTE_DYNAMIC;
+        unseen |= facts->routes[i].kind == DEP_ROUTE_UNSEEN;
+        live |= facts->routes[i].kind == DEP_ROUTE_INHERITED ||
+                facts->routes[i].kind == DEP_ROUTE_ALIAS;
+      }
+    }
+    if (unknown || (unseen && live)) {
+      if (!(routes.count == 1 && routes.routes[0].kind == DEP_ROUTE_DYNAMIC))
+        dep_route_set_set(out, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+      return true;
+    }
+  }
+  /* Facts that keep their order, or are sets: every alternative of both. */
+  for (uint32_t i = 0; i < additional.count; i++)
+    if (!dep_route_set_add(out, additional.routes[i]))
+      return false;
+  return true;
+}
 
+/* The default a version gives a key it does not store, as far as the key
+ * alone and the override map's fallback decide it. */
+static dep_route_set_t dep_fd_union_default(const dep_fd_union_t *u,
+                                            dep_fd_ref_t fd,
+                                            dep_fd_access_t access) {
+  if (fd.value == SHELL_DEP_FD_NAMED) {
+    dep_route_set_t result = {0};
+    if (access == DEP_FD_ACCESS_BINDING && u->fallback == DEP_ROUTE_DYNAMIC) {
+      dep_route_set_set(&result,
+                        (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+      return result;
+    }
+    if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE) {
+      dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, 0});
+      return result;
+    }
+  }
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
+    dep_route_set_t result = {0};
+    dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_INHERITED, 0});
+    return result;
+  }
+  return dep_fd_default_fact(fd, access, false);
+}
+
+static uint32_t dep_fd_union_leaf(void *context, uint64_t key, uint32_t left,
+                                  uint32_t right) {
+  dep_fd_union_t *u = context;
+  dep_route_journal_t *journal = u->journal;
+  dep_fd_ref_t fd = dep_route_key_fd(journal, key);
+  dep_fd_access_t access = dep_route_key_access(key);
+  /* Placeholder, replaced per version by dep_fd_force_context_keys. */
+  if (dep_fd_union_context_key(fd, access))
+    return left > right ? left : right;
+  dep_route_set_t absent = dep_fd_union_default(u, fd, access);
+  const dep_route_set_t *a =
+      left ? &journal->arena->snapshots[left - 1] : &absent;
+  const dep_route_set_t *b =
+      right ? &journal->arena->snapshots[right - 1] : &absent;
+  dep_route_set_t joined;
+  if (!dep_fd_force_fact(u, fd, access, a, b, &joined)) {
+    u->failed = true;
+    return left;
+  }
+  /* The left version's representation is kept: a fact it stores stays, one it
+   * does not store stays unstored when the join says no more than the default.
+   * (An empty stored fact is a marker, so it too is the left version's.) */
+  if (left ? dep_route_sets_equal(&joined, a)
+           : dep_route_sets_equal(&joined, &absent))
+    return left;
+  uint32_t id = dep_route_set_intern(journal, &joined);
+  if (!id)
+    u->failed = true;
+  return id;
+}
+
+static bool dep_fd_union_roots(dep_route_journal_t *journal, uint32_t left,
+                               uint32_t right, uint8_t tag, uint32_t *out) {
+  dep_fd_union_t u = {journal,
+                      tag == DEP_UNION_NAMED_DYNAMIC ? DEP_ROUTE_DYNAMIC
+                                                     : DEP_ROUTE_INHERITED,
+                      false};
+  return shell_pmap_union(&journal->arena->maps, left, right, dep_fd_union_leaf,
+                          &u, out, false, tag) &&
+         !u.failed;
+}
+
+/* The occupancy fact joining part of the two versions' process domains; l and
+ * r are the facts they store. A version without one has the occupancy of its
+ * binding facts. */
+static dep_route_set_t dep_fd_domain_joined(dep_route_journal_t *journal,
+                                            uint32_t left_root,
+                                            uint32_t right_root, uint32_t part,
+                                            uint32_t l, uint32_t r) {
+  dep_route_state_t left = dep_route_state_single(left_root);
+  dep_route_state_t right = dep_route_state_single(right_root);
+  shell_fd_occupancy_t joined =
+      l ? dep_domain_value(&journal->arena->snapshots[l - 1])
+      : part == DEP_DOMAIN_UNION ? dep_fd_occupancy_masks(&left, journal)
+                                 : dep_fd_domain(&left, journal).part[part];
+  shell_fd_occupancy_t other =
+      r ? dep_domain_value(&journal->arena->snapshots[r - 1])
+      : part == DEP_DOMAIN_UNION ? dep_fd_occupancy_masks(&right, journal)
+                                 : dep_fd_domain(&right, journal).part[part];
+  shell_fd_occupancy_join(&joined, &other);
+  return dep_domain_fact(joined);
+}
+
+/* Join the fact of one key of the version rooted at source into state, whose
+ * root before the join is left. */
+static bool dep_fd_force_key(dep_route_state_t *state,
+                             dep_route_journal_t *journal, uint32_t left,
+                             uint32_t source, dep_fd_ref_t fd,
+                             dep_fd_access_t access) {
+  if (access == DEP_FD_ACCESS_PROCESS_DOMAIN) {
+    uint32_t l = dep_route_map_snapshot(left, journal, fd, access);
+    uint32_t r = dep_route_map_snapshot(source, journal, fd, access);
+    if (l == r)
+      return true;
+    dep_route_set_t fact =
+        dep_fd_domain_joined(journal, left, source, fd.value, l, r);
+    return dep_route_state_append_one(state, journal, fd, access, fact);
+  }
+  dep_fd_union_t u = {journal, DEP_ROUTE_INHERITED, false};
+  dep_route_set_t a = dep_fd_raw_root_own_fact(left, journal, fd, access),
+                  b = dep_fd_raw_root_own_fact(source, journal, fd, access),
+                  joined;
+  if (!dep_fd_force_fact(&u, fd, access, &a, &b, &joined))
+    return false;
+  return dep_route_sets_equal(&joined, &a) ||
+         dep_route_state_append_one(state, journal, fd, access, joined);
+}
+
+typedef struct {
+  dep_route_journal_t *journal;
+  uint32_t left_root, right_root, *root;
+} dep_fd_context_keys_t;
+
+/* A key decided per version, stored differently by the two versions: the
+ * join of the two versions' own facts, a version's default included. A
+ * version's stored form is kept when it already says the joined fact. */
+static bool dep_fd_context_key(void *context, dep_fd_ref_t fd,
+                               dep_fd_access_t access, uint32_t l, uint32_t r) {
+  dep_fd_context_keys_t *walk = context;
+  dep_route_journal_t *journal = walk->journal;
+  if (!dep_fd_union_context_key(fd, access))
+    return true;
+  uint32_t id;
+  if (access == DEP_FD_ACCESS_PROCESS_DOMAIN) {
+    dep_route_set_t fact = dep_fd_domain_joined(
+        journal, walk->left_root, walk->right_root, fd.value, l, r);
+    id = dep_route_set_intern(journal, &fact);
+    if (!id)
+      return false;
+  } else {
+    dep_fd_union_t u = {journal, DEP_ROUTE_INHERITED, false};
+    dep_route_set_t a = dep_fd_raw_root_own_fact(walk->left_root, journal, fd,
+                                                 access),
+                    b = dep_fd_raw_root_own_fact(walk->right_root, journal, fd,
+                                                 access),
+                    joined;
+    if (!dep_fd_force_fact(&u, fd, access, &a, &b, &joined))
+      return false;
+    if (dep_route_sets_equal(&joined, &a))
+      id = l;
+    else if (dep_route_sets_equal(&joined, &b))
+      id = r;
+    else if (!(id = dep_route_set_intern(journal, &joined)))
+      return false;
+  }
+  return id == dep_route_map_snapshot(*walk->root, journal, fd, access) ||
+         dep_route_map_put(journal, walk->root, fd, access, id);
+}
+
+/* Set the keys of *root decided per version (see dep_fd_union_t). They are
+ * the keys below 4096, so the subtries of the two versions that hold them
+ * are found without a walk, and only the keys they store differently are
+ * visited: at most those of fds 0..63 and the domain. */
+static bool dep_fd_force_context_keys(dep_route_journal_t *journal,
+                                      uint32_t left_root, uint32_t right_root,
+                                      uint32_t *root) {
+  uint32_t left = shell_pmap_restrict(&journal->arena->maps, left_root, 0, 12);
+  uint32_t right =
+      shell_pmap_restrict(&journal->arena->maps, right_root, 0, 12);
+  dep_fd_context_keys_t walk = {journal, left_root, right_root, root};
+  return left == right ||
+         dep_route_map_diff(journal, left, right, dep_fd_context_key, &walk);
+}
+
+/* The single version over-approximating the versions rooted at left and
+ * right. */
+static bool dep_fd_force_join_roots(dep_route_journal_t *journal, uint32_t left,
+                                    uint32_t right, uint32_t *out) {
+  if (left == right) {
+    *out = left;
+    return true;
+  }
+  return dep_fd_union_roots(journal, left, right, DEP_UNION_FACTS, out) &&
+         dep_fd_force_context_keys(journal, left, right, out);
+}
+
+typedef struct {
+  /* Join versions whose inherited low-interval cases differ when nothing
+   * else keeps them apart. */
+  bool origins;
+  /* Set when the join of the two versions is not exact: a correlation or an
+   * alias would be lost. The caller keeps the versions apart. */
+  bool apart;
+} dep_fd_merge_relation_t;
+
+typedef struct {
+  uint32_t left, right;
+} dep_fd_roots_t;
+
+/* What a fold over two versions' maps returns (shell_pmap_fold). */
+enum {
+  /* The join at some key is not exact. */
+  DEP_EXACT_APART = 1u,
+  /* The answer at some key needs other facts of the two versions. */
+  DEP_EXACT_CONTEXT = 2u
+};
+
+/* Whether the join of the two versions at one key keeps what a later read
+ * of either can tell apart: sets relation->apart if it does not. left_set and
+ * right_set are the two versions' facts at the key, a version's default where
+ * it stores none. roots are the two versions' roots, for the keys whose
+ * answer needs other facts of them; NULL where the caller has left those
+ * keys to a pass that has the roots (dep_fd_exact_roots). access is not
+ * DEP_FD_ACCESS_NAMED_BINDINGS, whose facts are maps compared by a fold of
+ * their own (dep_fd_named_exact). The join itself is dep_fd_force_join_roots.
+ */
+static SHELL_NONNULL(1, 5, 6, 7) void dep_fd_key_exact(
+    dep_route_journal_t *journal, const dep_fd_roots_t *roots, dep_fd_ref_t fd,
+    dep_fd_access_t access, const dep_route_set_t *left_set,
+    const dep_route_set_t *right_set, dep_fd_merge_relation_t *relation) {
+  dep_route_set_t routes = *left_set;
+  dep_route_set_t additional = *right_set;
+  bool equal = dep_route_sets_equal(&routes, &additional);
   if (access == DEP_FD_ACCESS_VARIABLE_PRESENCE ||
       access == DEP_FD_ACCESS_PRESENCE_MAP ||
       access == DEP_FD_ACCESS_PROCESS_OWNED ||
@@ -3810,69 +4165,29 @@ static SHELL_NONNULL(1, 2, 9) bool dep_fd_merge_key(
       access == DEP_FD_ACCESS_SELECTOR) {
     /* A scratch slot and an ordinary descriptor on another path cannot share
      * a factored map. Preserve ownership until the frame disposes its saves. */
-    if (!equal && relation->force && access == DEP_FD_ACCESS_SELECTOR) {
-      /* One allocation identity, placed on either side's places. */
-      if (!routes.count || !additional.count)
-        return dep_route_state_append_one(result, journal, fd, access,
-                                          routes.count ? routes : additional);
-      shell_fd_allocation_t places = dep_slot_places(&routes);
-      shell_fd_allocation_t other = dep_slot_places(&additional);
-      places.candidates |= other.candidates;
-      places.tail |= other.tail;
-      return dep_route_state_append_one(
-          result, journal, fd, access,
-          dep_slot_places_fact(routes.routes[0].value, places));
-    }
-    if (!equal && relation->force) {
-      for (uint32_t i = 0; i < additional.count; i++)
-        if (!dep_route_set_add(&routes, additional.routes[i]))
-          return false;
-      return dep_route_state_append_one(result, journal, fd, access, routes);
-    }
-    if (!equal) {
-      result->correlated = true;
-      return true;
-    }
-    return true;
+    if (!equal)
+      relation->apart = true;
+    return;
   }
   if (access == DEP_FD_ACCESS_PROCESS_DOMAIN) {
     if (equal)
-      return true;
-    /* Missing means this path has not needed a process domain yet. Its
-     * binding facts still give its occupancy; it is neither an impossible
-     * world nor an empty contribution to the union. */
-    dep_route_state_t left = dep_route_state_single(left_root);
-    dep_route_state_t right = dep_route_state_single(right_root);
+      return;
     /* Versions split by inherited low-interval case keep allocations
      * correlated with that case; a join would lose it. */
-    if (!relation->force && !relation->origins &&
-        dep_fd_domain_origins(&left, journal) !=
-            dep_fd_domain_origins(&right, journal)) {
-      result->correlated = true;
-      return true;
+    if (!relation->origins) {
+      dep_route_state_t left = dep_route_state_single(roots->left);
+      dep_route_state_t right = dep_route_state_single(roots->right);
+      if (dep_fd_domain_origins(&left, journal) !=
+          dep_fd_domain_origins(&right, journal))
+        relation->apart = true;
     }
-    /* Each domain part joins with the same part, and the union with the
-     * union: fd is the part. */
-    shell_fd_occupancy_t joined =
-        routes.count ? dep_domain_value(&routes)
-        : fd.value == DEP_DOMAIN_UNION
-            ? dep_fd_occupancy_masks(&left, journal)
-            : dep_fd_domain(&left, journal).part[fd.value];
-    shell_fd_occupancy_t other =
-        additional.count ? dep_domain_value(&additional)
-        : fd.value == DEP_DOMAIN_UNION
-            ? dep_fd_occupancy_masks(&right, journal)
-            : dep_fd_domain(&right, journal).part[fd.value];
-    shell_fd_occupancy_join(&joined, &other);
-    return dep_route_state_append_one(result, journal, fd, access,
-                                      dep_domain_fact(joined));
+    return;
   }
   if (fd.value == SHELL_DEP_FD_NAMED &&
       (access == DEP_FD_ACCESS_READ || access == DEP_FD_ACCESS_WRITE)) {
     /* Factoring is safe only when selecting an alias cannot select another
      * path's slot contents. Private allocation identities missing on a path
-     * carry no competing resource; observable numeric identities do. Check
-     * during the existing changed-key join, not in a separate map traversal. */
+     * carry no competing resource; observable numeric identities do. */
     for (unsigned side = 0; side < 2; side++) {
       const dep_route_set_t *aliases = side ? &additional : &routes;
       for (uint32_t i = 0; i < aliases->count; i++) {
@@ -3881,12 +4196,12 @@ static SHELL_NONNULL(1, 2, 9) bool dep_fd_merge_key(
           continue;
         dep_fd_ref_t slot = dep_fd_numeric(alias.value);
         dep_route_set_t left =
-            dep_fd_raw_root_fact(left_root, journal, slot, access);
+            dep_fd_raw_root_own_fact(roots->left, journal, slot, access);
         dep_route_set_t right =
-            dep_fd_raw_root_fact(right_root, journal, slot, access);
+            dep_fd_raw_root_own_fact(roots->right, journal, slot, access);
         bool private_slot = alias.value > SHELL_DEP_FD_MAX;
         bool present[2] = {false, false};
-        bool equal = true;
+        bool agree = true;
         /* Neither fact needs interning just to decide whether the join may
          * discard its association. */
         for (unsigned direction = 0; direction < 2; direction++) {
@@ -3903,38 +4218,28 @@ static SHELL_NONNULL(1, 2, 9) bool dep_fd_merge_key(
             for (uint32_t k = 0; k < to->count; k++)
               found |= route.kind == to->routes[k].kind &&
                        route.value == to->routes[k].value;
-            equal &= found;
+            agree &= found;
           }
         }
         bool missing = private_slot && (!present[0] || !present[1]);
-        if (!missing && !equal && !relation->force) {
-          result->correlated = true;
-          return true;
+        if (!missing && !agree) {
+          relation->apart = true;
+          return;
         }
       }
     }
   }
-  uint32_t old_count = routes.count;
-  if (access == DEP_FD_ACCESS_IFS) {
-    uint32_t value =
-        dep_ifs_join(routes.routes[0].value, additional.routes[0].value);
-    if (value == routes.routes[0].value)
-      return true;
-    dep_route_set_set(&routes, (dep_fd_route_t){DEP_ROUTE_INHERITED, value});
-    return dep_route_state_append_one(result, journal, fd, access, routes);
-  }
   if (access == DEP_FD_ACCESS_READ &&
-      (dep_read_binding_observation(journal, fd) & DEP_READ_OBSERVE_ACCESS) &&
-      !relation->force) {
+      (dep_read_binding_observation(journal, fd) & DEP_READ_OBSERVE_ACCESS)) {
     /* Alternatives infeasible under the requirements need no version. */
     dep_route_set_t left =
-        dep_access_required_feasible(left_root, journal, fd, &routes);
+        dep_access_required_feasible(roots->left, journal, fd, &routes);
     dep_route_set_t right =
-        dep_access_required_feasible(right_root, journal, fd, &additional);
+        dep_access_required_feasible(roots->right, journal, fd, &additional);
     if (left.count && right.count &&
         dep_read_access_outcomes(&left) != dep_read_access_outcomes(&right)) {
-      result->correlated = true;
-      return true;
+      relation->apart = true;
+      return;
     }
   }
   if (access == DEP_FD_ACCESS_BINDING) {
@@ -3958,71 +4263,193 @@ static SHELL_NONNULL(1, 2, 9) bool dep_fd_merge_key(
                     : dep_read_value_class(&left) !=
                           dep_read_value_class(&right))
              : dep_read_binding_outcomes(&left) !=
-                   dep_read_binding_outcomes(&right)) &&
-        !relation->force) {
-      result->correlated = true;
-      return true;
-    }
-    bool unknown = false, unseen = false, live = false;
-    for (unsigned side = 0; side < 2; side++) {
-      const dep_route_set_t *facts = side ? &additional : &routes;
-      for (uint32_t i = 0; i < facts->count; i++) {
-        unknown |= facts->routes[i].kind == DEP_ROUTE_DYNAMIC;
-        unseen |= facts->routes[i].kind == DEP_ROUTE_UNSEEN;
-        live |= facts->routes[i].kind == DEP_ROUTE_INHERITED ||
-                facts->routes[i].kind == DEP_ROUTE_ALIAS;
-      }
-    }
-    if (unknown || (unseen && live)) {
-      if (routes.count == 1 && routes.routes[0].kind == DEP_ROUTE_DYNAMIC)
-        return true;
-      dep_route_set_set(&routes,
-                        (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
-      return dep_route_state_append_one(result, journal, fd, access, routes);
-    }
+                   dep_read_binding_outcomes(&right)))
+      relation->apart = true;
   }
-  for (uint32_t i = 0; i < additional.count; i++)
-    if (!dep_route_set_add(&routes, additional.routes[i]))
-      return false;
-  if (routes.count == old_count)
+}
+/* Whether the answer of dep_fd_key_exact at this key needs the roots: the
+ * alias check of a named read or write, and the feasibility of an observed
+ * read. */
+static bool dep_fd_exact_needs_roots(const dep_route_journal_t *journal,
+                                     dep_fd_ref_t fd, dep_fd_access_t access,
+                                     const dep_route_set_t *left,
+                                     const dep_route_set_t *right) {
+  if (access == DEP_FD_ACCESS_READ &&
+      (dep_read_binding_observation(journal, fd) & DEP_READ_OBSERVE_ACCESS))
     return true;
-  return dep_route_state_append_one(result, journal, fd, access, routes);
+  if (fd.value != SHELL_DEP_FD_NAMED ||
+      (access != DEP_FD_ACCESS_READ && access != DEP_FD_ACCESS_WRITE))
+    return false;
+  for (unsigned side = 0; side < 2; side++) {
+    const dep_route_set_t *facts = side ? right : left;
+    for (uint32_t i = 0; i < facts->count; i++)
+      if (facts->routes[i].kind == DEP_ROUTE_ALIAS)
+        return true;
+  }
+  return false;
 }
 
-/* Factor independent changed keys during this one join. If an alias would
- * select another path's resource, correlated marks that the original roots
- * must survive instead. No second map walk or source replay is needed. */
 typedef struct {
-  dep_route_state_t *result;
   dep_route_journal_t *journal;
-  uint32_t left_root, right_root;
-  dep_fd_merge_relation_t *relation;
-} dep_fd_merge_walk_t;
+  /* Fallback kind of the override map being compared. */
+  dep_route_kind_t fallback;
+  /* Set for the pass that decides the keys that need them. */
+  const dep_fd_roots_t *roots;
+  /* Set when the memo was full at a key: the fold decided nothing. */
+  bool failed;
+} dep_fd_exact_t;
 
-static bool dep_fd_merge_changed(void *context, dep_fd_ref_t fd,
-                                 dep_fd_access_t access, uint32_t left,
-                                 uint32_t right) {
-  dep_fd_merge_walk_t *walk = context;
-  /* A correlation ends the join: its caller keeps the versions apart. */
-  return !walk->result->correlated &&
-         dep_fd_merge_key(walk->result, walk->journal, walk->left_root,
-                          walk->right_root, fd, access, left, right,
-                          walk->relation) &&
-         !walk->result->correlated;
+static uint32_t dep_fd_exact_leaf(void *context, uint64_t key, uint32_t left,
+                                  uint32_t right);
+
+/* Named bindings: each version's fact is the root of a map of overrides keyed
+ * by name, and a name a map lacks reads as its fallback kind. The join keeps
+ * the versions' correlation only if the maps' fold finds nothing a read could
+ * tell apart; any bit, including a need for the roots, is apart. A fold the
+ * memo cannot hold sets exact->failed. */
+static uint32_t dep_fd_named_exact(dep_fd_exact_t *exact,
+                                   const dep_route_set_t *left_set,
+                                   const dep_route_set_t *right_set) {
+  dep_fd_route_t left = left_set->count
+                            ? left_set->routes[0]
+                            : (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+  dep_fd_route_t right = right_set->count
+                             ? right_set->routes[0]
+                             : (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+  if (left.kind != right.kind)
+    return DEP_EXACT_APART;
+  bool dynamic = left.kind == DEP_ROUTE_DYNAMIC;
+  dep_fd_exact_t nested = {exact->journal,
+                           dynamic ? DEP_ROUTE_DYNAMIC : DEP_ROUTE_INHERITED,
+                           NULL, false};
+  uint32_t bits;
+  if (!shell_pmap_fold(&exact->journal->arena->maps, left.value, right.value,
+                       dep_fd_exact_leaf, &nested, &bits, true,
+                       dynamic ? DEP_FOLD_NAMED_DYNAMIC
+                               : DEP_FOLD_NAMED_INHERITED) ||
+      nested.failed) {
+    exact->failed = true;
+    return DEP_EXACT_APART;
+  }
+  return bits ? DEP_EXACT_APART : 0;
 }
 
-/* Join every key whose facts differ between left_map and right_map, maps of
- * (or nested in) the versions left_root and right_root. */
-static SHELL_NONNULL(1, 2, 7) bool dep_fd_merge_maps(
-    dep_route_state_t *result, dep_route_journal_t *journal, uint32_t left_root,
-    uint32_t right_root, uint32_t left_map, uint32_t right_map,
-    dep_fd_merge_relation_t *relation) {
-  if (result->correlated)
+/* One key where the two versions differ, in the pass over their maps that
+ * needs no roots: the bit of an inexact join, or that the key needs them.
+ * Keys decided per version (see dep_fd_union_t) are left to
+ * dep_fd_exact_context_key. */
+static uint32_t dep_fd_exact_leaf(void *context, uint64_t key, uint32_t left,
+                                  uint32_t right) {
+  dep_fd_exact_t *exact = context;
+  dep_route_journal_t *journal = exact->journal;
+  dep_fd_ref_t fd = dep_route_key_fd(journal, key);
+  dep_fd_access_t access = dep_route_key_access(key);
+  if (dep_fd_union_context_key(fd, access))
+    return 0;
+  dep_fd_union_t defaults = {journal, exact->fallback, false};
+  dep_route_set_t absent = dep_fd_union_default(&defaults, fd, access);
+  const dep_route_set_t *a =
+      left ? &journal->arena->snapshots[left - 1] : &absent;
+  const dep_route_set_t *b =
+      right ? &journal->arena->snapshots[right - 1] : &absent;
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS)
+    return dep_fd_named_exact(exact, a, b);
+  if (dep_fd_exact_needs_roots(journal, fd, access, a, b))
+    return exact->roots ? 0 : DEP_EXACT_CONTEXT;
+  dep_fd_merge_relation_t relation = {0};
+  dep_fd_key_exact(journal, NULL, fd, access, a, b, &relation);
+  return relation.apart ? DEP_EXACT_APART : 0;
+}
+
+/* The same key in the pass that has the roots, for the keys that need them:
+ * an observed read, or a named one that may select a slot. The two versions'
+ * own facts stand for a key one does not store. */
+static uint32_t dep_fd_exact_roots_leaf(void *context, uint64_t key,
+                                        uint32_t left, uint32_t right) {
+  dep_fd_exact_t *exact = context;
+  dep_route_journal_t *journal = exact->journal;
+  dep_fd_ref_t fd = dep_route_key_fd(journal, key);
+  dep_fd_access_t access = dep_route_key_access(key);
+  if (dep_fd_union_context_key(fd, access))
+    return 0;
+  dep_route_set_t a = left ? journal->arena->snapshots[left - 1]
+                           : dep_fd_raw_root_own_fact(exact->roots->left,
+                                                      journal, fd, access),
+                  b = right ? journal->arena->snapshots[right - 1]
+                            : dep_fd_raw_root_own_fact(exact->roots->right,
+                                                       journal, fd, access);
+  if (!dep_fd_exact_needs_roots(journal, fd, access, &a, &b))
+    return 0;
+  dep_fd_merge_relation_t relation = {0};
+  dep_fd_key_exact(journal, exact->roots, fd, access, &a, &b, &relation);
+  return relation.apart ? DEP_EXACT_APART : 0;
+}
+
+typedef struct {
+  dep_route_journal_t *journal;
+  dep_fd_roots_t roots;
+  dep_fd_merge_relation_t *relation;
+} dep_fd_context_walk_t;
+
+/* A key decided per version, stored differently by the two versions. */
+static bool dep_fd_exact_context_key(void *context, dep_fd_ref_t fd,
+                                     dep_fd_access_t access, uint32_t l,
+                                     uint32_t r) {
+  dep_fd_context_walk_t *walk = context;
+  dep_route_journal_t *journal = walk->journal;
+  if (!dep_fd_union_context_key(fd, access))
     return true;
-  dep_fd_merge_walk_t walk = {result, journal, left_root, right_root, relation};
-  return dep_route_map_diff(journal, left_map, right_map, dep_fd_merge_changed,
-                            &walk) ||
-         result->correlated;
+  dep_route_set_t a = l ? journal->arena->snapshots[l - 1]
+                        : dep_fd_raw_root_own_fact(walk->roots.left, journal,
+                                                   fd, access),
+                  b = r ? journal->arena->snapshots[r - 1]
+                        : dep_fd_raw_root_own_fact(walk->roots.right, journal,
+                                                   fd, access);
+  dep_fd_key_exact(journal, &walk->roots, fd, access, &a, &b, walk->relation);
+  return !walk->relation->apart;
+}
+
+/* Whether the join of the versions rooted at left and right loses what a
+ * later read of either tells apart at some key: *apart is true then, and the
+ * versions stay apart. Most keys are decided from their two facts alone, in a
+ * fold of the two maps that costs the node pairs they do not share and is
+ * memoized across merges. The keys below 4096 (fds 0..63 and the occupancy)
+ * have defaults that depend on the version, and are decided from a walk of the
+ * at most 197 of them that differ. An observed read, or a named one that may
+ * select a slot, needs the roots: only when one of them differs is there a
+ * further pass over the maps, which is not memoized. False when the memo is
+ * full: the exactness is then unknown. Keeping the versions apart would be
+ * sound, but could admit a source the full memo refuses (the versions need not
+ * merge into the imprecise one), so the merge fails like one that finds the
+ * pool full, and a memo too small only ever refuses. */
+static bool dep_fd_exact_roots(dep_route_journal_t *journal, uint32_t left,
+                               uint32_t right, bool origins, bool *apart) {
+  dep_fd_exact_t exact = {journal, DEP_ROUTE_INHERITED, NULL, false};
+  uint32_t bits;
+  if (!shell_pmap_fold(&journal->arena->maps, left, right, dep_fd_exact_leaf,
+                       &exact, &bits, true, DEP_FOLD_FACTS) ||
+      exact.failed)
+    return false;
+  *apart = bits & DEP_EXACT_APART;
+  if (*apart)
+    return true;
+  dep_fd_merge_relation_t relation = {.origins = origins};
+  dep_fd_context_walk_t walk = {journal, {left, right}, &relation};
+  dep_route_map_diff(journal,
+                     shell_pmap_restrict(&journal->arena->maps, left, 0, 12),
+                     shell_pmap_restrict(&journal->arena->maps, right, 0, 12),
+                     dep_fd_exact_context_key, &walk);
+  if (!relation.apart && (bits & DEP_EXACT_CONTEXT)) {
+    exact.roots = &walk.roots;
+    uint32_t more;
+    /* Without the memo a fold needs no entry, so it cannot fail. */
+    (void)shell_pmap_fold(&journal->arena->maps, left, right,
+                          dep_fd_exact_roots_leaf, &exact, &more, false,
+                          DEP_FOLD_FACTS);
+    relation.apart = more & DEP_EXACT_APART;
+  }
+  *apart = relation.apart;
+  return true;
 }
 
 static SHELL_NONNULL(1) dep_route_join_t *dep_fd_join_cache(
@@ -4034,13 +4461,14 @@ static SHELL_NONNULL(1) dep_route_join_t *dep_fd_join_cache(
   return &journal->arena->joins[bucket];
 }
 
-/* destination is a single provisional factorized root. If correlated becomes
+/* destination is a single provisional factorized root. If *apart becomes
  * true, its caller discards that candidate and retains the original versions.
  */
-static SHELL_NONNULL(1,
-                     2) bool dep_fd_merge_root(dep_route_state_t *destination,
+static SHELL_NONNULL(1, 2,
+                     4) bool dep_fd_merge_root(dep_route_state_t *destination,
                                                dep_route_journal_t *journal,
-                                               uint32_t source_root) {
+                                               uint32_t source_root,
+                                               bool *apart) {
   if (destination->root == source_root)
     return true;
   uint32_t left_root = destination->root;
@@ -4049,35 +4477,37 @@ static SHELL_NONNULL(1,
   dep_route_join_t *cached = dep_fd_join_cache(journal, left_root, source_root);
   if (cached->left == low && cached->right == high) {
     if (cached->result == UINT32_MAX) {
-      destination->correlated = true;
+      *apart = true;
       return true;
     }
     destination->root = cached->result;
     return true;
   }
-  dep_fd_merge_relation_t relation = {0};
-  if (!dep_fd_merge_maps(destination, journal, left_root, source_root,
-                         left_root, source_root, &relation))
+  if (!dep_fd_exact_roots(journal, left_root, source_root, false, apart))
+    return false;
+  if (!*apart && !dep_fd_force_join_roots(journal, left_root, source_root,
+                                          &destination->root))
     return false;
   /* UINT32_MAX caches an unfactorable association, not a journal root. */
-  *cached = (dep_route_join_t){
-      low, high, destination->correlated ? UINT32_MAX : destination->root};
+  *cached =
+      (dep_route_join_t){low, high, *apart ? UINT32_MAX : destination->root};
   return true;
 }
 
 /* Join source_root into destination's primary root when the versions differ
  * in their inherited low-interval cases but in nothing a join must keep
- * apart; otherwise set destination->correlated. Not cached: the cache holds
- * joins that keep the cases apart. */
-static SHELL_NONNULL(1, 2) bool dep_fd_factor_origins(
+ * apart; otherwise set *apart. Not cached: the cache holds joins that keep
+ * the cases apart. */
+static SHELL_NONNULL(1, 2, 4) bool dep_fd_factor_origins(
     dep_route_state_t *destination, dep_route_journal_t *journal,
-    uint32_t source_root) {
+    uint32_t source_root, bool *apart) {
   if (destination->root == source_root)
     return true;
   uint32_t left_root = destination->root;
-  dep_fd_merge_relation_t relation = {.origins = true};
-  return dep_fd_merge_maps(destination, journal, left_root, source_root,
-                           left_root, source_root, &relation);
+  if (!dep_fd_exact_roots(journal, left_root, source_root, true, apart))
+    return false;
+  return *apart || dep_fd_force_join_roots(journal, left_root, source_root,
+                                           &destination->root);
 }
 
 /* The outcomes of one operation, joined per inherited low-interval case, as
@@ -4088,12 +4518,11 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_factor_choices(
   if (!have_choice[0] || !have_choice[1])
     return true;
   dep_route_state_t factored = chosen[0];
-  factored.correlated = false;
-  if (!dep_fd_factor_origins(&factored, journal, chosen[1].root))
+  bool apart = false;
+  if (!dep_fd_factor_origins(&factored, journal, chosen[1].root, &apart))
     return false;
-  if (factored.correlated)
+  if (apart)
     return true;
-  factored.correlated = chosen[0].correlated || chosen[1].correlated;
   chosen[0] = factored;
   have_choice[1] = false;
   return true;
@@ -4104,12 +4533,8 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_factor_choices(
 static SHELL_NONNULL(1, 2) bool dep_fd_join_root(dep_route_state_t *destination,
                                                  dep_route_journal_t *journal,
                                                  uint32_t source_root) {
-  if (destination->root == source_root)
-    return true;
-  uint32_t left_root = destination->root;
-  dep_fd_merge_relation_t relation = {.force = true};
-  return dep_fd_merge_maps(destination, journal, left_root, source_root,
-                           left_root, source_root, &relation);
+  return dep_fd_force_join_roots(journal, destination->root, source_root,
+                                 &destination->root);
 }
 
 /* Join every version of source into the single version of destination. */
@@ -4129,7 +4554,6 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_join(dep_route_state_t *destination,
   }
   dep_route_state_inherit(&joined, destination);
   dep_route_state_inherit(&joined, source);
-  joined.correlated = false;
   *destination = joined;
   return true;
 }
@@ -4139,7 +4563,8 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_classes(
     dep_route_journal_t *journal) {
   if (journal->read_observations.active && !journal->named_closes)
     return dep_fd_merge_versions(destination, source, journal);
-  bool correlated = destination->correlated || source->correlated;
+  bool correlated = dep_route_state_correlated(destination) ||
+                    dep_route_state_correlated(source);
   if (correlated && journal->named_closes)
     return dep_fd_merge_versions(destination, source, journal);
   dep_route_state_t collapsed = dep_route_state_single(destination->root);
@@ -4147,53 +4572,87 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_classes(
   /* The primary version is already represented by collapsed. */
   iterator.first = false;
   uint32_t root;
-  while (!collapsed.correlated && dep_route_next(&iterator, journal, &root))
-    if (!dep_fd_merge_root(&collapsed, journal, root))
+  bool apart = false;
+  while (!apart && dep_route_next(&iterator, journal, &root))
+    if (!dep_fd_merge_root(&collapsed, journal, root, &apart))
       return false;
   iterator = dep_route_iterator(source);
-  while (!collapsed.correlated && dep_route_next(&iterator, journal, &root))
-    if (!dep_fd_merge_root(&collapsed, journal, root))
+  while (!apart && dep_route_next(&iterator, journal, &root))
+    if (!dep_fd_merge_root(&collapsed, journal, root, &apart))
       return false;
-  if (collapsed.correlated) {
-    destination->correlated = true;
+  if (apart) {
     iterator = dep_route_iterator(source);
     while (dep_route_next(&iterator, journal, &root))
       if (!dep_route_state_add_root(destination, journal, root))
         return false;
   } else {
-    collapsed.correlated = correlated;
     *destination = collapsed;
   }
   return true;
 }
 
 /* Bounded disjunctive completion: a merge keeps correlated versions apart
- * only up to DEP_ROUTE_VERSION_LIMIT. Beyond it, the remaining versions are
- * joined into one, a sound over-approximation, so every later operation costs
- * at most that many versions however many paths kept their correlation. */
+ * only up to DEP_ROUTE_VERSION_LIMIT. Beyond it the pair whose join loses the
+ * least is replaced by that join, until the limit holds: a sound
+ * over-approximation, so every later operation costs at most that many
+ * versions however many paths kept their correlation. Which versions merge
+ * never depends on where they sit: the loss of a pair is the number of keys
+ * its two versions differ in, found with doubling budgets so the cost follows
+ * the cheapest pair, not the unknown size of the others. Versions that
+ * diverged at one fork sit within DEP_ROUTE_MERGE_WINDOW of each other, so
+ * only those neighbours are candidates, which keeps a step linear in the
+ * version count. */
+enum { DEP_ROUTE_MERGE_WINDOW = 4, DEP_ROUTE_MERGE_BUDGET = 256 };
+
 static SHELL_NONNULL(1, 2) bool dep_fd_widen(dep_route_state_t *state,
                                              dep_route_journal_t *journal) {
-  if (dep_route_state_count(state) <= DEP_ROUTE_VERSION_LIMIT)
+  uint32_t count = dep_route_state_count(state);
+  if (count <= DEP_ROUTE_VERSION_LIMIT)
     return true;
+  uint32_t roots[DEP_ROUTE_STATE_CAPACITY], n = 0, root;
   dep_route_iterator_t iterator = dep_route_iterator(state);
-  dep_route_state_t widened = {0}, joined = {0};
-  uint32_t root, kept = 0;
-  while (dep_route_next(&iterator, journal, &root)) {
-    if (kept == 0)
-      widened = dep_route_state_single(root);
-    else if (kept < DEP_ROUTE_VERSION_LIMIT - 1) {
-      if (!dep_route_state_add_root(&widened, journal, root))
-        return false;
-    } else if (kept == DEP_ROUTE_VERSION_LIMIT - 1)
-      joined = dep_route_state_single(root);
-    else if (!dep_fd_join_root(&joined, journal, root))
+  while (dep_route_next(&iterator, journal, &root))
+    roots[n++] = root;
+  while (n > DEP_ROUTE_VERSION_LIMIT) {
+    uint32_t best_low = 0, best_high = 0;
+    for (uint32_t budget = 1; !best_high; budget *= 2) {
+      uint32_t limit = budget;
+      for (uint32_t low = 0; low + 1 < n && !best_high; low++)
+        for (uint32_t high = low + 1;
+             high < n && high <= low + DEP_ROUTE_MERGE_WINDOW; high++) {
+          DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_ALTERNATIVES);
+          uint32_t differing;
+          if (shell_pmap_diff_within(&journal->arena->maps, roots[low],
+                                     roots[high], limit, &differing)) {
+            best_low = low;
+            best_high = high;
+            break;
+          }
+        }
+      /* No neighbours within the budget: any pair loses about as much, and a
+       * join costs the fresh node pairs only. Which pair is joined affects
+       * precision, never soundness. */
+      if (budget > DEP_ROUTE_MERGE_BUDGET && !best_high) {
+        best_low = 0;
+        best_high = 1;
+      }
+    }
+    dep_route_state_t joined = dep_route_state_single(roots[best_low]);
+    if (!dep_fd_join_root(&joined, journal, roots[best_high]))
       return false;
-    kept++;
+    roots[best_low] = joined.root;
+    memmove(&roots[best_high], &roots[best_high + 1],
+            (n - best_high - 1) * sizeof(roots[0]));
+    n--;
   }
-  if (!dep_route_state_add_root(&widened, journal, joined.root))
-    return false;
-  widened.truncated = state->truncated || joined.truncated;
-  widened.correlated = true;
+  dep_route_state_t widened = {0};
+  for (uint32_t i = 0; i < n; i++) {
+    if (i == 0)
+      widened = dep_route_state_single(roots[i]);
+    else if (!dep_route_state_add_root(&widened, journal, roots[i]))
+      return false;
+  }
+  widened.truncated = state->truncated || widened.truncated;
   *state = widened;
   return !state->truncated;
 }
@@ -4413,10 +4872,79 @@ static SHELL_NONNULL(1, 2, 4) bool dep_fd_private_project(
   return true;
 }
 
+/* The lists of an `if` are alternatives: the first command of a `then` list
+ * starts from the condition's success and that of an `else` list or `elif`
+ * condition from its failure. When the walk moves from a condition to its
+ * `then` list the failed outcome is parked, so the list's later commands
+ * cannot run on it; when it leaves a `then` list the finished outcomes are
+ * banked and the parked failure resumes. dep_fd_if_finish joins them. */
+static SHELL_NONNULL(1, 2,
+                     4) bool dep_fd_if_enter(const dep_parse_context_t *context,
+                                             dep_fd_stream_t *stream,
+                                             uint32_t event,
+                                             dep_route_journal_t *journal) {
+  uint8_t role, arm;
+  if (!dep_event_section(context, event, &role, &arm))
+    return true;
+  uint32_t group = (uint32_t)dep_snapshot_event_group(context, event);
+  uint8_t *section = stream->if_section[group];
+  if (role == section[0] && arm == section[1])
+    return true;
+  dep_fd_flow_t *flow = &stream->scope[group + 1];
+  if (section[0] != SHELL_RANGE_ROLE_NONE) {
+    if (role == SHELL_RANGE_ROLE_THEN) {
+      stream->if_failure[group] = (dep_fd_flow_t){0};
+      if (flow->mask & DEP_STATUS_MAY_FAIL) {
+        stream->if_failure[group].mask = DEP_STATUS_MAY_FAIL;
+        stream->if_failure[group].state[1] = flow->state[1];
+        flow->mask &= (uint8_t)~DEP_STATUS_MAY_FAIL;
+      }
+    } else {
+      for (unsigned outcome = 0; outcome < 5; outcome++)
+        if ((flow->mask & (1u << outcome)) &&
+            !dep_fd_add(&stream->if_exit[group], outcome, flow->state[outcome],
+                        journal))
+          return false;
+      *flow = stream->if_failure[group];
+      stream->if_failure[group] = (dep_fd_flow_t){0};
+    }
+  }
+  section[0] = role;
+  section[1] = arm;
+  return true;
+}
+
+/* The group's body flow becomes the outcomes of every list that ran. With no
+ * `else`, the last condition failing returns success without running a list. */
+static SHELL_NONNULL(1, 2, 4) bool dep_fd_if_finish(
+    const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t group,
+    dep_route_journal_t *journal) {
+  if (context->fast->groups[group].kind != SHELL_GROUP_IF ||
+      stream->if_section[group][0] == SHELL_RANGE_ROLE_NONE)
+    return true;
+  dep_fd_flow_t *flow = &stream->scope[group + 1];
+  dep_fd_flow_t *exit = &stream->if_exit[group];
+  for (unsigned outcome = 0; outcome < 5; outcome++)
+    if ((flow->mask & (1u << outcome)) &&
+        !dep_fd_add(exit, outcome, flow->state[outcome], journal))
+      return false;
+  if (stream->if_section[group][0] == SHELL_RANGE_ROLE_THEN &&
+      (stream->if_failure[group].mask & DEP_STATUS_MAY_FAIL) &&
+      !dep_fd_add(exit, 0, stream->if_failure[group].state[1], journal))
+    return false;
+  *flow = *exit;
+  *exit = (dep_fd_flow_t){0};
+  stream->if_failure[group] = (dep_fd_flow_t){0};
+  stream->if_section[group][0] = stream->if_section[group][1] = 0;
+  return true;
+}
+
 static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_begin(
     const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t event,
     dep_route_journal_t *journal, dep_route_state_t *selected) {
   uint32_t scope = (uint32_t)(dep_snapshot_event_group(context, event) + 1);
+  if (!dep_fd_if_enter(context, stream, event, journal))
+    return false;
   dep_fd_flow_t *flow = &stream->scope[scope];
   const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
   if (scope == 0) {
@@ -4670,7 +5198,6 @@ static SHELL_NONNULL(1, 2) bool dep_fd_note_unset_effects(
     }
   }
   updated.truncated = previous.truncated;
-  updated.correlated = previous.correlated;
   *state = updated;
   return true;
 }
@@ -4882,8 +5409,6 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_mutation_bindings(
     dep_route_state_inherit(&result, &one);
   }
   result.truncated |= state->truncated;
-  result.correlated |= state->correlated;
-  result.correlated |= entries.correlated;
   *state = result;
   return true;
 }
@@ -5257,9 +5782,8 @@ static bool dep_failure_join_key(void *context, dep_fd_ref_t fd,
   (void)from, (void)to;
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_DEPENDENCIES);
   dep_failure_join_walk_t *walk = context;
-  dep_fd_merge_relation_t relation = {.force = true};
-  return dep_fd_merge_key(walk->joined, walk->journal, walk->left, walk->source,
-                          fd, access, 0, 0, &relation);
+  return dep_fd_force_key(walk->joined, walk->journal, walk->left, walk->source,
+                          fd, access);
 }
 
 /* Join source's facts into joined at every key the batch from version from
@@ -5348,7 +5872,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
     else if (!dep_route_state_add_root(&local, journal, one.root))
       return false;
   }
-  local.correlated = true;
   dep_route_state_inherit(&local, setup_entry);
   if (op_count && !dep_setup_begin(&local, journal, ops[0].undo_mode))
     return false;
@@ -5385,7 +5908,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
       scan->root[level][version] = root;
       dep_route_state_t one = dep_route_state_single(root);
       dep_route_state_inherit(&one, &local);
-      one.correlated = true;
       dep_domain_collection_t path_pins = {
           .workspace = collection.workspace,
           .frame = collection.frame,
@@ -5431,7 +5953,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
           if (!have_next) {
             next = dep_route_state_single(applied_root);
             dep_route_state_inherit(&next, &applied);
-            next.correlated = true;
             have_next = true;
           } else if (!dep_route_state_add_root(&next, journal, applied_root))
             return false;
@@ -5518,7 +6039,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
       dep_route_state_t raised =
           dep_route_state_single(scan->root[level][version]);
       dep_route_state_inherit(&raised, &scan->level[level]);
-      raised.correlated = true;
       dep_route_state_t *running = &scan->pending[here][0][version];
       if (!dep_failure_bit(scan->present[here][0], version)) {
         *running = raised;
@@ -5686,7 +6206,8 @@ static SHELL_NONNULL(1, 2, 3, 8, 9, 10, 11) bool dep_fd_setup_failure_states(
     return true;
   }
   if (has_move || has_named || journal->scratch_observable ||
-      entry->correlated || completed->correlated) {
+      dep_route_state_correlated(entry) ||
+      dep_route_state_correlated(completed)) {
     dep_domain_collection_t collection = {
         .workspace = context->workspace,
         .frame =
@@ -6105,5 +6626,192 @@ bool shellsplit_test_process_fork_contract(void *workspace) {
                           DEP_ROUTE_CLOSED, UINT32_MAX) &&
          dep_test_fact_is(&cleaned, journal, 22, DEP_FD_ACCESS_BINDING,
                           DEP_ROUTE_INHERITED, UINT32_MAX);
+}
+
+/* Branches that own different descriptors join into one version. An end owned
+ * on every branch stays owned; one owned on some may be owned, and closing a
+ * maybe-owned end keeps what it held beside CLOSED. */
+bool shellsplit_test_process_owned_join_contract(void *workspace) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_set_t open = {0};
+  dep_route_set_set(&open, (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
+  dep_route_state_t base = {0};
+  for (uint32_t fd = 20; fd <= 22; fd++)
+    if (!dep_route_state_append_one(&base, journal, dep_fd_numeric(fd),
+                                    DEP_FD_ACCESS_BINDING, open))
+      return false;
+  dep_route_state_t left = base, right = base;
+  if (!dep_process_owned_set(&left, journal, dep_fd_numeric(20), true) ||
+      !dep_process_owned_set(&left, journal, dep_fd_numeric(22), true) ||
+      !dep_process_owned_set(&right, journal, dep_fd_numeric(21), true) ||
+      !dep_process_owned_set(&right, journal, dep_fd_numeric(22), true) ||
+      !dep_fd_join(&left, &right, journal))
+    return false;
+  /* No owned end of either branch is forgotten by the join. */
+  if (!dep_process_owned(&left, journal, dep_fd_numeric(20)) ||
+      !dep_process_owned(&left, journal, dep_fd_numeric(21)) ||
+      !dep_process_owned(&left, journal, dep_fd_numeric(22)))
+    return false;
+  dep_route_state_t cleaned = left;
+  if (!dep_process_cleanup(&cleaned, journal) ||
+      dep_process_owned_root(&cleaned, journal) != 0)
+    return false;
+  /* Owned on both branches: certainly closed. Owned on one: closed or not. */
+  for (uint32_t fd = 20; fd <= 22; fd++) {
+    dep_route_set_t fact = dep_fd_raw_fact(
+        &cleaned, journal, dep_fd_numeric(fd), DEP_FD_ACCESS_BINDING);
+    bool closed = false, kept = false;
+    for (uint32_t i = 0; i < fact.count; i++) {
+      closed |= fact.routes[i].kind == DEP_ROUTE_CLOSED;
+      kept |= fact.routes[i].kind == DEP_ROUTE_INHERITED;
+    }
+    if (!closed || kept != (fd != 22))
+      return false;
+  }
+  return true;
+}
+
+/* depth nested conditionals, each writing a descriptor of its own in its
+ * `then` list and none in its empty `else` list: every enclosing join joins
+ * the version holding all the writes of the levels inside it with the entry
+ * version. Checks that each descriptor ends joined with its default, closed.
+ * The persistent-map work it takes is counted by the caller. */
+bool shellsplit_test_nested_join_contract(void *workspace, uint32_t depth) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_state_t entry = {0};
+  dep_route_set_t base = {0};
+  dep_route_set_set(&base, (dep_fd_route_t){DEP_ROUTE_INHERITED, 1});
+  if (!dep_route_state_append_one(&entry, journal, dep_fd_numeric(70),
+                                  DEP_FD_ACCESS_WRITE, base))
+    return false;
+  dep_route_state_t exit = entry;
+  for (uint32_t level = depth; level-- > 0;) {
+    dep_route_set_t fact = {0};
+    dep_route_set_set(&fact,
+                      (dep_fd_route_t){DEP_ROUTE_INHERITED, 100 + level});
+    dep_route_state_t then = exit;
+    if (!dep_route_state_append_one(&then, journal, dep_fd_numeric(100 + level),
+                                    DEP_FD_ACCESS_WRITE, fact) ||
+        !dep_fd_join(&then, &entry, journal))
+      return false;
+    exit = then;
+  }
+  for (uint32_t level = 0; level < depth; level++) {
+    dep_route_set_t fact = dep_fd_raw_fact(
+        &exit, journal, dep_fd_numeric(100 + level), DEP_FD_ACCESS_WRITE);
+    bool written = false, closed = false;
+    for (uint32_t i = 0; i < fact.count; i++) {
+      written |= fact.routes[i].kind == DEP_ROUTE_INHERITED &&
+                 fact.routes[i].value == 100 + level;
+      closed |= fact.routes[i].kind == DEP_ROUTE_CLOSED;
+    }
+    if (!written || !closed)
+      return false;
+  }
+  return dep_test_fact_is(&exit, journal, 70, DEP_FD_ACCESS_WRITE,
+                          DEP_ROUTE_INHERITED, 1);
+}
+
+/* The same nesting through the exact merge a conditional's exits take: each
+ * level's version, which holds every write inside it, factors with the entry
+ * version into one version, however deep. */
+bool shellsplit_test_nested_merge_contract(void *workspace, uint32_t depth) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_state_t entry = {0};
+  dep_route_set_t base = {0};
+  dep_route_set_set(&base, (dep_fd_route_t){DEP_ROUTE_INHERITED, 1});
+  if (!dep_route_state_append_one(&entry, journal, dep_fd_numeric(70),
+                                  DEP_FD_ACCESS_WRITE, base))
+    return false;
+  dep_route_state_t exit = entry;
+  for (uint32_t level = depth; level-- > 0;) {
+    dep_route_set_t fact = {0};
+    dep_route_set_set(&fact,
+                      (dep_fd_route_t){DEP_ROUTE_INHERITED, 100 + level});
+    dep_route_state_t then = exit;
+    if (!dep_route_state_append_one(&then, journal, dep_fd_numeric(100 + level),
+                                    DEP_FD_ACCESS_WRITE, fact) ||
+        !dep_fd_merge(&then, &entry, journal) ||
+        dep_route_state_count(&then) != 1)
+      return false;
+    exit = then;
+  }
+  return true;
+}
+
+/* An undetermined descriptor below 64 reads as closed when its version's
+ * occupancy says it is not occupied, as its contract default when the
+ * occupancy leaves it open. Joining a version that stores a binding for it
+ * with one that stores none must give the stored binding and that default. */
+bool shellsplit_test_domain_join_contract(void *workspace) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_set_t open = {0};
+  dep_route_set_set(&open, (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
+  /* left: fd 5 open. right: stores nothing for fd 5, and its occupancy says
+   * fd 5 is not occupied. */
+  dep_route_state_t left = {0}, right = {0};
+  if (!dep_route_state_append_one(&left, journal, dep_fd_numeric(5),
+                                  DEP_FD_ACCESS_BINDING, open))
+    return false;
+  shell_fd_occupancy_t none = {UINT64_MAX, UINT64_MAX & ~(UINT64_C(1) << 5)};
+  shell_fd_partition_t partition = shell_fd_partition_split(&none);
+  if (!dep_fd_domain_store(&right, journal, &partition))
+    return false;
+  dep_route_state_t joined = left;
+  if (!dep_fd_join(&joined, &right, journal))
+    return false;
+  dep_route_set_t fact = dep_fd_raw_fact(&joined, journal, dep_fd_numeric(5),
+                                         DEP_FD_ACCESS_BINDING);
+  bool live = false, closed = false;
+  for (uint32_t i = 0; i < fact.count; i++) {
+    live |= fact.routes[i].kind == DEP_ROUTE_INHERITED;
+    closed |= fact.routes[i].kind == DEP_ROUTE_CLOSED;
+  }
+  /* Joined the other way round, the facts are the same. */
+  dep_route_state_t reversed = right;
+  if (!dep_fd_join(&reversed, &left, journal))
+    return false;
+  dep_route_set_t other = dep_fd_raw_fact(&reversed, journal, dep_fd_numeric(5),
+                                          DEP_FD_ACCESS_BINDING);
+  return live && closed && fact.count == other.count;
+}
+
+/* Two parent versions fork the same private group, and the child versions are
+ * joined into one. Returning to the parent must account for both parents. */
+bool shellsplit_test_private_entry_join_contract(void *workspace) {
+  dep_route_workspace_t *w = workspace;
+  dep_test_fresh_workspace(workspace);
+  dep_route_journal_t *journal = &w->journal;
+  dep_route_set_t first = {0}, second = {0};
+  dep_route_set_set(&first, (dep_fd_route_t){DEP_ROUTE_INHERITED, 11});
+  dep_route_set_set(&second, (dep_fd_route_t){DEP_ROUTE_INHERITED, 12});
+  dep_route_state_t left = {0}, right = {0};
+  if (!dep_route_state_append_one(&left, journal, dep_fd_numeric(20),
+                                  DEP_FD_ACCESS_WRITE, first) ||
+      !dep_route_state_append_one(&right, journal, dep_fd_numeric(20),
+                                  DEP_FD_ACCESS_WRITE, second) ||
+      !dep_fd_private_begin(&left, journal, 0) ||
+      !dep_fd_private_begin(&right, journal, 0) ||
+      !dep_fd_join(&left, &right, journal))
+    return false;
+  dep_route_state_t returned = {0};
+  if (!dep_fd_private_project(&left, journal, 0, &returned))
+    return false;
+  dep_route_set_t fact = dep_fd_raw_fact(&returned, journal, dep_fd_numeric(20),
+                                         DEP_FD_ACCESS_WRITE);
+  bool saw_first = false, saw_second = false;
+  for (uint32_t i = 0; i < fact.count; i++) {
+    saw_first |= fact.routes[i].value == 11;
+    saw_second |= fact.routes[i].value == 12;
+  }
+  return saw_first && saw_second;
 }
 #endif

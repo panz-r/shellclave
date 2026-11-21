@@ -3,6 +3,7 @@
 
 #include "shell_contract.h"
 #include <stddef.h>
+#include <stdint.h>
 
 /* Charge each prefix interval and actual word-scanner transitions, not elapsed
  * time or a single nominal charge for an entire operation.
@@ -89,9 +90,20 @@ typedef enum {
   /* Persistent descriptor-map steps: one per node visited by a lookup,
    * update, diff, merge or traversal (SHELL_PMAP_WORK). */
   SHELLSPLIT_TEST_WORK_MAP_STEPS,
+  /* Node pairs a persistent-map union computed (SHELL_PMAP_FRESH), and pairs
+   * it answered from its memo (SHELL_PMAP_MEMO_HIT). Fresh pairs are what the
+   * join cost proofs count. */
+  SHELLSPLIT_TEST_WORK_UNION_FRESH,
+  SHELLSPLIT_TEST_WORK_UNION_MEMO_HITS,
   SHELLSPLIT_TEST_WORK_COUNT
 } shellsplit_test_metadata_kind_t;
 void shellsplit_test_metadata_charge(shellsplit_test_metadata_kind_t kind);
+
+/* Run analyses with a union memo of at most this many entries; 0 restores
+ * the full table, and entries is otherwise at least 2. A setting, not work:
+ * reset does not clear it. */
+void shellsplit_test_set_union_memo_limit(uint32_t entries);
+uint32_t shellsplit_test_union_memo_limit(void);
 size_t shellsplit_test_metadata_work(shellsplit_test_metadata_kind_t kind);
 
 /* Record adjacent body-observation positions for one owner. Equal positions
