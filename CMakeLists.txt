@@ -525,11 +525,6 @@ if(BUILD_TESTING)
   shellclave_add_test(shellsplit_graph_fixture_test shellsplit/tests/graph_fixture_test.c shellsplit)
   target_link_libraries(shellsplit_graph_fixture_test PRIVATE shellsplit_graph_fixture shellsplit)
   set_property(TEST shellsplit_graph_fixture_test APPEND PROPERTY LABELS shellsplit)
-  # Golden-graph serializer for engine redesign stages; run by hand against a
-  # harvested corpus, so it is a tool rather than a registered test.
-  add_executable(shellsplit_golden_graphs shellsplit/tests/golden_graphs.c)
-  shellclave_project_target(shellsplit_golden_graphs)
-  target_link_libraries(shellsplit_golden_graphs PRIVATE shellsplit_graph_fixture shellsplit)
   target_link_libraries(shellsplit_fd_scaling_test PRIVATE shellsplit_graph_fixture shellsplit_test)
   foreach(fixture_case IN ITEMS presence conditional arithmetic boundary read_input descriptor_move source)
     target_link_libraries(shellsplit_${fixture_case}_test PRIVATE shellsplit_graph_fixture shellsplit_test)
