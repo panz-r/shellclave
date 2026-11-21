@@ -79,3 +79,14 @@ external input, meaningful NULL cases, and genuine operational failures.
 
 A diagnostic marks something wrong or fragile in the code. Resolve what it
 points at. Do not hide it. Likewise, do not weaken a failing check to make it pass.
+
+## Documentation
+
+The README is self-contained, or points only to documentation the maintainers
+have approved. Do not create markdown files to document a change, and do not
+add links to documents nobody has approved. A change explains itself in its
+code, its interface comments and its commit message.
+
+Do not edit the README without explicit permission and oversight. If a change
+makes it wrong, say where and why, and propose the text; apply it only when
+told to.

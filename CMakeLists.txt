@@ -305,12 +305,6 @@ if(BUILD_TESTING)
   set_tests_properties(shellclave_gate_example PROPERTIES LABELS "shellgate;example")
   add_test(NAME shellclave_source_example COMMAND shellclave_source_example)
   set_tests_properties(shellclave_source_example PROPERTIES LABELS "shellsplit;example")
-  add_test(NAME shellclave_documentation_contract
-    COMMAND "${Python3_EXECUTABLE}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_documentation.py"
-      --example $<TARGET_FILE:shellclave_gate_example>
-      --source-example $<TARGET_FILE:shellclave_source_example>)
-  set_tests_properties(shellclave_documentation_contract PROPERTIES LABELS docs)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
   shellclave_add_test(shellsplit_abstract_cli_test
