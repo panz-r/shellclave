@@ -21,7 +21,7 @@ class ConditionalCommands(unittest.TestCase):
             capture_output=True, timeout=10)
 
     def probe_result(self, source, mode="--truth"):
-        result = subprocess.run([self.probe, mode, source],
+        result = subprocess.run([*self.probe, mode, source],
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
@@ -80,7 +80,7 @@ class ConditionalCommands(unittest.TestCase):
                 self.assertEqual(result.stderr, b'')
                 self.assertEqual(result.stdout, str(final).encode())
                 self.assertEqual(self.probe_result(source, "--status"), 0)
-                rejected = subprocess.run([self.probe, "--truth", source],
+                rejected = subprocess.run([*self.probe, "--truth", source],
                                           capture_output=True, timeout=10)
                 self.assertEqual(rejected.returncode, 1)
         for operand in ("++2", "--2", "'1--2'", "'1++2'", "'0&&count'",
@@ -537,7 +537,7 @@ class ConditionalCommands(unittest.TestCase):
                 for left in (right, right + '!'):
                     with self.subTest(source=source, value=value, left=left):
                         resolved = subprocess.run(
-                            [self.probe, '--resolved', source, left, right],
+                            [*self.probe, '--resolved', source, left, right],
                             capture_output=True, check=True, timeout=10)
                         truth = int(resolved.stdout)
                         expected = ((left == right) != (operator == '!=')) != (negate == '! ')
@@ -924,7 +924,7 @@ class ConditionalCommands(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bash", required=True)
-    parser.add_argument("--probe", required=True)
+    parser.add_argument("--probe", nargs="+", required=True)
     args = parser.parse_args()
     ConditionalCommands.bash = args.bash
     ConditionalCommands.probe = args.probe

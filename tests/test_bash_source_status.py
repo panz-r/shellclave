@@ -8,7 +8,7 @@ import unittest
 
 class SourceStatusContract(unittest.TestCase):
     def classify(self, source):
-        result = subprocess.run([self.probe, "--probe"], input=source,
+        result = subprocess.run([*self.probe, "--probe"], input=source,
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
@@ -504,7 +504,7 @@ class SourceStatusContract(unittest.TestCase):
                     expected = netstring(b"".join(netstring(v) for v in
                                                  (b"printf", b"%s\\0",
                                                   reference[:-1])))
-                    actual = subprocess.run([self.probe, "--argv"],
+                    actual = subprocess.run([*self.probe, "--argv"],
                                             input=source, capture_output=True,
                                             check=True, timeout=10).stdout
                     self.assertEqual(actual, expected)
@@ -576,7 +576,7 @@ class SourceStatusContract(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), 0)
-                result = subprocess.run([self.probe, "--argv"], input=source,
+                result = subprocess.run([*self.probe, "--argv"], input=source,
                                         capture_output=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)
 
@@ -1259,7 +1259,7 @@ class SourceStatusContract(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bash", required=True)
-    parser.add_argument("--probe", required=True)
+    parser.add_argument("--probe", nargs="+", required=True)
     args = parser.parse_args()
     SourceStatusContract.bash = args.bash
     SourceStatusContract.probe = args.probe

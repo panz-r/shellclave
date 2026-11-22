@@ -1,7 +1,16 @@
+/* The shared test support the suites rely on as oracles: the comparison of two
+ * parse results, the comparison of two dependency graphs, and the graph fixture
+ * they build on: aligned and guarded workspaces, released cleanly, and bad
+ * requests refused. */
+#include "depgraph_compare.h"
+#include "graph_fixture.h"
 #include "source_compare.h"
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
+/* --- source_compare (from source_compare_test.c) --- */
 #define CHECK(condition)                                                       \
   do {                                                                         \
     if (!(condition)) {                                                        \
@@ -36,7 +45,7 @@ static SHELL_NONNULL(1, 2) void contrast_padding(void *a, void *b, size_t first,
   }
 }
 
-static void ranges(void) {
+static void source_compare_ranges(void) {
   shell_range_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -59,7 +68,7 @@ static void ranges(void) {
 #undef FIELDS
 }
 
-static void groups(void) {
+static void source_compare_groups(void) {
   shell_group_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -80,7 +89,7 @@ static void groups(void) {
 #undef FIELDS
 }
 
-static void parses(void) {
+static void source_compare_parses(void) {
   shell_parse_result_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -104,7 +113,7 @@ static void parses(void) {
   CHECK(difference(&a, &b) == NULL);
 }
 
-static void headers(void) {
+static void source_compare_headers(void) {
   shell_source_header_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -142,7 +151,7 @@ static void headers(void) {
 #undef FIELDS
 }
 
-static void io(void) {
+static void source_compare_io(void) {
   shell_group_io_op_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -176,7 +185,7 @@ static void io(void) {
     CHECK(memcmp(&a, &b, sizeof(a)) != 0);
 }
 
-static void redirects(void) {
+static void source_compare_redirects(void) {
   shell_source_redirect_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -204,7 +213,7 @@ static void redirects(void) {
   CHECK(difference(&a, &b) != NULL);
 }
 
-static void documents(void) {
+static void source_compare_documents(void) {
   static const char path[] = "input.txt", name[] = "EOF", value[] = "payload\n";
   shell_dep_doc_t a, b;
   memset(&a, 0x55, sizeof(a));
@@ -251,7 +260,7 @@ static void documents(void) {
   CHECK(difference(&a, &b) == NULL);
 }
 
-static void heredocs(void) {
+static void source_compare_heredocs(void) {
   shell_source_heredoc_t a, b;
   memset(&a, 0x55, sizeof(a));
   memset(&b, 0xaa, sizeof(b));
@@ -291,7 +300,7 @@ static void heredocs(void) {
   CHECK(difference(&a, &b) == NULL);
 }
 
-static void pending_redirector(void) {
+static void source_compare_pending_redirector(void) {
   /* background_operator.txt begins with 99,109: the fuzz oracle selects the
    * fourth received fragment and fifth compound, not the input's shell text. */
   char source[128] = "echo before; ( : ) >existing {";
@@ -319,16 +328,256 @@ static void pending_redirector(void) {
         completed.redirects[1].next == UINT32_MAX);
 }
 
-int main(void) {
-  ranges();
-  groups();
-  parses();
-  headers();
-  io();
-  redirects();
-  documents();
-  heredocs();
-  pending_redirector();
+static int run_source_compare(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  source_compare_ranges();
+  source_compare_groups();
+  source_compare_parses();
+  source_compare_headers();
+  source_compare_io();
+  source_compare_redirects();
+  source_compare_documents();
+  source_compare_heredocs();
+  source_compare_pending_redirector();
   puts("semantic source comparison tests passed");
   return 0;
+}
+#undef CHECK
+#undef INITIALIZE
+#undef MUTATE
+#undef CHECK_FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+#undef FIELDS
+
+/* --- depgraph_compare (from depgraph_compare_test.c) --- */
+#define CHECK(condition)                                                       \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      fprintf(stderr, "comparison check failed at %d: %s\n", __LINE__,         \
+              #condition);                                                     \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+static void depgraph_compare_test_edges(void) {
+  shell_dep_edge_t a, b;
+  memset(&a, 0x55, sizeof(a));
+  memset(&b, 0xaa, sizeof(b));
+#define EDGE_FIELD(field, initial, different)                                  \
+  a.field = initial;                                                           \
+  b.field = initial;
+#define EDGE_FIELDS                                                            \
+  EDGE_FIELD(from, 0, 1)                                                       \
+  EDGE_FIELD(to, 1, 2)                                                         \
+  EDGE_FIELD(type, SHELL_EDGE_PIPE, SHELL_EDGE_READ)                           \
+  EDGE_FIELD(dir, SHELL_DIR_FORWARD, SHELL_DIR_UNDIR)                          \
+  EDGE_FIELD(flags, 0, SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)                   \
+  EDGE_FIELD(source_fd, 1, 2)                                                  \
+  EDGE_FIELD(target_fd, 0, 3)                                                  \
+  EDGE_FIELD(source_fd_name, NULL, "fd")                                       \
+  EDGE_FIELD(source_fd_name_len, 0, 2)                                         \
+  EDGE_FIELD(target_fd_name, NULL, "out")                                      \
+  EDGE_FIELD(target_fd_name_len, 0, 3)
+  EDGE_FIELDS
+#undef EDGE_FIELD
+  CHECK(shellsplit_test_edge_difference(&a, &b) == NULL);
+#define EDGE_FIELD(field, initial, different)                                  \
+  b.field = different;                                                         \
+  CHECK(shellsplit_test_edge_difference(&a, &b) != NULL);                      \
+  b.field = a.field;
+  EDGE_FIELDS
+#undef EDGE_FIELD
+#undef EDGE_FIELDS
+}
+
+static void depgraph_compare_test_nodes(void) {
+  shell_dep_node_t a, b;
+  memset(&a, 0x55, sizeof(a));
+  memset(&b, 0xaa, sizeof(b));
+  a.type = b.type = SHELL_NODE_CMD;
+  a.cmd.token_count = b.cmd.token_count = 1;
+  a.cmd.tokens[0] = b.cmd.tokens[0] = "echo";
+  a.cmd.token_lens[0] = b.cmd.token_lens[0] = 4;
+#define CMD_FIELD(field, initial, different)                                   \
+  a.cmd.field = initial;                                                       \
+  b.cmd.field = initial;
+#define CMD_FIELDS                                                             \
+  CMD_FIELD(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)              \
+  CMD_FIELD(conditional_expression, NULL, "x")                                 \
+  CMD_FIELD(conditional_expression_length, 0, 1)                               \
+  CMD_FIELD(conditional_operands[0], NULL, "x")                                \
+  CMD_FIELD(conditional_operand_lengths[0], 0, 1)                              \
+  CMD_FIELD(conditional_operands[1], NULL, "x")                                \
+  CMD_FIELD(conditional_operand_lengths[1], 0, 1)                              \
+  CMD_FIELD(conditional_operand_count, 0, 2)                                   \
+  CMD_FIELD(conditional_predicate, SHELL_CONDITIONAL_PREDICATE_NONE,           \
+            SHELL_CONDITIONAL_STRING_EQUAL)                                    \
+  CMD_FIELD(conditional_negated, false, true)                                  \
+  CMD_FIELD(conditional_truth, 0, 1)                                           \
+  CMD_FIELD(conditional_arithmetic_unresolved, false, true)                    \
+  CMD_FIELD(conditional_unresolved, false, true)                               \
+  CMD_FIELD(arithmetic_expression, NULL, "1")                                  \
+  CMD_FIELD(arithmetic_expression_length, 0, 1)                                \
+  CMD_FIELD(arithmetic_truth, SHELL_ARITHMETIC_UNKNOWN, SHELL_ARITHMETIC_ZERO) \
+  CMD_FIELD(has_redirections, false, true)                                     \
+  CMD_FIELD(effective_command_known, true, false)                              \
+  CMD_FIELD(effective_command_token, 0, 1)                                     \
+  CMD_FIELD(effective_command_wrapper, SHELL_DEP_COMMAND_DIRECT,               \
+            SHELL_DEP_COMMAND_SEARCH)                                          \
+  CMD_FIELD(cwd_offset, 0, 1)                                                  \
+  CMD_FIELD(group_depth, 0, 1)                                                 \
+  CMD_FIELD(group_kinds, 0, 1)                                                 \
+  CMD_FIELD(backgrounded, false, true)                                         \
+  CMD_FIELD(pipeline_negation_count, 0, 1)                                     \
+  CMD_FIELD(pipeline_negated, false, true)                                     \
+  CMD_FIELD(pipeline_time_mode, SHELL_PIPE_TIME_NONE, SHELL_PIPE_TIME_DEFAULT) \
+  CMD_FIELD(pipeline_time_id, 0, 1)                                            \
+  CMD_FIELD(cwd_known, true, false)                                            \
+  CMD_FIELD(cwd_absolute, true, false)                                         \
+  CMD_FIELD(pipe_stdin_source, UINT32_MAX, 0)                                  \
+  CMD_FIELD(pipe_stdin_target, UINT32_MAX, 0)                                  \
+  CMD_FIELD(pipe_stdout_source, UINT32_MAX, 0)                                 \
+  CMD_FIELD(pipe_stdout_target, UINT32_MAX, 0)
+  CMD_FIELDS
+#undef CMD_FIELD
+  CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+#define CMD_FIELD(field, initial, different)                                   \
+  b.cmd.field = different;                                                     \
+  CHECK(shellsplit_test_node_difference(&a, &b) != NULL);                      \
+  b.cmd.field = a.cmd.field;
+  CMD_FIELDS
+#undef CMD_FIELD
+#undef CMD_FIELDS
+  b.cmd.tokens[0] = "other";
+  CHECK(shellsplit_test_node_difference(&a, &b) != NULL);
+  b.cmd.tokens[0] = a.cmd.tokens[0];
+  b.cmd.token_lens[0]++;
+  CHECK(shellsplit_test_node_difference(&a, &b) != NULL);
+
+  /* All node kinds can retain different inactive union bytes. Assignment of
+   * their active subobjects must not require clearing the whole union. */
+  static const shell_dep_node_type_t kinds[] = {
+      SHELL_NODE_DOC,      SHELL_NODE_GROUP, SHELL_NODE_TIME,
+      SHELL_NODE_ENDPOINT, SHELL_NODE_FD,    SHELL_NODE_FILE_COMPARISON};
+  for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+    memset(&a, 0x55, sizeof(a));
+    memset(&b, 0xaa, sizeof(b));
+    a.type = b.type = kinds[i];
+    switch (kinds[i]) {
+    case SHELL_NODE_DOC:
+      a.doc = (shell_dep_doc_t){.kind = SHELL_DOC_FILE};
+      b.doc = a.doc;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.doc.flags = SHELL_DEP_DOC_FLAG_DYNAMIC_NAME;
+      break;
+    case SHELL_NODE_GROUP:
+      a.group = (shell_dep_group_t){.parent = UINT32_MAX};
+      b.group = a.group;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.group.pipeline_time_id = 1;
+      break;
+    case SHELL_NODE_TIME:
+      a.time = (shell_dep_time_t){.report_external_fd_count = 1};
+      b.time = a.time;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.time.report_external_fds[0] = 2;
+      break;
+    case SHELL_NODE_ENDPOINT:
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.type = SHELL_NODE_DOC;
+      b.doc = (shell_dep_doc_t){.kind = SHELL_DOC_FILE};
+      break;
+    case SHELL_NODE_FD:
+      a.fd = (shell_dep_fd_t){.number = 1};
+      b.fd = a.fd;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.fd.number = 2;
+      break;
+    case SHELL_NODE_CMD:
+      break;
+    case SHELL_NODE_FILE_COMPARISON:
+      a.file_comparison =
+          (shell_dep_file_comparison_t){SHELL_FILE_COMPARE_SAME, 0};
+      b.file_comparison = a.file_comparison;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.file_comparison.empty_operands = 1;
+      break;
+    }
+    CHECK(shellsplit_test_node_difference(&a, &b) != NULL);
+  }
+}
+
+static int run_depgraph_compare(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  depgraph_compare_test_edges();
+  depgraph_compare_test_nodes();
+  puts("semantic graph comparison tests passed");
+  return 0;
+}
+#undef CHECK
+#undef EDGE_FIELD
+#undef EDGE_FIELDS
+#undef EDGE_FIELD
+#undef CMD_FIELD
+#undef CMD_FIELDS
+#undef CMD_FIELD
+
+/* --- fixture (from fixture_part.c) --- */
+#define CHECK(x)                                                               \
+  do {                                                                         \
+    if (!(x)) {                                                                \
+      fprintf(stderr, "fixture: %s:%d: %s\n", __FILE__, __LINE__, #x);         \
+      return 1;                                                                \
+    }                                                                          \
+  } while (0)
+
+static int run_fixture(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  shellsplit_graph_fixture_t fixture;
+  size_t alignment = shell_dep_workspace_alignment();
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 64,
+                                      2, true, alignment));
+  CHECK(fixture.graph[0] && fixture.graph[1] &&
+        fixture.graph[0] != fixture.graph[1]);
+  CHECK((uintptr_t)fixture.workspace % alignment == 0);
+  CHECK(fixture.limits.workspace_size % alignment == 0);
+  ((unsigned char *)
+       fixture.workspace)[fixture.limits.workspace_size + alignment - 1] = 1;
+  fixture.limits.workspace = NULL;
+  fixture.limits.workspace_size = 0;
+  shellsplit_graph_fixture_destroy(&fixture);
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 65,
+                                      0, true, 1));
+  ((unsigned char *)fixture.workspace)[fixture.limits.workspace_size] = 1;
+  shellsplit_graph_fixture_destroy(&fixture);
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_FIXED, 0, 0,
+                                      false, 0));
+  CHECK(!fixture.graph[0] && !fixture.graph[1]);
+  shellsplit_graph_fixture_destroy(&fixture);
+  CHECK(!shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE,
+                                       SIZE_MAX, 1, false, 0));
+  shellsplit_graph_fixture_destroy(&fixture);
+  CHECK(!shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_FIXED, 0, 1,
+                                       false, SIZE_MAX));
+  shellsplit_graph_fixture_destroy(&fixture);
+  return 0;
+}
+#undef CHECK
+
+int main(int argc, char **argv) {
+  int status = 0;
+  status |= run_source_compare(argc, argv);
+  status |= run_depgraph_compare(argc, argv);
+  status |= run_fixture(argc, argv);
+  return status != 0;
 }

@@ -1,8 +1,11 @@
-/* Core unit tests for the command policy learner. */
-
+/* The shelltype unit checks: the tokenizing and typing of commands, the arena,
+ * the policy verifier, and the integration of shelltype with shellsplit's
+ * processed subcommands. */
 #define _POSIX_C_SOURCE 200809L
 #include "../../tests/atomic_file_fixture.h"
+#include "arena.h"
 #include "crc32.h"
+#include "shell_processor.h"
 #include "shelltype.h"
 #include "test_allocator.h"
 #include "test_io.h"
@@ -12,39 +15,43 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
+/* --- unit (from test_shelltype.c) --- */
+/* Core unit tests for the command policy learner. */
 
-static const st_suggestion_t *find_suggestion(const st_suggestion_t *items,
-                                              size_t count,
-                                              const char *pattern);
+static int unit_tests_run;
+static int unit_tests_passed;
+static int unit_tests_failed;
 
-static char learner_temp_path[256];
-static char learner_template_path[264];
-static char learner_save_directory[256];
+static const st_suggestion_t *unit_find_suggestion(const st_suggestion_t *items,
+                                                   size_t count,
+                                                   const char *pattern);
 
-static void cleanup_learner_temp_file(void) {
-  if (learner_template_path[0] != '\0') {
-    (void)unlink(learner_template_path);
-    learner_template_path[0] = '\0';
+static char unit_learner_temp_path[256];
+static char unit_learner_template_path[264];
+static char unit_learner_save_directory[256];
+
+static void unit_cleanup_learner_temp_file(void) {
+  if (unit_learner_template_path[0] != '\0') {
+    (void)unlink(unit_learner_template_path);
+    unit_learner_template_path[0] = '\0';
   }
-  if (learner_temp_path[0] != '\0') {
-    (void)unlink(learner_temp_path);
-    learner_temp_path[0] = '\0';
+  if (unit_learner_temp_path[0] != '\0') {
+    (void)unlink(unit_learner_temp_path);
+    unit_learner_temp_path[0] = '\0';
   }
-  if (learner_save_directory[0]) {
+  if (unit_learner_save_directory[0]) {
     char path[272];
-    snprintf(path, sizeof(path), "%s/learner", learner_save_directory);
+    snprintf(path, sizeof(path), "%s/learner", unit_learner_save_directory);
     (void)test_atomic_temp_files(path, true);
-    (void)rmdir(learner_save_directory);
-    learner_save_directory[0] = '\0';
+    (void)rmdir(unit_learner_save_directory);
+    unit_learner_save_directory[0] = '\0';
   }
 }
 
@@ -59,25 +66,25 @@ static void cleanup_learner_temp_file(void) {
 
 #define TEST(function)                                                         \
   do {                                                                         \
-    tests_run++;                                                               \
+    unit_tests_run++;                                                          \
     printf("  %-38s ", #function);                                             \
     if (function()) {                                                          \
-      tests_passed++;                                                          \
+      unit_tests_passed++;                                                     \
       printf("PASS\n");                                                        \
     } else {                                                                   \
-      tests_failed++;                                                          \
+      unit_tests_failed++;                                                     \
       printf("FAIL\n");                                                        \
     }                                                                          \
   } while (0)
 
-static st_node_t *find_child(st_node_t *parent, const char *token) {
+static st_node_t *unit_find_child(st_node_t *parent, const char *token) {
   for (size_t i = 0; i < parent->num_children; i++)
     if (strcmp(parent->children[i]->token, token) == 0)
       return parent->children[i];
   return NULL;
 }
 
-static int nodes_equal(const st_node_t *a, const st_node_t *b) {
+static int unit_nodes_equal(const st_node_t *a, const st_node_t *b) {
   if (!a || !b || strcmp(a->token, b->token) != 0 || a->type != b->type ||
       a->count != b->count || a->observed_types != b->observed_types ||
       a->metadata_observations != b->metadata_observations ||
@@ -86,22 +93,12 @@ static int nodes_equal(const st_node_t *a, const st_node_t *b) {
       a->num_children != b->num_children)
     return 0;
   for (size_t i = 0; i < a->num_children; i++)
-    if (!nodes_equal(a->children[i], b->children[i]))
+    if (!unit_nodes_equal(a->children[i], b->children[i]))
       return 0;
   return 1;
 }
 
-static int trie_counts_equal(const st_node_t *a, const st_node_t *b) {
-  if (!a || !b || strcmp(a->token, b->token) != 0 || a->type != b->type ||
-      a->count != b->count || a->num_children != b->num_children)
-    return 0;
-  for (size_t i = 0; i < a->num_children; i++)
-    if (!trie_counts_equal(a->children[i], b->children[i]))
-      return 0;
-  return 1;
-}
-
-static st_learner_t *baseline_learner(void) {
+static st_learner_t *unit_baseline_learner(void) {
   st_learner_t *learner = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
                              .min_confidence = 0.0,
@@ -114,17 +111,13 @@ static st_learner_t *baseline_learner(void) {
   return learner;
 }
 
-static int no_learner_save_temps(const char *path) {
+static int unit_no_learner_save_temps(const char *path) {
   return test_atomic_temp_files(path, false);
 }
 
-static void remove_learner_save_temps(const char *path) {
-  (void)test_atomic_temp_files(path, true);
-}
-
-static int test_feed_is_atomic(void) {
+static int unit_test_feed_is_atomic(void) {
   st_test_alloc_reset();
-  st_learner_t *probe = baseline_learner();
+  st_learner_t *probe = unit_baseline_learner();
   ASSERT(probe != NULL);
   st_test_alloc_reset();
   ASSERT(test_st_feed(probe, "git commit -m /tmp/message") == ST_OK);
@@ -134,15 +127,15 @@ static int test_feed_is_atomic(void) {
 
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_test_alloc_reset();
-    st_learner_t *expected = baseline_learner();
-    st_learner_t *actual = baseline_learner();
+    st_learner_t *expected = unit_baseline_learner();
+    st_learner_t *actual = unit_baseline_learner();
     ASSERT(expected && actual);
     st_test_alloc_fail_at(fail_at);
     st_error_t error = test_st_feed(actual, "git commit -m /tmp/message");
     st_test_alloc_reset();
     if (error == ST_ERR_MEMORY)
       ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
-             nodes_equal(actual->trie.root, expected->trie.root));
+             unit_nodes_equal(actual->trie.root, expected->trie.root));
     else
       ASSERT(error == ST_OK && actual->trie.total_commands == 3);
     st_learner_free(expected);
@@ -151,7 +144,7 @@ static int test_feed_is_atomic(void) {
 
   st_token_array_t parsed = {0};
   ASSERT(test_st_classify("git push /tmp/repository", &parsed) == ST_OK);
-  probe = baseline_learner();
+  probe = unit_baseline_learner();
   ASSERT(probe != NULL);
   st_test_alloc_reset();
   ASSERT(st_learner_feed_tokens(probe, &parsed) == ST_OK);
@@ -159,15 +152,15 @@ static int test_feed_is_atomic(void) {
   st_learner_free(probe);
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_test_alloc_reset();
-    st_learner_t *expected = baseline_learner();
-    st_learner_t *actual = baseline_learner();
+    st_learner_t *expected = unit_baseline_learner();
+    st_learner_t *actual = unit_baseline_learner();
     ASSERT(expected && actual);
     st_test_alloc_fail_at(fail_at);
     st_error_t error = st_learner_feed_tokens(actual, &parsed);
     st_test_alloc_reset();
     if (error == ST_ERR_MEMORY)
       ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
-             nodes_equal(actual->trie.root, expected->trie.root));
+             unit_nodes_equal(actual->trie.root, expected->trie.root));
     else
       ASSERT(error == ST_OK && actual->trie.total_commands == 3);
     st_learner_free(expected);
@@ -175,7 +168,7 @@ static int test_feed_is_atomic(void) {
   }
   st_token_array_free(&parsed);
 
-  st_learner_t *learner = baseline_learner();
+  st_learner_t *learner = unit_baseline_learner();
   ASSERT(learner != NULL);
   st_token_t invalid_token = {.text = NULL, .type = ST_TYPE_WORD};
   st_token_array_t invalid = {.tokens = &invalid_token, .count = 1};
@@ -194,154 +187,7 @@ static int test_feed_is_atomic(void) {
   return 1;
 }
 
-static int test_feed_netargv_avoids_classifier_allocations(void) {
-  static const char netargv[] = "3:git,6:commit,2:-m,12:/tmp/message,";
-  st_token_t tokens[] = {
-      {.text = "git", .type = ST_TYPE_LITERAL},
-      {.text = "commit", .type = ST_TYPE_LITERAL},
-      {.text = "-m", .type = ST_TYPE_SHORTOPT},
-      {.text = "/tmp/message", .type = ST_TYPE_ABS_PATH},
-  };
-  const st_token_array_t typed = {
-      .tokens = tokens,
-      .count = sizeof(tokens) / sizeof(tokens[0]),
-  };
-  st_learner_t *from_netargv = baseline_learner();
-  st_learner_t *from_tokens = baseline_learner();
-  ASSERT(from_netargv && from_tokens);
-
-  st_test_alloc_reset();
-  ASSERT(st_learner_feed_netargv_view(
-             from_netargv, (st_netargv_view_t){netargv, sizeof(netargv) - 1}) ==
-         ST_OK);
-  size_t netargv_allocations = st_test_alloc_count();
-  st_test_alloc_reset();
-  ASSERT(st_learner_feed_tokens(from_tokens, &typed) == ST_OK);
-  size_t token_allocations = st_test_alloc_count();
-
-  ASSERT(netargv_allocations == token_allocations);
-  ASSERT(nodes_equal(from_netargv->trie.root, from_tokens->trie.root));
-  st_learner_free(from_netargv);
-  st_learner_free(from_tokens);
-  return 1;
-}
-
-static int test_borrowed_binary_feed_is_atomic(void) {
-  static const char frame[] = "4:echo,3:a\0b,";
-  char *exact = malloc(sizeof(frame) - 1);
-  ASSERT(exact != NULL);
-  memcpy(exact, frame, sizeof(frame) - 1);
-  st_netargv_view_t view = {exact, sizeof(frame) - 1};
-  st_test_alloc_reset();
-  st_learner_t *probe = baseline_learner();
-  ASSERT(probe != NULL);
-  st_test_alloc_reset();
-  ASSERT(st_learner_feed_netargv_view(probe, view) == ST_OK);
-  size_t allocations = st_test_alloc_count();
-  st_learner_free(probe);
-  ASSERT(allocations > 0);
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    st_test_alloc_reset();
-    st_learner_t *expected = baseline_learner();
-    st_learner_t *actual = baseline_learner();
-    ASSERT(expected && actual);
-    st_test_alloc_fail_at(fail_at);
-    st_error_t error = st_learner_feed_netargv_view(actual, view);
-    st_test_alloc_reset();
-    ASSERT(error == ST_ERR_MEMORY);
-    ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
-           nodes_equal(actual->trie.root, expected->trie.root));
-    st_learner_free(expected);
-    st_learner_free(actual);
-  }
-  free(exact);
-  return 1;
-}
-
-static int test_timestamp_metadata_feed_is_atomic(void) {
-  static const char initial[] = "4:tool,20:2026-10-05T12:34:56Z,3:old,";
-  static const char *const incoming[] = {
-      "4:tool,20:2026-10-05t12:34:56Z,2:42,",
-      "4:tool,10:2026-10-05,2:42,",
-      "4:tool,8:12:34:56,2:42,",
-  };
-  for (size_t i = 0; i < sizeof(incoming) / sizeof(incoming[0]); i++) {
-    size_t length = strlen(incoming[i]);
-    char *exact = malloc(length);
-    ASSERT(exact != NULL);
-    memcpy(exact, incoming[i], length);
-    st_netargv_view_t view = {exact, length};
-    st_test_alloc_reset();
-    st_learner_t *probe = baseline_learner();
-    ASSERT(probe != NULL &&
-           st_learner_feed_netargv_view(
-               probe, (st_netargv_view_t){initial, strlen(initial)}) == ST_OK);
-    st_test_alloc_reset();
-    ASSERT(st_learner_feed_netargv_view(probe, view) == ST_OK);
-    size_t allocations = st_test_alloc_count();
-    st_learner_free(probe);
-    ASSERT(allocations > 0);
-    for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-      st_test_alloc_reset();
-      st_learner_t *expected = baseline_learner();
-      st_learner_t *actual = baseline_learner();
-      ASSERT(expected != NULL && actual != NULL);
-      ASSERT(st_learner_feed_netargv_view(
-                 expected, (st_netargv_view_t){initial, strlen(initial)}) ==
-                 ST_OK &&
-             st_learner_feed_netargv_view(
-                 actual, (st_netargv_view_t){initial, strlen(initial)}) ==
-                 ST_OK);
-      st_test_alloc_fail_at(fail_at);
-      st_error_t error = st_learner_feed_netargv_view(actual, view);
-      st_test_alloc_reset();
-      /* Insertion changes the existing timestamp bucket before allocating
-       * its new continuation. Both common and mixed evidence must roll back
-       * when any later allocation fails. */
-      ASSERT(error == ST_ERR_MEMORY);
-      ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
-             nodes_equal(actual->trie.root, expected->trie.root));
-      st_learner_free(expected);
-      st_learner_free(actual);
-    }
-    free(exact);
-  }
-  return 1;
-}
-
-static int test_expressive_literal_suggestions(void) {
-  static const struct {
-    const char *command;
-    const char *argument;
-    const char *expected_cpl;
-  } cases[] = {{"space", "two words", "space \"two words\""},
-               {"empty", "", "empty \"\""},
-               {"hash", "#n", "hash \"#n\""},
-               {"star", "*", "star \"*\""},
-               {"line", "line\nfeed", "line \"line\\nfeed\""}};
-  st_learner_t *learner = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(learner != NULL);
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    st_token_t tokens[] = {
-        {.text = (char *)cases[i].command, .type = ST_TYPE_LITERAL},
-        {.text = (char *)cases[i].argument, .type = ST_TYPE_LITERAL}};
-    st_token_array_t command = {.tokens = tokens, .count = 2};
-    ASSERT(st_learner_feed_tokens(learner, &command) == ST_OK);
-  }
-  size_t count = 0;
-  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-  ASSERT(suggestions != NULL && count == sizeof(cases) / sizeof(cases[0]));
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
-    ASSERT(find_suggestion(suggestions, count, cases[i].expected_cpl));
-  st_suggestion_list_free(suggestions, count);
-  st_learner_free(learner);
-  return 1;
-}
-
-static int test_compound_option_suggestion(void) {
+static int unit_test_compound_option_suggestion(void) {
   st_learner_t *learner = st_learner_new(
       &(st_learner_config_t){.min_support = 2,
                              .min_confidence = 0.0,
@@ -352,13 +198,13 @@ static int test_compound_option_suggestion(void) {
   size_t count = 0;
   st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions != NULL);
-  ASSERT(find_suggestion(suggestions, count, "tool --output={#p}"));
+  ASSERT(unit_find_suggestion(suggestions, count, "tool --output={#p}"));
   st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
 
-static int test_learner_state_transitions(void) {
+static int unit_test_learner_state_transitions(void) {
   st_learner_t *learner = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
                              .min_confidence = 0.0,
@@ -376,10 +222,10 @@ static int test_learner_state_transitions(void) {
     ASSERT(learner->trie.root->count == i + 1);
   }
 
-  st_node_t *git = find_child(learner->trie.root, "git");
+  st_node_t *git = unit_find_child(learner->trie.root, "git");
   ASSERT(git && git->count == 5);
-  ASSERT(find_child(git, "commit") != NULL);
-  ASSERT(find_child(git, "status") != NULL);
+  ASSERT(unit_find_child(git, "commit") != NULL);
+  ASSERT(unit_find_child(git, "status") != NULL);
   ASSERT(learner->trie.total_commands == 5);
 
   st_token_array_t parsed = {0};
@@ -388,7 +234,7 @@ static int test_learner_state_transitions(void) {
   st_token_array_free(&parsed);
   ASSERT(learner->trie.total_commands == 6);
   ASSERT(learner->trie.root->count == 6);
-  ASSERT(find_child(learner->trie.root, "curl") != NULL);
+  ASSERT(unit_find_child(learner->trie.root, "curl") != NULL);
 
   st_token_t too_many_tokens[ST_MAX_CMD_TOKENS + 1];
   for (size_t i = 0; i < sizeof(too_many_tokens) / sizeof(too_many_tokens[0]);
@@ -404,8 +250,8 @@ static int test_learner_state_transitions(void) {
   return 1;
 }
 
-static int test_learner_input_boundaries(void) {
-  st_learner_t *learner = baseline_learner();
+static int unit_test_learner_input_boundaries(void) {
+  st_learner_t *learner = unit_baseline_learner();
   ASSERT(learner != NULL);
   ASSERT(test_st_feed(learner, "") == ST_ERR_INVALID);
   ASSERT(test_st_feed(learner, "   ") == ST_ERR_INVALID);
@@ -437,7 +283,7 @@ static int test_learner_input_boundaries(void) {
   return 1;
 }
 
-static int test_learner_configuration_boundaries(void) {
+static int unit_test_learner_configuration_boundaries(void) {
   st_learner_config_t config = {0};
   st_learner_config_default(&config);
   ASSERT(config.min_support == ST_DEFAULT_MIN_SUPPORT);
@@ -476,7 +322,7 @@ static int test_learner_configuration_boundaries(void) {
   return 1;
 }
 
-static int test_learner_stats_contract(void) {
+static int unit_test_learner_stats_contract(void) {
   st_learner_stats_t stats = {.command_count = UINT32_MAX,
                               .blacklist_count = SIZE_MAX};
 
@@ -516,11 +362,12 @@ typedef struct {
   const char *pattern;
   uint32_t count;
   double confidence;
-} expected_suggestion_t;
+} unit_expected_suggestion_t;
 
-static int suggestions_equal(const st_suggestion_t *actual, size_t actual_count,
-                             const expected_suggestion_t *expected,
-                             size_t expected_count) {
+static int unit_suggestions_equal(const st_suggestion_t *actual,
+                                  size_t actual_count,
+                                  const unit_expected_suggestion_t *expected,
+                                  size_t expected_count) {
   if (!actual || actual_count != expected_count) {
     fprintf(stderr, "suggestion count: actual=%zu expected=%zu\n", actual_count,
             expected_count);
@@ -547,10 +394,10 @@ static int suggestions_equal(const st_suggestion_t *actual, size_t actual_count,
   return 1;
 }
 
-static int suggestion_lists_equal(const st_suggestion_t *left,
-                                  size_t left_count,
-                                  const st_suggestion_t *right,
-                                  size_t right_count) {
+static int unit_suggestion_lists_equal(const st_suggestion_t *left,
+                                       size_t left_count,
+                                       const st_suggestion_t *right,
+                                       size_t right_count) {
   if (left_count != right_count || (left_count != 0 && (!left || !right)))
     return 0;
   for (size_t i = 0; i < left_count; i++)
@@ -563,10 +410,10 @@ static int suggestion_lists_equal(const st_suggestion_t *left,
   return 1;
 }
 
-static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
-                                      size_t suggestion_count,
-                                      const char *const *commands,
-                                      size_t command_count) {
+static int unit_suggestions_replay_exactly(const st_suggestion_t *suggestions,
+                                           size_t suggestion_count,
+                                           const char *const *commands,
+                                           size_t command_count) {
   for (size_t suggestion = 0; suggestion < suggestion_count; suggestion++) {
     ASSERT(st_netpattern_validate_view(
                (st_netpattern_view_t){suggestions[suggestion].pattern,
@@ -594,42 +441,7 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
   return 1;
 }
 
-static int test_suggestion_order_is_input_order_independent(void) {
-  static const char *commands[] = {
-      "copy /tmp/alpha.cfg", "copy /tmp/beta.cfg", "copy /tmp/gamma.log",
-      "move /tmp/alpha.cfg", "move /tmp/beta.cfg", "move /tmp/gamma.log"};
-  static const size_t orders[][6] = {
-      {0, 1, 2, 3, 4, 5}, {5, 4, 3, 2, 1, 0}, {2, 5, 1, 4, 0, 3}};
-  st_suggestion_t *baseline = NULL;
-  size_t baseline_count = 0;
-  for (size_t order = 0; order < sizeof(orders) / sizeof(orders[0]); order++) {
-    st_learner_t *learner = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(learner != NULL);
-    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
-      ASSERT(test_st_feed(learner, commands[orders[order][i]]) == ST_OK);
-    size_t count = 0;
-    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-    ASSERT(suggestions != NULL && count > 0);
-    ASSERT(suggestions_replay_exactly(suggestions, count, commands,
-                                      sizeof(commands) / sizeof(commands[0])));
-    if (order == 0) {
-      baseline = suggestions;
-      baseline_count = count;
-    } else {
-      ASSERT(
-          suggestion_lists_equal(baseline, baseline_count, suggestions, count));
-      st_suggestion_list_free(suggestions, count);
-    }
-    st_learner_free(learner);
-  }
-  st_suggestion_list_free(baseline, baseline_count);
-  return 1;
-}
-
-static uint32_t history_random_next(uint32_t *state) {
+static uint32_t unit_history_random_next(uint32_t *state) {
   *state = *state * UINT32_C(1664525) + UINT32_C(1013904223);
   return *state;
 }
@@ -638,17 +450,18 @@ typedef struct {
   const char *command;
   const char *argument;
   st_token_type_t type;
-} oracle_observation_t;
+} unit_oracle_observation_t;
 
 typedef struct {
   char pattern[ST_MAX_NETPATTERN_LEN];
   uint32_t count;
   double confidence;
-} oracle_suggestion_t;
+} unit_oracle_suggestion_t;
 
-static int compare_oracle_suggestions(const void *left, const void *right) {
-  const oracle_suggestion_t *a = left;
-  const oracle_suggestion_t *b = right;
+static int unit_compare_oracle_suggestions(const void *left,
+                                           const void *right) {
+  const unit_oracle_suggestion_t *a = left;
+  const unit_oracle_suggestion_t *b = right;
   if (a->confidence != b->confidence)
     return a->confidence > b->confidence ? -1 : 1;
   if (a->count != b->count)
@@ -658,11 +471,11 @@ static int compare_oracle_suggestions(const void *left, const void *right) {
 
 /* Independent two-token learner model.  It operates on the observation
  * multiset directly and never examines the production trie. */
-static size_t oracle_two_token_suggestions(
-    const oracle_observation_t *corpus, size_t corpus_count,
+static size_t unit_oracle_two_token_suggestions(
+    const unit_oracle_observation_t *corpus, size_t corpus_count,
     const size_t *history, size_t history_count, uint32_t min_support,
     double min_confidence, size_t limit, const char *blacklist,
-    oracle_suggestion_t *out, size_t capacity) {
+    unit_oracle_suggestion_t *out, size_t capacity) {
   size_t out_count = 0;
   for (size_t command_index = 0; command_index < corpus_count;
        command_index++) {
@@ -703,7 +516,7 @@ static size_t oracle_two_token_suggestions(
     if (total == 0)
       continue;
 
-    oracle_suggestion_t candidates[ST_TYPE_COUNT + 32] = {0};
+    unit_oracle_suggestion_t candidates[ST_TYPE_COUNT + 32] = {0};
     size_t candidate_count = 0;
     if (literal_count >= 2) {
       snprintf(candidates[0].pattern, sizeof(candidates[0].pattern), "%s *",
@@ -761,7 +574,7 @@ static size_t oracle_two_token_suggestions(
     }
 
     for (size_t candidate = 0; candidate < candidate_count; candidate++) {
-      oracle_suggestion_t value = candidates[candidate];
+      unit_oracle_suggestion_t value = candidates[candidate];
       if (value.count < min_support || value.confidence < min_confidence ||
           (blacklist && strcmp(value.pattern, blacklist) == 0))
         continue;
@@ -769,12 +582,12 @@ static size_t oracle_two_token_suggestions(
       out[out_count++] = value;
     }
   }
-  qsort(out, out_count, sizeof(*out), compare_oracle_suggestions);
+  qsort(out, out_count, sizeof(*out), unit_compare_oracle_suggestions);
   return out_count > limit ? limit : out_count;
 }
 
-static int test_independent_two_token_learner_oracle(void) {
-  static const oracle_observation_t corpus[] = {
+static int unit_test_independent_two_token_learner_oracle(void) {
+  static const unit_oracle_observation_t corpus[] = {
       {"copy", "alpha", ST_TYPE_LITERAL},
       {"copy", "beta", ST_TYPE_LITERAL},
       {"probe", "42", ST_TYPE_NUMBER},
@@ -793,8 +606,8 @@ static int test_independent_two_token_learner_oracle(void) {
     size_t history[HISTORY_COUNT];
     uint32_t state = seed;
     for (size_t i = 0; i < HISTORY_COUNT; i++)
-      history[i] =
-          history_random_next(&state) % (sizeof(corpus) / sizeof(corpus[0]));
+      history[i] = unit_history_random_next(&state) %
+                   (sizeof(corpus) / sizeof(corpus[0]));
 
     for (size_t configuration = 0; configuration < 2; configuration++) {
       uint32_t min_support = configuration == 0 ? 1 : 3;
@@ -814,7 +627,7 @@ static int test_independent_two_token_learner_oracle(void) {
         ASSERT(test_st_blacklist_add(learner, blacklist) == ST_OK);
 
       for (size_t i = 0; i < HISTORY_COUNT; i++) {
-        const oracle_observation_t *item = &corpus[history[i]];
+        const unit_oracle_observation_t *item = &corpus[history[i]];
         st_token_t tokens[] = {
             {.text = (char *)item->command, .type = ST_TYPE_LITERAL},
             {.text = (char *)item->argument, .type = item->type},
@@ -823,8 +636,8 @@ static int test_independent_two_token_learner_oracle(void) {
         ASSERT(st_learner_feed_tokens(learner, &parsed) == ST_OK);
       }
 
-      oracle_suggestion_t expected[ORACLE_CAPACITY] = {0};
-      size_t expected_count = oracle_two_token_suggestions(
+      unit_oracle_suggestion_t expected[ORACLE_CAPACITY] = {0};
+      size_t expected_count = unit_oracle_two_token_suggestions(
           corpus, sizeof(corpus) / sizeof(corpus[0]), history, HISTORY_COUNT,
           min_support, min_confidence, limit, blacklist, expected,
           ORACLE_CAPACITY);
@@ -846,153 +659,8 @@ static int test_independent_two_token_learner_oracle(void) {
   return 1;
 }
 
-static int test_generated_suggestion_history_properties(void) {
-  static const char *corpus[] = {
-      "copy /tmp/alpha.cfg",
-      "copy /tmp/beta.cfg",
-      "copy /tmp/gamma.log",
-      "move /tmp/alpha.cfg",
-      "move ../beta.cfg",
-      "move file.txt",
-      "probe 10",
-      "probe 11",
-      "probe 550e8400-e29b-41d4-a716-446655440000",
-      "probe 550e8400-e29b-51d4-a716-446655440000",
-      "allocate 1MiB",
-      "allocate 2MiB",
-      "allocate 3GiB",
-      "sleep 1ms",
-      "sleep 2ms",
-      "sleep 3s",
-      "git status",
-      "git log",
-  };
-  enum { HISTORY_COUNT = 48 };
-  char path[] = "/tmp/shelltype-history-v4-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-
-  for (uint32_t seed = 1; seed <= 16; seed++) {
-    const char *history[HISTORY_COUNT];
-    uint32_t state = seed;
-    for (size_t i = 0; i < HISTORY_COUNT; i++)
-      history[i] = corpus[history_random_next(&state) %
-                          (sizeof(corpus) / sizeof(corpus[0]))];
-
-    st_learner_t *forward = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    st_learner_t *reverse = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    st_learner_t *permuted = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    st_learner_t *loaded = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(forward && reverse && permuted && loaded);
-    for (size_t i = 0; i < HISTORY_COUNT; i++) {
-      ASSERT(test_st_feed(forward, history[i]) == ST_OK);
-      ASSERT(test_st_feed(reverse, history[HISTORY_COUNT - i - 1]) == ST_OK);
-      ASSERT(test_st_feed(permuted, history[(i * 17) % HISTORY_COUNT]) ==
-             ST_OK);
-    }
-
-    size_t forward_count = 0, reverse_count = 0, permuted_count = 0,
-           loaded_count = 0;
-    st_suggestion_t *forward_items =
-        st_learner_suggest(forward, &forward_count);
-    st_suggestion_t *reverse_items =
-        st_learner_suggest(reverse, &reverse_count);
-    st_suggestion_t *permuted_items =
-        st_learner_suggest(permuted, &permuted_count);
-    if (!suggestion_lists_equal(forward_items, forward_count, reverse_items,
-                                reverse_count) ||
-        !suggestion_lists_equal(forward_items, forward_count, permuted_items,
-                                permuted_count)) {
-      fprintf(stderr, "generated suggestion order differs for seed %u\n", seed);
-      return 0;
-    }
-    ASSERT(suggestions_replay_exactly(forward_items, forward_count, history,
-                                      HISTORY_COUNT));
-    ASSERT(st_learner_save(forward, path) == ST_OK);
-    ASSERT(st_learner_load(loaded, path) == ST_OK);
-    st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
-    ASSERT(suggestion_lists_equal(forward_items, forward_count, loaded_items,
-                                  loaded_count));
-
-    st_suggestion_list_free(forward_items, forward_count);
-    st_suggestion_list_free(reverse_items, reverse_count);
-    st_suggestion_list_free(permuted_items, permuted_count);
-    st_suggestion_list_free(loaded_items, loaded_count);
-    st_learner_free(forward);
-    st_learner_free(reverse);
-    st_learner_free(permuted);
-    st_learner_free(loaded);
-  }
-
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  return 1;
-}
-
-static int test_suggestion_matrix(void) {
-  static const struct {
-    const char *name;
-    const char *format;
-    size_t repetitions;
-    expected_suggestion_t expected[5];
-    size_t expected_count;
-  } cases[] = {
-      {"path family", "ls -l /tmp/file%zu", 5, {{"ls #sopt #p", 5, 1.0}}, 1},
-      {"pipeline family",
-       "cat /var/log/file%zu.log | grep ERROR",
-       4,
-       {{"cat #p | grep ERROR", 4, 1.0}},
-       1},
-      {"extension family", "cat /etc/file%zu.cfg", 5, {{"cat #p", 5, 1.0}}, 1},
-      {"size suffix family",
-       "allocate %zuMiB",
-       5,
-       {{"allocate #size.MiB", 5, 1.0}},
-       1},
-  };
-
-  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
-    st_learner_t *learner = st_learner_new(
-        &(st_learner_config_t){.min_support = 3,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(learner != NULL);
-    char command_storage[8][128];
-    const char *commands[8];
-    for (size_t i = 0; i < cases[c].repetitions; i++) {
-      snprintf(command_storage[i], sizeof(command_storage[i]), cases[c].format,
-               i);
-      commands[i] = command_storage[i];
-      ASSERT(test_st_feed(learner, commands[i]) == ST_OK);
-    }
-
-    size_t count = 0;
-    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-    ASSERT(suggestions_equal(suggestions, count, cases[c].expected,
-                             cases[c].expected_count));
-    ASSERT(suggestions_replay_exactly(suggestions, count, commands,
-                                      cases[c].repetitions));
-    st_suggestion_list_free(suggestions, count);
-    st_learner_free(learner);
-  }
-  return 1;
-}
-
-static int test_suggestion_thresholds_and_limit(void) {
-  static const expected_suggestion_t expected_capped[] = {
+static int unit_test_suggestion_thresholds_and_limit(void) {
+  static const unit_expected_suggestion_t expected_capped[] = {
       {"alpha #n", 3, 1.0},
       {"beta #n", 3, 1.0},
       {"delta #n", 3, 1.0},
@@ -1029,9 +697,9 @@ static int test_suggestion_thresholds_and_limit(void) {
       ASSERT(test_st_feed(learner, command) == ST_OK);
     }
   suggestions = st_learner_suggest(learner, &count);
-  ASSERT(
-      suggestions_equal(suggestions, count, expected_capped,
-                        sizeof(expected_capped) / sizeof(expected_capped[0])));
+  ASSERT(unit_suggestions_equal(suggestions, count, expected_capped,
+                                sizeof(expected_capped) /
+                                    sizeof(expected_capped[0])));
   st_suggestion_list_free(suggestions, count);
   learner_config.max_suggestions = 0;
   ASSERT(st_learner_set_config(learner, &learner_config) == ST_OK);
@@ -1041,8 +709,8 @@ static int test_suggestion_thresholds_and_limit(void) {
   return 1;
 }
 
-static int test_confidence_ranking(void) {
-  static const expected_suggestion_t expected[] = {
+static int unit_test_confidence_ranking(void) {
+  static const unit_expected_suggestion_t expected[] = {
       {"git commit #sopt *", 8, 1.0},
       {"git *", 2, 0.2},
   };
@@ -1061,98 +729,21 @@ static int test_confidence_ranking(void) {
 
   size_t count = 0;
   st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-  ASSERT(suggestions_equal(suggestions, count, expected,
-                           sizeof(expected) / sizeof(expected[0])));
+  ASSERT(unit_suggestions_equal(suggestions, count, expected,
+                                sizeof(expected) / sizeof(expected[0])));
   static const char *commands[] = {"git commit -m msg0", "git commit -m msg1",
                                    "git commit -m msg2", "git commit -m msg3",
                                    "git commit -m msg4", "git commit -m msg5",
                                    "git commit -m msg6", "git commit -m msg7",
                                    "git status",         "git log"};
-  ASSERT(suggestions_replay_exactly(suggestions, count, commands,
-                                    sizeof(commands) / sizeof(commands[0])));
+  ASSERT(unit_suggestions_replay_exactly(
+      suggestions, count, commands, sizeof(commands) / sizeof(commands[0])));
   st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
 
-static int check_complete_rule_case(const char *const *commands,
-                                    size_t command_count,
-                                    const expected_suggestion_t *expected,
-                                    size_t expected_count) {
-  st_learner_t *learner = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(learner != NULL);
-  for (size_t i = 0; i < command_count; i++)
-    ASSERT(test_st_feed(learner, commands[i]) == ST_OK);
-  size_t count = 0;
-  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-  ASSERT(suggestions_equal(suggestions, count, expected, expected_count));
-  ASSERT(
-      suggestions_replay_exactly(suggestions, count, commands, command_count));
-  st_suggestion_list_free(suggestions, count);
-  st_learner_free(learner);
-  return 1;
-}
-
-static int test_complete_rule_branch_semantics(void) {
-  static const char *dominant[] = {
-      "probe 1 tail",
-      "probe 2 tail",
-      "probe 3 tail",
-      "probe 4 tail",
-      "probe 5 tail",
-      "probe 6 tail",
-      "probe 7 tail",
-      "probe 550e8400-e29b-41d4-a716-446655440000 tail",
-      "probe 123e4567-e89b-42d3-a456-426614174000 tail",
-      "probe 987e6543-e21b-45d3-a456-426614174999 tail"};
-  static const expected_suggestion_t dominant_expected[] = {
-      {"probe #n tail", 7, 0.7}};
-  ASSERT(check_complete_rule_case(
-      dominant, sizeof(dominant) / sizeof(dominant[0]), dominant_expected,
-      sizeof(dominant_expected) / sizeof(dominant_expected[0])));
-
-  static const char *joined[] = {
-      "probe 1 tail",
-      "probe 2 tail",
-      "probe 3 tail",
-      "probe 550e8400-e29b-41d4-a716-446655440000 tail",
-      "probe 123e4567-e89b-42d3-a456-426614174000 tail",
-      "probe 987e6543-e21b-45d3-a456-426614174999 tail"};
-  static const expected_suggestion_t joined_expected[] = {
-      {"probe #val tail", 6, 1.0}};
-  ASSERT(check_complete_rule_case(joined, sizeof(joined) / sizeof(joined[0]),
-                                  joined_expected, 1));
-
-  static const char *separate[] = {
-      "probe 1 left", "probe 2 left",
-      "probe 550e8400-e29b-41d4-a716-446655440000 right",
-      "probe 123e4567-e89b-42d3-a456-426614174000 right"};
-  static const expected_suggestion_t separate_expected[] = {
-      {"probe #n left", 2, 1.0}, {"probe #uuid.v4 right", 2, 1.0}};
-  ASSERT(check_complete_rule_case(
-      separate, sizeof(separate) / sizeof(separate[0]), separate_expected, 2));
-
-  static const char *prefixes[] = {"git",        "git",        "git",
-                                   "git commit", "git commit", "git commit",
-                                   "git commit"};
-  static const expected_suggestion_t prefix_expected[] = {
-      {"git commit", 4, 4.0 / 7.0}, {"git", 3, 3.0 / 7.0}};
-  ASSERT(check_complete_rule_case(
-      prefixes, sizeof(prefixes) / sizeof(prefixes[0]), prefix_expected, 2));
-
-  static const char *literals[] = {"echo red tail", "echo green tail",
-                                   "echo blue tail"};
-  static const expected_suggestion_t literal_expected[] = {
-      {"echo * tail", 3, 1.0}};
-  ASSERT(check_complete_rule_case(
-      literals, sizeof(literals) / sizeof(literals[0]), literal_expected, 1));
-  return 1;
-}
-
-static int test_blacklist_filters_exact_suggestion(void) {
+static int unit_test_blacklist_filters_exact_suggestion(void) {
   st_learner_t *learner = st_learner_new(
       &(st_learner_config_t){.min_support = 3,
                              .min_confidence = 0.0,
@@ -1179,7 +770,7 @@ static int test_blacklist_filters_exact_suggestion(void) {
   return 1;
 }
 
-static int test_blacklist_allocation_failures_are_atomic(void) {
+static int unit_test_blacklist_allocation_failures_are_atomic(void) {
   st_test_alloc_reset();
   st_learner_t *probe = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
@@ -1225,11 +816,11 @@ static int test_blacklist_allocation_failures_are_atomic(void) {
   return 1;
 }
 
-static int test_serialization_roundtrip_and_validation(void) {
+static int unit_test_serialization_roundtrip_and_validation(void) {
   char path[] = "/tmp/shelltype-learner-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+  snprintf(unit_learner_temp_path, sizeof(unit_learner_temp_path), "%s", path);
   close(fd);
 
   st_learner_t *source = st_learner_new(
@@ -1244,7 +835,7 @@ static int test_serialization_roundtrip_and_validation(void) {
   ASSERT(test_st_feed(loaded, "obsolete command") == ST_OK);
   ASSERT(st_learner_load(loaded, "/tmp/shelltype-file-does-not-exist") ==
          ST_ERR_IO);
-  ASSERT(find_child(loaded->trie.root, "obsolete") != NULL);
+  ASSERT(unit_find_child(loaded->trie.root, "obsolete") != NULL);
   for (size_t i = 0; i < 4; i++) {
     char command[128];
     snprintf(command, sizeof(command), "cat /var/log/file%zu | grep ERROR", i);
@@ -1258,7 +849,7 @@ static int test_serialization_roundtrip_and_validation(void) {
   st_learner_free(empty_source);
   ASSERT(st_learner_load(loaded, path) == ST_OK);
   ASSERT(loaded->trie.total_commands == 0);
-  ASSERT(find_child(loaded->trie.root, "obsolete") == NULL);
+  ASSERT(unit_find_child(loaded->trie.root, "obsolete") == NULL);
 
   /* A serialization allocation failure must not replace the previous file. */
   st_test_alloc_reset();
@@ -1289,7 +880,7 @@ static int test_serialization_roundtrip_and_validation(void) {
   ASSERT(st_learner_save(source, path) == ST_OK);
   ASSERT(st_learner_load(loaded, path) == ST_OK);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
-  ASSERT(find_child(loaded->trie.root, "obsolete") == NULL);
+  ASSERT(unit_find_child(loaded->trie.root, "obsolete") == NULL);
 
   /* A syntactically valid framed stream with a damaged checksum must be
    * rejected without replacing the learner's current state. */
@@ -1311,15 +902,15 @@ static int test_serialization_roundtrip_and_validation(void) {
   ASSERT(fclose(damaged) == 0);
   ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
-  ASSERT(find_child(loaded->trie.root, "git") == NULL);
+  ASSERT(unit_find_child(loaded->trie.root, "git") == NULL);
   ASSERT(st_learner_save(source, path) == ST_OK);
 
   size_t source_count = 0, loaded_count = 0;
   st_suggestion_t *source_items = st_learner_suggest(source, &source_count);
   st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
   ASSERT(source_items && loaded_items && source_count == 1 &&
-         suggestion_lists_equal(source_items, source_count, loaded_items,
-                                loaded_count));
+         unit_suggestion_lists_equal(source_items, source_count, loaded_items,
+                                     loaded_count));
 
   static const char *malformed[] = {
       "not a record\n",
@@ -1374,7 +965,7 @@ static int test_serialization_roundtrip_and_validation(void) {
     ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
     ASSERT(loaded->trie.total_commands == source->trie.total_commands);
     ASSERT(loaded->trie.root->num_children == original_children);
-    ASSERT(find_child(loaded->trie.root, "git") == NULL);
+    ASSERT(unit_find_child(loaded->trie.root, "git") == NULL);
   }
 
   static const char *const malformed_framed[] = {
@@ -1458,13 +1049,13 @@ static int test_serialization_roundtrip_and_validation(void) {
   return 1;
 }
 
-static int test_learner_numeric_fields_reject_hidden_bytes(void) {
+static int unit_test_learner_numeric_fields_reject_hidden_bytes(void) {
   char path[] = "/tmp/shelltype-numeric-fields-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *expected = baseline_learner();
-  st_learner_t *actual = baseline_learner();
+  snprintf(unit_learner_temp_path, sizeof(unit_learner_temp_path), "%s", path);
+  st_learner_t *expected = unit_baseline_learner();
+  st_learner_t *actual = unit_baseline_learner();
   ASSERT(expected && actual);
   const size_t numeric_fields[] = {0, 1, 3, 4, 6};
   const char *fields[] = {"1", "0", "L", "0", "1", "-", "0", "echo"};
@@ -1509,76 +1100,27 @@ static int test_learner_numeric_fields_reject_hidden_bytes(void) {
       } else {
         ASSERT(st_learner_load(actual, path) == ST_ERR_FORMAT);
         ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
-               nodes_equal(actual->trie.root, expected->trie.root));
+               unit_nodes_equal(actual->trie.root, expected->trie.root));
       }
     }
   }
   st_learner_free(actual);
   st_learner_free(expected);
   ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
+  unit_learner_temp_path[0] = '\0';
   return 1;
 }
 
-static int test_serialization_preserves_prefix_nodes(void) {
-  char path[] = "/tmp/shelltype-learner-prefix-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  ASSERT(close(fd) == 0);
-
-  st_learner_t *source = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  st_learner_t *loaded = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(source != NULL && loaded != NULL);
-  ASSERT(test_st_feed(source, "git") == ST_OK);
-  ASSERT(test_st_feed(source, "git") == ST_OK);
-  ASSERT(test_st_feed(source, "git") == ST_OK);
-  ASSERT(test_st_feed(source, "git commit") == ST_OK);
-  ASSERT(test_st_feed(source, "git commit") == ST_OK);
-  ASSERT(test_st_feed(source, "git commit -m fix") == ST_OK);
-  ASSERT(source->trie.total_commands == 6);
-  ASSERT(source->trie.root->count == 6);
-  st_node_t *git = find_child(source->trie.root, "git");
-  ASSERT(git != NULL && git->count == 6);
-  st_node_t *commit = find_child(git, "commit");
-  ASSERT(commit != NULL && commit->count == 3);
-
-  ASSERT(st_learner_save(source, path) == ST_OK);
-  ASSERT(st_learner_load(loaded, path) == ST_OK);
-  ASSERT(loaded->trie.total_commands == source->trie.total_commands);
-  ASSERT(trie_counts_equal(source->trie.root, loaded->trie.root));
-
-  size_t source_count = 0, loaded_count = 0;
-  st_suggestion_t *source_items = st_learner_suggest(source, &source_count);
-  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
-  ASSERT(source_items != NULL && loaded_items != NULL &&
-         suggestion_lists_equal(source_items, source_count, loaded_items,
-                                loaded_count));
-  st_suggestion_list_free(source_items, source_count);
-  st_suggestion_list_free(loaded_items, loaded_count);
-  st_learner_free(source);
-  st_learner_free(loaded);
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  return 1;
-}
-
-static int test_learner_save_io_failures_are_atomic(void) {
+static int unit_test_learner_save_io_failures_are_atomic(void) {
   char directory[] = "/tmp/shelltype-learner-io-XXXXXX";
   ASSERT(mkdtemp(directory) != NULL);
-  strcpy(learner_save_directory, directory);
+  strcpy(unit_learner_save_directory, directory);
   char path[256];
   snprintf(path, sizeof(path), "%s/learner", directory);
   int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
   ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *learner = baseline_learner();
+  snprintf(unit_learner_temp_path, sizeof(unit_learner_temp_path), "%s", path);
+  st_learner_t *learner = unit_baseline_learner();
   ASSERT(learner != NULL);
 
   st_test_io_reset();
@@ -1597,7 +1139,7 @@ static int test_learner_save_io_failures_are_atomic(void) {
     ASSERT(fclose(fp) == 0);
     fp = fopen(template_path, "wb");
     ASSERT(fp != NULL);
-    strcpy(learner_template_path, template_path);
+    strcpy(unit_learner_template_path, template_path);
     ASSERT(fwrite("keep", 1, 4, fp) == 4 && fclose(fp) == 0);
     int next_fd = open(path, O_RDONLY);
     ASSERT(next_fd >= 0 && close(next_fd) == 0);
@@ -1615,7 +1157,7 @@ static int test_learner_save_io_failures_are_atomic(void) {
     ASSERT(!ferror(fp) && fclose(fp) == 0);
     ASSERT(template_length == 4 && memcmp(contents, "keep", 4) == 0);
     ASSERT(unlink(template_path) == 0);
-    learner_template_path[0] = '\0';
+    unit_learner_template_path[0] = '\0';
     fp = fopen(path, "rb");
     ASSERT(fp != NULL);
     size_t length = fread(contents, 1, sizeof(contents), fp);
@@ -1636,396 +1178,20 @@ static int test_learner_save_io_failures_are_atomic(void) {
       ASSERT(check->trie.total_commands == learner->trie.total_commands);
       st_learner_free(check);
     }
-    ASSERT(no_learner_save_temps(path));
+    ASSERT(unit_no_learner_save_temps(path));
     ASSERT(learner->trie.total_commands == 2);
   }
 
   st_learner_free(learner);
   ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
+  unit_learner_temp_path[0] = '\0';
   ASSERT(rmdir(directory) == 0);
-  learner_save_directory[0] = '\0';
+  unit_learner_save_directory[0] = '\0';
   return 1;
 }
 
-static SHELL_NONNULL(2, 3, 4) st_error_t
-    save_destination_candidate(unsigned kind, const st_learner_t *learner,
-                               const st_policy_t *policy, const char *path) {
-  if (kind == 0)
-    return st_learner_save(learner, path);
-  if (kind == 1)
-    return st_policy_save(policy, path);
-  return st_policy_render_nfa(policy, path, NULL);
-}
-
-static int test_save_destination_candidate_is_not_published(void) {
-  char directory[] = "/tmp/shelltype-destination-candidate-XXXXXX";
-  if (!mkdtemp(directory))
-    return 0;
-  char path[256];
-  snprintf(path, sizeof(path), "%s/.scl-aaaaaa", directory);
-  st_learner_t *learner = baseline_learner();
-  st_policy_ctx_t *context = st_policy_ctx_new();
-  st_policy_t *policy = context ? st_policy_new(context) : NULL;
-  bool ok = learner && policy;
-  if (ok)
-    ok = test_st_policy_add(policy, "git status") == ST_OK;
-  for (unsigned kind = 0; ok && kind < 3; kind++) {
-    unsigned char random[SHELL_FILE_TEMP_RANDOM_BYTES] = {0};
-    st_test_io_reset();
-    st_test_io_temp_random_set(random);
-    ok = save_destination_candidate(kind, learner, policy, path) == ST_ERR_IO &&
-         test_atomic_directory_only_entry(directory, NULL);
-    memset(random + 6, 1, 6);
-    st_test_io_reset();
-    st_test_io_temp_random_set(random);
-    if (ok)
-      ok = save_destination_candidate(kind, learner, policy, path) == ST_OK;
-    size_t operations = st_test_io_count();
-    st_test_io_reset();
-    unsigned char expected[8192];
-    size_t expected_length = 0;
-    FILE *stream = ok ? fopen(path, "rb") : NULL;
-    if (stream) {
-      expected_length = fread(expected, 1, sizeof(expected), stream);
-      ok = expected_length > 0 && expected_length < sizeof(expected) &&
-           !ferror(stream);
-      ok = fclose(stream) == 0 && ok;
-    } else {
-      ok = false;
-    }
-    if (ok)
-      ok = test_atomic_directory_only_entry(directory, ".scl-aaaaaa") &&
-           unlink(path) == 0 && operations > 0;
-    for (size_t fail_at = 1; ok && fail_at <= operations; fail_at++) {
-      st_test_io_fail_at(fail_at);
-      st_test_io_temp_random_set(random);
-      st_error_t result =
-          save_destination_candidate(kind, learner, policy, path);
-      st_test_io_reset();
-      bool published = access(path, F_OK) == 0;
-      ok = result == ST_ERR_IO &&
-           test_atomic_directory_only_entry(directory,
-                                            published ? ".scl-aaaaaa" : NULL);
-      if (published) {
-        unsigned char bytes[sizeof(expected)];
-        stream = fopen(path, "rb");
-        if (stream) {
-          size_t length = fread(bytes, 1, sizeof(bytes), stream);
-          ok = ok && !ferror(stream) && length == expected_length &&
-               memcmp(bytes, expected, length) == 0;
-          ok = fclose(stream) == 0 && ok;
-        } else {
-          ok = false;
-        }
-        ok = unlink(path) == 0 && ok;
-      }
-    }
-  }
-  st_test_io_reset();
-  st_policy_free(policy);
-  st_policy_ctx_release(context);
-  st_learner_free(learner);
-  return test_atomic_cleanup_directory(directory) && ok;
-}
-
-static int test_learner_load_rejects_binary_and_overlong_lines(void) {
-  char path[] = "/tmp/shelltype-learner-load-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *learner = baseline_learner();
-  ASSERT(learner != NULL);
-
-  static const unsigned char binary[] =
-      "# ST trie dump v2\n# total_commands=1\n1\t!\t1\t#w\0evil\n";
-  FILE *fp = fopen(path, "wb");
-  ASSERT(fp != NULL);
-  ASSERT(fwrite(binary, 1, sizeof(binary) - 1, fp) == sizeof(binary) - 1);
-  ASSERT(fclose(fp) == 0);
-  ASSERT(st_learner_load(learner, path) == ST_ERR_FORMAT);
-  ASSERT(learner->trie.total_commands == 2);
-  ASSERT(find_child(learner->trie.root, "git") != NULL);
-
-  fp = fopen(path, "wb");
-  ASSERT(fp != NULL);
-  ASSERT(fputs("# ST trie dump v2\n# total_commands=1\n1\t!\t1\t", fp) >= 0);
-  for (size_t i = 0; i < 4096; i++)
-    ASSERT(fputc('a', fp) != EOF);
-  ASSERT(fputc('\n', fp) != EOF && fclose(fp) == 0);
-  ASSERT(st_learner_load(learner, path) == ST_ERR_FORMAT);
-  ASSERT(learner->trie.total_commands == 2);
-  ASSERT(find_child(learner->trie.root, "git") != NULL);
-
-  st_learner_free(learner);
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  return 1;
-}
-
-static int test_learner_binary_literal_roundtrip(void) {
-  static const char binary_netargv[] = {'4', ':', 'e', 'c',  'h', 'o',
-                                        ',', '2', ':', '\0', 'x', ','};
-  st_netargv_view_t netargv = {.data = binary_netargv,
-                               .length = sizeof(binary_netargv)};
-  st_netpattern_t expected = {0};
-  ASSERT(st_netpattern_from_cpl_owned("echo \"\\x00x\"", &expected) == ST_OK);
-
-  st_learner_t *learner = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(learner != NULL);
-  ASSERT(st_learner_feed_netargv_view(learner, netargv) == ST_OK);
-  size_t count = 0;
-  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-  ASSERT(suggestions != NULL && count == 1 &&
-         suggestions[0].pattern_length == expected.length &&
-         memcmp(suggestions[0].pattern, expected.data, expected.length) == 0 &&
-         st_netpattern_validate_view(
-             (st_netpattern_view_t){.data = suggestions[0].pattern,
-                                    .length = suggestions[0].pattern_length},
-             NULL) == ST_OK);
-  st_suggestion_list_free(suggestions, count);
-
-  char path[] = "/tmp/shelltype-learner-binary-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  ASSERT(st_learner_save(learner, path) == ST_OK);
-  st_learner_t *loaded = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(loaded != NULL && st_learner_load(loaded, path) == ST_OK);
-  suggestions = st_learner_suggest(loaded, &count);
-  ASSERT(suggestions != NULL && count == 1 &&
-         suggestions[0].pattern_length == expected.length &&
-         memcmp(suggestions[0].pattern, expected.data, expected.length) == 0);
-  st_suggestion_list_free(suggestions, count);
-
-  ASSERT(st_learner_blacklist_add_netpattern(
-             loaded, (st_netpattern_view_t){.data = (const char *)expected.data,
-                                            .length = expected.length}) ==
-         ST_OK);
-  ASSERT(st_learner_is_netpattern_blacklisted(
-      loaded, (st_netpattern_view_t){.data = (const char *)expected.data,
-                                     .length = expected.length}));
-  ASSERT(st_learner_suggest(loaded, &count) == NULL && count == 0);
-  st_learner_free(loaded);
-  st_learner_free(learner);
-  st_netpattern_free(&expected);
-  ASSERT(unlink(path) == 0);
-  return 1;
-}
-
-static int test_generalization_after_empty_and_binary_arguments(void) {
-  static const char empty[] = "4:tool,0:,";
-  static const char binary[] = "4:tool,2:\0x,";
-  static const char nested_empty[] = "4:tool,0:,0:,";
-  static const char nested_binary[] = "4:tool,0:,2:\0x,";
-  static const struct {
-    st_netargv_view_t prefix;
-    const char *wildcard;
-    const char *compound;
-  } cases[] = {
-      {{empty, sizeof(empty) - 1}, "tool \"\" *", "tool \"\" --limit={#n}"},
-      {{binary, sizeof(binary) - 1},
-       "tool \"\\x00x\" *",
-       "tool \"\\x00x\" --limit={#n}"},
-      {{nested_empty, sizeof(nested_empty) - 1},
-       "tool \"\" \"\" *",
-       "tool \"\" \"\" --limit={#n}"},
-      {{nested_binary, sizeof(nested_binary) - 1},
-       "tool \"\" \"\\x00x\" *",
-       "tool \"\" \"\\x00x\" --limit={#n}"},
-  };
-  static const char *const alternatives[][2] = {{"alpha", "beta"},
-                                                {"--limit=42", "--limit=43"}};
-  static const st_learner_config_t configs[] = {
-      {.min_support = 1, .min_confidence = 0.0, .max_suggestions = 20},
-      {.min_support = 6, .min_confidence = 0.8, .max_suggestions = 20},
-  };
-  char path[] = "/tmp/shelltype-empty-prefix-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    for (size_t kind = 0; kind < 2; kind++) {
-      st_netpattern_t expected = {0};
-      ASSERT(st_netpattern_from_cpl_owned(kind ? cases[i].compound
-                                               : cases[i].wildcard,
-                                          &expected) == ST_OK);
-      char records[2][128];
-      st_netargv_view_t history[2];
-      for (size_t j = 0; j < 2; j++) {
-        size_t written = 0;
-        memcpy(records[j], cases[i].prefix.data, cases[i].prefix.length);
-        ASSERT(shell_netstring_write(
-                   records[j] + cases[i].prefix.length,
-                   sizeof(records[j]) - cases[i].prefix.length,
-                   alternatives[kind][j], strlen(alternatives[kind][j]),
-                   &written) == SHELL_NETSTRING_OK);
-        history[j] =
-            (st_netargv_view_t){records[j], cases[i].prefix.length + written};
-      }
-      st_suggestion_t *baseline = NULL;
-      size_t baseline_count = 0;
-      for (size_t config = 0; config < 2; config++) {
-        for (size_t reverse = 0; reverse < 2; reverse++) {
-          st_learner_t *learner = st_learner_new(&configs[config]);
-          ASSERT(learner != NULL);
-          for (size_t j = 0; j < 6; j++)
-            ASSERT(st_learner_feed_netargv_view(
-                       learner, history[(j % 2) ^ reverse]) == ST_OK);
-          size_t count = 0;
-          st_suggestion_t *items = st_learner_suggest(learner, &count);
-          ASSERT(items != NULL && count == 1 &&
-                 items[0].pattern_length == expected.length &&
-                 memcmp(items[0].pattern, expected.data, expected.length) ==
-                     0 &&
-                 items[0].count == 6 && items[0].confidence == 1.0);
-          if (!baseline) {
-            baseline = items;
-            baseline_count = count;
-          } else {
-            ASSERT(
-                suggestion_lists_equal(baseline, baseline_count, items, count));
-            st_suggestion_list_free(items, count);
-          }
-
-          st_policy_ctx_t *context = st_policy_ctx_new();
-          st_policy_t *policy = context ? st_policy_new(context) : NULL;
-          ASSERT(policy != NULL &&
-                 st_policy_add_netpattern_view(
-                     policy, (st_netpattern_view_t){(const char *)expected.data,
-                                                    expected.length}) == ST_OK);
-          uint32_t replay = 0;
-          for (size_t j = 0; j < 2; j++) {
-            bool matched = false;
-            ASSERT(st_policy_match_view(policy, history[j], &matched) == ST_OK);
-            replay += matched ? 3 : 0;
-          }
-          ASSERT(replay == baseline[0].count);
-          st_policy_free(policy);
-          st_policy_ctx_release(context);
-
-          ASSERT(st_learner_save(learner, path) == ST_OK);
-          st_learner_t *loaded = st_learner_new(&configs[config]);
-          ASSERT(loaded != NULL && st_learner_load(loaded, path) == ST_OK);
-          items = st_learner_suggest(loaded, &count);
-          ASSERT(
-              suggestion_lists_equal(baseline, baseline_count, items, count));
-          st_suggestion_list_free(items, count);
-          st_learner_free(loaded);
-          st_learner_free(learner);
-        }
-      }
-      st_suggestion_list_free(baseline, baseline_count);
-      st_netpattern_free(&expected);
-    }
-  }
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  return 1;
-}
-
-static int test_command_heads_are_not_generalized(void) {
-  static const char empty[] = "0:,5:alpha,";
-  static const char binary[] = "2:\0x,5:alpha,";
-  static const st_netargv_view_t history[] = {
-      {empty, sizeof(empty) - 1},
-      {binary, sizeof(binary) - 1},
-      {"4:tool,5:alpha,", sizeof("4:tool,5:alpha,") - 1}};
-  st_learner_t *learner = st_learner_new(&(st_learner_config_t){
-      .min_support = 1, .min_confidence = 0.0, .max_suggestions = 20});
-  ASSERT(learner != NULL);
-  for (size_t i = 0; i < 3; i++)
-    ASSERT(st_learner_feed_netargv_view(learner, history[i]) == ST_OK);
-  size_t count = 0;
-  st_suggestion_t *items = st_learner_suggest(learner, &count);
-  ASSERT(items != NULL && count == 3);
-  for (size_t i = 0; i < count; i++) {
-    st_token_array_t tokens = {0};
-    ASSERT(
-        st_netpattern_decode_view(
-            (st_netpattern_view_t){items[i].pattern, items[i].pattern_length},
-            &tokens) == ST_OK &&
-        tokens.count == 2 && tokens.tokens[0].type == ST_TYPE_LITERAL &&
-        items[i].count == 1);
-    st_token_array_free(&tokens);
-  }
-  st_suggestion_list_free(items, count);
-  st_learner_free(learner);
-  return 1;
-}
-
-static int test_typed_token_metadata_is_span_safe(void) {
-  static const char unterminated_size[] = {'1', 'M', 'i', 'B'};
-  static const char binary_size[] = {'1', 'M', 'i', 'B', '\0', 'x'};
-  st_token_t text_tokens[] = {
-      {.text = "allocate", .type = ST_TYPE_LITERAL},
-      {.text = unterminated_size,
-       .text_length = sizeof(unterminated_size),
-       .type = ST_TYPE_SIZE},
-  };
-  st_token_array_t text_typed = {.tokens = text_tokens, .count = 2};
-  st_token_t binary_tokens[] = {
-      {.text = "allocate", .type = ST_TYPE_LITERAL},
-      {.text = binary_size,
-       .text_length = sizeof(binary_size),
-       .type = ST_TYPE_SIZE},
-  };
-  st_token_array_t binary_typed = {.tokens = binary_tokens, .count = 2};
-  st_learner_t *text_learner = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  st_learner_t *binary_learner = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(text_learner != NULL && binary_learner != NULL &&
-         st_learner_feed_tokens(text_learner, &text_typed) == ST_OK &&
-         st_learner_feed_tokens(text_learner, &text_typed) == ST_OK &&
-         st_learner_feed_tokens(binary_learner, &binary_typed) == ST_OK &&
-         st_learner_feed_tokens(binary_learner, &binary_typed) == ST_OK);
-
-  size_t count = 0;
-  st_suggestion_t *suggestions = st_learner_suggest(text_learner, &count);
-  ASSERT(suggestions != NULL &&
-         find_suggestion(suggestions, count, "allocate #size.MiB"));
-  st_suggestion_list_free(suggestions, count);
-
-  suggestions = st_learner_suggest(binary_learner, &count);
-  ASSERT(suggestions != NULL &&
-         find_suggestion(suggestions, count, "allocate #size") &&
-         !find_suggestion(suggestions, count, "allocate #size.MiB"));
-  st_suggestion_list_free(suggestions, count);
-  st_learner_free(text_learner);
-  st_learner_free(binary_learner);
-  for (size_t binary_first = 0; binary_first < 2; binary_first++) {
-    st_learner_t *mixed = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(mixed != NULL);
-    ASSERT(st_learner_feed_tokens(mixed, binary_first ? &binary_typed
-                                                      : &text_typed) == ST_OK);
-    ASSERT(st_learner_feed_tokens(
-               mixed, binary_first ? &text_typed : &binary_typed) == ST_OK);
-    suggestions = st_learner_suggest(mixed, &count);
-    ASSERT(suggestions != NULL &&
-           find_suggestion(suggestions, count, "allocate #size") &&
-           !find_suggestion(suggestions, count, "allocate #size.MiB"));
-    st_suggestion_list_free(suggestions, count);
-    st_learner_free(mixed);
-  }
-  return 1;
-}
-
-static int feed_suggestion_allocation_fixture(st_learner_t *learner,
-                                              bool overlapping) {
+static int unit_feed_suggestion_allocation_fixture(st_learner_t *learner,
+                                                   bool overlapping) {
   if (overlapping) {
     static const char *const records[] = {"4:tool,2:42,5:alpha,4:1MiB,",
                                           "4:tool,2:42,4:beta,4:2MiB,",
@@ -2053,14 +1219,14 @@ static int feed_suggestion_allocation_fixture(st_learner_t *learner,
   return 1;
 }
 
-static int check_suggestion_allocation_failures(bool overlapping) {
+static int unit_check_suggestion_allocation_failures(bool overlapping) {
   st_test_alloc_reset();
   st_learner_t *probe = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
                              .min_confidence = 0.0,
                              .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(probe != NULL);
-  ASSERT(feed_suggestion_allocation_fixture(probe, overlapping));
+  ASSERT(unit_feed_suggestion_allocation_fixture(probe, overlapping));
   st_test_alloc_reset();
   size_t probe_count = 0;
   st_suggestion_t *probe_suggestions = st_learner_suggest(probe, &probe_count);
@@ -2072,7 +1238,7 @@ static int check_suggestion_allocation_failures(bool overlapping) {
                              .min_confidence = 0.0,
                              .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
-  ASSERT(feed_suggestion_allocation_fixture(learner, overlapping));
+  ASSERT(unit_feed_suggestion_allocation_fixture(learner, overlapping));
 
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
@@ -2088,7 +1254,7 @@ static int check_suggestion_allocation_failures(bool overlapping) {
       ASSERT(count > 0);
       st_suggestion_list_free(suggestions, count);
     }
-    ASSERT(nodes_equal(probe->trie.root, learner->trie.root) &&
+    ASSERT(unit_nodes_equal(probe->trie.root, learner->trie.root) &&
            probe->trie.total_commands == learner->trie.total_commands);
     /* An allocation failure must not consume observations or poison the next
      * accounting pass. The same learner recovers the identical ordered rules.
@@ -2111,13 +1277,13 @@ static int check_suggestion_allocation_failures(bool overlapping) {
   return 1;
 }
 
-static int test_suggestion_allocation_failures_are_clean(void) {
-  ASSERT(check_suggestion_allocation_failures(false));
-  ASSERT(check_suggestion_allocation_failures(true));
+static int unit_test_suggestion_allocation_failures_are_clean(void) {
+  ASSERT(unit_check_suggestion_allocation_failures(false));
+  ASSERT(unit_check_suggestion_allocation_failures(true));
   return 1;
 }
 
-static int test_compound_support_uses_indexed_prefixes(void) {
+static int unit_test_compound_support_uses_indexed_prefixes(void) {
   enum { FAMILIES = 256 };
   st_learner_t *learner = st_learner_new(&(st_learner_config_t){
       .min_support = 1, .min_confidence = 0.0, .max_suggestions = FAMILIES});
@@ -2164,11 +1330,11 @@ static int test_compound_support_uses_indexed_prefixes(void) {
   return 1;
 }
 
-static int test_load_allocation_failures_preserve_learner(void) {
+static int unit_test_load_allocation_failures_preserve_learner(void) {
   char path[] = "/tmp/shelltype-load-fail-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+  snprintf(unit_learner_temp_path, sizeof(unit_learner_temp_path), "%s", path);
   close(fd);
 
   st_test_alloc_reset();
@@ -2204,7 +1370,7 @@ static int test_load_allocation_failures_preserve_learner(void) {
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;
-      ASSERT(find_child(loaded->trie.root, "keep") != NULL);
+      ASSERT(unit_find_child(loaded->trie.root, "keep") != NULL);
     } else {
       if (err != ST_OK)
         printf("    load fail_at=%zu returned %s\n", fail_at,
@@ -2217,15 +1383,15 @@ static int test_load_allocation_failures_preserve_learner(void) {
   ASSERT(observed);
   st_learner_free(source);
   ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
+  unit_learner_temp_path[0] = '\0';
   return 1;
 }
 
-static int test_learner_load_read_failures_preserve_state(void) {
+static int unit_test_learner_load_read_failures_preserve_state(void) {
   char path[] = "/tmp/shelltype-learner-read-fail-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+  snprintf(unit_learner_temp_path, sizeof(unit_learner_temp_path), "%s", path);
   st_learner_t *source = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
                              .min_confidence = 0.0,
@@ -2235,7 +1401,7 @@ static int test_learner_load_read_failures_preserve_state(void) {
   ASSERT(test_st_feed(source, "replacement 43") == ST_OK);
   ASSERT(st_learner_save(source, path) == ST_OK);
 
-  st_learner_t *probe = baseline_learner();
+  st_learner_t *probe = unit_baseline_learner();
   ASSERT(probe != NULL);
   st_test_io_reset();
   ASSERT(st_learner_load(probe, path) == ST_OK);
@@ -2245,37 +1411,37 @@ static int test_learner_load_read_failures_preserve_state(void) {
   st_learner_free(probe);
 
   for (size_t fail_at = 1; fail_at <= read_count; fail_at++) {
-    st_learner_t *learner = baseline_learner();
-    st_learner_t *expected = baseline_learner();
+    st_learner_t *learner = unit_baseline_learner();
+    st_learner_t *expected = unit_baseline_learner();
     ASSERT(learner && expected);
     st_test_read_fail_at(fail_at);
     ASSERT(st_learner_load(learner, path) == ST_ERR_IO);
     st_test_io_reset();
     ASSERT(learner->trie.total_commands == expected->trie.total_commands);
-    ASSERT(nodes_equal(learner->trie.root, expected->trie.root));
+    ASSERT(unit_nodes_equal(learner->trie.root, expected->trie.root));
     ASSERT(test_st_feed(learner, "after failure") == ST_OK);
     st_learner_free(expected);
     st_learner_free(learner);
   }
 
-  st_learner_t *close_failed = baseline_learner();
-  st_learner_t *expected = baseline_learner();
+  st_learner_t *close_failed = unit_baseline_learner();
+  st_learner_t *expected = unit_baseline_learner();
   ASSERT(close_failed && expected);
   st_test_io_fail_at(1);
   ASSERT(st_learner_load(close_failed, path) == ST_ERR_IO);
   st_test_io_reset();
-  ASSERT(nodes_equal(close_failed->trie.root, expected->trie.root));
+  ASSERT(unit_nodes_equal(close_failed->trie.root, expected->trie.root));
   st_learner_free(expected);
   st_learner_free(close_failed);
   st_learner_free(source);
   ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
+  unit_learner_temp_path[0] = '\0';
   return 1;
 }
 
-static const st_suggestion_t *find_suggestion(const st_suggestion_t *items,
-                                              size_t count,
-                                              const char *pattern) {
+static const st_suggestion_t *unit_find_suggestion(const st_suggestion_t *items,
+                                                   size_t count,
+                                                   const char *pattern) {
   for (size_t i = 0; i < count; i++)
     if (test_pattern_is_cpl(
             (st_netpattern_view_t){items[i].pattern, items[i].pattern_length},
@@ -2284,142 +1450,11 @@ static const st_suggestion_t *find_suggestion(const st_suggestion_t *items,
   return NULL;
 }
 
-static int test_mixed_type_widening_and_v4_roundtrip(void) {
-  char path[] = "/tmp/shelltype-mixed-v4-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-
-  static const char *number_commands[] = {"probe 10", "probe 11", "probe 12",
-                                          "probe 13", "probe 14", "probe 15",
-                                          "probe 16"};
-  static const char *uuid_commands[] = {
-      "probe 550e8400-e29b-41d4-a716-446655440000",
-      "probe 123e4567-e89b-42d3-a456-426614174000",
-      "probe 6ba7b810-9dad-41d1-80b4-00c04fd430c8"};
-  static const size_t orders[][10] = {
-      {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
-      {9, 8, 7, 6, 5, 4, 3, 2, 1, 0},
-      {7, 0, 8, 1, 9, 2, 3, 4, 5, 6},
-  };
-  st_suggestion_t *baseline = NULL;
-  size_t baseline_count = 0;
-  for (size_t order = 0; order < sizeof(orders) / sizeof(orders[0]); order++) {
-    st_learner_t *learner = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(learner != NULL);
-    for (size_t i = 0; i < 10; i++) {
-      size_t index = orders[order][i];
-      const char *command =
-          index < 7 ? number_commands[index] : uuid_commands[index - 7];
-      ASSERT(test_st_feed(learner, command) == ST_OK);
-    }
-    size_t count = 0;
-    st_suggestion_t *items = st_learner_suggest(learner, &count);
-    const st_suggestion_t *dominant = find_suggestion(items, count, "probe #n");
-    ASSERT(dominant && dominant->count == 7 && dominant->confidence == 0.7);
-    ASSERT(!find_suggestion(items, count, "probe #val"));
-    if (order == 0) {
-      baseline = items;
-      baseline_count = count;
-      ASSERT(st_learner_save(learner, path) == ST_OK);
-    } else {
-      ASSERT(suggestion_lists_equal(baseline, baseline_count, items, count));
-      st_suggestion_list_free(items, count);
-    }
-    st_learner_free(learner);
-  }
-
-  st_learner_t *loaded = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(loaded && st_learner_load(loaded, path) == ST_OK);
-  size_t loaded_count = 0;
-  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
-  ASSERT(suggestion_lists_equal(baseline, baseline_count, loaded_items,
-                                loaded_count));
-
-  st_learner_t *joined = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(joined != NULL);
-  for (size_t i = 0; i < 6; i++)
-    ASSERT(test_st_feed(joined, number_commands[i]) == ST_OK);
-  for (size_t i = 0; i < 3; i++)
-    ASSERT(test_st_feed(joined, uuid_commands[i]) == ST_OK);
-  ASSERT(test_st_feed(joined, "probe 9.9.9") == ST_OK);
-  size_t joined_count = 0;
-  st_suggestion_t *joined_items = st_learner_suggest(joined, &joined_count);
-  const st_suggestion_t *generic =
-      find_suggestion(joined_items, joined_count, "probe #val");
-  ASSERT(generic && generic->count == 10 && generic->confidence == 1.0);
-
-  st_suggestion_list_free(baseline, baseline_count);
-  st_suggestion_list_free(loaded_items, loaded_count);
-  st_suggestion_list_free(joined_items, joined_count);
-  st_learner_free(loaded);
-  st_learner_free(joined);
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  return 1;
-}
-
-static int test_v4_preserves_reserved_literal_spellings(void) {
-  char path[] = "/tmp/shelltype-literal-v4-XXXXXX";
-  int fd = mkstemp(path);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *source = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  st_learner_t *loaded = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(source && loaded);
-
-  for (int type = ST_TYPE_HEXHASH; type < ST_TYPE_COUNT; type++) {
-    st_token_t token = {.text = (char *)st_type_symbol[type],
-                        .type = ST_TYPE_LITERAL};
-    st_token_array_t parsed = {.tokens = &token, .count = 1};
-    ASSERT(st_learner_feed_tokens(source, &parsed) == ST_OK);
-  }
-  ASSERT(st_learner_save(source, path) == ST_OK);
-  ASSERT(st_learner_load(loaded, path) == ST_OK);
-  ASSERT(source->trie.total_commands == loaded->trie.total_commands);
-  for (int type = ST_TYPE_HEXHASH; type < ST_TYPE_COUNT; type++) {
-    st_node_t *node = find_child(loaded->trie.root, st_type_symbol[type]);
-    ASSERT(node && node->type == ST_TYPE_LITERAL && node->observed_types == 0);
-  }
-  size_t source_count = SIZE_MAX;
-  size_t loaded_count = SIZE_MAX;
-  st_suggestion_t *source_items = st_learner_suggest(source, &source_count);
-  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
-  ASSERT(source_items != NULL && loaded_items != NULL && source_count != 0 &&
-         source_count == loaded_count);
-  ASSERT(suggestion_lists_equal(source_items, source_count, loaded_items,
-                                loaded_count));
-
-  st_suggestion_list_free(source_items, source_count);
-  st_suggestion_list_free(loaded_items, loaded_count);
-
-  st_learner_free(source);
-  st_learner_free(loaded);
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  return 1;
-}
-
-static int test_metadata_aggregation_and_v4_roundtrip(void) {
+static int unit_test_metadata_aggregation_and_v4_roundtrip(void) {
   char path[] = "/tmp/shelltype-metadata-v2-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+  snprintf(unit_learner_temp_path, sizeof(unit_learner_temp_path), "%s", path);
 
   st_learner_t *uniform = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
@@ -2454,18 +1489,22 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   st_suggestion_t *mixed_a_items = st_learner_suggest(mixed_a, &mixed_a_count);
   st_suggestion_t *mixed_b_items = st_learner_suggest(mixed_b, &mixed_b_count);
   ASSERT(uniform_items && mixed_a_items && mixed_b_items);
-  ASSERT(find_suggestion(uniform_items, uniform_count, "allocate #size.MiB"));
-  ASSERT(find_suggestion(mixed_a_items, mixed_a_count, "allocate #size"));
-  ASSERT(find_suggestion(mixed_b_items, mixed_b_count, "allocate #size"));
-  ASSERT(!find_suggestion(mixed_a_items, mixed_a_count, "allocate #size.MiB"));
-  ASSERT(!find_suggestion(mixed_b_items, mixed_b_count, "allocate #size.MiB"));
+  ASSERT(
+      unit_find_suggestion(uniform_items, uniform_count, "allocate #size.MiB"));
+  ASSERT(unit_find_suggestion(mixed_a_items, mixed_a_count, "allocate #size"));
+  ASSERT(unit_find_suggestion(mixed_b_items, mixed_b_count, "allocate #size"));
+  ASSERT(!unit_find_suggestion(mixed_a_items, mixed_a_count,
+                               "allocate #size.MiB"));
+  ASSERT(!unit_find_suggestion(mixed_b_items, mixed_b_count,
+                               "allocate #size.MiB"));
 
   ASSERT(st_learner_save(uniform, path) == ST_OK);
   ASSERT(st_learner_load(loaded, path) == ST_OK);
   size_t loaded_count = 0;
   st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
-  ASSERT(loaded_items && suggestion_lists_equal(uniform_items, uniform_count,
-                                                loaded_items, loaded_count));
+  ASSERT(loaded_items &&
+         unit_suggestion_lists_equal(uniform_items, uniform_count, loaded_items,
+                                     loaded_count));
 
   static const struct {
     const char *first;
@@ -2507,24 +1546,24 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
     ASSERT(test_st_feed(family, metadata_cases[i].second) == ST_OK);
     size_t family_count = 0;
     st_suggestion_t *family_items = st_learner_suggest(family, &family_count);
-    ASSERT(find_suggestion(family_items, family_count,
-                           metadata_cases[i].specific));
+    ASSERT(unit_find_suggestion(family_items, family_count,
+                                metadata_cases[i].specific));
     ASSERT(st_learner_save(family, path) == ST_OK);
     ASSERT(st_learner_load(family_loaded, path) == ST_OK);
     size_t family_loaded_count = 0;
     st_suggestion_t *family_loaded_items =
         st_learner_suggest(family_loaded, &family_loaded_count);
-    ASSERT(suggestion_lists_equal(family_items, family_count,
-                                  family_loaded_items, family_loaded_count));
+    ASSERT(unit_suggestion_lists_equal(
+        family_items, family_count, family_loaded_items, family_loaded_count));
 
     if (metadata_cases[i].different) {
       ASSERT(test_st_feed(family, metadata_cases[i].different) == ST_OK);
       st_suggestion_list_free(family_items, family_count);
       family_items = st_learner_suggest(family, &family_count);
-      ASSERT(find_suggestion(family_items, family_count,
-                             metadata_cases[i].generic));
-      ASSERT(!find_suggestion(family_items, family_count,
-                              metadata_cases[i].specific));
+      ASSERT(unit_find_suggestion(family_items, family_count,
+                                  metadata_cases[i].generic));
+      ASSERT(!unit_find_suggestion(family_items, family_count,
+                                   metadata_cases[i].specific));
     }
     st_suggestion_list_free(family_items, family_count);
     st_suggestion_list_free(family_loaded_items, family_loaded_count);
@@ -2565,113 +1604,653 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   st_learner_free(mixed_b);
   st_learner_free(loaded);
   ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
+  unit_learner_temp_path[0] = '\0';
   return 1;
 }
 
-static int test_learner_save_crash_boundaries(void) {
-  char directory[] = "/tmp/shelltype-crash-save-XXXXXX";
-  ASSERT(mkdtemp(directory) != NULL);
-  strcpy(learner_save_directory, directory);
-  char path[256];
-  snprintf(path, sizeof(path), "%s/learner", directory);
-  int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
-  ASSERT(fd >= 0 && close(fd) == 0);
-  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *old_state = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  st_learner_t *new_state = st_learner_new(
-      &(st_learner_config_t){.min_support = 1,
-                             .min_confidence = 0.0,
-                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-  ASSERT(old_state && new_state);
-  ASSERT(test_st_feed(old_state, "old 1MiB") == ST_OK);
-  ASSERT(test_st_feed(new_state, "new 1GiB") == ST_OK);
-  ASSERT(test_st_feed(new_state, "new 2GiB") == ST_OK);
+static int run_unit(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  atexit(unit_cleanup_learner_temp_file);
+  printf("Running shelltype unit tests...\n\n");
+  TEST(unit_test_learner_state_transitions);
+  TEST(unit_test_learner_input_boundaries);
+  TEST(unit_test_learner_configuration_boundaries);
+  TEST(unit_test_learner_stats_contract);
+  TEST(unit_test_independent_two_token_learner_oracle);
+  TEST(unit_test_suggestion_thresholds_and_limit);
+  TEST(unit_test_confidence_ranking);
+  TEST(unit_test_blacklist_filters_exact_suggestion);
+  TEST(unit_test_blacklist_allocation_failures_are_atomic);
+  TEST(unit_test_serialization_roundtrip_and_validation);
+  TEST(unit_test_learner_numeric_fields_reject_hidden_bytes);
+  TEST(unit_test_learner_save_io_failures_are_atomic);
+  TEST(unit_test_suggestion_allocation_failures_are_clean);
+  TEST(unit_test_compound_support_uses_indexed_prefixes);
+  TEST(unit_test_load_allocation_failures_preserve_learner);
+  TEST(unit_test_learner_load_read_failures_preserve_state);
+  TEST(unit_test_metadata_aggregation_and_v4_roundtrip);
+  TEST(unit_test_feed_is_atomic);
+  TEST(unit_test_compound_option_suggestion);
+  printf("\nResults: %d/%d passed, %d failed\n", unit_tests_passed,
+         unit_tests_run, unit_tests_failed);
+  return unit_tests_failed > 0 ? 1 : 0;
+}
+#undef ASSERT
+#undef TEST
 
-  st_test_io_reset();
-  ASSERT(st_learner_save(new_state, path) == ST_OK);
-  size_t operation_count = st_test_io_count();
-  ASSERT(operation_count > 0);
-  st_test_io_reset();
+/* --- arena (from test_arena.c) --- */
+/*
+ * Focused tests for ShellType's internal bump allocator.
+ */
 
-  for (size_t crash_after = 1; crash_after <= operation_count; crash_after++) {
-    ASSERT(st_learner_save(old_state, path) == ST_OK);
-    pid_t child = fork();
-    ASSERT(child >= 0);
-    if (child == 0) {
-      st_test_io_crash_after(crash_after);
-      (void)st_learner_save(new_state, path);
-      _exit(92);
-    }
-    int status = 0;
-    ASSERT(waitpid(child, &status, 0) == child);
-    ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 91);
-    st_test_io_reset();
+#define ASSERT(condition)                                                      \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      fprintf(stderr, "Assertion failed: %s at %s:%d\n", #condition, __FILE__, \
+              __LINE__);                                                       \
+      return 1;                                                                \
+    }                                                                          \
+  } while (0)
 
-    st_learner_t *loaded = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(loaded && st_learner_load(loaded, path) == ST_OK);
-    ASSERT(loaded->trie.total_commands == 1 ||
-           loaded->trie.total_commands == 2);
-    st_learner_free(loaded);
-    remove_learner_save_temps(path);
+static int run_arena(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  arena_t arena = {0};
+  ASSERT(arena_init(&arena, 1));
+  ASSERT(arena_used(&arena) == 0);
+
+  unsigned char *first = arena_alloc(&arena, 1);
+  ASSERT(first != NULL);
+  ASSERT(arena_used(&arena) == 8);
+  memset(first, 0xa5, 8);
+
+  size_t capacity = arena.size;
+  char *base = arena.base;
+  unsigned char *exact = arena_alloc(&arena, capacity - arena.used);
+  ASSERT(exact == (unsigned char *)base + 8);
+  ASSERT(arena.base == base);
+  ASSERT(arena_used(&arena) == capacity);
+  exact[capacity - 9] = 0x5a;
+
+  void *zero = arena_alloc(&arena, 0);
+  ASSERT(zero == arena.base + capacity);
+  ASSERT(arena.base == base);
+  ASSERT(arena_used(&arena) == capacity);
+
+  unsigned char *grown = arena_alloc(&arena, 1);
+  ASSERT(grown == (unsigned char *)arena.base + capacity);
+  ASSERT(arena.size == capacity * 2);
+  ASSERT(arena_used(&arena) == capacity + 8);
+  ASSERT(memcmp(arena.base, "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0);
+  ASSERT((unsigned char)arena.base[capacity - 1] == 0x5a);
+
+  size_t used_before_reserve = arena.used;
+  size_t size_before_reserve = arena.size;
+  ASSERT(arena_reserve(&arena, 0));
+  ASSERT(arena.used == used_before_reserve &&
+         arena.size == size_before_reserve);
+  ASSERT(arena_reserve(&arena, arena.size));
+  ASSERT(arena.used == used_before_reserve && arena.size > size_before_reserve);
+  ASSERT(memcmp(arena.base, "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0);
+  ASSERT((unsigned char)arena.base[capacity - 1] == 0x5a);
+
+  size_t reserved_size = arena.size;
+  st_test_alloc_fail_at(1);
+  ASSERT(!arena_reserve(&arena, reserved_size));
+  st_test_alloc_reset();
+  ASSERT(arena.used == used_before_reserve && arena.size == reserved_size);
+  ASSERT(!arena_reserve(&arena, SIZE_MAX));
+  ASSERT(arena.used == used_before_reserve && arena.size == reserved_size);
+
+  static const struct {
+    size_t size;
+    size_t used;
+    size_t request;
+  } rejected[] = {
+      {0, 1, 1},
+      {SIZE_MAX, SIZE_MAX - 4, 8},
+      {SIZE_MAX / 2 + 1, SIZE_MAX / 2 + 1, 1},
+      {0, 0, SIZE_MAX},
+  };
+  char sentinel = 0;
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    arena_t invalid = {
+        .base = &sentinel, .size = rejected[i].size, .used = rejected[i].used};
+    ASSERT(arena_alloc(&invalid, rejected[i].request) == NULL);
+    ASSERT(invalid.base == &sentinel);
+    ASSERT(invalid.size == rejected[i].size);
+    ASSERT(invalid.used == rejected[i].used);
   }
 
-  st_learner_free(old_state);
-  st_learner_free(new_state);
-  ASSERT(unlink(path) == 0);
-  learner_temp_path[0] = '\0';
-  ASSERT(rmdir(directory) == 0);
-  learner_save_directory[0] = '\0';
+  /* Exercise the two overflow-adjacent growth branches without asking the
+   * allocator for a real near-SIZE_MAX block. The deterministic hook rejects
+   * the realloc after the arena has selected its exact required capacity. */
+  arena_t exact_growth = {0};
+  ASSERT(arena_init(&exact_growth, 1));
+  st_test_alloc_fail_at(1);
+  ASSERT(arena_alloc(&exact_growth, SIZE_MAX - 1023) == NULL);
+  st_test_alloc_reset();
+  ASSERT(exact_growth.size == 1 && exact_growth.used == 0);
+  arena_free(&exact_growth);
+
+  arena_t reserve_exact = {
+      .base = &sentinel, .size = SIZE_MAX / 2 + 1, .used = 0};
+  st_test_alloc_fail_at(1);
+  ASSERT(!arena_reserve(&reserve_exact, SIZE_MAX / 2 + 2));
+  st_test_alloc_reset();
+  ASSERT(reserve_exact.base == &sentinel &&
+         reserve_exact.size == SIZE_MAX / 2 + 1 && reserve_exact.used == 0);
+
+  arena_free(&arena);
+  ASSERT(arena.base == NULL);
+  ASSERT(arena.size == 0);
+  ASSERT(arena_used(&arena) == 0);
+  return 0;
+}
+#undef ASSERT
+
+/* --- verify (from test_verify.c) --- */
+/* Verification and suggestion integration tests. */
+
+static int verify_tests_run;
+static int verify_tests_passed;
+static int verify_tests_failed;
+
+static int verify_pattern_view_is_cpl(st_netpattern_view_t actual,
+                                      const char *cpl) {
+  st_netpattern_t encoded = {0};
+  int equal = actual.data &&
+              st_netpattern_from_cpl_owned(cpl, &encoded) == ST_OK &&
+              actual.length == encoded.length &&
+              memcmp(actual.data, encoded.data, actual.length) == 0;
+  st_netpattern_free(&encoded);
+  return equal;
+}
+
+#define ASSERT(condition)                                                      \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      printf("    assertion failed: %s at %s:%d\n", #condition, __FILE__,      \
+             __LINE__);                                                        \
+      return 0;                                                                \
+    }                                                                          \
+  } while (0)
+
+#define TEST(function)                                                         \
+  do {                                                                         \
+    verify_tests_run++;                                                        \
+    printf("  %-38s ", #function);                                             \
+    if (function()) {                                                          \
+      verify_tests_passed++;                                                   \
+      printf("PASS\n");                                                        \
+    } else {                                                                   \
+      verify_tests_failed++;                                                   \
+      printf("FAIL\n");                                                        \
+    }                                                                          \
+  } while (0)
+
+static st_policy_t *verify_new_policy(st_policy_ctx_t *context,
+                                      const char *const *patterns,
+                                      size_t count) {
+  st_policy_t *policy = st_policy_new(context);
+  if (!policy)
+    return NULL;
+  for (size_t i = 0; i < count; i++)
+    if (test_st_policy_add(policy, patterns[i]) != ST_OK) {
+      st_policy_free(policy);
+      return NULL;
+    }
+  return policy;
+}
+
+typedef struct {
+  st_netpattern_view_t patterns[4];
+  size_t count;
+  size_t stop_after;
+} verify_match_visit_t;
+
+static bool verify_visit_match(st_netpattern_view_t pattern, void *user_ctx) {
+  verify_match_visit_t *visit = user_ctx;
+  visit->patterns[visit->count++] = pattern;
+  return visit->count < visit->stop_after;
+}
+
+static int verify_test_verify_all_matrix(void) {
+  static const char *patterns[] = {"git commit -m *", "git commit -m fix",
+                                   "git status", "typed #n #val",
+                                   "typed #val #n"};
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  ASSERT(context != NULL);
+  st_policy_t *policy = verify_new_policy(
+      context, patterns, sizeof(patterns) / sizeof(patterns[0]));
+  ASSERT(policy != NULL);
+
+  static const struct {
+    const char *command;
+    const char *expected[2];
+    size_t count;
+  } cases[] = {
+      {"git commit -m hello", {"git commit -m *", NULL}, 1},
+      {"git commit -m fix", {"git commit -m *", NULL}, 1},
+      {"git status", {"git status", NULL}, 1},
+      {"typed 1 2", {"typed #n #val", "typed #val #n"}, 2},
+      {"rm -rf /", {NULL, NULL}, 0},
+  };
+
+  /* The wildcard subsumes the exact commit rule; the crossing typed rules do
+   * not subsume one another. */
+  ASSERT(st_policy_rule_count(policy) == 4);
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    st_netpattern_view_t *matches = NULL;
+    size_t count = 99;
+    ASSERT(test_st_policy_verify_all(policy, cases[i].command, &matches,
+                                     &count) == ST_OK);
+    ASSERT(count == cases[i].count);
+    ASSERT((count == 0) == (matches == NULL));
+    for (size_t j = 0; j < count; j++) {
+      for (size_t k = j + 1; k < count; k++)
+        ASSERT((matches[j].length != matches[k].length ||
+                memcmp(matches[j].data, matches[k].data, matches[j].length)) !=
+               0);
+    }
+    for (size_t j = 0; j < cases[i].count; j++) {
+      bool found = false;
+      for (size_t k = 0; k < count; k++)
+        found = found || test_pattern_is_cpl(matches[k], cases[i].expected[j]);
+      ASSERT(found);
+    }
+    st_policy_matches_free(matches);
+  }
+
+  st_netpattern_view_t *borrowed_matches = NULL;
+  size_t borrowed_count = 0;
+  st_eval_result_t borrowed_eval = {0};
+  ASSERT(test_st_policy_verify_all(policy, "git status", &borrowed_matches,
+                                   &borrowed_count) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "git status", &borrowed_eval) == ST_OK);
+  ASSERT(borrowed_count == 1 &&
+         borrowed_matches[0].data == borrowed_eval.matching_pattern);
+  st_policy_matches_free(borrowed_matches);
+
+  shell_netstring_buffer_t netargv = test_netargv("typed 1 2");
+  ASSERT(netargv.data != NULL);
+  verify_match_visit_t visit = {.stop_after = 4};
+  size_t visited = 0;
+  ASSERT(st_policy_visit_matches_view(
+             policy,
+             (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+             verify_visit_match, &visit, &visited) == ST_OK);
+  ASSERT(visited == 2 && visit.count == 2);
+  ASSERT(verify_pattern_view_is_cpl(visit.patterns[0], "typed #n #val") ||
+         verify_pattern_view_is_cpl(visit.patterns[1], "typed #n #val"));
+  visit = (verify_match_visit_t){.stop_after = 1};
+  ASSERT(st_policy_visit_matches_view(
+             policy,
+             (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+             verify_visit_match, &visit, &visited) == ST_OK);
+  ASSERT(visited == 1 && visit.count == 1);
+  shell_netstring_buffer_free(&netargv);
+
+  st_netpattern_view_t *matches = NULL;
+  size_t count = 99;
+  ASSERT(test_st_policy_verify_all(policy, "", &matches, &count) == ST_OK);
+  ASSERT(matches == NULL && count == 0);
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
   return 1;
 }
 
-int main(void) {
-  atexit(cleanup_learner_temp_file);
-  printf("Running shelltype unit tests...\n\n");
-  TEST(test_learner_state_transitions);
-  TEST(test_learner_input_boundaries);
-  TEST(test_learner_configuration_boundaries);
-  TEST(test_learner_stats_contract);
-  TEST(test_suggestion_matrix);
-  TEST(test_suggestion_order_is_input_order_independent);
-  TEST(test_generated_suggestion_history_properties);
-  TEST(test_independent_two_token_learner_oracle);
-  TEST(test_suggestion_thresholds_and_limit);
-  TEST(test_confidence_ranking);
-  TEST(test_complete_rule_branch_semantics);
-  TEST(test_blacklist_filters_exact_suggestion);
-  TEST(test_blacklist_allocation_failures_are_atomic);
-  TEST(test_serialization_roundtrip_and_validation);
-  TEST(test_serialization_preserves_prefix_nodes);
-  TEST(test_learner_numeric_fields_reject_hidden_bytes);
-  TEST(test_learner_save_io_failures_are_atomic);
-  TEST(test_save_destination_candidate_is_not_published);
-  TEST(test_learner_load_rejects_binary_and_overlong_lines);
-  TEST(test_learner_binary_literal_roundtrip);
-  TEST(test_generalization_after_empty_and_binary_arguments);
-  TEST(test_command_heads_are_not_generalized);
-  TEST(test_typed_token_metadata_is_span_safe);
-  TEST(test_suggestion_allocation_failures_are_clean);
-  TEST(test_compound_support_uses_indexed_prefixes);
-  TEST(test_load_allocation_failures_preserve_learner);
-  TEST(test_learner_load_read_failures_preserve_state);
-  TEST(test_mixed_type_widening_and_v4_roundtrip);
-  TEST(test_v4_preserves_reserved_literal_spellings);
-  TEST(test_metadata_aggregation_and_v4_roundtrip);
-  TEST(test_learner_save_crash_boundaries);
-  TEST(test_feed_is_atomic);
-  TEST(test_feed_netargv_avoids_classifier_allocations);
-  TEST(test_borrowed_binary_feed_is_atomic);
-  TEST(test_timestamp_metadata_feed_is_atomic);
-  TEST(test_expressive_literal_suggestions);
-  TEST(test_compound_option_suggestion);
-  printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,
-         tests_failed);
-  return tests_failed > 0 ? 1 : 0;
+static int verify_test_policy_match_matrix(void) {
+  static const char *patterns[] = {"echo #n", "kill #signal", "grep #regex",
+                                   "assign value=1"};
+  static const struct {
+    const char *command;
+    bool expected;
+  } cases[] = {{"echo 42", true},        {"echo value", false},
+               {"kill 9", true},         {"grep 'a.*'", true},
+               {"assign value=1", true}, {"assign value=2", false}};
+
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  ASSERT(context != NULL);
+  st_policy_t *policy = verify_new_policy(
+      context, patterns, sizeof(patterns) / sizeof(patterns[0]));
+  ASSERT(policy != NULL);
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_netstring_buffer_t netargv = test_netargv(cases[i].command);
+    ASSERT(netargv.data != NULL);
+    st_eval_result_t eval = {0};
+    bool matches = !cases[i].expected;
+    ASSERT(st_policy_eval_view(
+               policy,
+               (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+               &eval) == ST_OK);
+    ASSERT(st_policy_match_view(
+               policy,
+               (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+               &matches) == ST_OK);
+    ASSERT(eval.matches == cases[i].expected && matches == eval.matches);
+    shell_netstring_buffer_free(&netargv);
+  }
+
+  static char long_netargv[sizeof("4:echo,256:") + ST_MAX_TOKEN_LEN + 1];
+  size_t long_prefix_length = sizeof("4:echo,256:") - 1;
+  memcpy(long_netargv, "4:echo,256:", long_prefix_length);
+  memset(long_netargv + long_prefix_length, 'x', ST_MAX_TOKEN_LEN);
+  long_netargv[long_prefix_length + ST_MAX_TOKEN_LEN] = ',';
+  long_netargv[long_prefix_length + ST_MAX_TOKEN_LEN + 1] = '\0';
+  bool matches = true;
+  ASSERT(st_policy_match_view(
+             policy,
+             (st_netargv_view_t){long_netargv,
+                                 long_prefix_length + ST_MAX_TOKEN_LEN + 1},
+             &matches) == ST_OK);
+  ASSERT(!matches);
+
+  matches = true;
+  ASSERT(st_policy_match_view(policy,
+                              (st_netargv_view_t){"1:x,x", sizeof("1:x,x") - 1},
+                              &matches) == ST_ERR_FORMAT);
+  ASSERT(!matches);
+
+  ASSERT(!matches);
+
+  shell_netstring_buffer_t netargv = test_netargv("echo 42");
+  ASSERT(netargv.data != NULL);
+  ASSERT(st_policy_match_view(
+             policy,
+             (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+             &matches) == ST_OK &&
+         matches);
+  st_test_alloc_reset();
+  ASSERT(st_policy_match_view(
+             policy,
+             (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+             &matches) == ST_OK &&
+         matches);
+  ASSERT(st_test_alloc_count() == 0);
+  st_test_alloc_reset();
+  shell_netstring_buffer_free(&netargv);
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
+static int verify_test_verify_high_fanout_growth(void) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = st_policy_new(context);
+  ASSERT(context && policy);
+  char expected[ST_MAX_NETPATTERN_LEN] = {0};
+  size_t pattern_count = 0;
+  for (unsigned mask = 0; mask < (1u << 9); mask++) {
+    if (__builtin_popcount(mask) != 4)
+      continue;
+    char pattern[ST_MAX_NETPATTERN_LEN] = "x";
+    for (unsigned pos = 0; pos < 9; pos++)
+      strcat(pattern, (mask & (1u << pos)) ? " #n" : " #val");
+    ASSERT(test_st_policy_add(policy, pattern) == ST_OK);
+    if (expected[0] == '\0' || strcmp(pattern, expected) < 0)
+      strcpy(expected, pattern);
+    pattern_count++;
+  }
+  ASSERT(pattern_count == 126 && st_policy_rule_count(policy) == 126);
+  const char *command = "x 1 2 3 4 5 6 7 8 9";
+  st_netpattern_view_t *matches = NULL;
+  size_t count = 0;
+  ASSERT(test_st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
+  ASSERT(count == 126);
+  st_policy_matches_free(matches);
+  st_eval_result_t result = {0};
+  ASSERT(test_st_policy_eval(policy, command, &result) == ST_OK);
+  ASSERT(result.matches &&
+         test_pattern_is_cpl(
+             (st_netpattern_view_t){result.matching_pattern,
+                                    result.matching_pattern_length},
+             expected));
+
+  st_test_alloc_reset();
+  ASSERT(test_st_policy_eval(policy, command, &result) == ST_OK);
+  size_t eval_allocations = st_test_alloc_count();
+  bool eval_failure_observed = false;
+  for (size_t fail_at = 1; fail_at <= eval_allocations; fail_at++) {
+    memset(&result, 0xa5, sizeof(result));
+    st_test_alloc_fail_at(fail_at);
+    st_error_t error = test_st_policy_eval(policy, command, &result);
+    st_test_alloc_reset();
+    if (error == ST_ERR_MEMORY) {
+      eval_failure_observed = true;
+      ASSERT(!result.matches && result.matching_pattern == NULL &&
+             result.suggestion_count == 0 && result.suggestion_error == ST_OK);
+    } else {
+      ASSERT(error == ST_OK && result.matches && result.matching_pattern &&
+             test_pattern_is_cpl(
+                 (st_netpattern_view_t){result.matching_pattern,
+                                        result.matching_pattern_length},
+                 expected));
+    }
+  }
+  ASSERT(eval_failure_observed);
+
+  st_test_alloc_reset();
+  ASSERT(test_st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
+  size_t allocations = st_test_alloc_count();
+  st_policy_matches_free(matches);
+  bool observed = false;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    matches = NULL;
+    count = 99;
+    st_test_alloc_fail_at(fail_at);
+    st_error_t error =
+        test_st_policy_verify_all(policy, command, &matches, &count);
+    st_test_alloc_reset();
+    if (error == ST_ERR_MEMORY) {
+      observed = true;
+      ASSERT(matches == NULL && count == 0);
+    } else {
+      ASSERT(error == ST_OK && count == 126);
+      st_policy_matches_free(matches);
+    }
+  }
+  ASSERT(observed);
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
+static int run_verify(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  printf("Running verification tests...\n\n");
+  TEST(verify_test_verify_all_matrix);
+  TEST(verify_test_policy_match_matrix);
+  TEST(verify_test_verify_high_fanout_growth);
+  printf("\nResults: %d/%d passed, %d failed\n", verify_tests_passed,
+         verify_tests_run, verify_tests_failed);
+  return verify_tests_failed > 0 ? 1 : 0;
+}
+#undef ASSERT
+#undef TEST
+
+/* --- integration (from test_shelltype_integration.c) --- */
+/* End-to-end tests for suggestion ranking across mixed command workloads. */
+
+static int integration_tests_run;
+static int integration_tests_passed;
+static int integration_tests_failed;
+
+#define ASSERT(condition)                                                      \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      printf("    assertion failed: %s at %s:%d\n", #condition, __FILE__,      \
+             __LINE__);                                                        \
+      return 0;                                                                \
+    }                                                                          \
+  } while (0)
+
+#define TEST(function)                                                         \
+  do {                                                                         \
+    integration_tests_run++;                                                   \
+    printf("  %-38s ", #function);                                             \
+    if (function()) {                                                          \
+      integration_tests_passed++;                                              \
+      printf("PASS\n");                                                        \
+    } else {                                                                   \
+      integration_tests_failed++;                                              \
+      printf("FAIL\n");                                                        \
+    }                                                                          \
+  } while (0)
+
+typedef struct {
+  const char *pattern;
+  uint32_t count;
+  double confidence;
+} integration_expected_suggestion_t;
+
+static int run_integration(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  printf("Running shelltype integration tests...\n\n");
+  printf("\nResults: %d/%d passed, %d failed\n", integration_tests_passed,
+         integration_tests_run, integration_tests_failed);
+  return integration_tests_failed > 0 ? 1 : 0;
+}
+#undef ASSERT
+#undef TEST
+
+/* --- processed (from test_processed_subcommand.c) --- */
+static int processed_check_pipeline(const char *input,
+                                    const char *expected_clean,
+                                    const char *const *expected_tokens,
+                                    size_t expected_count) {
+  (void)expected_clean;
+  shell_command_info_t *commands = NULL;
+  size_t command_count = 0;
+  shell_netstring_buffer_t netargv = {0};
+  if (shell_process_command(input, strlen(input), NULL, &commands,
+                            &command_count) != SHELL_PROCESS_OK ||
+      command_count != 1 ||
+      shell_command_info_has_dangerous_features(&commands[0]))
+    goto fail;
+  if (shell_render_netargv_buffer(&commands[0], NULL, &netargv) !=
+      SHELL_PROCESS_OK)
+    goto fail;
+
+  st_token_array_t typed = {0};
+  if (st_netargv_classify_view(
+          (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+          &typed) != ST_OK ||
+      typed.count != expected_count) {
+    st_token_array_free(&typed);
+    goto fail;
+  }
+  for (size_t i = 0; i < expected_count; i++) {
+    if (strcmp(typed.tokens[i].text, expected_tokens[i]) != 0) {
+      st_token_array_free(&typed);
+      goto fail;
+    }
+  }
+  st_token_array_free(&typed);
+  shell_command_infos_free(commands, command_count);
+  shell_netstring_buffer_free(&netargv);
+  return 1;
+
+fail:
+  shell_command_infos_free(commands, command_count);
+  shell_netstring_buffer_free(&netargv);
+  return 0;
+}
+
+static int processed_check_trusted_processed_input(void) {
+  static const char netargv[] =
+      "6:printf,9:two words,16:literal>operator,3:a\\b,";
+  static const char *const expected[] = {"printf", "two words",
+                                         "literal>operator", "a\\b"};
+  st_token_array_t typed = {0};
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_policy_ctx_t *ctx = st_policy_ctx_new();
+  st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
+  if (!learner ||
+      st_netargv_classify_view(
+          (st_netargv_view_t){netargv, sizeof(netargv) - 1}, &typed) != ST_OK ||
+      typed.count != sizeof(expected) / sizeof(expected[0]))
+    goto fail;
+  for (size_t i = 0; i < typed.count; i++)
+    if (strcmp(typed.tokens[i].text, expected[i]) != 0)
+      goto fail;
+  if (st_learner_feed_netargv_view(
+          learner, (st_netargv_view_t){netargv, sizeof(netargv) - 1}) != ST_OK)
+    goto fail;
+  st_netpattern_t netpattern = {0};
+  if (!policy ||
+      st_netpattern_from_cpl_owned("printf * * *", &netpattern) != ST_OK ||
+      st_policy_add_netpattern_view(
+          policy, (st_netpattern_view_t){(const char *)netpattern.data,
+                                         netpattern.length}) != ST_OK) {
+    st_netpattern_free(&netpattern);
+    goto fail;
+  }
+  st_netpattern_free(&netpattern);
+  st_eval_result_t result = {0};
+  if (st_policy_eval_view(policy,
+                          (st_netargv_view_t){netargv, sizeof(netargv) - 1},
+                          &result) != ST_OK ||
+      !result.matches)
+    goto fail;
+  st_netpattern_view_t *matches = NULL;
+  size_t match_count = 0;
+  if (st_policy_verify_all_view(
+          policy, (st_netargv_view_t){netargv, sizeof(netargv) - 1}, &matches,
+          &match_count) != ST_OK ||
+      match_count != 1) {
+    st_policy_matches_free(matches);
+    goto fail;
+  }
+  st_policy_matches_free(matches);
+  st_token_array_free(&typed);
+  st_learner_free(learner);
+  st_policy_free(policy);
+  st_policy_ctx_release(ctx);
+  return 1;
+
+fail:
+  st_token_array_free(&typed);
+  st_learner_free(learner);
+  st_policy_free(policy);
+  st_policy_ctx_release(ctx);
+  return 0;
+}
+
+static int run_processed(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  static const char *const assembled[] = {"echo", "foobar", "a b",
+                                          "pre mid post"};
+  static const char *const empty[] = {"printf", "", "", ">"};
+  static const char *const escaped[] = {"printf", "a\"b", "c'd", "x\\y"};
+  int passed = processed_check_pipeline("echo foo\"bar\" a\\ b pre' mid 'post",
+                                        "echo foobar \"a b\" \"pre mid post\"",
+                                        assembled, 4) &&
+               processed_check_pipeline("printf '' \"\" '>'",
+                                        "printf \"\" \"\" \">\"", empty, 4) &&
+               processed_check_pipeline("printf 'a\"b' \"c'd\" 'x\\y'",
+                                        "printf \"a\\\"b\" \"c'd\" \"x\\\\y\"",
+                                        escaped, 4) &&
+               processed_check_trusted_processed_input();
+  printf("processed-subcommand integration: %s\n", passed ? "PASS" : "FAIL");
+  return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int main(int argc, char **argv) {
+  int status = 0;
+  status |= run_unit(argc, argv);
+  status |= run_arena(argc, argv);
+  status |= run_verify(argc, argv);
+  status |= run_integration(argc, argv);
+  status |= run_processed(argc, argv);
+  return status != 0;
 }

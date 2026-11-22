@@ -8,6 +8,7 @@ static _Thread_local size_t delimiter_work;
 static _Thread_local size_t metadata_work[SHELLSPLIT_TEST_WORK_COUNT];
 static _Thread_local size_t observation_order_errors;
 static _Thread_local uint32_t memo_limit;
+static _Thread_local uint64_t trace_bits[SHELLSPLIT_TRACE_KINDS * 32 / 64];
 
 void shellsplit_test_source_scan_charge(size_t length) { scan_work += length; }
 void shellsplit_test_source_scan_reset(void) {
@@ -20,6 +21,25 @@ void shellsplit_test_source_scan_reset(void) {
     metadata_work[i] = 0;
 }
 size_t shellsplit_test_source_scan_work(void) { return scan_work; }
+void shellsplit_test_trace(shellsplit_test_trace_kind_t kind,
+                           unsigned outcome) {
+  unsigned id = (unsigned)kind * 32 + (outcome & 31u);
+  trace_bits[id / 64] |= UINT64_C(1) << (id % 64);
+}
+void shellsplit_test_trace_reset(void) {
+  for (size_t i = 0; i < sizeof(trace_bits) / sizeof(trace_bits[0]); i++)
+    trace_bits[i] = 0;
+}
+size_t shellsplit_test_trace_events(uint16_t *events, size_t capacity) {
+  size_t n = 0;
+  for (unsigned id = 0; id < SHELLSPLIT_TRACE_KINDS * 32; id++)
+    if ((trace_bits[id / 64] >> (id % 64)) & 1u) {
+      if (n < capacity)
+        events[n] = (uint16_t)id;
+      n++;
+    }
+  return n;
+}
 void shellsplit_test_set_union_memo_limit(uint32_t entries) {
   memo_limit = entries;
 }

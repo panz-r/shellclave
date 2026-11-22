@@ -48,8 +48,16 @@
 
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 #define DEP_METADATA_WORK(kind) shellsplit_test_metadata_charge(kind)
+#define DEP_TRACE(kind, outcome) shellsplit_test_trace(kind, outcome)
+/* The position of an access kind's bit, for a decision event: at most 31, and
+ * 31 for no bit or one that high. */
+#define DEP_ACCESS_INDEX(access)                                               \
+  ((access) && __builtin_ctzll((unsigned long long)(access)) < 31              \
+       ? (unsigned)__builtin_ctzll((unsigned long long)(access))               \
+       : 31u)
 #else
 #define DEP_METADATA_WORK(kind) ((void)0)
+#define DEP_TRACE(kind, outcome) ((void)0)
 #endif
 
 /* --- NAME HELPERS --- */
@@ -9248,7 +9256,8 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
           !dep_fd_copy_source_exists(ops + op, &alternatives,
                                      &workspace->journal,
                                      &workspace->journal)) {
-        workspace->journal.unmodeled = true;
+        workspace->journal.unmodeled =
+            (DEP_TRACE(SHELLSPLIT_TRACE_UNMODELED, 1), true);
         return SHELL_DEP_EUNMODELED;
       }
       if ((outcomes & DEP_STATUS_MAY_FAIL) &&
@@ -9277,7 +9286,8 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
          * the graph requires: the operation then fails only where those
          * requirements fail. */
         if (!excused) {
-          workspace->journal.unmodeled = true;
+          workspace->journal.unmodeled =
+              (DEP_TRACE(SHELLSPLIT_TRACE_UNMODELED, 2), true);
           return SHELL_DEP_EUNMODELED;
         }
         /* Every path reaching it fails here, as Bash does: the owner's setup
@@ -9289,7 +9299,8 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
       if (persistent &&
           !dep_fd_exec_contract_holds(&effective, &alternatives, &setup_entry,
                                       &shell_entry, &workspace->journal)) {
-        workspace->journal.unmodeled = true;
+        workspace->journal.unmodeled =
+            (DEP_TRACE(SHELLSPLIT_TRACE_UNMODELED, 3), true);
         return SHELL_DEP_EUNMODELED;
       }
       dep_route_state_t previous_state = alternatives;
@@ -10796,7 +10807,8 @@ static SHELL_NONNULL(1, 2, 3) void dep_record_file_failure(
     shell_dep_graph_t *graph, const dep_parse_context_t *context,
     const dep_token_t *word, uint32_t owner,
     shell_expand_word_purpose_t purpose, uint32_t document) {
-  context->workspace->journal.unmodeled = true;
+  context->workspace->journal.unmodeled =
+      (DEP_TRACE(SHELLSPLIT_TRACE_UNMODELED, 4), true);
   graph->nodes[document].doc.flags |= SHELL_DEP_DOC_FLAG_EXPANSION_FAILED;
   if (purpose == SHELL_EXPAND_WORD_REDIRECT_PATH) {
     uint32_t position = (uint32_t)(word->start - context->cmd);
@@ -12748,9 +12760,16 @@ static SHELL_NONNULL(1, 3, 4, 5, 6, 7) bool dep_publish_read_inputs(
                             workspace->read_frontiers);
       if (result.exhausted)
         return false;
+      DEP_TRACE(SHELLSPLIT_TRACE_READ,
+                (result.descriptor_missing ? 1u : 0u) |
+                    (result.shell_error ? 2u : 0u) |
+                    (result.unsupported ? 4u : 0u) |
+                    (result.assigned_failure ? 8u : 0u) |
+                    (result.unassigned_failure ? 16u : 0u));
       if ((result.descriptor_missing || result.shell_error) &&
           !dep_read_status_consumed(context, owner))
-        workspace->journal.unmodeled = true;
+        workspace->journal.unmodeled =
+            (DEP_TRACE(SHELLSPLIT_TRACE_UNMODELED, 5), true);
       for (uint32_t selection = 0; selection <= plan->count; selection++) {
         if (!(result.input & (UINT64_C(1) << selection)))
           continue;
@@ -17352,7 +17371,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       if (shell_process_measure_word_value(
               name->start, name->len, &decoded_length) == SHELL_PROCESS_OK &&
           decoded_length == 0)
-        parse_context.workspace->journal.unmodeled = true;
+        parse_context.workspace->journal.unmodeled =
+            (DEP_TRACE(SHELLSPLIT_TRACE_UNMODELED, 6), true);
     }
 
     bool expandable_arguments[SHELL_DEP_MAX_TOKENS];

@@ -234,12 +234,101 @@ if(BUILD_TESTING)
   target_include_directories(shellgate_test PRIVATE shellgate/tests shellsplit/tests)
 endif()
 
-function(shellclave_add_test name source library)
+# Test suites. A suite is a test source compiled with its main renamed; the
+# suites built against one library share one runner executable that picks the
+# suite by name, so a suite adds an object file to the build, not a binary.
+# CTest keeps one entry per suite (runner NAME), with its own labels and
+# timeout. A standalone test keeps its own executable: one that other tests
+# drive as a probe.
+function(shellclave_add_suite name source library)
+  add_library(${name} OBJECT ${source})
+  shellclave_project_target(${name})
+  target_compile_definitions(${name} PRIVATE main=${name}_main)
+  target_link_libraries(${name} PRIVATE ${library})
+  string(REPLACE "::" "_" runner "${library}_runner")
+  set_property(GLOBAL APPEND PROPERTY SHELLCLAVE_RUNNERS ${runner})
+  set_property(GLOBAL APPEND PROPERTY SHELLCLAVE_SUITES_${runner} ${name})
+  set_property(GLOBAL PROPERTY SHELLCLAVE_SOURCE_${name}
+    "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+  add_test(NAME ${name} COMMAND ${runner} ${name})
+endfunction()
+
+function(shellclave_add_standalone_test name source library)
   add_executable(${name} ${source})
   shellclave_project_target(${name})
   target_link_libraries(${name} PRIVATE ${library})
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
+
+function(shellclave_add_test name source library)
+  shellclave_add_suite(${name} ${source} ${library})
+endfunction()
+
+# The runners: one generated dispatcher per library, linked with the objects
+# of every suite built against it and with what those suites link.
+function(shellclave_finalize_runners)
+  get_property(runners GLOBAL PROPERTY SHELLCLAVE_RUNNERS)
+  list(REMOVE_DUPLICATES runners)
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runners")
+  foreach(runner IN LISTS runners)
+    get_property(suites GLOBAL PROPERTY SHELLCLAVE_SUITES_${runner})
+    set(declarations "")
+    set(table "")
+    set(objects "")
+    set(libraries "")
+    foreach(suite IN LISTS suites)
+      get_property(source GLOBAL PROPERTY SHELLCLAVE_SOURCE_${suite})
+      file(STRINGS "${source}" main_line REGEX "^int main\\(" LIMIT_COUNT 1)
+      if(main_line MATCHES "main\\(void\\)")
+        string(APPEND declarations "int ${suite}_main(void);\n")
+        string(APPEND table "  {\"${suite}\", 0, ${suite}_main},\n")
+      else()
+        string(APPEND declarations "int ${suite}_main(int, char **);\n")
+        string(APPEND table "  {\"${suite}\", ${suite}_main, 0},\n")
+      endif()
+      list(APPEND objects $<TARGET_OBJECTS:${suite}>)
+      get_target_property(suite_libraries ${suite} LINK_LIBRARIES)
+      if(suite_libraries)
+        list(APPEND libraries ${suite_libraries})
+      endif()
+    endforeach()
+    list(REMOVE_DUPLICATES libraries)
+    set(generated "${CMAKE_CURRENT_BINARY_DIR}/runners/${runner}.c")
+    file(WRITE "${generated}.in" "/* Generated: dispatches a test suite by name. */
+#include <stdio.h>
+#include <string.h>
+
+${declarations}
+static const struct {
+  const char *name;
+  int (*with_arguments)(int, char **);
+  int (*without_arguments)(void);
+} suites[] = {
+${table}};
+
+int main(int argc, char **argv) {
+  if (argc >= 2)
+    for (unsigned i = 0; i < sizeof(suites) / sizeof(suites[0]); i++)
+      if (strcmp(argv[1], suites[i].name) == 0)
+        return suites[i].with_arguments
+                   ? suites[i].with_arguments(argc - 1, argv + 1)
+                   : suites[i].without_arguments();
+  fprintf(stderr, \"usage: %s SUITE\\n\", argv[0]);
+  for (unsigned i = 0; i < sizeof(suites) / sizeof(suites[0]); i++)
+    fprintf(stderr, \"  %s\\n\", suites[i].name);
+  return 2;
+}
+")
+    configure_file("${generated}.in" "${generated}" COPYONLY)
+    add_executable(${runner} "${generated}" ${objects})
+    shellclave_project_target(${runner})
+    target_link_libraries(${runner} PRIVATE ${libraries})
+    if(NOT runner MATCHES "_test_runner$" AND TARGET shellclave_production_tests)
+      add_dependencies(shellclave_production_tests ${runner})
+    endif()
+  endforeach()
+endfunction()
+cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL shellclave_finalize_runners)
 
 function(shellclave_register_production_test name)
   # Generic registration adds only production-suite membership. Tests that
@@ -252,13 +341,17 @@ endfunction()
 function(shellclave_add_production_test name source library)
   # Shipping-library production tests belong to that component as well as the
   # aggregate production suite. Keep both labels coupled to registration.
-  shellclave_add_test(${name} ${source} ${library})
+  if("STANDALONE" IN_LIST ARGN)
+    shellclave_add_standalone_test(${name} ${source} ${library})
+  else()
+    shellclave_add_test(${name} ${source} ${library})
+  endif()
   set_property(TEST ${name} APPEND PROPERTY LABELS ${library})
   shellclave_register_production_test(${name})
 endfunction()
 
 function(shellclave_add_concurrency_test name source library)
-  shellclave_add_test(${name} ${source} ${library})
+  shellclave_add_standalone_test(${name} ${source} ${library})
   set_property(TEST ${name} APPEND PROPERTY LABELS concurrency)
   add_dependencies(shellclave_concurrency_tests ${name})
 endfunction()
@@ -300,14 +393,14 @@ if(BUILD_TESTING)
     endif()
   endforeach()
   shellclave_add_production_test(shellgate_example_contract
-    tests/test_gate_example.c shellgate)
+    tests/test_gate_example.c shellgate STANDALONE)
   add_test(NAME shellclave_gate_example COMMAND shellclave_gate_example)
   set_tests_properties(shellclave_gate_example PROPERTIES LABELS "shellgate;example")
   add_test(NAME shellclave_source_example COMMAND shellclave_source_example)
   set_tests_properties(shellclave_source_example PROPERTIES LABELS "shellsplit;example")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
-  shellclave_add_test(shellsplit_abstract_cli_test
+  shellclave_add_standalone_test(shellsplit_abstract_cli_test
     shellsplit/tests/test_abstract_cli.c shellsplit)
   set_tests_properties(shellsplit_abstract_cli_test PROPERTIES
     LABELS "shellsplit;tools")
@@ -412,11 +505,11 @@ if(BUILD_TESTING)
     set_tests_properties(shellsplit_bash_source_semantics PROPERTIES LABELS shellsplit)
     add_test(NAME shellsplit_bash_conditional_commands
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_conditional_commands.py"
-        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_conditional_production_test>)
+        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_evaluation_production_test> conditional)
     set_tests_properties(shellsplit_bash_conditional_commands PROPERTIES LABELS shellsplit TIMEOUT 45)
     add_test(NAME shellsplit_bash_variable_presence
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_variable_presence.py"
-        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_presence_production_test>)
+        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_evaluation_production_test> presence)
     set_tests_properties(shellsplit_bash_variable_presence PROPERTIES LABELS shellsplit TIMEOUT 60)
     add_test(NAME shellsplit_bash_if_descriptors
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_if_descriptors.py"
@@ -424,13 +517,13 @@ if(BUILD_TESTING)
     set_tests_properties(shellsplit_bash_if_descriptors PROPERTIES LABELS shellsplit TIMEOUT 120)
     add_test(NAME shellsplit_bash_arithmetic_commands
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_arithmetic_commands.py"
-        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_arithmetic_production_test>)
+        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_evaluation_production_test> arithmetic)
     set_tests_properties(shellsplit_bash_arithmetic_commands PROPERTIES LABELS shellsplit TIMEOUT 45)
     add_test(NAME shellsplit_bash_source_status
       COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_source_status.py"
         --bash "${SHELLCLAVE_BASH_EXECUTABLE}"
-        --probe $<TARGET_FILE:shellsplit_source_status_production_test>)
+        --probe $<TARGET_FILE:shellsplit_source_probe>)
     set_tests_properties(shellsplit_bash_source_status PROPERTIES
       LABELS shellsplit TIMEOUT 45)
     if(UNIX)
@@ -450,64 +543,50 @@ if(BUILD_TESTING)
       ENVIRONMENT
         "BASH_ENV=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/bash_env_enable_lastpipe.sh;BASHOPTS=lastpipe;SHELLOPTS=braceexpand:hashall:interactive-comments:monitor;POSIXLY_CORRECT=1")
   endif()
-  shellclave_add_test(shellsplit_tokenizer_test shellsplit/tests/tokenizer_test.c shellsplit_test)
-  shellclave_add_test(shellsplit_depgraph_compare_test
-    shellsplit/tests/depgraph_compare_test.c shellsplit)
-  set_tests_properties(shellsplit_depgraph_compare_test PROPERTIES LABELS shellsplit)
-  shellclave_add_test(shellsplit_source_compare_test
-    shellsplit/tests/source_compare_test.c shellsplit)
-  set_tests_properties(shellsplit_source_compare_test PROPERTIES LABELS shellsplit)
-  shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit_test)
-  # Exercise the same public parser contract against the shipping library. The
-  # allocation-failure variant above links the instrumented test library;
-  # keeping this production variant prevents that build from being the only
-  # implementation exercised by the parser regression suite.
-  shellclave_add_production_test(shellsplit_fast_parser_production_test shellsplit/tests/fast_parser_test.c shellsplit)
-  target_compile_definitions(shellsplit_fast_parser_test PRIVATE
-    SHELLSPLIT_TEST_SOURCE_SCANS)
-  shellclave_add_test(shellsplit_abstract_test shellsplit/tests/abstract_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_support_test
+    shellsplit/tests/support_test.c shellsplit)
+  target_link_libraries(shellsplit_support_test PRIVATE shellsplit_graph_fixture)
+  set_tests_properties(shellsplit_support_test PROPERTIES LABELS shellsplit)
   # Run identical syntax/codec contracts in both variants. These cases do not
   # use fault hooks, but must cover the test CFG as well as shipping behavior.
-  shellclave_add_test(shellsplit_semantics_test
-    shellsplit/tests/production_semantics_test.c shellsplit_test)
-  target_compile_definitions(shellsplit_semantics_test PRIVATE
+  shellclave_add_test(shellsplit_word_semantics_test
+    shellsplit/tests/word_semantics_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_word_semantics_test PRIVATE
     SHELLSPLIT_TEST_SOURCE_SCANS)
-  target_include_directories(shellsplit_semantics_test PRIVATE
+  target_include_directories(shellsplit_word_semantics_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)
-  shellclave_add_production_test(shellsplit_production_semantics_test
-    shellsplit/tests/production_semantics_test.c shellsplit)
-  set_property(TEST shellsplit_semantics_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_test(shellsplit_presence_test shellsplit/tests/presence_test.c shellsplit_test)
-  set_property(TEST shellsplit_presence_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_production_test(shellsplit_presence_production_test shellsplit/tests/presence_test.c shellsplit)
+  shellclave_add_production_test(shellsplit_word_semantics_production_test
+    shellsplit/tests/word_semantics_test.c shellsplit)
+  set_property(TEST shellsplit_word_semantics_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_test(shellsplit_evaluation_test shellsplit/tests/evaluation_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_evaluation_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
+  set_property(TEST shellsplit_evaluation_test APPEND PROPERTY LABELS shellsplit)
+  # The Bash differentials launch this suite thousands of times as a probe, so it
+  # is its own small executable rather than a member of the large runner.
+  shellclave_add_production_test(shellsplit_evaluation_production_test shellsplit/tests/evaluation_test.c shellsplit STANDALONE)
+  add_executable(shellsplit_source_probe shellsplit/tests/source_probe.c)
+  target_link_libraries(shellsplit_source_probe PRIVATE shellsplit)
+  shellclave_project_target(shellsplit_source_probe)
   add_executable(shellsplit_if_graph_probe shellsplit/tests/if_graph_probe.c)
   target_link_libraries(shellsplit_if_graph_probe PRIVATE shellsplit)
   shellclave_project_target(shellsplit_if_graph_probe)
-  shellclave_add_test(shellsplit_conditional_test shellsplit/tests/conditional_test.c shellsplit_test)
-  target_compile_definitions(shellsplit_conditional_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
-  set_property(TEST shellsplit_conditional_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_production_test(shellsplit_conditional_production_test shellsplit/tests/conditional_test.c shellsplit)
-  shellclave_add_test(shellsplit_arithmetic_test shellsplit/tests/arithmetic_test.c shellsplit_test)
-  target_compile_definitions(shellsplit_arithmetic_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
-  set_property(TEST shellsplit_arithmetic_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_production_test(shellsplit_arithmetic_production_test shellsplit/tests/arithmetic_test.c shellsplit)
-  shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
+  # The grammar suite runs against the instrumented and the shipping library:
+  # its cases do not use fault hooks, but must cover the test CFG as well as
+  # the shipping behavior.
+  shellclave_add_test(shellsplit_grammar_test shellsplit/tests/grammar_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_grammar_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
+  shellclave_add_production_test(shellsplit_grammar_production_test shellsplit/tests/grammar_test.c shellsplit)
+  foreach(grammar_target IN ITEMS shellsplit_grammar_test shellsplit_grammar_production_test)
+    target_include_directories(${grammar_target} PRIVATE
+      shellsplit/tests "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  endforeach()
+  set_property(TEST shellsplit_grammar_test APPEND PROPERTY LABELS shellsplit)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
-  shellclave_add_test(shellsplit_boundary_test shellsplit/tests/boundary_test.c shellsplit_test)
-  shellclave_add_test(shellsplit_source_test shellsplit/tests/source_test.c shellsplit_test)
-  target_compile_definitions(shellsplit_source_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS SHELLSPLIT_TEST_ALLOCATOR)
-  target_include_directories(shellsplit_source_test PRIVATE shellsplit/tests)
-  shellclave_add_production_test(shellsplit_source_production_test shellsplit/tests/source_test.c shellsplit)
-  set_property(TEST shellsplit_source_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_test(shellsplit_source_status_test
-    shellsplit/tests/source_status_test.c shellsplit_test)
-  shellclave_add_production_test(shellsplit_source_status_production_test
-    shellsplit/tests/source_status_test.c shellsplit)
-  target_compile_definitions(shellsplit_boundary_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
-  target_include_directories(shellsplit_boundary_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)
-  shellclave_add_production_test(shellsplit_boundary_production_test shellsplit/tests/boundary_test.c shellsplit)
-  set_property(TEST shellsplit_boundary_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_test(shellsplit_source_admission_test shellsplit/tests/source_admission_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_source_admission_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS SHELLSPLIT_TEST_ALLOCATOR)
+  target_include_directories(shellsplit_source_admission_test PRIVATE shellsplit/tests)
+  shellclave_add_production_test(shellsplit_source_admission_production_test shellsplit/tests/source_admission_test.c shellsplit)
+  set_property(TEST shellsplit_source_admission_test APPEND PROPERTY LABELS shellsplit)
   shellclave_add_test(shellsplit_read_input_test
     shellsplit/tests/read_input_test.c shellsplit_test)
   target_compile_definitions(shellsplit_read_input_test PRIVATE
@@ -521,19 +600,16 @@ if(BUILD_TESTING)
     SHELLSPLIT_TEST_ALLOCATOR SHELLSPLIT_TEST_SOURCE_SCANS)
   shellclave_add_production_test(shellsplit_descriptor_move_production_test
     shellsplit/tests/descriptor_move_test.c shellsplit)
-  shellclave_add_test(shellsplit_fd_scaling_test
-    shellsplit/tests/fd_scaling_test.c shellsplit_test)
-  target_compile_definitions(shellsplit_fd_scaling_test PRIVATE
+  shellclave_add_test(shellsplit_depgraph_flow_test
+    shellsplit/tests/depgraph_flow_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_depgraph_flow_test PRIVATE
     SHELLSPLIT_TEST_SOURCE_SCANS)
-  set_property(TEST shellsplit_fd_scaling_test APPEND PROPERTY LABELS shellsplit)
+  set_property(TEST shellsplit_depgraph_flow_test APPEND PROPERTY LABELS shellsplit)
   add_library(shellsplit_graph_fixture STATIC shellsplit/tests/graph_fixture.c)
   shellclave_project_target(shellsplit_graph_fixture)
   target_include_directories(shellsplit_graph_fixture PRIVATE shellsplit/include)
-  shellclave_add_test(shellsplit_graph_fixture_test shellsplit/tests/graph_fixture_test.c shellsplit)
-  target_link_libraries(shellsplit_graph_fixture_test PRIVATE shellsplit_graph_fixture shellsplit)
-  set_property(TEST shellsplit_graph_fixture_test APPEND PROPERTY LABELS shellsplit)
-  target_link_libraries(shellsplit_fd_scaling_test PRIVATE shellsplit_graph_fixture shellsplit_test)
-  foreach(fixture_case IN ITEMS presence conditional arithmetic boundary read_input descriptor_move source)
+  target_link_libraries(shellsplit_depgraph_flow_test PRIVATE shellsplit_graph_fixture shellsplit_test)
+  foreach(fixture_case IN ITEMS evaluation grammar read_input descriptor_move source_admission word_semantics)
     target_link_libraries(shellsplit_${fixture_case}_test PRIVATE shellsplit_graph_fixture shellsplit_test)
     target_link_libraries(shellsplit_${fixture_case}_production_test PRIVATE shellsplit_graph_fixture shellsplit)
   endforeach()
@@ -543,40 +619,31 @@ if(BUILD_TESTING)
   # public contract against both the fault-injection and shipping builds.
   shellclave_add_production_test(shellsplit_depgraph_production_test shellsplit/tests/test_depgraph.c shellsplit)
   shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit_test)
-  shellclave_add_test(shellsplit_netstring_test shellsplit/tests/netstring_test.c shellsplit_test)
-  shellclave_add_test(shellsplit_persistent_map_test
-    shellsplit/tests/persistent_map_test.c shellsplit_test)
-  target_include_directories(shellsplit_persistent_map_test PRIVATE shellsplit/src)
-  set_property(TEST shellsplit_persistent_map_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_test(shellsplit_fd_occupancy_test
-    shellsplit/tests/fd_occupancy_test.c shellsplit_test)
-  target_include_directories(shellsplit_fd_occupancy_test PRIVATE shellsplit/src)
-  set_property(TEST shellsplit_fd_occupancy_test APPEND PROPERTY LABELS shellsplit)
-  shellclave_add_test(shellsplit_avl_index_test
-    shellsplit/tests/avl_index_test.c shellsplit_test)
-  target_include_directories(shellsplit_avl_index_test PRIVATE shellsplit/src)
-  set_property(TEST shellsplit_avl_index_test APPEND PROPERTY LABELS shellsplit)
-  foreach(shellsplit_test_target IN ITEMS shellsplit_tokenizer_test
-      shellsplit_fast_parser_test shellsplit_abstract_test shellsplit_entropy_test
-      shellsplit_depgraph_test shellsplit_interop_test shellsplit_netstring_test
-      shellsplit_fast_parser_production_test shellsplit_depgraph_production_test
+  shellclave_add_test(shellsplit_leaf_modules_test
+    shellsplit/tests/leaf_modules_test.c shellsplit_test)
+  target_include_directories(shellsplit_leaf_modules_test PRIVATE shellsplit/src
+    shellsplit/tests)
+  target_link_libraries(shellsplit_leaf_modules_test PRIVATE
+    shellsplit_graph_fixture shellsplit_test)
+  set_property(TEST shellsplit_leaf_modules_test APPEND PROPERTY LABELS shellsplit)
+  foreach(shellsplit_test_target IN ITEMS
+      shellsplit_depgraph_test shellsplit_interop_test shellsplit_leaf_modules_test
+      shellsplit_depgraph_production_test
       shellsplit_read_input_test shellsplit_read_input_production_test)
     target_include_directories(${shellsplit_test_target} PRIVATE shellsplit/tests)
   endforeach()
   shellclave_add_test(shelltype_token_types_test shelltype/tests/test_token_types.c shelltype_test)
   shellclave_add_test(shelltype_unit_test shelltype/tests/test_shelltype.c shelltype_test)
-  shellclave_add_test(shelltype_arena_test shelltype/tests/test_arena.c shelltype_test)
-  target_include_directories(shelltype_arena_test PRIVATE shelltype/src shelltype/tests)
+  target_link_libraries(shelltype_unit_test PRIVATE shellsplit_test)
   shellclave_add_test(shelltype_policy_test shelltype/tests/test_policy.c shelltype_test)
+  set_tests_properties(shelltype_policy_test PROPERTIES TIMEOUT 300)
   # Always compile and exercise the real benchmark caller, even when optional
   # throughput executables are disabled. The test uses bounded iterations.
-  shellclave_add_test(shelltype_policy_benchmark_test
+  shellclave_add_standalone_test(shelltype_policy_benchmark_test
     shelltype/tests/test_policy_benchmark.c shelltype_test)
   target_include_directories(shelltype_policy_benchmark_test PRIVATE shelltype/tests)
   set_tests_properties(shelltype_policy_benchmark_test PROPERTIES LABELS "shelltype;benchmark")
   shellclave_add_concurrency_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype_test)
-  shellclave_add_test(shelltype_verify_test shelltype/tests/test_verify.c shelltype_test)
-  shellclave_add_test(shelltype_integration_test shelltype/tests/test_shelltype_integration.c shelltype_test)
   foreach(variant IN ITEMS test production)
     if(variant STREQUAL "test")
       set(contract_library shelltype_test)
@@ -592,22 +659,8 @@ if(BUILD_TESTING)
       set_property(TEST shelltype_public_contract_${variant} APPEND PROPERTY LABELS test)
     endif()
   endforeach()
-  add_executable(processed_subcommand_integration_test
-    tests/test_processed_subcommand.c)
-  shellclave_project_target(processed_subcommand_integration_test)
-  target_link_libraries(processed_subcommand_integration_test PRIVATE
-    shellsplit_test shelltype_test)
-  add_test(NAME processed_subcommand_integration_test
-    COMMAND processed_subcommand_integration_test)
-  shellclave_add_test(shelltype_compact_policy_test shelltype/tests/test_policy_compact.c shelltype_test)
-  target_include_directories(shelltype_compact_policy_test PRIVATE shelltype/src)
-  shellclave_add_test(shelltype_policy_user_data_test shelltype/tests/test_policy_user_data.c shelltype_test)
-  shellclave_add_test(shelltype_policy_model_test shelltype/tests/test_policy_model.c shelltype_test)
-  shellclave_add_test(shelltype_policy_capacity_test shelltype/tests/test_policy_capacity.c shelltype_test)
-  set_tests_properties(shelltype_policy_capacity_test PROPERTIES TIMEOUT 300)
   foreach(shelltype_test_target IN ITEMS shelltype_token_types_test shelltype_unit_test
-      shelltype_policy_test shelltype_policy_concurrency_test shelltype_verify_test
-      shelltype_integration_test shelltype_compact_policy_test)
+      shelltype_policy_test shelltype_policy_concurrency_test)
     target_include_directories(${shelltype_test_target} PRIVATE
       shelltype/src shelltype/tests)
   endforeach()
@@ -658,23 +711,12 @@ if(BUILD_TESTING)
   # The same sanitized fixture is useful below Shellgate as well: it keeps
   # the public Shellsplit parsing, canonicalization, and graph surfaces in
   # agreement over realistic command shapes without ever executing them.
-  shellclave_add_test(shellsplit_corpus_test shellsplit/tests/corpus_test.c shellsplit_test)
-  shellclave_add_production_test(shellsplit_corpus_production_test
-    shellsplit/tests/corpus_test.c shellsplit)
-  target_include_directories(shellsplit_corpus_test PRIVATE
-    shellsplit/tests "${CMAKE_CURRENT_BINARY_DIR}/tests")
-  target_include_directories(shellsplit_corpus_production_test PRIVATE
-    shellsplit/tests "${CMAKE_CURRENT_BINARY_DIR}/tests")
-  set_property(TEST shellsplit_corpus_test APPEND PROPERTY LABELS shellsplit)
   shellclave_add_test(shellgate_corpus_test shellgate/tests/test_corpus.c shellgate_test)
   # Shared-policy concurrency uses shipping libraries, not global fault-injection
   # counters. Each thread owns a separate gate and evaluation workspace.
   shellclave_add_concurrency_test(shellgate_policy_sharing_test
     shellgate/tests/test_policy_sharing.c shellgate)
   shellclave_register_production_test(shellgate_policy_sharing_test)
-  shellclave_add_test(shellsplit_expand_test
-    shellsplit/tests/expand_test.c shellsplit_test)
-  target_link_libraries(shellsplit_expand_test PRIVATE shellsplit_graph_fixture shellsplit_test)
   set_property(TEST shellgate_policy_sharing_test APPEND PROPERTY LABELS shellgate)
   target_include_directories(shellgate_corpus_test PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")

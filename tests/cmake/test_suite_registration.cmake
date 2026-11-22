@@ -90,6 +90,8 @@ foreach(required IN LISTS reference_bash_tests)
   endif()
 endforeach()
 
+# A runner is built for the suites it holds and is not a test of its own.
+list(FILTER SHELLCLAVE_PRODUCTION_TARGETS EXCLUDE REGEX "_runner$")
 list(SORT production_tests)
 list(SORT SHELLCLAVE_PRODUCTION_TARGETS)
 if(NOT "${production_tests}" STREQUAL "${SHELLCLAVE_PRODUCTION_TARGETS}")
@@ -100,7 +102,7 @@ if(NOT "${production_tests}" STREQUAL "${SHELLCLAVE_PRODUCTION_TARGETS}")
 endif()
 
 # Explicit regressions for the executables omitted by the old CI build list.
-foreach(required IN ITEMS shellsplit_boundary_production_test
+foreach(required IN ITEMS shellsplit_grammar_production_test
     shellsplit_read_input_production_test shellgate_policy_sharing_test)
   if(NOT required IN_LIST production_tests)
     message(FATAL_ERROR "Missing production suite member: ${required}")

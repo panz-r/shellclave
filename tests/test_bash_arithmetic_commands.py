@@ -9,7 +9,7 @@ import unittest
 class ArithmeticCommands(unittest.TestCase):
     def truth(self, expression):
         source = "((" + expression + "))"
-        result = subprocess.run([self.probe, "--truth", source],
+        result = subprocess.run([*self.probe, "--truth", source],
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
@@ -116,7 +116,7 @@ class ArithmeticCommands(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bash", required=True)
-    parser.add_argument("--probe", required=True)
+    parser.add_argument("--probe", nargs="+", required=True)
     args = parser.parse_args()
     ArithmeticCommands.bash = args.bash
     ArithmeticCommands.probe = args.probe

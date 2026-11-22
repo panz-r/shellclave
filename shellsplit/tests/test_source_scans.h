@@ -99,6 +99,29 @@ typedef enum {
 } shellsplit_test_metadata_kind_t;
 void shellsplit_test_metadata_charge(shellsplit_test_metadata_kind_t kind);
 
+/* Decision events of one analysis: which way the engine decided at a choice
+ * point (a merge, an allocation, a read, an if section...). Each (kind,
+ * outcome) is recorded once; the set is the semantic trace of a source. */
+typedef enum {
+  SHELLSPLIT_TRACE_MERGE,       /* outcome: how a root pair was merged */
+  SHELLSPLIT_TRACE_APART,       /* outcome: access kind that keeps apart */
+  SHELLSPLIT_TRACE_WIDEN,       /* outcome: widening step */
+  SHELLSPLIT_TRACE_ALLOC_VIEWS, /* outcome: views of an allocation */
+  SHELLSPLIT_TRACE_ALLOC_MODES, /* outcome: low-interval cases of slots */
+  SHELLSPLIT_TRACE_OPERATION,   /* outcome: may-fail/may-succeed set */
+  SHELLSPLIT_TRACE_READ,        /* outcome: flags of a read's result */
+  SHELLSPLIT_TRACE_IF,          /* outcome: if section entry or finish */
+  SHELLSPLIT_TRACE_FORCE,       /* outcome: access kind a forced join met */
+  SHELLSPLIT_TRACE_UNMODELED,   /* outcome: site that refused the source */
+  SHELLSPLIT_TRACE_STATUS,      /* outcome: final status class */
+  SHELLSPLIT_TRACE_KINDS = 32
+} shellsplit_test_trace_kind_t;
+void shellsplit_test_trace(shellsplit_test_trace_kind_t kind, unsigned outcome);
+void shellsplit_test_trace_reset(void);
+/* The recorded events, as kind * 32 + outcome in increasing order; returns
+ * how many there are, writing at most capacity. */
+size_t shellsplit_test_trace_events(uint16_t *events, size_t capacity);
+
 /* Run analyses with a union memo of at most this many entries; 0 restores
  * the full table, and entries is otherwise at least 2. A setting, not work:
  * reset does not clear it. */

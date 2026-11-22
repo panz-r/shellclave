@@ -1,3 +1,7 @@
+/* Grammar: how sources are tokenized and parsed, the fast parser's ranges and
+ * groups, the inherited boundaries between commands, and the corpus of sources
+ * the parsers must agree on. */
+#include "../src/shell_pipeline_internal.h"
 #include "../src/shell_processor_internal.h"
 #include "../src/shell_semantics_internal.h"
 #include "../src/shell_source_internal.h"
@@ -14,20 +18,38 @@
 #include "syntax_boundary_cases.h"
 #include "test_allocator.h"
 #include "test_source_scans.h"
+#include "word_expansion_cases.h"
+#include <ctype.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+#include "test_source_scans.h"
+#endif
+#include "../src/shell_builtin_internal.h"
+#include "../src/shell_depgraph_internal.h"
+#include "depgraph_compare.h"
+#include "depgraph_invariants.h"
+#include "graph_fixture.h"
+#include "shell_netstring.h"
+#include "shellclave_command_corpus_fixtures.h"
 
-static int test_count = 0;
-static int pass_count = 0;
+/* The tokenizer's allocation-failure checks use the test library's fault
+ * injection, which the production variant does not link. */
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+/* --- tokenizer (from tokenizer_test.c) --- */
+static int tokenizer_test_count = 0;
+static int tokenizer_pass_count = 0;
 
 /* Anomaly command sequences walk executable substitutions in source order,
  * including the special expansion grammar of an unquoted here-document body.
  * Keep that contract explicit: quote bytes in the body are data, but command
  * substitutions and parameter-expansion fallbacks execute before `cat`. */
-static bool command_netseq_matches(const char *input, const char *expected,
-                                   size_t expected_count) {
+static bool tokenizer_command_netseq_matches(const char *input,
+                                             const char *expected,
+                                             size_t expected_count) {
   shell_netstring_buffer_t sequence = {0};
   size_t count = 0;
   shell_process_status_t status = shell_build_command_netseq_buffer(
@@ -43,7 +65,8 @@ static bool command_netseq_matches(const char *input, const char *expected,
 /* The grouped-redirection collector appends several independently owned
  * records. Exercise every allocation boundary through the public processor so
  * an error cannot expose a partial command or group-I/O list. */
-static bool process_commands_allocation_failure_atomic(const char *input) {
+static bool
+tokenizer_process_commands_allocation_failure_atomic(const char *input) {
   if (!input)
     return false;
   shell_processed_commands_t processed = {0};
@@ -76,7 +99,8 @@ static bool process_commands_allocation_failure_atomic(const char *input) {
 /* The legacy flat processor still owns several per-command buffers.  Its
  * callers must receive no partial command list if one of those allocations
  * fails, just like users of the structured result. */
-static bool process_command_allocation_failure_atomic(const char *input) {
+static bool
+tokenizer_process_command_allocation_failure_atomic(const char *input) {
   if (!input)
     return false;
   shell_command_info_t *infos = NULL;
@@ -109,38 +133,23 @@ typedef struct {
   unsigned char *bytes;
   size_t capacity;
   size_t stop_after;
-} decoded_word_capture_t;
+} tokenizer_decoded_word_capture_t;
 
 typedef struct {
   unsigned char bytes[64];
   size_t length;
   size_t stop_after;
-} source_byte_capture_t;
+} tokenizer_source_byte_capture_t;
 
 typedef struct {
   size_t count;
   size_t starts[2];
   size_t lengths[2];
   bool quoted[2];
-} heredoc_body_capture_t;
+} tokenizer_heredoc_body_capture_t;
 
-static bool capture_heredoc_body(const char *input, size_t body_start,
-                                 size_t body_length, bool delimiter_quoted,
-                                 void *context) {
-  (void)input;
-  heredoc_body_capture_t *capture = context;
-  if (!capture ||
-      capture->count == sizeof(capture->starts) / sizeof(capture->starts[0]))
-    return false;
-  size_t index = capture->count++;
-  capture->starts[index] = body_start;
-  capture->lengths[index] = body_length;
-  capture->quoted[index] = delimiter_quoted;
-  return true;
-}
-
-static bool capture_source_byte(unsigned char byte, void *context) {
-  source_byte_capture_t *capture = context;
+static bool tokenizer_capture_source_byte(unsigned char byte, void *context) {
+  tokenizer_source_byte_capture_t *capture = context;
   if (capture->length == sizeof(capture->bytes) ||
       (capture->stop_after != 0 && capture->length == capture->stop_after))
     return false;
@@ -148,15 +157,15 @@ static bool capture_source_byte(unsigned char byte, void *context) {
   return true;
 }
 
-static bool reject_source_byte(unsigned char byte, void *context) {
+static bool tokenizer_reject_source_byte(unsigned char byte, void *context) {
   (void)byte;
   (void)context;
   return false;
 }
 
-static bool capture_decoded_word_byte(unsigned char byte, size_t offset,
-                                      void *context) {
-  decoded_word_capture_t *capture = context;
+static bool tokenizer_capture_decoded_word_byte(unsigned char byte,
+                                                size_t offset, void *context) {
+  tokenizer_decoded_word_capture_t *capture = context;
   if (offset >= capture->capacity)
     return false;
   capture->bytes[offset] = byte;
@@ -164,9 +173,9 @@ static bool capture_decoded_word_byte(unsigned char byte, size_t offset,
 }
 
 void test(const char *name, int result) {
-  test_count++;
+  tokenizer_test_count++;
   if (result) {
-    pass_count++;
+    tokenizer_pass_count++;
     printf("  [PASS] %s\n", name);
   } else {
     printf("  [FAIL] %s\n", name);
@@ -174,8 +183,9 @@ void test(const char *name, int result) {
   }
 }
 
-static bool tokens_are_consistent(const char *input, shell_command_t *cmds,
-                                  size_t count) {
+static bool tokenizer_tokens_are_consistent(const char *input,
+                                            shell_command_t *cmds,
+                                            size_t count) {
   size_t input_len = strlen(input);
   for (size_t i = 0; i < count; i++) {
     if (cmds[i].start_pos > cmds[i].end_pos || cmds[i].end_pos > input_len)
@@ -194,7 +204,7 @@ static bool tokens_are_consistent(const char *input, shell_command_t *cmds,
   return true;
 }
 
-static bool processed_group_descriptors_match_source(
+static bool tokenizer_processed_group_descriptors_match_source(
     const shell_parse_result_t *fast,
     const shell_processed_commands_t *result) {
   if (fast->group_count != result->group_count)
@@ -214,7 +224,7 @@ static bool processed_group_descriptors_match_source(
   return true;
 }
 
-static void test_token_type_names(void) {
+static void tokenizer_test_token_type_names(void) {
   static const char *names[] = {
       "COMMAND",
       "ARGUMENT",
@@ -268,7 +278,7 @@ static void test_token_type_names(void) {
   test("Token type names cover every enum value", valid);
 }
 
-static void test_list_syntax_contract(void) {
+static void tokenizer_test_list_syntax_contract(void) {
   static const char *const valid[] = {
       "",
       "echo \\| \\& \\!",
@@ -503,7 +513,7 @@ static void test_list_syntax_contract(void) {
   test("A redirect touching another operator has no target", targets_required);
 }
 
-static void test_source_scanner_boundaries(void) {
+static void tokenizer_test_source_scanner_boundaries(void) {
   static const struct {
     const char *prefix;
     bool descriptor;
@@ -830,19 +840,21 @@ static void test_source_scanner_boundaries(void) {
       shell_source_skip_redirect("> >(cmd", 0, strlen("> >(cmd")) == 0 &&
       shell_source_skip_redirect(">& >(cmd", 0, strlen(">& >(cmd")) == 0;
 
-  source_byte_capture_t capture = {0};
+  tokenizer_source_byte_capture_t capture = {0};
   static const char ansi[] = "$'\\a\\b\\e\\E\\f\\n\\r\\t\\v\\\\\\'\\\"\\?"
                              "\\cA\\x41\\u00e9\\U0001f600\\101\\q'";
   size_t position = 0;
   valid = valid &&
           shell_source_decode_ansi_c_quote(ansi, sizeof(ansi) - 1, &position,
-                                           capture_source_byte, &capture) &&
+                                           tokenizer_capture_source_byte,
+                                           &capture) &&
           position == sizeof(ansi) - 1 && capture.length > 16;
-  source_byte_capture_t rejected = {.stop_after = 1};
+  tokenizer_source_byte_capture_t rejected = {.stop_after = 1};
   position = 0;
   valid = valid &&
           !shell_source_decode_ansi_c_quote("$'ab'", strlen("$'ab'"), &position,
-                                            capture_source_byte, &rejected) &&
+                                            tokenizer_capture_source_byte,
+                                            &rejected) &&
           rejected.length == 1;
   static const char *const control_backslashes[] = {"$'\\c\\\\X'",
                                                     "$'\\c\\'X'"};
@@ -852,51 +864,52 @@ static void test_source_scanner_boundaries(void) {
     valid = valid &&
             !shell_source_decode_ansi_c_quote(
                 control_backslashes[i], strlen(control_backslashes[i]),
-                &position, reject_source_byte, NULL) &&
+                &position, tokenizer_reject_source_byte, NULL) &&
             position == 6;
   }
-  source_byte_capture_t protected_quote = {.stop_after = 1};
+  tokenizer_source_byte_capture_t protected_quote = {.stop_after = 1};
   position = 0;
   valid = valid &&
-          !shell_source_decode_ansi_c_quote("$'\\c\\'X'", strlen("$'\\c\\'X'"),
-                                            &position, capture_source_byte,
-                                            &protected_quote) &&
+          !shell_source_decode_ansi_c_quote(
+              "$'\\c\\'X'", strlen("$'\\c\\'X'"), &position,
+              tokenizer_capture_source_byte, &protected_quote) &&
           position == 6 && protected_quote.length == 1 &&
           protected_quote.bytes[0] == 0x1c;
   /* Incomplete ANSI-C escapes remain literal bytes. This matters to the
    * canonical netargv builder because dropping the backslash changes argv. */
-  source_byte_capture_t incomplete_control = {0};
-  source_byte_capture_t incomplete_hex = {0};
-  source_byte_capture_t incomplete_unicode = {0};
+  tokenizer_source_byte_capture_t incomplete_control = {0};
+  tokenizer_source_byte_capture_t incomplete_hex = {0};
+  tokenizer_source_byte_capture_t incomplete_unicode = {0};
   position = 0;
   valid = valid &&
-          shell_source_decode_ansi_c_quote("$'\\c'", strlen("$'\\c'"),
-                                           &position, capture_source_byte,
-                                           &incomplete_control) &&
+          shell_source_decode_ansi_c_quote(
+              "$'\\c'", strlen("$'\\c'"), &position,
+              tokenizer_capture_source_byte, &incomplete_control) &&
           incomplete_control.length == 2 &&
           memcmp(incomplete_control.bytes, "\\c", 2) == 0;
   position = 0;
   valid =
       valid &&
       shell_source_decode_ansi_c_quote("$'\\x'", strlen("$'\\x'"), &position,
-                                       capture_source_byte, &incomplete_hex) &&
+                                       tokenizer_capture_source_byte,
+                                       &incomplete_hex) &&
       incomplete_hex.length == 2 && memcmp(incomplete_hex.bytes, "\\x", 2) == 0;
   position = 0;
   valid = valid &&
-          shell_source_decode_ansi_c_quote("$'\\u'", strlen("$'\\u'"),
-                                           &position, capture_source_byte,
-                                           &incomplete_unicode) &&
+          shell_source_decode_ansi_c_quote(
+              "$'\\u'", strlen("$'\\u'"), &position,
+              tokenizer_capture_source_byte, &incomplete_unicode) &&
           incomplete_unicode.length == 2 &&
           memcmp(incomplete_unicode.bytes, "\\u", 2) == 0;
-  valid =
-      valid &&
-      shell_source_ansi_emit_codepoint(capture_source_byte, &capture, 0x800) &&
-      shell_source_ansi_emit_codepoint(capture_source_byte, &capture,
-                                       0x200000) &&
-      shell_source_ansi_emit_codepoint(capture_source_byte, &capture,
-                                       0x4000000) &&
-      shell_source_ansi_emit_codepoint(capture_source_byte, &capture,
-                                       UINT32_MAX);
+  valid = valid &&
+          shell_source_ansi_emit_codepoint(tokenizer_capture_source_byte,
+                                           &capture, 0x800) &&
+          shell_source_ansi_emit_codepoint(tokenizer_capture_source_byte,
+                                           &capture, 0x200000) &&
+          shell_source_ansi_emit_codepoint(tokenizer_capture_source_byte,
+                                           &capture, 0x4000000) &&
+          shell_source_ansi_emit_codepoint(tokenizer_capture_source_byte,
+                                           &capture, UINT32_MAX);
 
   static const char heredocs[] = "<<A <<-'B'\nbody\nA\n\tB\n";
   bool complete = false;
@@ -1098,12 +1111,13 @@ static void test_source_scanner_boundaries(void) {
       after == 6 &&
       !shell_source_skip_complete_ansi_c_quote("$'unterminated", 14, 0, &after);
   position = 0;
-  valid = valid && !shell_source_decode_ansi_c_quote(
-                       NULL, 0, &position, capture_source_byte, &capture);
+  valid =
+      valid && !shell_source_decode_ansi_c_quote(
+                   NULL, 0, &position, tokenizer_capture_source_byte, &capture);
   position = 0;
   valid = valid && !shell_source_decode_ansi_c_quote(
                        "$'trailing\\", strlen("$'trailing\\"), &position,
-                       capture_source_byte, &capture);
+                       tokenizer_capture_source_byte, &capture);
   static const char ansi_literal_variable[] = "$'don\\'t $literal'";
   static const char ansi_then_variable[] = "$'don\\'t $literal'${NAME}";
   shell_token_t ansi_literal_token = {
@@ -1154,11 +1168,11 @@ static void test_source_scanner_boundaries(void) {
   position = 0;
   valid = valid && shell_source_decode_ansi_c_quote(
                        malformed_ansi, sizeof(malformed_ansi) - 1, &position,
-                       capture_source_byte, &capture);
+                       tokenizer_capture_source_byte, &capture);
   position = 0;
   valid = valid && !shell_source_decode_ansi_c_quote(
                        "$'unterminated", strlen("$'unterminated"), &position,
-                       capture_source_byte, &capture);
+                       tokenizer_capture_source_byte, &capture);
 
   complete = true;
   after = 0;
@@ -1202,7 +1216,7 @@ static void test_source_scanner_boundaries(void) {
 /* Redirect operands and ordinary words use the same borrowed-span iterator.
  * It must keep quoted delimiters opaque and refuse incomplete substitutions
  * rather than exposing a misleading executable span. */
-static void test_executable_substitution_scanner_contract(void) {
+static void tokenizer_test_executable_substitution_scanner_contract(void) {
   static const struct {
     const char *word;
     const char *span;
@@ -1299,40 +1313,11 @@ static void test_executable_substitution_scanner_contract(void) {
        valid);
 }
 
-/* `&&` inside a substitution is one logical operator, also when an escaped
- * line ending separates its bytes; only a lone `&` is background execution. */
-static void test_substitution_and_list_is_not_background(void) {
-  static const struct {
-    const char *source;
-    bool background;
-  } cases[] = {
-      {"echo \"$(printf x && printf y)\"", false},
-      {"echo \"$(printf x &\\\n& printf y)\"", false},
-      {"echo $(printf x && printf y)", false},
-      {"echo \"`printf x && printf y`\"", false},
-      {"echo \"$(echo x 2>&1 && true)\"", false},
-      {"echo \"$(printf x & printf y)\"", true},
-      {"echo \"$(sleep 1 &)\"", true},
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_parse_result_t parsed = {0};
-    uint32_t features = 0;
-    valid = valid && shell_parse_fast(cases[i].source, strlen(cases[i].source),
-                                      NULL, &parsed) == SHELL_OK;
-    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
-      features |= parsed.cmds[cmd].features;
-    valid = valid && (features & SHELL_FEAT_SUBSHELL) != 0 &&
-            ((features & SHELL_FEAT_BACKGROUND) != 0) == cases[i].background;
-  }
-  test("&& in a substitution is not background execution", valid);
-}
-
 /* A closing brace is a complete word when the next logical byte ends it. An
  * escaped line ending is removed before parsing, so it may separate `}` from
  * what follows: the group must close in the same place, with the same command
  * spans, as without it. */
-static void test_brace_close_across_line_continuation(void) {
+static void tokenizer_test_brace_close_across_line_continuation(void) {
   static const struct {
     const char *source;
     uint32_t group_end;
@@ -1408,8 +1393,9 @@ static void test_brace_close_across_line_continuation(void) {
  * ending is removed before words are recognized, so it joins `!` to a
  * preceding expansion instead of starting a new word: Bash reads
  * `echo $x\\<newline>! tail` as the arguments `abc!` and `tail`. */
-static size_t test_negator_positions(const char *source, size_t *positions,
-                                     size_t capacity) {
+static size_t tokenizer_test_negator_positions(const char *source,
+                                               size_t *positions,
+                                               size_t capacity) {
   shell_tokenizer_state_t state;
   shell_token_t token;
   size_t count = 0;
@@ -1421,7 +1407,7 @@ static size_t test_negator_positions(const char *source, size_t *positions,
   return count;
 }
 
-static void test_negator_requires_a_word_start(void) {
+static void tokenizer_test_negator_requires_a_word_start(void) {
   static const char *const joined[] = {
       "printf '<%s>\\n' $value\\\n! tail",
       "printf '<%s>\\n' $(printf abc)\\\n! tail",
@@ -1439,7 +1425,7 @@ static void test_negator_requires_a_word_start(void) {
   bool valid = true;
   for (size_t i = 0; valid && i < sizeof(joined) / sizeof(joined[0]); i++) {
     size_t positions[4];
-    valid = test_negator_positions(joined[i], positions, 4) == 0;
+    valid = tokenizer_test_negator_positions(joined[i], positions, 4) == 0;
     if (!valid)
       fprintf(stderr, "unexpected negator: %s\n", joined[i]);
   }
@@ -1467,7 +1453,8 @@ static void test_negator_requires_a_word_start(void) {
   valid = true;
   for (size_t i = 0; valid && i < sizeof(negated) / sizeof(negated[0]); i++) {
     size_t positions[4];
-    size_t count = test_negator_positions(negated[i].source, positions, 4);
+    size_t count =
+        tokenizer_test_negator_positions(negated[i].source, positions, 4);
     valid = count == negated[i].count && positions[0] == negated[i].first;
     if (!valid)
       fprintf(stderr, "negator lost or moved: %s\n", negated[i].source);
@@ -1475,62 +1462,11 @@ static void test_negator_requires_a_word_start(void) {
   test("Pipeline negators at a word start are still recognized", valid);
 }
 
-/* A brace group inside an executable substitution is a group, as a
- * parenthesized one is. `{` opens a group only at a command position: in
- * `echo {a,b}` or `echo {` it is word text. */
-static void test_nested_brace_group_is_a_feature(void) {
-  static const struct {
-    const char *source;
-    uint32_t required; /* feature bits that must be set */
-    bool group;
-  } cases[] = {
-      {"echo $( { :; } )", SHELL_FEAT_SUBSHELL, true},
-      {"echo $( ( : ) )", SHELL_FEAT_SUBSHELL, true},
-      {"echo <( { :; } )", SHELL_FEAT_PROCESS_SUB, true},
-      {"echo >( { :; } )", SHELL_FEAT_PROCESS_SUB, true},
-      {"echo <( ( : ) )", SHELL_FEAT_PROCESS_SUB, true},
-      {"echo `{ :; }`", SHELL_FEAT_SUBSHELL, true},
-      {"echo \"$( { :; } )\"", SHELL_FEAT_SUBSHELL, true},
-      {"echo $( echo a; { :; } )", SHELL_FEAT_SUBSHELL, true},
-      {"echo $( echo a && { :; } )", SHELL_FEAT_SUBSHELL, true},
-      {"echo $( echo $( { :; } ) )", SHELL_FEAT_SUBSHELL, true},
-      {"x=$( { :; } )", SHELL_FEAT_SUBSHELL, true},
-      {"{ :; }", 0, true},
-      {"( : )", 0, true},
-      /* Braces that are words, quoted text, or expansions, not groups. */
-      {"echo {a,b}", 0, false},
-      {"echo {", 0, false},
-      {"echo $( echo {a,b} )", SHELL_FEAT_SUBSHELL, false},
-      {"echo $( echo { )", SHELL_FEAT_SUBSHELL, false},
-      {"echo $( echo a{ )", SHELL_FEAT_SUBSHELL, false},
-      {"echo $( : {x} )", SHELL_FEAT_SUBSHELL, false},
-      {"echo $( echo '{ :; }' )", SHELL_FEAT_SUBSHELL, false},
-      {"echo $( echo \"{ :; }\" )", SHELL_FEAT_SUBSHELL, false},
-      {"echo $( echo ${x} )", SHELL_FEAT_SUBSHELL, false},
-      {"echo <( echo {a,b} )", SHELL_FEAT_PROCESS_SUB, false},
-  };
-  bool valid = true;
-  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_parse_result_t parsed = {0};
-    uint32_t features = 0;
-    valid = shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
-                             &parsed) == SHELL_OK;
-    for (uint32_t cmd = 0; valid && cmd < parsed.count; cmd++)
-      features |= parsed.cmds[cmd].features;
-    valid = valid && (features & cases[i].required) == cases[i].required &&
-            ((features & SHELL_FEAT_GROUP) != 0) == cases[i].group;
-    if (!valid)
-      fprintf(stderr, "wrong group feature (0x%04x): %s\n", features,
-              cases[i].source);
-  }
-  test("A nested brace group sets the group feature", valid);
-}
-
 /* `>&` and `<&` duplicate or close a descriptor: their `&` belongs to the
  * operator, also when an escaped line ending separates the two bytes, and is
  * never background execution. Conversely an `&` after an escaped `>` is a real
  * background operator. */
-static void test_descriptor_duplication_is_not_background(void) {
+static void tokenizer_test_descriptor_duplication_is_not_background(void) {
   static const struct {
     const char *source;
     bool background;
@@ -1588,7 +1524,7 @@ static void test_descriptor_duplication_is_not_background(void) {
  * sit anywhere in a bracket expression, including between the delimiter and
  * the `]` that closes a POSIX class: `[[:alpha:\<newline>]]` is `[[:alpha:]]`.
  * An unterminated bracket stays a literal word. */
-static void test_glob_class_continuation_keeps_the_feature(void) {
+static void tokenizer_test_glob_class_continuation_keeps_the_feature(void) {
   static const struct {
     const char *source;
     bool globs;
@@ -1647,7 +1583,7 @@ static void test_glob_class_continuation_keeps_the_feature(void) {
 /* A quoted prefix and an adjacent extglob are one shell word. The extglob
  * opener must not restart the token and drop the prefix: the token spans have
  * to cover every byte of the word, and the redirect-operand forms are valid. */
-static void test_quoted_prefix_extglob_is_one_word(void) {
+static void tokenizer_test_quoted_prefix_extglob_is_one_word(void) {
   static const struct {
     const char *source;
     /* Source text of each token, space-separated; a token never contains
@@ -1712,7 +1648,7 @@ static void test_quoted_prefix_extglob_is_one_word(void) {
 /* Quoted and ANSI-C spans inside a bracket expression are literal members: a
  * quoted space or operator does not end the word, and a quoted `]` does not
  * close the expression. Bash expands `[a" "b]` but leaves `[a"]"` alone. */
-static void test_glob_bracket_quoted_members_keep_the_feature(void) {
+static void tokenizer_test_glob_bracket_quoted_members_keep_the_feature(void) {
   static const struct {
     const char *source;
     bool globs;
@@ -1792,7 +1728,7 @@ static void test_glob_bracket_quoted_members_keep_the_feature(void) {
 /* The wrapper state machine is shared by the semantic gate and the dependency
  * graph. Exercise its transition contract directly as well as through those
  * higher-level APIs, including quote removal and every terminating outcome. */
-static void test_current_shell_wrapper_chain_contract(void) {
+static void tokenizer_test_current_shell_wrapper_chain_contract(void) {
   shell_source_wrapper_state_t state = {0};
   bool valid =
       shell_source_wrapper_start(&state, "", 0) ==
@@ -1840,14 +1776,15 @@ static void test_current_shell_wrapper_chain_contract(void) {
       shell_source_word_static_equals("'builtin'", strlen("'builtin'"),
                                       "builtin");
 
-  source_byte_capture_t stopped = {.length = 1, .stop_after = 1};
+  tokenizer_source_byte_capture_t stopped = {.length = 1, .stop_after = 1};
   valid = valid &&
           !shell_source_visit_static_word("$'x'", strlen("$'x'"),
-                                          capture_source_byte, &stopped) &&
-          !shell_source_visit_static_word("\\x", strlen("\\x"),
-                                          capture_source_byte, &stopped) &&
-          !shell_source_visit_static_word("x", strlen("x"), capture_source_byte,
+                                          tokenizer_capture_source_byte,
                                           &stopped) &&
+          !shell_source_visit_static_word(
+              "\\x", strlen("\\x"), tokenizer_capture_source_byte, &stopped) &&
+          !shell_source_visit_static_word(
+              "x", strlen("x"), tokenizer_capture_source_byte, &stopped) &&
           shell_source_skip_redirect("<>out", 0, strlen("<>out")) ==
               strlen("<>out");
   test("Current-shell wrapper chains share static semantics", valid);
@@ -1857,7 +1794,7 @@ static void test_current_shell_wrapper_chain_contract(void) {
  * the following byte.  These cases deliberately put the removal point inside
  * every expansion opener so the low-level scanners, canonical processor, and
  * dependency graph cannot silently disagree on the resulting command. */
-static void test_expansion_line_continuation_contract(void) {
+static void tokenizer_test_expansion_line_continuation_contract(void) {
   static const char *const accepted[] = {
       "printf %s ${f\\\nd}",
       "printf %s $\\\n(printf child)",
@@ -2068,7 +2005,7 @@ static void test_expansion_line_continuation_contract(void) {
  * directly: a malformed spelling must never become a command word, a file
  * endpoint, or a descriptor alias merely because another scanner accepted a
  * surrounding command. */
-static void test_redirect_operand_safety_contract(void) {
+static void tokenizer_test_redirect_operand_safety_contract(void) {
   size_t name_start = SIZE_MAX;
   size_t name_end = SIZE_MAX;
   uint32_t fd = UINT32_MAX;
@@ -2106,102 +2043,7 @@ static void test_redirect_operand_safety_contract(void) {
        valid);
 }
 
-/* A terminal escaped physical ending belongs to a raw redirect token but not
- * to its logical spelling. The following path must remain redirect-owned and
- * cannot appear in canonical argv. */
-static void test_terminal_redirect_continuation_contract(void) {
-  static const struct {
-    const char *input;
-    const char *command;
-    size_t token_count;
-  } cases[] = {
-      {"printf payload >\\\n/tmp/write", "printf", 2},
-      {"cat <\\\n/tmp/read", "cat", 1},
-      {"printf payload >>\\\n/tmp/append", "printf", 2},
-      {"printf payload >|\\\n/tmp/clobber", "printf", 2},
-      {"printf payload &>\\\n/tmp/both", "printf", 2},
-      {"printf payload &>>\\\n/tmp/both-append", "printf", 2},
-      {"cat <>\\\n/tmp/read-write", "cat", 1},
-      {"exec {fd}>\\\n/tmp/trace", "exec", 1},
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_command_info_t *infos = NULL;
-    size_t count = 0;
-    valid = valid &&
-            shell_process_command(cases[i].input, strlen(cases[i].input), NULL,
-                                  &infos, &count) == SHELL_PROCESS_OK &&
-            count == 1 && infos[0].has_redirections &&
-            infos[0].command_token_count == cases[i].token_count &&
-            infos[0].command_tokens[0].length == strlen(cases[i].command) &&
-            memcmp(infos[0].command_tokens[0].start, cases[i].command,
-                   strlen(cases[i].command)) == 0;
-    shell_command_infos_free(infos, count);
-  }
-
-  static const char group_command[] = "{ echo one; } >\\\n/tmp/group";
-  shell_processed_commands_t processed = {0};
-  valid = valid &&
-          shell_process_commands(group_command, sizeof(group_command) - 1, NULL,
-                                 &processed) == SHELL_PROCESS_OK &&
-          processed.command_count == 1 && processed.group_count == 1 &&
-          processed.group_io_op_count == 1 &&
-          processed.group_io_ops[0].kind == SHELL_GROUP_IO_WRITE_FILE &&
-          processed.group_io_ops[0].fd == 1 &&
-          processed.group_io_ops[0].source_end -
-                  processed.group_io_ops[0].source_start ==
-              strlen(">\\\n/tmp/group");
-  shell_processed_commands_free(&processed);
-  test("Terminal redirect continuations retain operand ownership", valid);
-}
-
-static void test_named_fd_word_boundaries(void) {
-  static const struct {
-    const char *input;
-    const char *netseq;
-    size_t words;
-  } cases[] = {
-      {"cat $'x'{fd}>out", "14:3:cat,5:x{fd},,", 2},
-      {"cat ''{fd}>out", "13:3:cat,4:{fd},,", 2},
-      {"cat ${x}{fd}>out", "17:3:cat,8:${x}{fd},,", 2},
-      {"cat $(x){fd}>out", "17:3:cat,8:$(x){fd},,", 2},
-      {"cat {f\\\nd}>out", "6:3:cat,,", 1},
-      {"cat {f\\\nd}\\\n>out", "6:3:cat,,", 1},
-      {"cat {fd} >out", "13:3:cat,4:{fd},,", 2},
-      {"cat {fd}\t>out", "13:3:cat,4:{fd},,", 2},
-      {"cat {f d}>out", "16:3:cat,2:{f,2:d},,", 3},
-      {"cat $'x'{fd}<<<body", "14:3:cat,5:x{fd},,", 2},
-      {"cat {f\\\nd}<<<body", "6:3:cat,,", 1},
-      {"cmd {fd}>out >&$fd", "6:3:cmd,,", 1},
-      {"cmd {fd}>out >&\"${fd}\"", "6:3:cmd,,", 1},
-      {"cmd {f\\\nd}>out >&$f\\\nd", "6:3:cmd,,", 1},
-      {"printf x <&$fd", "13:6:printf,1:x,,", 2},
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_netstring_buffer_t sequence = {0};
-    size_t count = 0;
-    bool features = false;
-    shell_processed_commands_t processed = {0};
-    valid = valid &&
-            shell_build_netargv_sequence_buffer(
-                cases[i].input, strlen(cases[i].input), NULL, &sequence, &count,
-                &features) == SHELL_PROCESS_OK &&
-            sequence.data &&
-            (sequence.length != strlen(cases[i].netseq) ||
-             memcmp(sequence.data, cases[i].netseq, sequence.length)) == 0 &&
-            count == 1 && features &&
-            shell_process_commands(cases[i].input, strlen(cases[i].input), NULL,
-                                   &processed) == SHELL_PROCESS_OK &&
-            processed.command_count == 1 &&
-            processed.commands[0].command_token_count == cases[i].words;
-    shell_processed_commands_free(&processed);
-    shell_netstring_buffer_free(&sequence);
-  }
-  test("Named descriptors require whole words across canonical APIs", valid);
-}
-
-static void test_record_parser_boundaries(void) {
+static void tokenizer_test_record_parser_boundaries(void) {
   shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
   size_t count = SIZE_MAX;
   const shell_process_limits_t short_record = {
@@ -2297,7 +2139,7 @@ static void test_record_parser_boundaries(void) {
   test("Record parser validates limits and supported-source contracts", valid);
 }
 
-static void test_modern_bash_syntax_contract(void) {
+static void tokenizer_test_modern_bash_syntax_contract(void) {
   bool enum_values_stable =
       SHELL_GROUP_IO_READ_FILE == 0 && SHELL_GROUP_IO_WRITE_FILE == 1 &&
       SHELL_GROUP_IO_APPEND_FILE == 2 && SHELL_GROUP_IO_HEREDOC == 3 &&
@@ -2520,8 +2362,8 @@ static void test_modern_bash_syntax_contract(void) {
                 timed_commands[0].pipeline_negation_count == 1 &&
                 timed_commands[0].token_count != 0 &&
                 timed_commands[0].tokens[0].type == SHELL_TOKEN_PIPE_NEGATE &&
-                tokens_are_consistent(attached_negator_redirects[i],
-                                      timed_commands, timed_count);
+                tokenizer_tokens_are_consistent(attached_negator_redirects[i],
+                                                timed_commands, timed_count);
     valid = valid && item;
     shell_commands_free(timed_commands, timed_count);
   }
@@ -2694,8 +2536,8 @@ static void test_modern_bash_syntax_contract(void) {
                     prefixed_groups[i], strlen(prefixed_groups[i]),
                     &timed_commands, &timed_count) == SHELL_TOKENIZE_OK &&
                 timed_count == 1 &&
-                tokens_are_consistent(prefixed_groups[i], timed_commands,
-                                      timed_count) &&
+                tokenizer_tokens_are_consistent(prefixed_groups[i],
+                                                timed_commands, timed_count) &&
                 shell_transform_command_line(
                     prefixed_groups[i], strlen(prefixed_groups[i]), NULL,
                     &transformed, &transformed_count) == SHELL_TRANSFORM_OK &&
@@ -3565,7 +3407,7 @@ static void test_modern_bash_syntax_contract(void) {
   test("Deferred control-flow constructs reject semantically", valid);
 }
 
-static void test_processor_routing_cross_product(void) {
+static void tokenizer_test_processor_routing_cross_product(void) {
   static const char *const cases[] = {
       "VAR=value command --flag \"two words\" ''",
       "command $VAR ${VAR:-default} $1 $? $((1 + 2))",
@@ -3606,7 +3448,7 @@ static void test_processor_routing_cross_product(void) {
   test("Processor preserves routing syntax across canonical adapters", valid);
 }
 
-static void test_escaped_word_prefix_boundaries(void) {
+static void tokenizer_test_escaped_word_prefix_boundaries(void) {
   static const struct {
     const char *source;
     const char *word;
@@ -3698,156 +3540,7 @@ static void test_escaped_word_prefix_boundaries(void) {
        valid);
 }
 
-static void test_flat_processor_parse_selection(void) {
-  bool valid = true;
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-  static const struct {
-    const char *source;
-    size_t strict_parses;
-  } cases[] = {
-      {"printf ordinary", 0},    {"printf one | cat", 0},
-      {"(printf unfinished", 0}, {"{ printf grouped; }", 1},
-      {"(printf grouped)", 1},
-  };
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_command_info_t *infos = NULL;
-    size_t count = 0;
-    shellsplit_test_source_scan_reset();
-    bool item_valid =
-        shell_process_command(cases[i].source, strlen(cases[i].source), NULL,
-                              &infos, &count) == SHELL_PROCESS_OK &&
-        count != 0 &&
-        shellsplit_test_metadata_work(
-            SHELLSPLIT_TEST_WORK_PROCESS_STRICT_PARSE) ==
-            cases[i].strict_parses;
-    shell_command_infos_free(infos, count);
-    if (!item_valid)
-      fprintf(stderr, "flat processor parse selection failed: %s\n",
-              cases[i].source);
-    valid = valid && item_valid;
-  }
-#endif
-  test("Flat processor strictly reparses only complete groups", valid);
-}
-
-static void test_canonical_buffer_output_contract(void) {
-  const char *source = "printf value";
-  shell_command_info_t *infos = NULL;
-  size_t info_count = 0;
-  shell_netstring_buffer_t rendered = {0};
-  shell_netstring_buffer_t argv_sequence = {0};
-  shell_netstring_buffer_t command_sequence = {0};
-  shell_netstring_buffer_t type_sequence = {0};
-  shell_netstring_buffer_t anomaly_commands = {0};
-  shell_netstring_buffer_t anomaly_types = {0};
-  size_t count = 0;
-  bool features = false;
-
-  bool valid = shell_process_command(source, strlen(source), NULL, &infos,
-                                     &info_count) == SHELL_PROCESS_OK &&
-               info_count == 1 &&
-               shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
-                   SHELL_PROCESS_OK &&
-               rendered.data != NULL && rendered.length != 0;
-  shell_netstring_buffer_free(&rendered);
-  valid = valid &&
-          shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
-              SHELL_PROCESS_OK &&
-          rendered.data != NULL && rendered.length != 0;
-  valid = valid && !((&rendered)->data == NULL && (&rendered)->length == 0);
-  shell_netstring_buffer_free(&rendered);
-  valid = valid && ((&rendered)->data == NULL && (&rendered)->length == 0);
-  shell_command_infos_free(infos, info_count);
-
-  valid = valid &&
-          shell_build_netargv_sequence_buffer(source, strlen(source), NULL,
-                                              &argv_sequence, &count,
-                                              &features) == SHELL_PROCESS_OK &&
-          argv_sequence.data != NULL && argv_sequence.length != 0;
-  shell_netstring_buffer_free(&argv_sequence);
-  valid = valid &&
-          shell_build_netargv_sequence_buffer(source, strlen(source), NULL,
-                                              &argv_sequence, &count,
-                                              &features) == SHELL_PROCESS_OK &&
-          argv_sequence.data != NULL && argv_sequence.length != 0;
-  shell_netstring_buffer_free(&argv_sequence);
-  count = SIZE_MAX;
-  features = true;
-  valid = valid &&
-          shell_build_netargv_sequence_buffer(
-              "while true; do :; done", strlen("while true; do :; done"), NULL,
-              &argv_sequence, &count, &features) == SHELL_PROCESS_EPARSE &&
-          argv_sequence.data == NULL && argv_sequence.length == 0 &&
-          count == 0 && !features;
-
-  valid = valid &&
-          shell_build_command_netseq_buffer(source, strlen(source), NULL,
-                                            &command_sequence,
-                                            &count) == SHELL_PROCESS_OK &&
-          command_sequence.data != NULL && command_sequence.length != 0;
-  shell_netstring_buffer_free(&command_sequence);
-  valid = valid &&
-          shell_build_command_netseq_buffer(source, strlen(source), NULL,
-                                            &command_sequence,
-                                            &count) == SHELL_PROCESS_OK &&
-          command_sequence.data != NULL && command_sequence.length != 0;
-  shell_netstring_buffer_free(&command_sequence);
-  count = SIZE_MAX;
-  valid = valid &&
-          shell_build_command_netseq_buffer(
-              "while true; do :; done", strlen("while true; do :; done"), NULL,
-              &command_sequence, &count) == SHELL_PROCESS_EPARSE &&
-          command_sequence.data == NULL && command_sequence.length == 0 &&
-          count == 0;
-
-  valid = valid &&
-          shell_build_type_netseq_buffer(source, strlen(source), NULL,
-                                         &type_sequence,
-                                         &count) == SHELL_PROCESS_OK &&
-          type_sequence.data != NULL && type_sequence.length != 0;
-  shell_netstring_buffer_free(&type_sequence);
-  valid = valid &&
-          shell_build_type_netseq_buffer(source, strlen(source), NULL,
-                                         &type_sequence,
-                                         &count) == SHELL_PROCESS_OK &&
-          type_sequence.data != NULL && type_sequence.length != 0;
-  shell_netstring_buffer_free(&type_sequence);
-  count = SIZE_MAX;
-  valid = valid &&
-          shell_build_type_netseq_buffer(
-              "while true; do :; done", strlen("while true; do :; done"), NULL,
-              &type_sequence, &count) == SHELL_PROCESS_EPARSE &&
-          type_sequence.data == NULL && type_sequence.length == 0 && count == 0;
-
-  valid = valid &&
-          shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL,
-                                             &anomaly_commands, &anomaly_types,
-                                             &count) == SHELL_PROCESS_OK &&
-          anomaly_commands.data != NULL && anomaly_commands.length != 0 &&
-          anomaly_types.data != NULL && anomaly_types.length != 0;
-  shell_netstring_buffer_free(&anomaly_commands);
-  shell_netstring_buffer_free(&anomaly_types);
-  valid = valid &&
-          shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL,
-                                             &anomaly_commands, &anomaly_types,
-                                             &count) == SHELL_PROCESS_OK &&
-          anomaly_commands.data != NULL && anomaly_commands.length != 0 &&
-          anomaly_types.data != NULL && anomaly_types.length != 0;
-  shell_netstring_buffer_free(&anomaly_commands);
-  shell_netstring_buffer_free(&anomaly_types);
-  count = SIZE_MAX;
-  valid =
-      valid &&
-      shell_build_anomaly_netseqs_buffer(
-          "while true; do :; done", strlen("while true; do :; done"), NULL,
-          &anomaly_commands, &anomaly_types, &count) == SHELL_PROCESS_EPARSE &&
-      anomaly_commands.data == NULL && anomaly_commands.length == 0 &&
-      anomaly_types.data == NULL && anomaly_types.length == 0 && count == 0;
-
-  test("Canonical buffer outputs require release before reuse", valid);
-}
-
-static void test_array_semantic_boundaries(void) {
+static void tokenizer_test_array_semantic_boundaries(void) {
   static const char *const supported[] = {
       "echo ${x:-[abc]}",   "echo ${x#[abc]}",     "echo ${x%[abc]}",
       "echo ${x//[abc]/q}", "echo ${x:-foo[bar]}", "echo \\${items[0]}",
@@ -3910,7 +3603,7 @@ static void test_array_semantic_boundaries(void) {
        valid);
 }
 
-static void test_ansi_c_structural_scanner_contract(void) {
+static void tokenizer_test_ansi_c_structural_scanner_contract(void) {
   static const char *const cases[] = {
       "echo $(printf $'foo\\'bar)')",
       "cat <(printf $'foo\\'bar)')",
@@ -3977,7 +3670,7 @@ static void test_ansi_c_structural_scanner_contract(void) {
   test("Quoted array subscripts tokenize once and reject consistently", valid);
 }
 
-static void test_nested_quote_and_ansi_completion(void) {
+static void tokenizer_test_nested_quote_and_ansi_completion(void) {
   static const char *const nested[] = {
       "echo \"${value:-\"x;y\"}\"",
       "echo \"$(printf \"x;y\")\"",
@@ -4165,7 +3858,7 @@ static void test_nested_quote_and_ansi_completion(void) {
     size_t cursor = 0;
     const char *source = rejected_decode_paths[i];
     decoder_failure_atomic &= !shell_source_decode_ansi_c_quote(
-        source, strlen(source), &cursor, reject_source_byte, NULL);
+        source, strlen(source), &cursor, tokenizer_reject_source_byte, NULL);
   }
   test("ANSI-C decoding stops on caller rejection in every escape family",
        decoder_failure_atomic);
@@ -4205,7 +3898,7 @@ static void test_nested_quote_and_ansi_completion(void) {
        !shell_source_skip_shell_word(deeply_nested, position, 0, &after));
 }
 
-static void test_double_quoted_parameter_substitution_scope(void) {
+static void tokenizer_test_double_quoted_parameter_substitution_scope(void) {
   static const struct {
     const char *source;
     bool executes;
@@ -4261,7 +3954,7 @@ static void test_double_quoted_parameter_substitution_scope(void) {
                                            &types,
                                            &stage_count) == SHELL_PROCESS_OK &&
         stage_count == (cases[i].executes ? 2u : 1u) &&
-        command_netseq_matches(
+        tokenizer_command_netseq_matches(
             source, cases[i].executes ? "6:printf,4:echo," : "4:echo,",
             cases[i].executes ? 2 : 1);
     if (!case_valid)
@@ -4355,7 +4048,7 @@ static void test_double_quoted_parameter_substitution_scope(void) {
        encoded_rejected);
 }
 
-static void test_error_strings(void) {
+static void tokenizer_test_error_strings(void) {
   static const struct {
     shell_error_t error;
     const char *text;
@@ -4371,7 +4064,7 @@ static void test_error_strings(void) {
   test("Fast-parser error strings cover known and unknown values", valid);
 }
 
-static void test_composition_metadata(void) {
+static void tokenizer_test_composition_metadata(void) {
   shell_command_t *commands = NULL;
   size_t count = 0;
   bool ok = (shell_tokenize_commands("echo ok # | ignored\npwd",
@@ -4433,7 +4126,7 @@ static void test_composition_metadata(void) {
   test("Expansion-only commands retain their terminating separator", ok);
 }
 
-static bool is_cleared_end_token(const shell_token_t *token) {
+static bool tokenizer_is_cleared_end_token(const shell_token_t *token) {
   return token->type == SHELL_TOKEN_END && token->start == NULL &&
          token->length == 0 && token->position == 0 && !token->is_quoted &&
          !token->is_escaped;
@@ -4448,9 +4141,10 @@ typedef struct {
   int if_depth;
   int loop_depth;
   int case_depth;
-} iterator_case_t;
+} tokenizer_iterator_case_t;
 
-static void run_iterator_cases(const iterator_case_t *cases, size_t count) {
+static void tokenizer_run_iterator_cases(const tokenizer_iterator_case_t *cases,
+                                         size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_tokenizer_state_t state;
     shell_tokenizer_init(&state, cases[i].input, strlen(cases[i].input), NULL);
@@ -4476,12 +4170,12 @@ static void run_iterator_cases(const iterator_case_t *cases, size_t count) {
             state.if_depth == cases[i].if_depth &&
             state.loop_depth == cases[i].loop_depth &&
             state.case_depth == cases[i].case_depth &&
-            is_cleared_end_token(&end_token) && valid;
+            tokenizer_is_cleared_end_token(&end_token) && valid;
     test(cases[i].name, valid);
   }
 }
 
-static void test_iterator_argument_contracts(void) {
+static void tokenizer_test_iterator_argument_contracts(void) {
   shell_tokenizer_state_t state;
   memset(&state, 0xA5, sizeof(state));
   shell_tokenizer_init(&state, NULL, 0, NULL);
@@ -4494,7 +4188,7 @@ static void test_iterator_argument_contracts(void) {
       state.brace_depth == 0 && !state.in_arithmetic &&
       state.arith_depth == 0 && state.if_depth == 0 && state.loop_depth == 0 &&
       state.case_depth == 0 && !shell_tokenizer_next(&state, &token) &&
-      is_cleared_end_token(&token);
+      tokenizer_is_cleared_end_token(&token);
 
   shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
   size_t command_count = SIZE_MAX;
@@ -4523,9 +4217,11 @@ typedef struct {
   const char *name;
   const char *input;
   size_t command_count;
-} tokenizer_case_t;
+} tokenizer_tokenizer_case_t;
 
-static void run_tokenizer_cases(const tokenizer_case_t *cases, size_t count) {
+static void
+tokenizer_run_tokenizer_cases(const tokenizer_tokenizer_case_t *cases,
+                              size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
@@ -4533,21 +4229,21 @@ static void run_tokenizer_cases(const tokenizer_case_t *cases, size_t count) {
         (shell_tokenize_commands(cases[i].input, strlen(cases[i].input),
                                  &commands, &command_count) ==
          (cases[i].command_count ? SHELL_TOKENIZE_OK : SHELL_TOKENIZE_BLANK));
-    test(cases[i].name,
-         parsed && command_count == cases[i].command_count &&
-             tokens_are_consistent(cases[i].input, commands, command_count));
+    test(cases[i].name, parsed && command_count == cases[i].command_count &&
+                            tokenizer_tokens_are_consistent(
+                                cases[i].input, commands, command_count));
     shell_commands_free(commands, command_count);
   }
 }
 
-static void check_tokenizer_case(const char *name, const char *input,
-                                 size_t expected_count) {
+static void tokenizer_check_tokenizer_case(const char *name, const char *input,
+                                           size_t expected_count) {
   shell_command_t *commands = NULL;
   size_t command_count = 0;
   bool parsed = (shell_tokenize_commands(input, strlen(input), &commands,
                                          &command_count) == SHELL_TOKENIZE_OK);
   bool valid = parsed && command_count == expected_count &&
-               tokens_are_consistent(input, commands, command_count);
+               tokenizer_tokens_are_consistent(input, commands, command_count);
   if (!valid)
     printf("    commands: got %zu, expected %zu\n", command_count,
            expected_count);
@@ -4555,7 +4251,9 @@ static void check_tokenizer_case(const char *name, const char *input,
   shell_commands_free(commands, command_count);
 }
 
-static void run_rejected_cases(const tokenizer_case_t *cases, size_t count) {
+static void
+tokenizer_run_rejected_cases(const tokenizer_tokenizer_case_t *cases,
+                             size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *sentinel = (shell_command_t *)(uintptr_t)1;
     shell_command_t *commands = sentinel;
@@ -4571,24 +4269,26 @@ static void run_rejected_cases(const tokenizer_case_t *cases, size_t count) {
 }
 
 enum {
-  EXPECT_VARIABLE = 1u << 0,
-  EXPECT_GLOB = 1u << 1,
-  EXPECT_SUBSHELL = 1u << 2,
-  EXPECT_ARITHMETIC = 1u << 3,
-  EXPECT_LOOP = 1u << 4,
-  EXPECT_CONDITIONAL = 1u << 5,
-  EXPECT_CASE = 1u << 6,
-  EXPECT_IF = 1u << 7,
-  EXPECT_SHELL_FEATURE =
-      EXPECT_VARIABLE | EXPECT_GLOB | EXPECT_SUBSHELL | EXPECT_ARITHMETIC,
+  tokenizer_EXPECT_VARIABLE = 1u << 0,
+  tokenizer_EXPECT_GLOB = 1u << 1,
+  tokenizer_EXPECT_SUBSHELL = 1u << 2,
+  tokenizer_EXPECT_ARITHMETIC = 1u << 3,
+  tokenizer_EXPECT_LOOP = 1u << 4,
+  tokenizer_EXPECT_CONDITIONAL = 1u << 5,
+  tokenizer_EXPECT_CASE = 1u << 6,
+  tokenizer_EXPECT_IF = 1u << 7,
+  tokenizer_EXPECT_SHELL_FEATURE =
+      tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB |
+      tokenizer_EXPECT_SUBSHELL | tokenizer_EXPECT_ARITHMETIC,
 };
 
 typedef struct {
-  tokenizer_case_t tokenizer;
+  tokenizer_tokenizer_case_t tokenizer;
   unsigned features;
-} feature_case_t;
+} tokenizer_feature_case_t;
 
-static void run_feature_cases(const feature_case_t *cases, size_t count) {
+static void tokenizer_run_feature_cases(const tokenizer_feature_case_t *cases,
+                                        size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
@@ -4600,20 +4300,20 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
     unsigned features = 0;
     for (size_t j = 0; j < command_count; j++) {
       unsigned command_features =
-          (commands[j].has_variables ? EXPECT_VARIABLE : 0) |
-          (commands[j].has_globs ? EXPECT_GLOB : 0) |
-          (commands[j].has_subshells ? EXPECT_SUBSHELL : 0) |
-          (commands[j].has_arithmetic ? EXPECT_ARITHMETIC : 0) |
-          (commands[j].has_loops ? EXPECT_LOOP : 0) |
-          (commands[j].has_conditionals ? EXPECT_CONDITIONAL : 0) |
-          (commands[j].has_if ? EXPECT_IF : 0) |
-          (commands[j].has_case ? EXPECT_CASE : 0);
+          (commands[j].has_variables ? tokenizer_EXPECT_VARIABLE : 0) |
+          (commands[j].has_globs ? tokenizer_EXPECT_GLOB : 0) |
+          (commands[j].has_subshells ? tokenizer_EXPECT_SUBSHELL : 0) |
+          (commands[j].has_arithmetic ? tokenizer_EXPECT_ARITHMETIC : 0) |
+          (commands[j].has_loops ? tokenizer_EXPECT_LOOP : 0) |
+          (commands[j].has_conditionals ? tokenizer_EXPECT_CONDITIONAL : 0) |
+          (commands[j].has_if ? tokenizer_EXPECT_IF : 0) |
+          (commands[j].has_case ? tokenizer_EXPECT_CASE : 0);
       features |= command_features;
     }
     bool valid = parsed && command_count == cases[i].tokenizer.command_count &&
                  features == cases[i].features &&
-                 tokens_are_consistent(cases[i].tokenizer.input, commands,
-                                       command_count);
+                 tokenizer_tokens_are_consistent(cases[i].tokenizer.input,
+                                                 commands, command_count);
     if (!valid)
       printf("    features: count=%zu expected=%zu got=%#x expected=%#x\n",
              command_count, cases[i].tokenizer.command_count, features,
@@ -4624,14 +4324,15 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
 }
 
 typedef struct {
-  tokenizer_case_t tokenizer;
+  tokenizer_tokenizer_case_t tokenizer;
   uint64_t variable_stages;
   uint64_t glob_stages;
   uint64_t subshell_stages;
   uint64_t arithmetic_stages;
-} stage_case_t;
+} tokenizer_stage_case_t;
 
-static void run_stage_cases(const stage_case_t *cases, size_t count) {
+static void tokenizer_run_stage_cases(const tokenizer_stage_case_t *cases,
+                                      size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
@@ -4655,8 +4356,8 @@ static void run_stage_cases(const stage_case_t *cases, size_t count) {
                  globs == cases[i].glob_stages &&
                  subshells == cases[i].subshell_stages &&
                  arithmetic == cases[i].arithmetic_stages &&
-                 tokens_are_consistent(cases[i].tokenizer.input, commands,
-                                       command_count);
+                 tokenizer_tokens_are_consistent(cases[i].tokenizer.input,
+                                                 commands, command_count);
     if (!valid)
       printf("    stages: count=%zu vars=%#llx globs=%#llx subs=%#llx "
              "arith=%#llx\n",
@@ -4669,10 +4370,10 @@ static void run_stage_cases(const stage_case_t *cases, size_t count) {
 }
 
 enum {
-  PROCESS_PIPE_INPUT = 1u << 0,
-  PROCESS_PIPE_OUTPUT = 1u << 1,
-  PROCESS_REDIRECTION = 1u << 2,
-  PROCESS_ERROR_REDIRECTION = 1u << 3,
+  tokenizer_PROCESS_PIPE_INPUT = 1u << 0,
+  tokenizer_PROCESS_PIPE_OUTPUT = 1u << 1,
+  tokenizer_PROCESS_REDIRECTION = 1u << 2,
+  tokenizer_PROCESS_ERROR_REDIRECTION = 1u << 3,
 };
 
 typedef struct {
@@ -4683,11 +4384,12 @@ typedef struct {
   const char *legacy_renderings[4];
   unsigned flags[4];
   unsigned feature_stages;
-} processor_case_t;
+} tokenizer_processor_case_t;
 
-static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
-                                          size_t token_count,
-                                          const char *original_command) {
+static bool
+tokenizer_tokens_refer_to_owned_command(const shell_token_t *tokens,
+                                        size_t token_count,
+                                        const char *original_command) {
   if ((!tokens && token_count != 0) || !original_command)
     return false;
   size_t length = strlen(original_command);
@@ -4700,7 +4402,9 @@ static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
   return true;
 }
 
-static void run_processor_cases(const processor_case_t *cases, size_t count) {
+static void
+tokenizer_run_processor_cases(const tokenizer_processor_case_t *cases,
+                              size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_info_t *infos = NULL;
     size_t command_count = 0;
@@ -4715,10 +4419,11 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
     for (size_t j = 0; infos && j < cases[i].command_count && j < command_count;
          j++) {
       unsigned flags =
-          (infos[j].has_pipe_input ? PROCESS_PIPE_INPUT : 0) |
-          (infos[j].has_pipe_output ? PROCESS_PIPE_OUTPUT : 0) |
-          (infos[j].has_redirections ? PROCESS_REDIRECTION : 0) |
-          (infos[j].has_error_redirection ? PROCESS_ERROR_REDIRECTION : 0);
+          (infos[j].has_pipe_input ? tokenizer_PROCESS_PIPE_INPUT : 0) |
+          (infos[j].has_pipe_output ? tokenizer_PROCESS_PIPE_OUTPUT : 0) |
+          (infos[j].has_redirections ? tokenizer_PROCESS_REDIRECTION : 0) |
+          (infos[j].has_error_redirection ? tokenizer_PROCESS_ERROR_REDIRECTION
+                                          : 0);
       bool expected_feature = (cases[i].feature_stages & (1u << j)) != 0;
       shell_netstring_buffer_t netargv = {0};
       bool rendered = shell_render_netargv_buffer(&infos[j], NULL, &netargv) ==
@@ -4728,12 +4433,12 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
           strcmp(infos[j].original_command, cases[i].original_commands[j]) ==
               0 &&
           flags == cases[i].flags[j] &&
-          tokens_refer_to_owned_command(infos[j].shell_tokens,
-                                        infos[j].shell_token_count,
-                                        infos[j].original_command) &&
-          tokens_refer_to_owned_command(infos[j].command_tokens,
-                                        infos[j].command_token_count,
-                                        infos[j].original_command) &&
+          tokenizer_tokens_refer_to_owned_command(infos[j].shell_tokens,
+                                                  infos[j].shell_token_count,
+                                                  infos[j].original_command) &&
+          tokenizer_tokens_refer_to_owned_command(infos[j].command_tokens,
+                                                  infos[j].command_token_count,
+                                                  infos[j].original_command) &&
           shell_command_info_has_dangerous_features(&infos[j]) ==
               expected_feature;
       if (!stage_valid)
@@ -4762,10 +4467,11 @@ typedef struct {
   const char *transformed_commands[5];
   unsigned transformed_stages;
   const char *original_commands[5];
-} transform_line_case_t;
+} tokenizer_transform_line_case_t;
 
-static void run_transform_line_cases(const transform_line_case_t *cases,
-                                     size_t count) {
+static void
+tokenizer_run_transform_line_cases(const tokenizer_transform_line_case_t *cases,
+                                   size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_transformed_command_t **commands = NULL;
     size_t command_count = 0;
@@ -4807,293 +4513,7 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
   }
 }
 
-static void test_tokenize_allocation_failures(void) {
-  static const char input[] =
-      "echo a b c d e f g h i j k l m n o p q r ; printf x ; sort";
-  shell_command_t *commands = NULL;
-  size_t count = 0;
-  shellsplit_test_alloc_reset();
-  bool success = (shell_tokenize_commands(input, strlen(input), &commands,
-                                          &count) == SHELL_TOKENIZE_OK);
-  size_t allocations = shellsplit_test_alloc_count();
-  test("Allocation probe tokenizes multiple grown commands",
-       success && count == 3 && allocations >= 5);
-  shell_commands_free(commands, count);
-
-  bool atomic = true;
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    commands = (shell_command_t *)(void *)1;
-    count = SIZE_MAX;
-    shellsplit_test_alloc_fail_at(fail_at);
-    success = (shell_tokenize_commands(input, strlen(input), &commands,
-                                       &count) == SHELL_TOKENIZE_OK);
-    shellsplit_test_alloc_reset();
-    if (success || commands != NULL || count != 0) {
-      atomic = false;
-      shell_commands_free(commands, count);
-      break;
-    }
-  }
-  test("Tokenizer allocation failures clear outputs", atomic);
-
-  static const char compound_input[] =
-      "{ printf left; } 3>/tmp/left | { cat; } 2>>/tmp/right && "
-      "{ printf tail; }";
-  commands = NULL;
-  count = 0;
-  shellsplit_test_alloc_reset();
-  success = shell_tokenize_commands(compound_input, strlen(compound_input),
-                                    &commands, &count) == SHELL_TOKENIZE_OK;
-  allocations = shellsplit_test_alloc_count();
-  bool compound_success = success && commands != NULL && count == 3;
-  shell_commands_free(commands, count);
-
-  atomic = true;
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    commands = (shell_command_t *)(void *)1;
-    count = SIZE_MAX;
-    shellsplit_test_alloc_fail_at(fail_at);
-    success = shell_tokenize_commands(compound_input, strlen(compound_input),
-                                      &commands, &count) == SHELL_TOKENIZE_OK;
-    shellsplit_test_alloc_reset();
-    if (success || commands != NULL || count != 0) {
-      atomic = false;
-      shell_commands_free(commands, count);
-      break;
-    }
-  }
-  test("Compound brace growth is allocation-failure atomic",
-       compound_success && atomic);
-}
-
-static void test_processor_allocation_failures(void) {
-  static const char input[] =
-      "echo prefix$USER-suffix a b c d e f g h i j k l m n o p | grep "
-      "'*.txt'";
-  shell_command_info_t *infos = NULL;
-  size_t count = 0;
-  shellsplit_test_alloc_reset();
-  shell_process_status_t status =
-      shell_process_command(input, strlen(input), NULL, &infos, &count);
-  size_t allocations = shellsplit_test_alloc_count();
-  test("Processor allocation probe succeeds",
-       status == SHELL_PROCESS_OK && count == 2 && allocations > 5);
-  shell_command_infos_free(infos, count);
-
-  bool atomic = true;
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    infos = (shell_command_info_t *)(void *)1;
-    count = SIZE_MAX;
-    shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_process_command(input, strlen(input), NULL, &infos, &count);
-    shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || infos != NULL || count != 0) {
-      atomic = false;
-      shell_command_infos_free(infos, count);
-      break;
-    }
-  }
-  test("Processor allocation failures report ENOMEM and clear outputs", atomic);
-
-  static const char repeated_negation[] = "! ! true";
-  shell_processed_commands_t repeated = {0};
-  shellsplit_test_alloc_reset();
-  status = shell_process_commands(
-      repeated_negation, sizeof(repeated_negation) - 1, NULL, &repeated);
-  allocations = shellsplit_test_alloc_count();
-  bool repeated_success = status == SHELL_PROCESS_OK &&
-                          repeated.command_count == 1 &&
-                          repeated.commands[0].pipeline_negation_count == 2 &&
-                          !repeated.commands[0].pipeline_negated &&
-                          repeated.commands[0].command_token_count == 1;
-  shell_processed_commands_free(&repeated);
-
-  atomic = true;
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    repeated.commands = (shell_command_info_t *)(uintptr_t)1;
-    repeated.command_count = SIZE_MAX;
-    repeated.groups = (shell_group_t *)(uintptr_t)1;
-    repeated.group_count = SIZE_MAX;
-    repeated.group_io_ops = (shell_group_io_op_t *)(uintptr_t)1;
-    repeated.group_io_op_count = SIZE_MAX;
-    shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_process_commands(
-        repeated_negation, sizeof(repeated_negation) - 1, NULL, &repeated);
-    shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || repeated.commands != NULL ||
-        repeated.command_count != 0 || repeated.groups != NULL ||
-        repeated.group_count != 0 || repeated.group_io_ops != NULL ||
-        repeated.group_io_op_count != 0) {
-      atomic = false;
-      shell_processed_commands_free(&repeated);
-      break;
-    }
-  }
-  test("Repeated negation processing is allocation-failure atomic",
-       repeated_success && atomic);
-  static const char *const document_boundaries[] = {
-      "time (cat <<<body)",
-      "exec {fd}>/dev/null; exec {fd}>&-{out}<<<x; cat <&$out",
-      "exec {fd}>/dev/null; exec {fd}>&-{out}<<EOF; cat <&$out\nx\nEOF\n",
-      ">first; { time -p printf x |& cat; >inner; } 2>err; >last",
-      "{ { >a; }; { printf x; >b; } 2>err; } >out",
-      "time (cat <<'EOF'\ntime bad |& x; }\nEOF\n); >last",
-  };
-  bool documents_atomic = true;
-  for (size_t i = 0;
-       i < sizeof(document_boundaries) / sizeof(document_boundaries[0]); i++) {
-    documents_atomic =
-        process_commands_allocation_failure_atomic(document_boundaries[i]) &&
-        documents_atomic;
-    documents_atomic =
-        process_command_allocation_failure_atomic(document_boundaries[i]) &&
-        documents_atomic;
-  }
-  test("Compact and adjacent document processing is allocation-failure atomic",
-       documents_atomic);
-
-  bool has_features = false;
-  shell_netstring_buffer_t sequence = {0};
-  shellsplit_test_alloc_reset();
-  status = shell_build_netargv_sequence_buffer(
-      input, strlen(input), NULL, &sequence, &count, &has_features);
-  allocations = shellsplit_test_alloc_count();
-  test("Netargv-sequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && sequence.data && count == 2 &&
-           has_features);
-  shell_netstring_buffer_free(&sequence);
-
-  atomic = true;
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    sequence = (shell_netstring_buffer_t){0};
-    count = SIZE_MAX;
-    has_features = true;
-    shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_build_netargv_sequence_buffer(
-        input, strlen(input), NULL, &sequence, &count, &has_features);
-    shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || sequence.data != NULL || count != 0 ||
-        has_features) {
-      atomic = false;
-      shell_netstring_buffer_free(&sequence);
-      break;
-    }
-  }
-  test("Netargv-sequence allocation failures are atomic", atomic);
-
-  shellsplit_test_alloc_reset();
-  status = shell_build_command_netseq_buffer(input, strlen(input), NULL,
-                                             &sequence, &count);
-  allocations = shellsplit_test_alloc_count();
-  test("Command-netsequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && sequence.data && count == 2);
-  shell_netstring_buffer_free(&sequence);
-
-  atomic = true;
-  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    sequence = (shell_netstring_buffer_t){0};
-    count = SIZE_MAX;
-    shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_build_command_netseq_buffer(input, strlen(input), NULL,
-                                               &sequence, &count);
-    shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || sequence.data != NULL || count != 0) {
-      atomic = false;
-      shell_netstring_buffer_free(&sequence);
-      break;
-    }
-  }
-  test("Command-netsequence allocation failures are atomic", atomic);
-}
-
-static void test_transform_source_limit_preflight(void) {
-  static const char *const sources[] = {
-      "echo ok",
-      "  time -p echo ok  ",
-      "echo before; time -p echo ok",
-      "time ({ printf %s ok; })",
-      "time ({(printf %s ok)})",
-      "cat < input",
-  };
-  bool preflight = true, exact = true, atomic = true, owned = true;
-  for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
-    char source[128];
-    strcpy(source, sources[i]);
-    shell_command_t *commands = NULL;
-    size_t count = 0;
-    shellsplit_test_alloc_reset();
-    if (shell_tokenize_commands(source, strlen(source), &commands, &count) !=
-            SHELL_TOKENIZE_OK ||
-        count == 0) {
-      preflight = exact = atomic = owned = false;
-      shell_commands_free(commands, count);
-      continue;
-    }
-    const shell_command_t *command = &commands[count - 1];
-    size_t length = command->end_pos - command->start_pos;
-    char expected[128];
-    memcpy(expected, source + command->start_pos, length);
-    expected[length] = '\0';
-    shell_transform_limits_t limits = {length - 1, SIZE_MAX};
-    for (size_t limit = 0; limit < 2; limit++) {
-      limits.max_string_bytes = limit == 0 ? 0 : length - 1;
-      shell_transformed_command_t *transformed =
-          (shell_transformed_command_t *)(uintptr_t)1;
-      shellsplit_test_alloc_fail_at(1);
-      shell_transform_status_t status =
-          shell_transform_command(command, &limits, &transformed);
-      size_t allocations = shellsplit_test_alloc_count();
-      shellsplit_test_alloc_reset();
-      preflight = preflight && status == SHELL_TRANSFORM_EOUTPUT_LIMIT &&
-                  transformed == NULL && allocations == 0;
-      shell_transformed_command_free(transformed);
-    }
-
-    limits.max_string_bytes = length;
-    shell_transformed_command_t *transformed = NULL;
-    shellsplit_test_alloc_reset();
-    shell_transform_status_t status =
-        shell_transform_command(command, &limits, &transformed);
-    size_t allocations = shellsplit_test_alloc_count();
-    shellsplit_test_alloc_reset();
-    exact = exact && status == SHELL_TRANSFORM_OK && transformed &&
-            strcmp(transformed->original_command, expected) == 0;
-    shell_transformed_command_free(transformed);
-
-    for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-      transformed = (shell_transformed_command_t *)(uintptr_t)1;
-      shellsplit_test_alloc_fail_at(fail_at);
-      status = shell_transform_command(command, &limits, &transformed);
-      shellsplit_test_alloc_reset();
-      atomic =
-          atomic && status == SHELL_TRANSFORM_ENOMEM && transformed == NULL;
-      shell_transformed_command_free(transformed);
-    }
-
-    limits.max_total_bytes = 1;
-    transformed = (shell_transformed_command_t *)(uintptr_t)1;
-    status = shell_transform_command(command, &limits, &transformed);
-    atomic = atomic && status == SHELL_TRANSFORM_EOUTPUT_LIMIT &&
-             transformed == NULL;
-    shell_transformed_command_free(transformed);
-
-    limits.max_total_bytes = SIZE_MAX;
-    transformed = NULL;
-    status = shell_transform_command(command, &limits, &transformed);
-    shell_commands_free(commands, count);
-    memset(source, 'x', strlen(source));
-    owned = owned && status == SHELL_TRANSFORM_OK && transformed &&
-            strcmp(transformed->original_command, expected) == 0;
-    shell_transformed_command_free(transformed);
-  }
-  test("Transform source limits reject before any allocation", preflight);
-  test("Transform accepts exact source limits including timing prefixes",
-       exact);
-  test("Single-command transform failures are allocation-atomic", atomic);
-  test("Transform owns source copies independently of lexical input", owned);
-}
-
-static void test_transform_allocation_failures(void) {
+static void tokenizer_test_transform_allocation_failures(void) {
   static const char input[] =
       "echo prefix$USER-suffix \"literal\"${NAME}\\\n-tail a b c d e f g h "
       "i j k l m n o p \"$OUTER$(printf '\"$INNER')$AFTER\" "
@@ -5126,7 +4546,7 @@ static void test_transform_allocation_failures(void) {
   test("Transform allocation failures report ENOMEM and clear outputs", atomic);
 }
 
-static void test_output_limit_boundaries(void) {
+static void tokenizer_test_output_limit_boundaries(void) {
   static const char input[] = "echo one日本 ; printf two\x80\xff";
   shell_command_info_t *infos = NULL;
   size_t count = 0;
@@ -5291,7 +4711,7 @@ static void test_output_limit_boundaries(void) {
  * needs one additional byte. Keep this arithmetic in a shared helper and
  * exercise its exact boundary without constructing an impossible input-sized
  * shell command. */
-static void test_cstring_allocation_size_boundaries(void) {
+static void tokenizer_test_cstring_allocation_size_boundaries(void) {
   size_t allocation_size = SIZE_MAX;
   bool valid =
       shell_process_cstring_allocation_size(0, &allocation_size) ==
@@ -5307,30 +4727,7 @@ static void test_cstring_allocation_size_boundaries(void) {
        valid);
 }
 
-static void test_posix_brace_group_sequence(void) {
-  const char *input =
-      "cd /workspace && { sleep 2; printf 'q'; } | ./clock > /tmp/clock.out";
-  shell_netstring_buffer_t sequence = {0};
-  size_t count = 0;
-  bool features = false;
-  shell_process_status_t status = shell_build_netargv_sequence_buffer(
-      input, strlen(input), NULL, &sequence, &count, &features);
-  test(
-      "POSIX brace group renders four canonical netargv records",
-      status == SHELL_PROCESS_OK && count == 4 && features &&
-          sequence.data != NULL &&
-          (sequence.length !=
-               sizeof("19:2:cd,10:/workspace,,12:5:sleep,1:2,,13:6:printf,1:q,,"
-                      "10:7:./clock,,") -
-                   1 ||
-           memcmp(sequence.data,
-                  "19:2:cd,10:/workspace,,12:5:sleep,1:2,,13:6:printf,1:q,,"
-                  "10:7:./clock,,",
-                  sequence.length)) == 0);
-  shell_netstring_buffer_free(&sequence);
-}
-
-static void test_canonical_control_compounds_rejected(void) {
+static void tokenizer_test_canonical_control_compounds_rejected(void) {
   static const char *const diagnostic_cases[] = {
       "for ((i=0; i<3; i++)); do echo \"$i\"; done\n",
       "echo before; for ((i=0; i<3; i++)); do echo inside; done; echo after | "
@@ -5472,125 +4869,7 @@ static void test_canonical_control_compounds_rejected(void) {
   test("Canonical APIs accept a well-formed if without its keywords", if_valid);
 }
 
-static void test_unsupported_control_precedes_capacity(void) {
-  char input[2048];
-  size_t used = 0;
-  for (size_t i = 0; i <= SHELL_MAX_SUBCOMMANDS; i++) {
-    int written = snprintf(input + used, sizeof(input) - used, "x%zu | ", i);
-    if (written < 0 || (size_t)written >= sizeof(input) - used) {
-      test("Unsupported controls take precedence over command capacity", false);
-      return;
-    }
-    used += (size_t)written;
-  }
-  int written = snprintf(input + used, sizeof(input) - used,
-                         "select choice in one two; do :; done");
-  if (written < 0 || (size_t)written >= sizeof(input) - used) {
-    test("Unsupported controls take precedence over command capacity", false);
-    return;
-  }
-  used += (size_t)written;
-
-  shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
-  size_t info_count = SIZE_MAX;
-  shell_processed_commands_t processed = {
-      .commands = (shell_command_info_t *)(uintptr_t)1,
-      .command_count = SIZE_MAX,
-      .groups = (shell_group_t *)(uintptr_t)1,
-      .group_count = SIZE_MAX,
-      .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
-      .group_io_op_count = SIZE_MAX,
-  };
-  shell_netstring_buffer_t netargv = {0};
-  size_t count = SIZE_MAX;
-  bool features = true;
-  bool valid =
-      shell_process_validate_supported_source(input, used, NULL) ==
-          SHELL_PROCESS_EPARSE &&
-      shell_process_command(input, used, NULL, &infos, &info_count) ==
-          SHELL_PROCESS_EPARSE &&
-      infos == NULL && info_count == 0 &&
-      shell_process_commands(input, used, NULL, &processed) ==
-          SHELL_PROCESS_EPARSE &&
-      processed.commands == NULL && processed.command_count == 0 &&
-      processed.groups == NULL && processed.group_count == 0 &&
-      processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
-      shell_build_netargv_sequence_buffer(input, used, NULL, &netargv, &count,
-                                          &features) == SHELL_PROCESS_EPARSE &&
-      netargv.data == NULL && count == 0 && !features;
-  test("Unsupported controls take precedence over command capacity", valid);
-}
-
-static void test_malformed_source_precedes_capacity(void) {
-  static const char *const tails[] = {
-      "echo 'unterminated",
-      "( echo unfinished",
-  };
-  bool valid = true;
-  for (size_t tail = 0; tail < sizeof(tails) / sizeof(tails[0]); tail++) {
-    char input[2048];
-    size_t used = 0;
-    for (size_t i = 0; i <= SHELL_MAX_SUBCOMMANDS; i++) {
-      int written = snprintf(input + used, sizeof(input) - used, "x%zu | ", i);
-      if (written < 0 || (size_t)written >= sizeof(input) - used) {
-        valid = false;
-        break;
-      }
-      used += (size_t)written;
-    }
-    if (!valid)
-      break;
-    size_t tail_length = strlen(tails[tail]);
-    if (tail_length >= sizeof(input) - used) {
-      valid = false;
-      break;
-    }
-    memcpy(input + used, tails[tail], tail_length + 1);
-    used += tail_length;
-
-    shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
-    size_t info_count = SIZE_MAX;
-    shell_processed_commands_t processed = {
-        .commands = (shell_command_info_t *)(uintptr_t)1,
-        .command_count = SIZE_MAX,
-        .groups = (shell_group_t *)(uintptr_t)1,
-        .group_count = SIZE_MAX,
-        .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
-        .group_io_op_count = SIZE_MAX,
-    };
-    shell_netstring_buffer_t netargv = {0};
-    size_t count = SIZE_MAX;
-    bool features = true;
-    shell_process_status_t validation =
-        shell_process_validate_supported_source(input, used, NULL);
-    shell_process_status_t flat =
-        shell_process_command(input, used, NULL, &infos, &info_count);
-    shell_process_status_t structured =
-        shell_process_commands(input, used, NULL, &processed);
-    shell_process_status_t sequence = shell_build_netargv_sequence_buffer(
-        input, used, NULL, &netargv, &count, &features);
-    bool flat_valid =
-        tail == 1
-            ? flat == SHELL_PROCESS_OK && infos != NULL && info_count != 0
-            : flat == SHELL_PROCESS_EPARSE && infos == NULL && info_count == 0;
-    bool case_valid =
-        validation == SHELL_PROCESS_EPARSE && flat_valid &&
-        structured == SHELL_PROCESS_EPARSE && processed.commands == NULL &&
-        processed.command_count == 0 && processed.groups == NULL &&
-        processed.group_count == 0 && processed.group_io_ops == NULL &&
-        processed.group_io_op_count == 0 && sequence == SHELL_PROCESS_EPARSE &&
-        netargv.data == NULL && count == 0 && !features;
-    if (!case_valid)
-      printf("    malformed tail %zu: validation=%d flat=%d structured=%d "
-             "sequence=%d\n",
-             tail, validation, flat, structured, sequence);
-    shell_command_infos_free(infos, info_count);
-    valid = valid && case_valid;
-  }
-  test("Malformed syntax takes precedence over command capacity", valid);
-}
-
-static void test_control_word_literals_are_accepted(void) {
+static void tokenizer_test_control_word_literals_are_accepted(void) {
   static const char *const cases[] = {
       "echo if then elif else fi while until for do done case in esac function",
       "echo 'if' \"while\" \\for",
@@ -5619,7 +4898,7 @@ static void test_control_word_literals_are_accepted(void) {
   test("Canonical APIs keep non-structural control words as literals", valid);
 }
 
-static void test_structured_processor_requires_complete_syntax(void) {
+static void tokenizer_test_structured_processor_requires_complete_syntax(void) {
   const char *input = "echo `unterminated";
   shell_command_info_t *flat = NULL;
   size_t flat_count = 0;
@@ -5651,7 +4930,7 @@ static void test_structured_processor_requires_complete_syntax(void) {
   test("Structured processing rejects incomplete lexical records", valid);
 }
 
-static void test_tolerant_unfinished_group_omits_empty_command(void) {
+static void tokenizer_test_tolerant_unfinished_group_omits_empty_command(void) {
   const char *input = "one && (";
   shell_command_t *commands = NULL;
   size_t command_count = 0;
@@ -5666,67 +4945,10 @@ static void test_tolerant_unfinished_group_omits_empty_command(void) {
   test("Tolerant unfinished groups do not produce empty commands", valid);
 }
 
-static void test_processed_commands_preserve_comment_free_ranges(void) {
-  static const struct {
-    const char *input;
-    const char *fast_range;
-    const char *command;
-  } cases[] = {{"#\nJ", "J", "J"},
-               {"# ignored by the full tokenizer\nprintf visible\n",
-                "printf visible", "printf"}};
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_parse_result_t fast = {0};
-    shell_processed_commands_t processed = {0};
-    size_t fast_range_length = strlen(cases[i].fast_range);
-    size_t command_length = strlen(cases[i].command);
-    valid = valid &&
-            shell_parse_fast(cases[i].input, strlen(cases[i].input), NULL,
-                             &fast) == SHELL_OK &&
-            fast.count == 1 && fast.cmds[0].len == fast_range_length &&
-            memcmp(cases[i].input + fast.cmds[0].start, cases[i].fast_range,
-                   fast_range_length) == 0 &&
-            shell_process_commands(cases[i].input, strlen(cases[i].input), NULL,
-                                   &processed) == SHELL_PROCESS_OK &&
-            processed.command_count == 1 && processed.commands != NULL &&
-            processed.commands[0].command_token_count != 0 &&
-            processed.commands[0].command_tokens[0].length == command_length &&
-            memcmp(processed.commands[0].command_tokens[0].start,
-                   cases[i].command, command_length) == 0;
-    shell_processed_commands_free(&processed);
-  }
-  test("Processed commands preserve comment-free fast ranges", valid);
-}
-
-static void test_tokenizer_empty_source_is_not_a_parse_error(void) {
-  static const char *const empty[] = {
-      "",
-      " \t\n",
-      "# just a comment",
-      "# <(printf data)\n",
-      "\\\n",
-      "\\\n # continued empty source\n \\\n",
-  };
-  bool valid = true;
-  for (size_t i = 0; valid && i < sizeof(empty) / sizeof(empty[0]); i++) {
-    shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
-    size_t count = SIZE_MAX;
-    valid = shell_tokenize_commands(empty[i], strlen(empty[i]), &commands,
-                                    &count) == SHELL_TOKENIZE_BLANK &&
-            commands == NULL && count == 0;
-  }
-  static const char invalid[] = "echo one |";
-  shell_command_t *commands = NULL;
-  size_t count = 0;
-  valid = valid && shell_tokenize_commands(invalid, strlen(invalid), &commands,
-                                           &count) == SHELL_TOKENIZE_EPARSE;
-  test("Valid source without commands is empty, not a parse error", valid);
-}
-
 /* Blank source is valid but has no command: every command-line API reports
- * BLANK rather than success with nothing, or a parse error. Zero-length input
- * stays invalid input where the strict parser defines it so. */
-static void test_blank_source_convention(void) {
+ * BLANK rather than success with nothing, or a parse error. Zero-length
+ * input stays invalid input where the strict parser defines it so. */
+static void tokenizer_test_blank_source_convention(void) {
   static const char *const blank[] = {
       " \t\n",
       "# comment",
@@ -5780,7 +5002,7 @@ static void test_blank_source_convention(void) {
 /* An unmatched `(` leaves no lexical command record, yet it is incomplete
  * syntax, not blank source. The tokenizer, the flat processor and the
  * canonical sequence builder all reject it. */
-static void test_record_less_syntax_is_not_blank(void) {
+static void tokenizer_test_record_less_syntax_is_not_blank(void) {
   static const char *const cases[] = {"(", "( ", "((", ")", "(!", "( !"};
   bool valid = true;
   for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -5810,65 +5032,7 @@ static void test_record_less_syntax_is_not_blank(void) {
   test("Record-less incomplete syntax is a parse error, not blank", valid);
 }
 
-/* Flattened records omit group delimiters, yet a group is shell syntax of
- * the call even around one command without any separator. */
-static void test_single_command_group_has_shell_features(void) {
-  static const char *const cases[] = {"(a)", "( a )", "{ a; }"};
-  bool valid = true;
-  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_netstring_buffer_t argv = {0};
-    size_t count = 0;
-    bool features = false;
-    valid = shell_build_netargv_sequence_buffer(
-                cases[i], strlen(cases[i]), NULL, &argv, &count, &features) ==
-                SHELL_PROCESS_OK &&
-            count == 1 && features;
-    shell_netstring_buffer_free(&argv);
-  }
-  test("A single-command group still reports shell features", valid);
-}
-
-static void test_processed_comment_only_source_is_empty(void) {
-  static const char *const cases[] = {
-      "# comment-only source",
-      "# <(printf data)",
-      " \t\n",
-      "\\\n",
-      "\\\n # continued empty source\n \\\n",
-  };
-  bool valid = true;
-  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_parse_result_t fast = {0};
-    shell_processed_commands_t processed = {0};
-    valid =
-        shell_parse_fast(cases[i], strlen(cases[i]), NULL, &fast) == SHELL_OK &&
-        fast.count == 0 && fast.status == SHELL_STATUS_OK &&
-        shell_process_commands(cases[i], strlen(cases[i]), NULL, &processed) ==
-            SHELL_PROCESS_BLANK &&
-        processed.commands == NULL && processed.command_count == 0 &&
-        processed.groups == NULL && processed.group_count == 0 &&
-        processed.group_io_ops == NULL && processed.group_io_op_count == 0;
-    shell_processed_commands_free(&processed);
-  }
-  test("Structured processing reports trivia-only source as blank without "
-       "records",
-       valid);
-  /* Backslash-CR retains a command word, unlike a backslash-LF continuation. */
-  static const char nonblank[] = " \\\n \\\r\n \t";
-  shell_parse_result_t fast = {0};
-  shell_processed_commands_t processed = {0};
-  bool retained = shell_parse_fast(nonblank, sizeof(nonblank) - 1, NULL,
-                                   &fast) == SHELL_OK &&
-                  fast.count == 1 &&
-                  shell_process_commands(nonblank, sizeof(nonblank) - 1, NULL,
-                                         &processed) == SHELL_PROCESS_OK &&
-                  processed.command_count == 1;
-  shell_processed_commands_free(&processed);
-  test("Nonblank physical line endings cannot become empty successful source",
-       retained);
-}
-
-static void test_posix_brace_group_forms(void) {
+static void tokenizer_test_posix_brace_group_forms(void) {
   static const struct {
     const char *input;
     size_t command_count;
@@ -5982,171 +5146,7 @@ static void test_posix_brace_group_forms(void) {
   shell_processed_commands_free(&processed);
 }
 
-static void test_command_position_group_syntax_rejected(void) {
-  static const char *const invalid_cases[] = {
-      "foo; {",  "foo; }",  "foo && {",      "foo && }",   "foo | {",
-      "foo | }", "foo | )", "echo { foo; }", "echo (foo)", "echo ((1))",
-  };
-  shell_limits_t strict_limits = {
-      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
-      .strict_mode = true,
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(invalid_cases) / sizeof(invalid_cases[0]);
-       i++) {
-    const char *input = invalid_cases[i];
-    size_t length = strlen(input);
-    shell_parse_result_t parsed = {0};
-    shell_processed_commands_t processed = {0};
-    shell_netstring_buffer_t netargv = {0};
-    shell_netstring_buffer_t commands = {0};
-    shell_netstring_buffer_t types = {0};
-    shell_netstring_buffer_t anomaly_commands = {0};
-    shell_netstring_buffer_t anomaly_types = {0};
-    size_t count = SIZE_MAX;
-    size_t anomaly_count = SIZE_MAX;
-    bool features = true;
-    shell_dep_graph_t graph;
-
-    valid = valid &&
-            shell_parse_fast(input, length, &strict_limits, &parsed) ==
-                SHELL_EPARSE &&
-            shell_process_commands(input, length, NULL, &processed) ==
-                SHELL_PROCESS_EPARSE &&
-            processed.commands == NULL && processed.command_count == 0 &&
-            shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
-                                                &count, &features) ==
-                SHELL_PROCESS_EPARSE &&
-            netargv.data == NULL && count == 0 && !features &&
-            shell_build_command_netseq_buffer(input, length, NULL, &commands,
-                                              &count) == SHELL_PROCESS_EPARSE &&
-            commands.data == NULL && count == 0 &&
-            shell_build_type_netseq_buffer(input, length, NULL, &types,
-                                           &count) == SHELL_PROCESS_EPARSE &&
-            types.data == NULL && count == 0 &&
-            shell_build_anomaly_netseqs_buffer(
-                input, length, NULL, &anomaly_commands, &anomaly_types,
-                &anomaly_count) == SHELL_PROCESS_EPARSE &&
-            anomaly_commands.data == NULL && anomaly_types.data == NULL &&
-            anomaly_count == 0 &&
-            shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
-                SHELL_DEP_EPARSE;
-    shell_netstring_buffer_free(&netargv);
-    shell_netstring_buffer_free(&commands);
-    shell_netstring_buffer_free(&types);
-    shell_netstring_buffer_free(&anomaly_commands);
-    shell_netstring_buffer_free(&anomaly_types);
-    shell_processed_commands_free(&processed);
-  }
-  test("Semantic APIs reject command-position group syntax", valid);
-
-  static const char *const literal_cases[] = {
-      "echo {", "echo }", "echo {foo}", "echo foo}", "{( echo )}",
-  };
-  valid = true;
-  for (size_t i = 0; i < sizeof(literal_cases) / sizeof(literal_cases[0]);
-       i++) {
-    const char *input = literal_cases[i];
-    shell_parse_result_t parsed = {0};
-    shell_netstring_buffer_t netargv = {0};
-    size_t count = 0;
-    bool features = false;
-    valid = valid &&
-            shell_parse_fast(input, strlen(input), &strict_limits, &parsed) ==
-                SHELL_OK &&
-            shell_build_netargv_sequence_buffer(input, strlen(input), NULL,
-                                                &netargv, &count, &features) ==
-                SHELL_PROCESS_OK &&
-            count > 0;
-    shell_netstring_buffer_free(&netargv);
-  }
-  test("Strict group syntax preserves literal brace words", valid);
-}
-
-static void test_full_tokenizer_group_context(void) {
-  const char *input =
-      "{ printf \"$value\" $(id) <(producer) >out <<EOF\nbody\nEOF\n; }";
-  shell_tokenizer_state_t state;
-  shell_token_t token;
-  bool valid = shell_tokenizer_init(&state, input, strlen(input), NULL);
-  bool saw_quoted_variable = false;
-  bool saw_substitution = false;
-  bool saw_process_substitution = false;
-  bool saw_redirect = false;
-  bool saw_heredoc = false;
-  bool saw_separator = false;
-  size_t token_count = 0;
-  while (valid && shell_tokenizer_next(&state, &token)) {
-    valid = token.group_depth == 1 && token.group_kinds == SHELL_GROUP_BRACE;
-    switch (token.type) {
-    case SHELL_TOKEN_VARIABLE_QUOTED:
-      saw_quoted_variable = true;
-      break;
-    case SHELL_TOKEN_SUBSHELL:
-      saw_substitution = true;
-      break;
-    case SHELL_TOKEN_PROCESS_SUB:
-      saw_process_substitution = true;
-      break;
-    case SHELL_TOKEN_REDIRECT_OUT:
-      saw_redirect = true;
-      break;
-    case SHELL_TOKEN_HEREDOC:
-      saw_heredoc = true;
-      break;
-    case SHELL_TOKEN_SEMICOLON:
-      saw_separator = true;
-      break;
-    default:
-      break;
-    }
-    token_count++;
-  }
-  valid = valid && token_count != 0 && saw_quoted_variable &&
-          saw_substitution && saw_process_substitution && saw_redirect &&
-          saw_heredoc && saw_separator;
-  test("Full tokenizer stamps group context on every token path", valid);
-
-  static const struct {
-    shell_token_type_t type;
-    size_t group_depth;
-    uint8_t group_kinds;
-  } nested_expected[] = {
-      {SHELL_TOKEN_GROUP_START, 1, SHELL_GROUP_BRACE},
-      {SHELL_TOKEN_GROUP_START, 2, SHELL_GROUP_BRACE | SHELL_GROUP_SUBSHELL},
-      {SHELL_TOKEN_COMMAND, 2, SHELL_GROUP_BRACE | SHELL_GROUP_SUBSHELL},
-      {SHELL_TOKEN_GROUP_END, 2, SHELL_GROUP_BRACE | SHELL_GROUP_SUBSHELL},
-      {SHELL_TOKEN_SEMICOLON, 1, SHELL_GROUP_BRACE},
-      {SHELL_TOKEN_GROUP_END, 1, SHELL_GROUP_BRACE},
-  };
-  const char *nested_input = "{ ( echo ); }";
-  valid =
-      shell_tokenizer_init(&state, nested_input, strlen(nested_input), NULL);
-  for (size_t i = 0;
-       valid && i < sizeof(nested_expected) / sizeof(nested_expected[0]); i++) {
-    valid = shell_tokenizer_next(&state, &token) &&
-            token.type == nested_expected[i].type &&
-            token.group_depth == nested_expected[i].group_depth &&
-            token.group_kinds == nested_expected[i].group_kinds;
-  }
-  valid = valid && !shell_tokenizer_next(&state, &token);
-  test("Nested group delimiters retain their complete context", valid);
-
-  shell_command_t *commands = NULL;
-  size_t command_count = 0;
-  const char *multiple_commands = "{ echo one; echo two; }";
-  valid =
-      shell_tokenize_commands(multiple_commands, strlen(multiple_commands),
-                              &commands, &command_count) == SHELL_TOKENIZE_OK &&
-      command_count == 2;
-  for (size_t i = 0; valid && i < command_count; i++)
-    valid = commands[i].group_depth == 1 &&
-            commands[i].group_kinds == SHELL_GROUP_BRACE;
-  shell_commands_free(commands, command_count);
-  test("Brace-contained commands retain depth after list separators", valid);
-}
-
-static void test_brace_group_process_substitution_contract(void) {
+static void tokenizer_test_brace_group_process_substitution_contract(void) {
   static const struct {
     const char *input;
     size_t command_count;
@@ -6202,294 +5202,7 @@ static void test_brace_group_process_substitution_contract(void) {
   test("Brace process substitutions retain their canonical role", valid);
 }
 
-static void test_clobber_redirection_operand_contract(void) {
-  static const struct {
-    const char *input;
-    const char *netargv;
-  } valid_cases[] = {
-      {"echo hi >| /tmp/out", "12:4:echo,2:hi,,"},
-      {"echo hi 2>|/tmp/err", "12:4:echo,2:hi,,"},
-  };
-
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(valid_cases) / sizeof(valid_cases[0]); i++) {
-    shell_command_info_t *infos = NULL;
-    size_t info_count = 0;
-    shell_netstring_buffer_t netargv = {0};
-    size_t netargv_count = 0;
-    bool has_features = false;
-    valid =
-        valid &&
-        shell_process_command(valid_cases[i].input,
-                              strlen(valid_cases[i].input), NULL, &infos,
-                              &info_count) == SHELL_PROCESS_OK &&
-        infos != NULL && info_count == 1 && infos[0].command_token_count == 2 &&
-        infos[0].has_redirections &&
-        infos[0].command_tokens[0].length == strlen("echo") &&
-        memcmp(infos[0].command_tokens[0].start, "echo", strlen("echo")) == 0 &&
-        infos[0].command_tokens[1].length == strlen("hi") &&
-        memcmp(infos[0].command_tokens[1].start, "hi", strlen("hi")) == 0 &&
-        shell_build_netargv_sequence_buffer(
-            valid_cases[i].input, strlen(valid_cases[i].input), NULL, &netargv,
-            &netargv_count, &has_features) == SHELL_PROCESS_OK &&
-        netargv.data != NULL && netargv_count == 1 && has_features &&
-        (netargv.length != strlen(valid_cases[i].netargv) ||
-         memcmp(netargv.data, valid_cases[i].netargv, netargv.length)) == 0;
-    shell_netstring_buffer_free(&netargv);
-    shell_command_infos_free(infos, info_count);
-  }
-
-  const char *invalid = "{ echo; } >| (echo)";
-  shell_parse_result_t fast = {0};
-  shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
-  size_t command_count = SIZE_MAX;
-  valid =
-      valid &&
-      shell_parse_fast(invalid, strlen(invalid), NULL, &fast) == SHELL_EPARSE &&
-      shell_tokenize_commands(invalid, strlen(invalid), &commands,
-                              &command_count) == SHELL_TOKENIZE_EPARSE &&
-      commands == NULL && command_count == 0;
-  shell_commands_free(commands, command_count);
-  test("Clobber redirects consume operands across canonical processing", valid);
-}
-
-static void test_brace_group_processed_contract(void) {
-  static const char *const valid_cases[] = {
-      "{ echo \"$(printf '}')\"; }",
-      "{ echo \"${value}\"; }",
-      "{ echo \"$((1 + 2))\"; `printf '}'`; }",
-      "{ echo one; # } remains a comment\n echo two; }",
-      "{ { echo inner; } && ( echo outer ); } > /tmp/group.out",
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(valid_cases) / sizeof(valid_cases[0]); i++) {
-    shell_parse_result_t fast = {0};
-    shell_processed_commands_t processed = {0};
-    shell_process_status_t status = shell_process_commands(
-        valid_cases[i], strlen(valid_cases[i]), NULL, &processed);
-    valid = valid &&
-            shell_parse_fast(valid_cases[i], strlen(valid_cases[i]), NULL,
-                             &fast) == SHELL_OK &&
-            status == SHELL_PROCESS_OK &&
-            /* The rich result omits structural redirect-only ranges that the
-             * fast parser intentionally retains for lexical callers. */
-            processed.command_count <= fast.count &&
-            processed.group_count == fast.group_count &&
-            processed_group_descriptors_match_source(&fast, &processed);
-    shell_processed_commands_free(&processed);
-  }
-  test("Processed brace descriptors agree across opaque syntax contexts",
-       valid);
-
-  static const char *const invalid_cases[] = {
-      "{ echo",
-      "{ echo;",
-      "{ ( echo; } )",
-      "{ echo $(printf; }",
-      "{ echo `printf; }",
-      "{ cat <<EOF\nbody\n; }",
-  };
-  valid = true;
-  for (size_t i = 0; i < sizeof(invalid_cases) / sizeof(invalid_cases[0]);
-       i++) {
-    shell_processed_commands_t processed = {
-        .commands = (shell_command_info_t *)(uintptr_t)1,
-        .command_count = 1,
-        .groups = (shell_group_t *)(uintptr_t)1,
-        .group_count = 1,
-    };
-    shell_process_status_t status = shell_process_commands(
-        invalid_cases[i], strlen(invalid_cases[i]), NULL, &processed);
-    valid = valid && status == SHELL_PROCESS_EPARSE &&
-            processed.commands == NULL && processed.command_count == 0 &&
-            processed.groups == NULL && processed.group_count == 0;
-  }
-  test("Processed brace failures clear owned results", valid);
-}
-
-static void test_processed_group_command_intervals(void) {
-  static const char input[] = "cat <<<value; { printf one; { printf two; }; }";
-  shell_parse_result_t fast = {0};
-  shell_processed_commands_t processed = {0};
-  shell_process_status_t status =
-      shell_process_commands(input, sizeof(input) - 1, NULL, &processed);
-  bool valid =
-      shell_parse_fast(input, sizeof(input) - 1, NULL, &fast) == SHELL_OK &&
-      status == SHELL_PROCESS_OK && processed.command_count == 3 &&
-      processed.group_count == 2 && processed.groups[0].first_command == 1 &&
-      processed.groups[0].command_count == 2 &&
-      processed.groups[1].first_command == 2 &&
-      processed.groups[1].command_count == 1 &&
-      processed_group_descriptors_match_source(&fast, &processed);
-  shell_processed_commands_free(&processed);
-  test("Processed group intervals index retained commands", valid);
-
-  static const struct {
-    const char *source;
-    size_t commands;
-    size_t groups;
-    uint16_t first[3];
-    uint16_t count[3];
-  } cases[] = {
-      {"{ >out; }; echo ok", 1, 1, {0}, {0}},
-      {"echo before; { >out; }; echo after", 2, 1, {1}, {0}},
-      {"echo before; { >out; }", 1, 1, {1}, {0}},
-      {"{ >out; }; { echo ok; }", 1, 2, {0, 0}, {0, 1}},
-      {"{ { >out; }; }; echo ok", 1, 2, {0, 0}, {0, 0}},
-      {"{ echo before; { >out; }; echo after; }", 2, 2, {0, 1}, {2, 0}},
-      {"{ time; }; echo ok", 1, 1, {0}, {0}},
-      {"time { >out; } | cat", 1, 1, {0}, {0}},
-      {"{ >out; }", 0, 1, {0}, {0}},
-      {"{ >out; } <<EOF\nbody\nEOF\necho ok", 1, 1, {0}, {0}},
-      {"cat <<<value; { >out; }; echo ok", 2, 1, {1}, {0}},
-  };
-  valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    processed = (shell_processed_commands_t){0};
-    status = shell_process_commands(cases[i].source, strlen(cases[i].source),
-                                    NULL, &processed);
-    bool matches = status == SHELL_PROCESS_OK &&
-                   processed.command_count == cases[i].commands &&
-                   processed.group_count == cases[i].groups;
-    for (size_t group = 0; matches && group < cases[i].groups; group++)
-      matches =
-          processed.groups[group].first_command == cases[i].first[group] &&
-          processed.groups[group].command_count == cases[i].count[group];
-    if (!matches)
-      fprintf(stderr, "Empty group interval case %zu failed: %s\n", i,
-              cases[i].source);
-    valid &= matches;
-    shell_processed_commands_free(&processed);
-  }
-  test("Empty processed groups retain their source insertion positions", valid);
-}
-
-static void test_processed_group_remapping_scaling(void) {
-  bool valid = true;
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-  for (unsigned family = 0; family < 2; family++) {
-    size_t previous = 0;
-    for (size_t count = 4; count <= 32; count *= 2) {
-      char source[1024];
-      size_t length = 0;
-      for (size_t i = 0; i < count; i++) {
-        const char *part = family == 0 ? "{ >out; }; echo ok; " : "{ ";
-        size_t part_length = strlen(part);
-        memcpy(source + length, part, part_length);
-        length += part_length;
-      }
-      if (family == 1) {
-        static const char redirect[] = ">out; ";
-        memcpy(source + length, redirect, sizeof(redirect) - 1);
-        length += sizeof(redirect) - 1;
-        for (size_t i = 0; i < count; i++) {
-          memcpy(source + length, "}; ", 3);
-          length += 3;
-        }
-        memcpy(source + length, "echo ok", 7);
-        length += 7;
-      }
-      source[length] = '\0';
-      shellsplit_test_source_scan_reset();
-      shell_processed_commands_t processed = {0};
-      shell_process_status_t status =
-          shell_process_commands(source, length, NULL, &processed);
-      size_t work = shellsplit_test_metadata_work(
-          SHELLSPLIT_TEST_WORK_PROCESS_GROUP_REMAP);
-      bool matches = status == SHELL_PROCESS_OK &&
-                     processed.group_count == count &&
-                     processed.command_count == (family == 0 ? count : 1) &&
-                     work >= count && work <= 4 * count &&
-                     (!previous || work <= 3 * previous);
-      for (size_t group = 0; matches && group < count; group++)
-        matches =
-            processed.groups[group].command_count == 0 &&
-            processed.groups[group].first_command == (family == 0 ? group : 0);
-      if (!matches)
-        fprintf(stderr,
-                "Group remapping scaling family=%u count=%zu "
-                "status=%d work=%zu previous=%zu\n",
-                family, count, status, work, previous);
-      previous = work;
-      valid &= matches;
-      shell_processed_commands_free(&processed);
-    }
-  }
-#endif
-  test("Processed group interval remapping performs linear metadata work",
-       valid);
-}
-
-static void test_brace_group_boundaries_and_redirections(void) {
-  static const struct {
-    const char *input;
-    size_t command_count;
-    uint32_t group_count;
-  } boundary_cases[] = {
-      {"{\n echo one\n}", 1, 1},
-      {"{ echo one; } | { cat; }", 2, 2},
-      {"{ \r\n  echo one\r\n}", 2, 1},
-      {"echo \\{ \\}", 1, 0},
-      {"echo {foo}", 1, 0},
-      {"echo foo}", 1, 0},
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(boundary_cases) / sizeof(boundary_cases[0]);
-       i++) {
-    shell_parse_result_t fast = {0};
-    shell_processed_commands_t processed = {0};
-    bool case_valid =
-        shell_parse_fast(boundary_cases[i].input,
-                         strlen(boundary_cases[i].input), NULL,
-                         &fast) == SHELL_OK &&
-        shell_process_commands(boundary_cases[i].input,
-                               strlen(boundary_cases[i].input), NULL,
-                               &processed) == SHELL_PROCESS_OK &&
-        fast.count == boundary_cases[i].command_count &&
-        processed.command_count == boundary_cases[i].command_count &&
-        fast.group_count == boundary_cases[i].group_count &&
-        processed.group_count == boundary_cases[i].group_count &&
-        processed_group_descriptors_match_source(&fast, &processed);
-    valid = valid && case_valid;
-    shell_processed_commands_free(&processed);
-  }
-  test("Brace delimiters respect POSIX word and newline boundaries", valid);
-
-  static const struct {
-    const char *input;
-    size_t token_count;
-  } redirect_cases[] = {
-      {"{ echo one; echo two; } > /tmp/group.out", 2},
-      {"{ echo one; echo two; } >> /tmp/group.out", 2},
-      {"{ cat; cat; } < /tmp/group.in", 1},
-      {"{ echo one; echo two; } 2>&1", 2},
-      {"{ cat; cat; } <<< value", 1},
-      {"{ cat; cat; } <<< \"two words\"", 1},
-      {"{ cat; cat; } <<'EOF'\n}\nEOF", 1},
-      {"{ echo one; echo two; } </tmp/group.in >/tmp/group.out "
-       "2>>/tmp/group.err",
-       2},
-  };
-  valid = true;
-  for (size_t i = 0; i < sizeof(redirect_cases) / sizeof(redirect_cases[0]);
-       i++) {
-    shell_command_info_t *infos = NULL;
-    size_t count = 0;
-    shell_process_status_t status = shell_process_command(
-        redirect_cases[i].input, strlen(redirect_cases[i].input), NULL, &infos,
-        &count);
-    bool case_valid = status == SHELL_PROCESS_OK && count == 2 && infos != NULL;
-    for (size_t j = 0; case_valid && j < count; j++)
-      case_valid =
-          infos[j].command_token_count == redirect_cases[i].token_count &&
-          infos[j].has_redirections == (j + 1 == count);
-    valid = valid && case_valid;
-    shell_command_infos_free(infos, count);
-  }
-  test("Brace-group redirects stay attached without synthetic commands", valid);
-}
-
-static void test_brace_group_heredoc_sequence_contract(void) {
+static void tokenizer_test_brace_group_heredoc_sequence_contract(void) {
   static const struct {
     const char *input;
     size_t command_count;
@@ -6549,7 +5262,7 @@ static void test_brace_group_heredoc_sequence_contract(void) {
   test("Brace heredoc bodies never become processed commands", valid);
 }
 
-static void test_brace_group_grammar_matrix(void) {
+static void tokenizer_test_brace_group_grammar_matrix(void) {
   static const struct {
     const char *input;
     size_t command_count;
@@ -6631,7 +5344,7 @@ static void test_brace_group_grammar_matrix(void) {
         process_status == SHELL_PROCESS_OK &&
         processed.command_count == valid_cases[i].command_count &&
         processed.group_count == valid_cases[i].group_count &&
-        processed_group_descriptors_match_source(&fast, &processed) &&
+        tokenizer_processed_group_descriptors_match_source(&fast, &processed) &&
         netargv_status == SHELL_PROCESS_OK && netargv.data != NULL &&
         netargv_count == valid_cases[i].command_count &&
         command_status == SHELL_PROCESS_OK && command_netseq.data != NULL &&
@@ -6770,7 +5483,7 @@ static void test_brace_group_grammar_matrix(void) {
        valid);
 }
 
-static void test_brace_group_operation_limits_are_atomic(void) {
+static void tokenizer_test_brace_group_operation_limits_are_atomic(void) {
   static const char input[] =
       "{ ( cat; ); printf two; } 3>/tmp/trace 2>>/tmp/err";
   shell_process_limits_t exact = {SIZE_MAX, SIZE_MAX, 2};
@@ -6828,27 +5541,12 @@ static void test_brace_group_operation_limits_are_atomic(void) {
   test("Brace-group operation limits clear every canonical result", valid);
 }
 
-static void test_extraneous_brace_closer_rejected(void) {
-  const char *input = "{ echo one; } }";
-  shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
-  size_t command_count = SIZE_MAX;
-  shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
-  size_t info_count = SIZE_MAX;
-  bool valid =
-      shell_tokenize_commands(input, strlen(input), &commands,
-                              &command_count) == SHELL_TOKENIZE_EPARSE &&
-      commands == NULL && command_count == 0 &&
-      shell_process_command(input, strlen(input), NULL, &infos, &info_count) ==
-          SHELL_PROCESS_EPARSE &&
-      infos == NULL && info_count == 0;
-  test("Full tokenizer rejects an extraneous brace-group closer", valid);
-}
-
 /* Anomaly sequences are structural execution inputs, not policy netargv.
  * Nested substitutions execute before the enclosing simple command, while the
  * ordinary netargv sequence remains deliberately top-level and
  * authorization-oriented. */
-static void test_anomaly_sequences_include_nested_execution_stages(void) {
+static void
+tokenizer_test_anomaly_sequences_include_nested_execution_stages(void) {
   static const struct {
     const char *input;
     const char *raw;
@@ -6974,7 +5672,7 @@ static void test_anomaly_sequences_include_nested_execution_stages(void) {
   test("Anomaly sequences include nested shell execution stages", valid);
 }
 
-static void test_static_arithmetic_depth_is_bounded(void) {
+static void tokenizer_test_static_arithmetic_depth_is_bounded(void) {
   /* The static arithmetic recognizer must reject adversarial nesting before
    * its recursive grammar can exhaust the process stack. Exercise both the
    * source-facing canonical APIs and the depgraph consumer. */
@@ -7127,7 +5825,8 @@ static void test_static_arithmetic_depth_is_bounded(void) {
   test("Static arithmetic nesting is bounded", valid);
 }
 
-static void test_anomaly_sequences_represent_redirect_only_record(void) {
+static void
+tokenizer_test_anomaly_sequences_represent_redirect_only_record(void) {
   const char *input = ">/tmp/no-executable";
   shell_netstring_buffer_t netargv = {0};
   shell_netstring_buffer_t command_netseq = {0};
@@ -7268,7 +5967,7 @@ static void test_anomaly_sequences_represent_redirect_only_record(void) {
 /* A redirect operand is one shell word. A physical line ending or comment
  * cannot quietly supply a later command word as that operand, whereas an
  * escaped physical line ending remains part of the same command. */
-static void test_redirect_operand_boundary_contract(void) {
+static void tokenizer_test_redirect_operand_boundary_contract(void) {
   static const char *const invalid[] = {
       "echo >\nout",         "echo > # comment",
       "echo >\n# note\nout", "echo <\nin",
@@ -7435,7 +6134,7 @@ static void test_redirect_operand_boundary_contract(void) {
   test("Redirect operands preserve inline boundaries across APIs", valid);
 }
 
-static void test_processed_group_io_contract(void) {
+static void tokenizer_test_processed_group_io_contract(void) {
   static const char composed[] =
       "cat /tmp/in | { cat; cat; } <<< \"two words\" | sort && printf tail";
   static const char documents[] = "{ cat; cat; } <<A <<-'B'\n"
@@ -7840,7 +6539,7 @@ static void test_processed_group_io_contract(void) {
        valid);
 }
 
-static void test_processed_group_io_boundaries(void) {
+static void tokenizer_test_processed_group_io_boundaries(void) {
   static const char mixed[] = "{ echo one; } 3>\"/tmp/trace file\" "
                               "0<prefix<(cat) 2>>>(cat)suffix 6>&1 4<&0 5>&-";
   static const shell_group_io_kind_t kinds[] = {
@@ -8059,80 +6758,8 @@ static void test_processed_group_io_boundaries(void) {
        valid && allocation_failures_atomic);
 }
 
-/* Redirect-only stages remain graph and anomaly structure, but the structured
- * argv result must not retain an empty command slot or its backing allocation.
- * Exercise lazy growth as well: five executable stages grow the owned array
- * before the final redirect-only stage is omitted. */
-static void test_redirect_only_processed_result_ownership(void) {
-  static const struct {
-    const char *source;
-    size_t command_count;
-  } cases[] = {
-      {">output", 0},
-      {"<input >output", 0},
-      {"printf x; >output", 1},
-      {"{ cat; } >out; >a", 1},
-      {"printf one; printf two; printf three; >output", 3},
-      {"printf one; printf two; printf three; printf four; printf five; "
-       ">output",
-       5},
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    shell_processed_commands_t result = {0};
-    shell_process_status_t status = shell_process_commands(
-        cases[i].source, strlen(cases[i].source), NULL, &result);
-    valid = valid && status == SHELL_PROCESS_OK &&
-            result.command_count == cases[i].command_count &&
-            (result.command_count == 0 ? result.commands == NULL
-                                       : result.commands != NULL);
-    shell_processed_commands_free(&result);
-  }
-
-  static const char *const allocation_cases[] = {
-      ">output",
-      "printf x; >output",
-      "printf one; printf two; printf three; >output",
-      "printf one; printf two; printf three; printf four; printf five; >output",
-  };
-  for (size_t i = 0;
-       valid && i < sizeof(allocation_cases) / sizeof(allocation_cases[0]);
-       i++) {
-    shell_processed_commands_t result = {0};
-    shellsplit_test_alloc_reset();
-    shell_process_status_t status = shell_process_commands(
-        allocation_cases[i], strlen(allocation_cases[i]), NULL, &result);
-    size_t allocation_count = shellsplit_test_alloc_count();
-    valid = valid && status == SHELL_PROCESS_OK && allocation_count > 0 &&
-            (result.command_count == 0 ? result.commands == NULL
-                                       : result.commands != NULL);
-    shell_processed_commands_free(&result);
-
-    for (size_t fail_at = 1; valid && fail_at <= allocation_count; fail_at++) {
-      result = (shell_processed_commands_t){
-          .commands = (shell_command_info_t *)(uintptr_t)1,
-          .command_count = SIZE_MAX,
-          .groups = (shell_group_t *)(uintptr_t)1,
-          .group_count = SIZE_MAX,
-          .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
-          .group_io_op_count = SIZE_MAX,
-      };
-      shellsplit_test_alloc_fail_at(fail_at);
-      status = shell_process_commands(
-          allocation_cases[i], strlen(allocation_cases[i]), NULL, &result);
-      shellsplit_test_alloc_reset();
-      valid = valid && status == SHELL_PROCESS_ENOMEM &&
-              result.commands == NULL && result.command_count == 0 &&
-              result.groups == NULL && result.group_count == 0 &&
-              result.group_io_ops == NULL && result.group_io_op_count == 0;
-    }
-  }
-  shellsplit_test_alloc_reset();
-  test("Redirect-only processed results are compact and allocation-atomic",
-       valid);
-}
-
-static void test_group_combined_named_redirect_and_document_contract(void) {
+static void
+tokenizer_test_group_combined_named_redirect_and_document_contract(void) {
   shell_processed_commands_t result = {0};
   shell_process_status_t status;
   bool valid = true;
@@ -8347,7 +6974,7 @@ static void test_group_combined_named_redirect_and_document_contract(void) {
        valid);
 }
 
-static void test_combined_redirect_prefix_word_contract(void) {
+static void tokenizer_test_combined_redirect_prefix_word_contract(void) {
   static const struct {
     const char *source;
     const char *netargv;
@@ -8412,503 +7039,11 @@ static void test_combined_redirect_prefix_word_contract(void) {
        valid);
 }
 
-static void test_substitution_scanner_contract(void) {
-  /* A group redirect operand is one shell word, not a whitespace split. Its
-   * embedded command substitutions and backticks can contain spaces while the
-   * source span still covers the complete operand. */
-  static const char redirects[] =
-      "{ echo; } >prefix$(printf '/tmp/out')suffix 2>`printf /tmp/err`";
-  shell_processed_commands_t result = {0};
-  shell_process_status_t status =
-      shell_process_commands(redirects, sizeof(redirects) - 1, NULL, &result);
-  bool valid = status == SHELL_PROCESS_OK && result.group_count == 1 &&
-               result.group_io_op_count == 2 &&
-               result.group_io_ops[0].kind == SHELL_GROUP_IO_WRITE_FILE &&
-               result.group_io_ops[1].kind == SHELL_GROUP_IO_WRITE_FILE &&
-               result.group_io_ops[0].operand_end -
-                       result.group_io_ops[0].operand_start ==
-                   strlen("prefix$(printf '/tmp/out')suffix") &&
-               result.group_io_ops[1].operand_end -
-                       result.group_io_ops[1].operand_start ==
-                   strlen("`printf /tmp/err`");
-  shell_processed_commands_free(&result);
-
-  shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX, 1};
-  status = shell_process_commands(redirects, sizeof(redirects) - 1, &limits,
-                                  &result);
-  valid = valid && status == SHELL_PROCESS_EOUTPUT_LIMIT &&
-          result.commands == NULL && result.group_io_ops == NULL;
-  shell_processed_commands_free(&result);
-
-  /* A closing parenthesis in a nested heredoc is data, not the process
-   * substitution delimiter. Unterminated bodies remain a parse error for the
-   * complete structured API. */
-  static const char nested_heredoc[] = "cat <(cat <<EOF\n)\nEOF\n)";
-  status = shell_process_commands(nested_heredoc, sizeof(nested_heredoc) - 1,
-                                  NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1;
-  shell_processed_commands_free(&result);
-
-  /* The same structural rule applies to a command substitution. Its heredoc
-   * body remains deferred data until the closing delimiter, then the outer
-   * command-substitution delimiter closes normally. */
-  static const char nested_command_heredoc[] = "echo $(cat <<EOF\n)\nEOF\n)";
-  status =
-      shell_process_commands(nested_command_heredoc,
-                             sizeof(nested_command_heredoc) - 1, NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1;
-  shell_processed_commands_free(&result);
-
-  static const char mixed_quote_delimiter[] = "echo $(cat <<E'OF'\n)\nEOF\n)";
-  status = shell_process_commands(
-      mixed_quote_delimiter, sizeof(mixed_quote_delimiter) - 1, NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1;
-  shell_processed_commands_free(&result);
-
-  /* `<<` is an arithmetic shift inside `$((...))`, not a heredoc operator.
-   * This must stay true through command and process substitutions. */
-  static const char arithmetic_command[] = "echo $(printf '%s' $((1 << 2)))";
-  status = shell_process_commands(
-      arithmetic_command, sizeof(arithmetic_command) - 1, NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1;
-  shell_processed_commands_free(&result);
-
-  static const char arithmetic_process[] = "cat <(printf '%s' $((1 << 2)))";
-  status = shell_process_commands(
-      arithmetic_process, sizeof(arithmetic_process) - 1, NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1;
-  shell_processed_commands_free(&result);
-
-  static const char arithmetic_brace[] = "{ echo $((1 << 2)); }";
-  status = shell_process_commands(arithmetic_brace,
-                                  sizeof(arithmetic_brace) - 1, NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1 &&
-          result.group_count == 1;
-  shell_processed_commands_free(&result);
-
-  /* A dynamic redirect operand can itself be arithmetic. Its shift operator
-   * remains part of that word rather than beginning a heredoc declaration. */
-  static const char arithmetic_redirect[] = "{ echo; } >$((1 << 2))";
-  status = shell_process_commands(
-      arithmetic_redirect, sizeof(arithmetic_redirect) - 1, NULL, &result);
-  valid = valid && status == SHELL_PROCESS_OK && result.command_count == 1 &&
-          result.group_count == 1 && result.group_io_op_count == 1 &&
-          result.group_io_ops[0].kind == SHELL_GROUP_IO_WRITE_FILE &&
-          result.group_io_ops[0].operand_end -
-                  result.group_io_ops[0].operand_start ==
-              strlen("$((1 << 2))");
-  shell_processed_commands_free(&result);
-
-  static const char unterminated[] = "cat <(cat <<EOF\n)\n";
-  status = shell_process_commands(unterminated, sizeof(unterminated) - 1, NULL,
-                                  &result);
-  valid = valid && status == SHELL_PROCESS_EPARSE && result.commands == NULL &&
-          result.group_io_ops == NULL;
-  shell_processed_commands_free(&result);
-
-  test("Substitution scanning preserves redirects, heredocs, and arithmetic",
-       valid);
-}
-
-static void test_processed_group_descriptor_contract(void) {
-  static const struct {
-    const char *input;
-    shell_group_kind_t group_kind;
-    size_t operation_count;
-    shell_group_io_kind_t kinds[4];
-    uint32_t fds[4];
-    uint32_t targets[4];
-  } cases[] = {
-      {"{ echo one; } 4<&0",
-       SHELL_GROUP_BRACE,
-       1,
-       {SHELL_GROUP_IO_DUP_FD},
-       {4},
-       {0}},
-      {"( echo one; ) 5>&-",
-       SHELL_GROUP_SUBSHELL,
-       1,
-       {SHELL_GROUP_IO_CLOSE_FD},
-       {5},
-       {UINT32_MAX}},
-      {"{ echo one; } 3>/tmp/trace 4<&0 5>&- 2>&1",
-       SHELL_GROUP_BRACE,
-       4,
-       {SHELL_GROUP_IO_WRITE_FILE, SHELL_GROUP_IO_DUP_FD,
-        SHELL_GROUP_IO_CLOSE_FD, SHELL_GROUP_IO_DUP_FD},
-       {3, 4, 5, 2},
-       {UINT32_MAX, 0, UINT32_MAX, 1}},
-      {"{ sh; } > >(cat) <<< \"$(printf payload)\"",
-       SHELL_GROUP_BRACE,
-       2,
-       {SHELL_GROUP_IO_PROCESS_SUB_OUT, SHELL_GROUP_IO_HERESTRING},
-       {1, 0},
-       {UINT32_MAX, UINT32_MAX}},
-  };
-  bool valid = true;
-  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
-    shell_parse_result_t fast = {0};
-    shell_processed_commands_t result = {0};
-    valid = valid &&
-            shell_parse_fast(cases[c].input, strlen(cases[c].input), NULL,
-                             &fast) == SHELL_OK &&
-            fast.group_count == 1 &&
-            shell_process_commands(cases[c].input, strlen(cases[c].input), NULL,
-                                   &result) == SHELL_PROCESS_OK &&
-            result.command_count == 1 && result.group_count == 1 &&
-            result.groups[0].kind == cases[c].group_kind &&
-            result.group_io_op_count == cases[c].operation_count;
-    for (size_t i = 0; valid && i < result.group_io_op_count; i++) {
-      const shell_group_io_op_t *op = &result.group_io_ops[i];
-      valid =
-          op->group_index == 0 && op->kind == cases[c].kinds[i] &&
-          op->fd == cases[c].fds[i] && op->target_fd == cases[c].targets[i] &&
-          op->source_start < op->source_end &&
-          (i == 0 || result.group_io_ops[i - 1].source_end <= op->source_start);
-    }
-    shell_processed_commands_free(&result);
-  }
-
-  static const char heredoc_descriptors[] =
-      "{ cat; cat; } 4<&0 5>&- <<-'EOF' 3>\"/tmp/trace file\" 6>&1\n"
-      "\tpayload\n"
-      "\tEOF\n";
-  static const shell_group_io_kind_t heredoc_kinds[] = {
-      SHELL_GROUP_IO_DUP_FD,  SHELL_GROUP_IO_CLOSE_FD,
-      SHELL_GROUP_IO_HEREDOC, SHELL_GROUP_IO_WRITE_FILE,
-      SHELL_GROUP_IO_DUP_FD,
-  };
-  static const uint32_t heredoc_fds[] = {4, 5, 0, 3, 6};
-  static const uint32_t heredoc_targets[] = {0, UINT32_MAX, UINT32_MAX,
-                                             UINT32_MAX, 1};
-  shell_processed_commands_t heredoc_result = {0};
-  shell_process_status_t heredoc_status = shell_process_commands(
-      heredoc_descriptors, sizeof(heredoc_descriptors) - 1, NULL,
-      &heredoc_result);
-  valid = valid && heredoc_status == SHELL_PROCESS_OK &&
-          heredoc_result.command_count == 2 &&
-          heredoc_result.group_count == 1 &&
-          heredoc_result.group_io_op_count ==
-              sizeof(heredoc_kinds) / sizeof(heredoc_kinds[0]);
-  for (size_t i = 0; valid && i < heredoc_result.group_io_op_count; i++) {
-    const shell_group_io_op_t *op = &heredoc_result.group_io_ops[i];
-    valid = op->group_index == 0 && op->kind == heredoc_kinds[i] &&
-            op->fd == heredoc_fds[i] && op->target_fd == heredoc_targets[i] &&
-            op->source_start < op->source_end &&
-            op->operand_start < op->operand_end &&
-            (i == 0 ||
-             heredoc_result.group_io_ops[i - 1].source_end <= op->source_start);
-  }
-  if (valid) {
-    const shell_group_io_op_t *write = &heredoc_result.group_io_ops[3];
-    size_t write_length = write->source_end - write->source_start;
-    valid = write_length == strlen("3>\"/tmp/trace file\"") &&
-            memcmp(heredoc_descriptors + write->source_start,
-                   "3>\"/tmp/trace file\"", write_length) == 0;
-  }
-  shell_processed_commands_free(&heredoc_result);
-
-  /* Apply the returned source-order operations to a tiny test-only descriptor
-   * table.  This verifies the metadata preserves POSIX's order-sensitive
-   * duplication semantics without turning the dependency graph into an FD
-   * routing model. */
-  static const struct {
-    const char *input;
-    int expected_fd1;
-    int expected_fd2;
-  } order_cases[] = {
-      {"{ echo one; } 2>&1 >/tmp/out", 3, 1},
-      {"{ echo one; } >/tmp/out 2>&1", 3, 3},
-      {"{ echo one; } 3>&1 1>&- 4>&3", -1, 2},
-  };
-  for (size_t c = 0; c < sizeof(order_cases) / sizeof(order_cases[0]); c++) {
-    shell_processed_commands_t result = {0};
-    int descriptor[5] = {0, 1, 2, -1, -1};
-    shell_process_status_t status = shell_process_commands(
-        order_cases[c].input, strlen(order_cases[c].input), NULL, &result);
-    valid = valid && status == SHELL_PROCESS_OK;
-    for (size_t i = 0; valid && i < result.group_io_op_count; i++) {
-      const shell_group_io_op_t *op = &result.group_io_ops[i];
-      if (op->fd >= sizeof(descriptor) / sizeof(descriptor[0])) {
-        valid = false;
-      } else if (op->kind == SHELL_GROUP_IO_DUP_FD) {
-        valid = op->target_fd < sizeof(descriptor) / sizeof(descriptor[0]);
-        if (valid)
-          descriptor[op->fd] = descriptor[op->target_fd];
-      } else if (op->kind == SHELL_GROUP_IO_CLOSE_FD) {
-        descriptor[op->fd] = -1;
-      } else if (op->kind == SHELL_GROUP_IO_WRITE_FILE ||
-                 op->kind == SHELL_GROUP_IO_APPEND_FILE) {
-        descriptor[op->fd] = 3;
-      }
-    }
-    valid = valid && descriptor[1] == order_cases[c].expected_fd1 &&
-            descriptor[2] == order_cases[c].expected_fd2;
-    if (c == 2)
-      valid = valid && descriptor[4] == 1;
-    shell_processed_commands_free(&result);
-  }
-  test("Processed groups preserve leading descriptor and routing order", valid);
-}
-
-static void test_heredoc_iterator_contract(void) {
-  static const char input[] = "cat <<E'OF' <<-\\D'ONE'\n"
-                              "one\n"
-                              "EOF\n"
-                              "\ttwo\n"
-                              "\tDONE\n"
-                              "printf done";
-  static const shell_token_type_t types[] = {
-      SHELL_TOKEN_COMMAND,   SHELL_TOKEN_HEREDOC, SHELL_TOKEN_HEREDOC,
-      SHELL_TOKEN_SEMICOLON, SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND,
-  };
-  static const char *const texts[] = {"cat", "<<E'OF'", "<<-\\D'ONE'",
-                                      "\n",  "printf",  "done"};
-  shell_tokenizer_state_t state;
-  shell_tokenizer_init(&state, input, sizeof(input) - 1, NULL);
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
-    shell_token_t token;
-    bool advanced = shell_tokenizer_next(&state, &token);
-    bool token_valid = advanced && token.type == types[i] &&
-                       token.length == strlen(texts[i]) &&
-                       memcmp(token.start, texts[i], token.length) == 0;
-    if (i == 1 || i == 2)
-      token_valid = token_valid && token.is_quoted;
-    valid = valid && token_valid;
-  }
-  shell_token_t token;
-  valid = valid && !shell_tokenizer_next(&state, &token) &&
-          !state.heredoc_error && state.pending_heredoc_count == 0;
-
-  /* A named descriptor is part of an inline-document redirect, not a word
-   * followed by a bare redirect. The full lexer must retain that boundary for
-   * both document forms. The lexical iterator preserves the terminating
-   * newline as a list separator; the structured command tokenizer below
-   * consumes it as the document-only stage boundary. */
-  static const char named_heredoc[] = "cat& {fd}<<EOF\nbody\nEOF\n";
-  shell_tokenizer_init(&state, named_heredoc, sizeof(named_heredoc) - 1, NULL);
-  static const shell_token_type_t named_types[] = {
-      SHELL_TOKEN_COMMAND,
-      SHELL_TOKEN_BACKGROUND,
-      SHELL_TOKEN_HEREDOC,
-      SHELL_TOKEN_SEMICOLON,
-  };
-  static const char *const named_texts[] = {"cat", "&", "{fd}<<EOF", "\n"};
-  for (size_t i = 0; i < sizeof(named_types) / sizeof(named_types[0]); i++) {
-    bool advanced = shell_tokenizer_next(&state, &token);
-    valid = valid && advanced && token.type == named_types[i] &&
-            token.length == strlen(named_texts[i]) &&
-            memcmp(token.start, named_texts[i], token.length) == 0;
-  }
-  valid = valid && !shell_tokenizer_next(&state, &token) &&
-          !state.heredoc_error && state.pending_heredoc_count == 0;
-
-  static const char named_herestring[] = "{fd}<<<payload";
-  shell_tokenizer_init(&state, named_herestring, sizeof(named_herestring) - 1,
-                       NULL);
-  bool named_herestring_advanced = shell_tokenizer_next(&state, &token);
-  bool named_herestring_valid =
-      named_herestring_advanced && token.type == SHELL_TOKEN_HERESTRING &&
-      token.length == sizeof("{fd}<<<") - 1 &&
-      memcmp(token.start, "{fd}<<<", token.length) == 0;
-  bool named_herestring_operand =
-      shell_tokenizer_next(&state, &token) &&
-      token.type == SHELL_TOKEN_COMMAND &&
-      token.length == sizeof("payload") - 1 &&
-      memcmp(token.start, "payload", token.length) == 0;
-  bool named_herestring_exhausted = !shell_tokenizer_next(&state, &token);
-  valid = valid && named_herestring_valid && named_herestring_operand &&
-          named_herestring_exhausted;
-
-  shell_command_t *named_commands = NULL;
-  size_t named_command_count = 0;
-  bool named_commands_valid =
-      shell_tokenize_commands(named_heredoc, sizeof(named_heredoc) - 1,
-                              &named_commands,
-                              &named_command_count) == SHELL_TOKENIZE_OK &&
-      named_command_count == 2 && named_commands != NULL &&
-      named_commands[1].token_count == 1 &&
-      named_commands[1].tokens[0].type == SHELL_TOKEN_HEREDOC &&
-      named_commands[1].tokens[0].length == sizeof("{fd}<<EOF") - 1;
-  valid = valid && named_commands_valid;
-  shell_commands_free(named_commands, named_command_count);
-
-  shell_command_t *commands = NULL;
-  size_t command_count = 0;
-  static const char unterminated[] = "cat <<EOF\nbody\n";
-  bool unterminated_valid =
-      shell_tokenize_commands(unterminated, sizeof(unterminated) - 1, &commands,
-                              &command_count) == SHELL_TOKENIZE_OK &&
-      commands != NULL && command_count == 1;
-  valid = valid && unterminated_valid;
-  shell_commands_free(commands, command_count);
-  test("Heredoc iterator emits declarations and skips ordered bodies", valid);
-}
-
-static void test_canonical_heredoc_api_contract(void) {
-  static const struct {
-    const char *name;
-    const char *input;
-    size_t document_count;
-    size_t literal_count;
-    const char *first_delimiter;
-  } cases[] = {
-      {"space-separated delimiter", "cat << EOF\nbody\nEOF\nprintf after\n", 1,
-       0, "EOF"},
-      {"double-quoted retained backslash",
-       "cat <<\"E\\qF\"\nbody\nE\\qF\nprintf after\n", 1, 1, "E\\qF"},
-      {"double-quoted whitespace delimiter",
-       "cat <<\"A B\"\nbody\nA B\nprintf after\n", 1, 1, "A B"},
-      {"escaped whitespace delimiter", "cat <<A\\ B\nbody\nA B\nprintf after\n",
-       1, 1, "A\\ B"},
-      {"empty single-quoted delimiter", "cat <<''\n\nprintf after\n", 1, 1, ""},
-      {"CR distinguishes delimiter lines",
-       "cat <<EOF\nEOF\r\nEOF\nprintf after\n", 1, 0, "EOF"},
-      {"CR survives quote removal and matches exactly",
-       "cat <<\"EOF\"\r\nEOF\nEOF\r\nprintf after\n", 1, 1, "\"EOF\"\r"},
-      {"mixed FIFO CRLF delimiters",
-       "cat << EOF <<-\"F\"\r\none\r\nEOF\n\ttwo\r\n\tF\r\n"
-       "printf after\r\n",
-       2, 1, "EOF"},
-  };
-
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    const char *input = cases[i].input;
-    size_t length = strlen(input);
-    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
-                             .strict_mode = true};
-    shell_parse_result_t fast = {0};
-    shell_command_t *commands = NULL;
-    size_t command_count = 0;
-    shell_processed_commands_t processed = {0};
-    shell_netstring_buffer_t netargv = {0};
-    shell_netstring_buffer_t command_netseq = {0};
-    shell_netstring_buffer_t anomaly_commands = {0};
-    shell_netstring_buffer_t anomaly_types = {0};
-    size_t netargv_count = 0;
-    size_t command_netseq_count = 0;
-    size_t anomaly_count = 0;
-    bool features = false;
-    shell_dep_graph_t graph = {0};
-
-    valid =
-        valid && shell_parse_fast(input, length, &strict, &fast) == SHELL_OK &&
-        fast.status == SHELL_STATUS_OK &&
-        shell_tokenize_commands(input, length, &commands, &command_count) ==
-            SHELL_TOKENIZE_OK &&
-        command_count == 2 &&
-        shell_process_commands(input, length, NULL, &processed) ==
-            SHELL_PROCESS_OK &&
-        processed.command_count == 2 &&
-        shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
-                                            &netargv_count,
-                                            &features) == SHELL_PROCESS_OK &&
-        netargv.data != NULL && netargv_count == 2 && features &&
-        shell_build_command_netseq_buffer(input, length, NULL, &command_netseq,
-                                          &command_netseq_count) ==
-            SHELL_PROCESS_OK &&
-        command_netseq.data != NULL && command_netseq_count == 2 &&
-        shell_build_anomaly_netseqs_buffer(
-            input, length, NULL, &anomaly_commands, &anomaly_types,
-            &anomaly_count) == SHELL_PROCESS_OK &&
-        anomaly_commands.data != NULL && anomaly_types.data != NULL &&
-        anomaly_count == 2 &&
-        shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
-            SHELL_DEP_OK &&
-        shell_dep_graph_validate(&graph).valid;
-
-    size_t documents = 0;
-    size_t literals = 0;
-    size_t reads = 0;
-    const shell_dep_doc_t *first_document = NULL;
-    for (uint32_t node = 0; node < graph.node_count; node++) {
-      const shell_dep_node_t *current = &graph.nodes[node];
-      if (current->type != SHELL_NODE_DOC ||
-          current->doc.kind != SHELL_DOC_HEREDOC)
-        continue;
-      if (!first_document)
-        first_document = &current->doc;
-      documents++;
-      literals +=
-          (current->doc.flags & SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL) != 0;
-    }
-    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-      reads += graph.edges[edge].type == SHELL_EDGE_READ;
-    valid = valid && documents == cases[i].document_count &&
-            literals == cases[i].literal_count && reads > 0 &&
-            first_document != NULL && first_document->name != NULL &&
-            first_document->name_len == strlen(cases[i].first_delimiter) &&
-            memcmp(first_document->name, cases[i].first_delimiter,
-                   first_document->name_len) == 0;
-
-    shell_commands_free(commands, command_count);
-    shell_processed_commands_free(&processed);
-    shell_netstring_buffer_free(&netargv);
-    shell_netstring_buffer_free(&command_netseq);
-    shell_netstring_buffer_free(&anomaly_commands);
-    shell_netstring_buffer_free(&anomaly_types);
-  }
-  test("Canonical APIs agree on POSIX heredoc delimiters", valid);
-}
-
-static void test_heredoc_expansion_semantic_contract(void) {
-  static const char *const unsupported[] = {
-      "cat <<EOF\n$(while true; do :; done)\nEOF\n",
-      "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
-      "cat <<EOF\n${items[0]}\nEOF\n",
-      "cat <<EOF\n$((items[0]))\nEOF\n",
-      "cat <<EOF\n\"${items[0]}\"\nEOF\n",
-      "echo $(cat <<EOF\n$(coproc worker { :; })\nEOF\n)",
-  };
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++)
-    valid = valid && shell_tokenizer_has_unsupported_semantics(
-                         unsupported[i], strlen(unsupported[i]));
-
-  static const char *const supported[] = {
-      ("cat <<EOF\nwhile true; do :; done\n$\"locale\"\n"
-       "\\$(while true; do :; done)\n\\${items[0]}\n$(printf x)\n"
-       "$((1 + 2))\nEOF\n"),
-      ("cat <<'EOF'\n$(while true; do :; done)\n${items[0]}\n"
-       "$((items[0]))\n$\"locale\"\nEOF\n"),
-      "cat <<${items[0]}\nbody\n${items[0]}\n",
-  };
-  for (size_t i = 0; valid && i < sizeof(supported) / sizeof(supported[0]); i++)
-    valid = !shell_tokenizer_has_unsupported_semantics(supported[i],
-                                                       strlen(supported[i]));
-
-  static const char visited[] = "cat <<EOF <<-'LITERAL'\r\n"
-                                "$(printf active)\r\n"
-                                "EOF\n"
-                                "\t$(while true; do :; done)\r\n"
-                                "\tLITERAL\r\n";
-  heredoc_body_capture_t capture = {0};
-  size_t after = 0;
-  bool complete = false;
-  size_t first_operator = strlen("cat ");
-  valid = valid &&
-          shell_source_visit_heredoc_sequence(
-              visited, sizeof(visited) - 1, first_operator,
-              capture_heredoc_body, &capture, &after, &complete) &&
-          complete && after == sizeof(visited) - 1 && capture.count == 2 &&
-          !capture.quoted[0] && capture.quoted[1] &&
-          capture.lengths[0] == strlen("$(printf active)\r\n") &&
-          capture.lengths[1] == strlen("\t$(while true; do :; done)\r\n") &&
-          memcmp(visited + capture.starts[0], "$(printf active)\r\n",
-                 capture.lengths[0]) == 0 &&
-          memcmp(visited + capture.starts[1], "\t$(while true; do :; done)\r\n",
-                 capture.lengths[1]) == 0;
-  test("Heredoc validation distinguishes active expansions from literal data",
-       valid);
-}
-
 /* Wider conditional predicates and mutating arithmetic are unsupported
  * compounds. Their punctuation may be separated only by physical continuations,
  * which shell removes before recognizing the command. Every public semantic
  * adapter must reject that source atomically. */
-static void test_continued_bash_compound_syntax_contract(void) {
+static void tokenizer_test_continued_bash_compound_syntax_contract(void) {
   static const char *const unsupported[] = {
       "(\\\n( count += 1 ))",
       "(\\\n( count += 1 ))",
@@ -8960,7 +7095,8 @@ static void test_continued_bash_compound_syntax_contract(void) {
   test("Continued Bash compound commands remain unsupported", valid);
 }
 
-static void test_current_shell_metaprogramming_semantic_contract(void) {
+static void
+tokenizer_test_current_shell_metaprogramming_semantic_contract(void) {
   /* The strict model must never accept a known builtin that can run a second
    * current-shell program, defer one to a handler, replay one, or alter later
    * command lookup. Quote removal, prefixes, and wrappers do not hide that
@@ -9193,7 +7329,7 @@ static void test_current_shell_metaprogramming_semantic_contract(void) {
  * readonly declaration can make a later named-FD allocation fail while keeping
  * the old descriptor binding alive, so every state-changing spelling must be
  * rejected before any public producer can expose a partial result. */
-static void test_readonly_named_fd_semantic_contract(void) {
+static void tokenizer_test_readonly_named_fd_semantic_contract(void) {
   static const char *const unsupported[] = {
       "readonly fd; exec {fd}>/tmp/second; printf bytes >&$fd",
       "readonly fd=locked; exec {fd}>/tmp/second; printf bytes >&$fd",
@@ -9245,7 +7381,8 @@ static void test_readonly_named_fd_semantic_contract(void) {
   test("Readonly descriptor mutations are unsupported atomically", valid);
 }
 
-static size_t render_nested_brace_heredoc(char *output, uint32_t depth) {
+static size_t tokenizer_render_nested_brace_heredoc(char *output,
+                                                    uint32_t depth) {
   size_t length = 0;
   for (uint32_t i = 0; i < depth; i++) {
     memcpy(output + length, "{ ", 2);
@@ -9261,9 +7398,10 @@ static size_t render_nested_brace_heredoc(char *output, uint32_t depth) {
   return length + sizeof(" <<EOF\nbody\nEOF") - 1;
 }
 
-static void test_brace_group_maximum_contract(void) {
+static void tokenizer_test_brace_group_maximum_contract(void) {
   char input[(SHELL_MAX_GROUPS + 1) * 5 + 32];
-  size_t length = render_nested_brace_heredoc(input, SHELL_MAX_GROUPS);
+  size_t length =
+      tokenizer_render_nested_brace_heredoc(input, SHELL_MAX_GROUPS);
   shell_parse_result_t fast = {0};
   shell_command_t *commands = NULL;
   size_t command_count = 0;
@@ -9289,7 +7427,7 @@ static void test_brace_group_maximum_contract(void) {
   shell_commands_free(commands, command_count);
   shell_processed_commands_free(&processed);
 
-  length = render_nested_brace_heredoc(input, SHELL_MAX_GROUPS + 1);
+  length = tokenizer_render_nested_brace_heredoc(input, SHELL_MAX_GROUPS + 1);
   commands = (shell_command_t *)(uintptr_t)1;
   command_count = SIZE_MAX;
   processed.commands = (shell_command_info_t *)(uintptr_t)1;
@@ -9319,40 +7457,7 @@ static void test_brace_group_maximum_contract(void) {
   test("Brace-group maximum depth is consistent across high-level APIs", valid);
 }
 
-static void test_canonical_sequence_model_capacity_contract(void) {
-  char input[(SHELL_MAX_SUBCOMMANDS + 1) * 2];
-  size_t length = 0;
-  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++) {
-    input[length++] = 'x';
-    if (i + 1 < SHELL_MAX_SUBCOMMANDS + 1)
-      input[length++] = '|';
-  }
-
-  shell_command_info_t *flat = NULL;
-  size_t flat_count = 0;
-  shell_processed_commands_t processed = {0};
-  shell_netstring_buffer_t netargv = {0};
-  size_t netargv_count = SIZE_MAX;
-  bool features = true;
-  bool valid =
-      shell_process_command(input, length, NULL, &flat, &flat_count) ==
-          SHELL_PROCESS_OK &&
-      flat != NULL && flat_count == SHELL_MAX_SUBCOMMANDS + 1 &&
-      shell_process_commands(input, length, NULL, &processed) ==
-          SHELL_PROCESS_EOUTPUT_LIMIT &&
-      processed.commands == NULL && processed.command_count == 0 &&
-      processed.groups == NULL && processed.group_count == 0 &&
-      processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
-      shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
-                                          &netargv_count, &features) ==
-          SHELL_PROCESS_EOUTPUT_LIMIT &&
-      netargv.data == NULL && netargv_count == 0 && !features;
-  shell_command_infos_free(flat, flat_count);
-  shell_processed_commands_free(&processed);
-  test("Canonical sequence honors semantic-model capacity", valid);
-}
-
-static void test_empty_process_argv(void) {
+static void tokenizer_test_empty_process_argv(void) {
   static const char source[] = "<() printf a<()b <()>() ''<() \"<()\"";
   static const char expected[] = "6:printf,2:ab,0:,3:<(),";
   shell_command_info_t *infos = NULL;
@@ -9387,17 +7492,18 @@ static void test_empty_process_argv(void) {
       shell_build_anomaly_netseqs_buffer(source, sizeof(source) - 1, NULL, &raw,
                                          &typed, &count) == SHELL_PROCESS_OK &&
       count == 1;
-  valid = valid && command_netseq_matches("<() printf ok", "6:printf,", 1);
+  valid = valid &&
+          tokenizer_command_netseq_matches("<() printf ok", "6:printf,", 1);
   shell_netstring_buffer_free(&raw);
   shell_netstring_buffer_free(&typed);
   shell_netstring_buffer_free(&sequence);
   test("Canonical argv elides empty process words, not quoted empty arguments",
        valid);
   test("Empty process words preserve allocation failure atomicity",
-       process_commands_allocation_failure_atomic(source));
+       tokenizer_process_commands_allocation_failure_atomic(source));
 }
 
-static void test_elided_group_records(void) {
+static void tokenizer_test_elided_group_records(void) {
   static const struct {
     const char *source;
     size_t flat_count, structured_count, groups;
@@ -9439,8 +7545,9 @@ static void test_elided_group_records(void) {
   }
   test("Elided stages preserve flat flags and structured group indexes", valid);
   test("Elided group records remain allocation-failure atomic",
-       process_commands_allocation_failure_atomic(cases[2].source) &&
-           process_commands_allocation_failure_atomic(cases[3].source));
+       tokenizer_process_commands_allocation_failure_atomic(cases[2].source) &&
+           tokenizer_process_commands_allocation_failure_atomic(
+               cases[3].source));
 
   /* Anomaly sequences retain both structural stages, including the empty
    * sentinel; structured omission must not remove that observation. */
@@ -9497,7 +7604,7 @@ static void test_elided_group_records(void) {
 #endif
 }
 
-static void test_processed_word_iterator_boundary_contract(void) {
+static void tokenizer_test_processed_word_iterator_boundary_contract(void) {
   static const char continuation_source[] = ">x\\\ny next";
   shell_token_t redirect_tokens[] = {
       {.type = SHELL_TOKEN_REDIRECT_OUT,
@@ -9582,7 +7689,7 @@ static void test_processed_word_iterator_boundary_contract(void) {
 /* Substitutions own their quoting and scalar parameters. A word-level scalar
  * iterator must not visit child command source or leak its quote state into
  * the enclosing word. Child commands are analyzed separately by netseq APIs. */
-static void test_scalar_variable_substitution_scopes(void) {
+static void tokenizer_test_scalar_variable_substitution_scopes(void) {
   static const struct {
     const char *word;
     const char *variables[3];
@@ -9724,57 +7831,7 @@ static void test_scalar_variable_substitution_scopes(void) {
        valid);
 }
 
-static void test_scalar_variable_scan_linear_work(void) {
-  static const size_t depths[] = {8, 24, 48};
-  static const size_t payloads[] = {16, 512, 4096};
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(depths) / sizeof(depths[0]); i++) {
-    for (size_t j = 0; j < sizeof(payloads) / sizeof(payloads[0]); j++) {
-      static const char prefix[] = "\"";
-      static const char opener[] = "$(printf ";
-      static const char literal[] = "'$INNER \"' ";
-      static const char suffix[] = "$AFTER\"";
-      size_t capacity = sizeof(prefix) + depths[i] * sizeof(opener) +
-                        sizeof(literal) + payloads[j] + sizeof(suffix) + 1;
-      char *word = malloc(capacity);
-      if (!word) {
-        valid = false;
-        continue;
-      }
-      size_t length = 0;
-      memcpy(word + length, prefix, sizeof(prefix) - 1);
-      length += sizeof(prefix) - 1;
-      for (size_t n = 0; n < depths[i]; n++) {
-        memcpy(word + length, opener, sizeof(opener) - 1);
-        length += sizeof(opener) - 1;
-      }
-      memcpy(word + length, literal, sizeof(literal) - 1);
-      length += sizeof(literal) - 1;
-      memset(word + length, 'x', payloads[j]);
-      length += payloads[j];
-      for (size_t n = 0; n < depths[i]; n++)
-        word[length++] = ')';
-      memcpy(word + length, suffix, sizeof(suffix));
-      length += sizeof(suffix) - 1;
-
-      shellsplit_test_source_scan_reset();
-      shell_token_t token = {.start = word, .length = length};
-      bool matches = shell_tokenizer_token_has_variable(&token);
-      size_t work = shellsplit_test_source_scan_work();
-      matches = matches && work >= payloads[j] && work <= 32 * length;
-      if (!matches)
-        fprintf(stderr,
-                "scalar scan depth=%zu payload=%zu bytes=%zu work=%zu\n",
-                depths[i], payloads[j], length, work);
-      valid = valid && matches;
-      free(word);
-    }
-  }
-  test("Scalar variable substitution scanning performs linear source work",
-       valid);
-}
-
-static void test_prevalidated_anomaly_stages(void) {
+static void tokenizer_test_prevalidated_anomaly_stages(void) {
   static const struct {
     const char *source;
     const char *raw;
@@ -9919,7 +7976,7 @@ static void test_prevalidated_anomaly_stages(void) {
   test("Prevalidated anomaly collection retains the group-I/O budget", valid);
 }
 
-static void test_control_syntax_scope_contract(void) {
+static void tokenizer_test_control_syntax_scope_contract(void) {
   static const struct {
     const char *source;
     shell_control_syntax_t expected;
@@ -9967,182 +8024,97 @@ static void test_control_syntax_scope_contract(void) {
        valid);
 }
 
-static void test_control_word_fragments(void) {
-  bool valid = true;
-  for (size_t i = 0; i < sizeof(shellsplit_test_control_word_fragments) /
-                             sizeof(shellsplit_test_control_word_fragments[0]);
-       i++) {
-    const char *source = shellsplit_test_control_word_fragments[i].source;
-    bool item = shell_tokenizer_control_syntax(source, strlen(source)) ==
-                SHELL_CONTROL_SYNTAX_NONE;
-    if (!item)
-      fprintf(stderr, "control word fragment: %s\n", source);
-    valid = item && valid;
-  }
-  test("Control syntax recognizes complete words rather than fragments", valid);
-
-  valid = true;
-  for (unsigned family = 0; family < 2; family++) {
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-    size_t previous = 0;
-#endif
-    for (size_t units = 64; units <= 512; units *= 2) {
-      char source[8192];
-      memcpy(source, family ? "if" : "fi", 2);
-      size_t length = 2;
-      const char *fragment = family ? "$(printf x)" : "\\\n";
-      size_t size = strlen(fragment);
-      for (size_t i = 0; i < units; i++) {
-        memcpy(source + length, fragment, size);
-        length += size;
-      }
-      if (!family) {
-        memcpy(source + length, "$(printf x)", 11);
-        length += 11;
-      }
-      source[length] = '\0';
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-      shellsplit_test_source_scan_reset();
-#endif
-      bool item = shell_tokenizer_control_syntax(source, length) ==
-                  SHELL_CONTROL_SYNTAX_NONE;
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-      size_t work = shellsplit_test_source_scan_work();
-      item = item && work <= 128 * length + 1024 &&
-             (!previous || work <= 2 * previous + 2048);
-      previous = work;
-#endif
-      if (!item)
-        fprintf(stderr, "control fragment scaling: family=%u units=%zu\n",
-                family, units);
-      valid = item && valid;
-    }
-  }
-  test("Control fragment classification has linear source work", valid);
-}
-
-int main(void) {
-  test_prevalidated_anomaly_stages();
-  test_control_syntax_scope_contract();
-  test_control_word_fragments();
-  test_scalar_variable_substitution_scopes();
-  test_scalar_variable_scan_linear_work();
-  test_tokenize_allocation_failures();
-  test_processor_allocation_failures();
-  test_transform_allocation_failures();
-  test_transform_source_limit_preflight();
+static int run_tokenizer(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  tokenizer_test_prevalidated_anomaly_stages();
+  tokenizer_test_control_syntax_scope_contract();
+  tokenizer_test_scalar_variable_substitution_scopes();
+  tokenizer_test_transform_allocation_failures();
   test("Quoted byte processing is allocation-failure atomic",
-       process_commands_allocation_failure_atomic(
+       tokenizer_process_commands_allocation_failure_atomic(
            "{ printf '%s' '日本'; } >'résumé.txt'") &&
-           process_command_allocation_failure_atomic(
+           tokenizer_process_command_allocation_failure_atomic(
                "printf '%s' '\x80\xff' >'réport.txt'"));
   test("Unquoted byte processing is allocation-failure atomic",
-       process_commands_allocation_failure_atomic(
+       tokenizer_process_commands_allocation_failure_atomic(
            "{ printf '%s' 日本; } >résumé.txt") &&
-           process_command_allocation_failure_atomic(
+           tokenizer_process_command_allocation_failure_atomic(
                "printf '%s' \x80\xff >résumé.txt"));
   test("ANSI-C byte processing is allocation-failure atomic",
-       process_commands_allocation_failure_atomic(
+       tokenizer_process_commands_allocation_failure_atomic(
            "{ printf '%s' $'日本\\t語'; } >$'résumé.txt'") &&
-           process_command_allocation_failure_atomic(
+           tokenizer_process_command_allocation_failure_atomic(
                "printf '%s' $'\x80\xff' >$'résumé.txt'"));
   test("ANSI-C NUL processing is allocation-failure atomic",
-       process_commands_allocation_failure_atomic(
+       tokenizer_process_commands_allocation_failure_atomic(
            "{ printf '%s' $'a\\0b'; } >$'out\\0ignored'") &&
-           process_command_allocation_failure_atomic(
+           tokenizer_process_command_allocation_failure_atomic(
                "printf '%s' pre$'a\\0b'post $'\\0'"));
   test("Later timing prefixes are allocation-failure atomic",
-       process_command_allocation_failure_atomic(
+       tokenizer_process_command_allocation_failure_atomic(
            "echo a; time -p echo b; time; ! echo c") &&
-           process_command_allocation_failure_atomic(
+           tokenizer_process_command_allocation_failure_atomic(
                "echo a; time { echo b; time; }"));
   test("Document execution stages are allocation-failure atomic",
-       process_commands_allocation_failure_atomic(
+       tokenizer_process_commands_allocation_failure_atomic(
            "{ time 3<<<body cat <&3; } | time <<<next") &&
-           process_commands_allocation_failure_atomic(
+           tokenizer_process_commands_allocation_failure_atomic(
                "time <<EOF cat argument\nbody\nEOF\n") &&
-           process_command_allocation_failure_atomic(
+           tokenizer_process_command_allocation_failure_atomic(
                "{ time <<<body cat; } | cat <<<next"));
-  test_output_limit_boundaries();
-  test_cstring_allocation_size_boundaries();
-  test_canonical_control_compounds_rejected();
-  test_unsupported_control_precedes_capacity();
-  test_malformed_source_precedes_capacity();
-  test_control_word_literals_are_accepted();
-  test_structured_processor_requires_complete_syntax();
-  test_tolerant_unfinished_group_omits_empty_command();
-  test_processed_commands_preserve_comment_free_ranges();
-  test_tokenizer_empty_source_is_not_a_parse_error();
-  test_blank_source_convention();
-  test_processed_comment_only_source_is_empty();
-  test_record_less_syntax_is_not_blank();
-  test_single_command_group_has_shell_features();
-  test_posix_brace_group_sequence();
-  test_posix_brace_group_forms();
-  test_command_position_group_syntax_rejected();
-  test_full_tokenizer_group_context();
-  test_brace_group_process_substitution_contract();
-  test_clobber_redirection_operand_contract();
-  test_brace_group_processed_contract();
-  test_processed_group_command_intervals();
-  test_processed_group_remapping_scaling();
-  test_brace_group_boundaries_and_redirections();
-  test_brace_group_heredoc_sequence_contract();
-  test_brace_group_grammar_matrix();
-  test_brace_group_operation_limits_are_atomic();
-  test_extraneous_brace_closer_rejected();
-  test_anomaly_sequences_include_nested_execution_stages();
-  test_static_arithmetic_depth_is_bounded();
-  test_anomaly_sequences_represent_redirect_only_record();
-  test_redirect_operand_boundary_contract();
-  test_processed_group_io_contract();
-  test_processed_group_io_boundaries();
-  test_redirect_only_processed_result_ownership();
-  test_group_combined_named_redirect_and_document_contract();
-  test_combined_redirect_prefix_word_contract();
-  test_substitution_scanner_contract();
-  test_processed_group_descriptor_contract();
-  test_heredoc_iterator_contract();
-  test_canonical_heredoc_api_contract();
-  test_heredoc_expansion_semantic_contract();
-  test_continued_bash_compound_syntax_contract();
-  test_current_shell_metaprogramming_semantic_contract();
-  test_readonly_named_fd_semantic_contract();
-  test_brace_group_maximum_contract();
-  test_canonical_sequence_model_capacity_contract();
-  test_processed_word_iterator_boundary_contract();
-  test_empty_process_argv();
-  test_elided_group_records();
-  test_token_type_names();
-  test_list_syntax_contract();
-  test_source_scanner_boundaries();
-  test_executable_substitution_scanner_contract();
-  test_substitution_and_list_is_not_background();
-  test_brace_close_across_line_continuation();
-  test_negator_requires_a_word_start();
-  test_nested_brace_group_is_a_feature();
-  test_descriptor_duplication_is_not_background();
-  test_glob_class_continuation_keeps_the_feature();
-  test_quoted_prefix_extglob_is_one_word();
-  test_glob_bracket_quoted_members_keep_the_feature();
-  test_current_shell_wrapper_chain_contract();
-  test_expansion_line_continuation_contract();
-  test_redirect_operand_safety_contract();
-  test_terminal_redirect_continuation_contract();
-  test_named_fd_word_boundaries();
-  test_record_parser_boundaries();
-  test_modern_bash_syntax_contract();
-  test_processor_routing_cross_product();
-  test_canonical_buffer_output_contract();
-  test_escaped_word_prefix_boundaries();
-  test_flat_processor_parse_selection();
-  test_array_semantic_boundaries();
-  test_ansi_c_structural_scanner_contract();
-  test_nested_quote_and_ansi_completion();
-  test_double_quoted_parameter_substitution_scope();
-  test_error_strings();
-  test_composition_metadata();
-  static const iterator_case_t iterator_cases[] = {
+  tokenizer_test_output_limit_boundaries();
+  tokenizer_test_cstring_allocation_size_boundaries();
+  tokenizer_test_canonical_control_compounds_rejected();
+  tokenizer_test_control_word_literals_are_accepted();
+  tokenizer_test_structured_processor_requires_complete_syntax();
+  tokenizer_test_tolerant_unfinished_group_omits_empty_command();
+  tokenizer_test_blank_source_convention();
+  tokenizer_test_record_less_syntax_is_not_blank();
+  tokenizer_test_posix_brace_group_forms();
+  tokenizer_test_brace_group_process_substitution_contract();
+  tokenizer_test_brace_group_heredoc_sequence_contract();
+  tokenizer_test_brace_group_grammar_matrix();
+  tokenizer_test_brace_group_operation_limits_are_atomic();
+  tokenizer_test_anomaly_sequences_include_nested_execution_stages();
+  tokenizer_test_static_arithmetic_depth_is_bounded();
+  tokenizer_test_anomaly_sequences_represent_redirect_only_record();
+  tokenizer_test_redirect_operand_boundary_contract();
+  tokenizer_test_processed_group_io_contract();
+  tokenizer_test_processed_group_io_boundaries();
+  tokenizer_test_group_combined_named_redirect_and_document_contract();
+  tokenizer_test_combined_redirect_prefix_word_contract();
+  tokenizer_test_continued_bash_compound_syntax_contract();
+  tokenizer_test_current_shell_metaprogramming_semantic_contract();
+  tokenizer_test_readonly_named_fd_semantic_contract();
+  tokenizer_test_brace_group_maximum_contract();
+  tokenizer_test_processed_word_iterator_boundary_contract();
+  tokenizer_test_empty_process_argv();
+  tokenizer_test_elided_group_records();
+  tokenizer_test_token_type_names();
+  tokenizer_test_list_syntax_contract();
+  tokenizer_test_source_scanner_boundaries();
+  tokenizer_test_executable_substitution_scanner_contract();
+  tokenizer_test_brace_close_across_line_continuation();
+  tokenizer_test_negator_requires_a_word_start();
+  tokenizer_test_descriptor_duplication_is_not_background();
+  tokenizer_test_glob_class_continuation_keeps_the_feature();
+  tokenizer_test_quoted_prefix_extglob_is_one_word();
+  tokenizer_test_glob_bracket_quoted_members_keep_the_feature();
+  tokenizer_test_current_shell_wrapper_chain_contract();
+  tokenizer_test_expansion_line_continuation_contract();
+  tokenizer_test_redirect_operand_safety_contract();
+  tokenizer_test_record_parser_boundaries();
+  tokenizer_test_modern_bash_syntax_contract();
+  tokenizer_test_processor_routing_cross_product();
+  tokenizer_test_escaped_word_prefix_boundaries();
+  tokenizer_test_array_semantic_boundaries();
+  tokenizer_test_ansi_c_structural_scanner_contract();
+  tokenizer_test_nested_quote_and_ansi_completion();
+  tokenizer_test_double_quoted_parameter_substitution_scope();
+  tokenizer_test_error_strings();
+  tokenizer_test_composition_metadata();
+  static const tokenizer_iterator_case_t iterator_cases[] = {
       {"Tokenizer iterator: empty input", "", 0, {0}, {NULL}, 0, 0, 0},
       {"Tokenizer iterator: leading whitespace preserves newline separator",
        " \t\n",
@@ -10262,13 +8234,13 @@ int main(void) {
        0,
        0},
   };
-  run_iterator_cases(iterator_cases,
-                     sizeof(iterator_cases) / sizeof(iterator_cases[0]));
-  test_iterator_argument_contracts();
+  tokenizer_run_iterator_cases(iterator_cases, sizeof(iterator_cases) /
+                                                   sizeof(iterator_cases[0]));
+  tokenizer_test_iterator_argument_contracts();
   printf("Running unified tokenizer tests...\n\n");
   printf("=== BASIC TOKENIZER TESTS ===\n\n");
 
-  static const tokenizer_case_t basic_cases[] = {
+  static const tokenizer_tokenizer_case_t basic_cases[] = {
       {"pipe and redirect", "cat xx | less -G > rsr", 2},
       {"multi-stage pipeline", "cat file.txt | grep pattern | sort | uniq", 4},
       {"variable and glob", "grep \\$PATTERN *.log", 1},
@@ -10293,50 +8265,53 @@ int main(void) {
        3},
       {"empty input", "", 0},
   };
-  run_tokenizer_cases(basic_cases,
-                      sizeof(basic_cases) / sizeof(basic_cases[0]));
+  tokenizer_run_tokenizer_cases(basic_cases,
+                                sizeof(basic_cases) / sizeof(basic_cases[0]));
 
   printf("\n=== EXTENDED TOKENIZER TESTS ===\n\n");
 
-  static const feature_case_t feature_cases[] = {
+  static const tokenizer_feature_case_t feature_cases[] = {
       {{"plain command", "echo hello", 1}, 0},
-      {{"simple variable", "echo $VAR", 1}, EXPECT_VARIABLE},
-      {{"braced variable", "echo ${VAR}", 1}, EXPECT_VARIABLE},
-      {{"special variables", "echo $1 $# $? $$", 1}, EXPECT_VARIABLE},
-      {{"multiple variables", "echo $A $B $C", 1}, EXPECT_VARIABLE},
-      {{"asterisk glob", "ls *.txt", 1}, EXPECT_GLOB},
-      {{"question-mark glob", "cat file?.txt", 1}, EXPECT_GLOB},
-      {{"bracket glob", "ls file[123].txt", 1}, EXPECT_GLOB},
-      {{"command substitution", "cat $(file)", 1}, EXPECT_SUBSHELL},
-      {{"backtick substitution", "cat `file`", 1}, EXPECT_SUBSHELL},
-      {{"arithmetic expansion", "echo $((x+1))", 1}, EXPECT_ARITHMETIC},
+      {{"simple variable", "echo $VAR", 1}, tokenizer_EXPECT_VARIABLE},
+      {{"braced variable", "echo ${VAR}", 1}, tokenizer_EXPECT_VARIABLE},
+      {{"special variables", "echo $1 $# $? $$", 1}, tokenizer_EXPECT_VARIABLE},
+      {{"multiple variables", "echo $A $B $C", 1}, tokenizer_EXPECT_VARIABLE},
+      {{"asterisk glob", "ls *.txt", 1}, tokenizer_EXPECT_GLOB},
+      {{"question-mark glob", "cat file?.txt", 1}, tokenizer_EXPECT_GLOB},
+      {{"bracket glob", "ls file[123].txt", 1}, tokenizer_EXPECT_GLOB},
+      {{"command substitution", "cat $(file)", 1}, tokenizer_EXPECT_SUBSHELL},
+      {{"backtick substitution", "cat `file`", 1}, tokenizer_EXPECT_SUBSHELL},
+      {{"arithmetic expansion", "echo $((x+1))", 1},
+       tokenizer_EXPECT_ARITHMETIC},
       {{"features across pipeline", "cat $FILE | grep *.log", 2},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"combined features", "ls ${DIR}/*.txt | sort", 2},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"empty input", "", 0}, 0},
       {{"whitespace input", "   ", 0}, 0},
       {{"single-character command", "x", 1}, 0},
       {{"variable with underscore and numbers", "echo $VAR_NAME_123", 1},
-       EXPECT_VARIABLE},
-      {{"empty command substitution", "echo $()", 1}, EXPECT_SUBSHELL},
+       tokenizer_EXPECT_VARIABLE},
+      {{"empty command substitution", "echo $()", 1},
+       tokenizer_EXPECT_SUBSHELL},
       {{"nested command substitutions", "echo $(echo $(echo hi))", 1},
-       EXPECT_SUBSHELL},
-      {{"glob argument", "cmd *.c", 1}, EXPECT_GLOB},
-      {{"combined glob forms", "ls file???[0-9]*.{c,h}", 1}, EXPECT_GLOB},
-      {{"negated bracket glob", "ls file[!123].txt", 1}, EXPECT_GLOB},
+       tokenizer_EXPECT_SUBSHELL},
+      {{"glob argument", "cmd *.c", 1}, tokenizer_EXPECT_GLOB},
+      {{"combined glob forms", "ls file???[0-9]*.{c,h}", 1},
+       tokenizer_EXPECT_GLOB},
+      {{"negated bracket glob", "ls file[!123].txt", 1}, tokenizer_EXPECT_GLOB},
   };
-  run_feature_cases(feature_cases,
-                    sizeof(feature_cases) / sizeof(feature_cases[0]));
+  tokenizer_run_feature_cases(feature_cases,
+                              sizeof(feature_cases) / sizeof(feature_cases[0]));
 
-  static const tokenizer_case_t rejected_cases[] = {
+  static const tokenizer_tokenizer_case_t rejected_cases[] = {
       {"reject nested variable braces", "echo ${VAR${SUFFIX}}", 0},
       {"reject unclosed variable brace", "echo ${VAR", 0},
   };
-  run_rejected_cases(rejected_cases,
-                     sizeof(rejected_cases) / sizeof(rejected_cases[0]));
+  tokenizer_run_rejected_cases(rejected_cases, sizeof(rejected_cases) /
+                                                   sizeof(rejected_cases[0]));
 
-  static const stage_case_t stage_cases[] = {
+  static const tokenizer_stage_case_t stage_cases[] = {
       {{"features remain attached to pipeline stages",
         "cmd1 $VAR1 | cmd2 *.txt | cmd3 $(sub) | cmd4 `back`", 4},
        UINT64_C(0x1),
@@ -10362,7 +8337,8 @@ int main(void) {
        0,
        0},
   };
-  run_stage_cases(stage_cases, sizeof(stage_cases) / sizeof(stage_cases[0]));
+  tokenizer_run_stage_cases(stage_cases,
+                            sizeof(stage_cases) / sizeof(stage_cases[0]));
 
   // Test 75: Large pipeline with all features
   {
@@ -10371,8 +8347,8 @@ int main(void) {
         "grep -v \"^\\.\" | sort -u | head -${MAX_COUNT} | "
         "while read file; do wc -l \"$file\"; done | "
         "awk '{sum+=$1} END {print sum}' > ${OUTPUT_FILE}";
-    check_tokenizer_case("Extended tokenizer: large mixed-feature pipeline",
-                         input, 8);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: large mixed-feature pipeline", input, 8);
   }
 
   // Test 76: Complex data processing pipeline
@@ -10385,8 +8361,8 @@ int main(void) {
         "head -n ${LIMIT} | "
         "awk '{print $2 \" \" $1}' > ${OUTPUT_DIR}/results.txt && "
         "echo \"Processed $(wc -l < ${OUTPUT_DIR}/results.txt) entries\"";
-    check_tokenizer_case("Extended tokenizer: data processing pipeline", input,
-                         9);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: data processing pipeline", input, 9);
   }
 
   // Test 77: System monitoring pipeline
@@ -10401,8 +8377,8 @@ int main(void) {
         "done | sort -t= -k2 -rn | "
         "tee ${OUTPUT_DIR}/top_procs.txt | "
         "mail -s \"Top processes on ${HOSTNAME}\" ${ADMIN_EMAIL}";
-    check_tokenizer_case("Extended tokenizer: system monitoring pipeline",
-                         input, 10);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: system monitoring pipeline", input, 10);
   }
 
   // Test 78: Build and test pipeline with a PIPESTATUS array reference
@@ -10423,7 +8399,7 @@ int main(void) {
         "  echo \"Build failed\" | mail -s \"${PROJECT} build: FAILED\" "
         "${TEAM_EMAIL}; "
         "fi";
-    check_tokenizer_case(
+    tokenizer_check_tokenizer_case(
         "Extended tokenizer: preserve PIPESTATUS pipeline structure", input,
         13);
   }
@@ -10443,8 +8419,8 @@ int main(void) {
         "done | "
         "mysql -u${DB_USER} -p${DB_PASS} -h ${DB_HOST} ${DB_NAME} -e "
         "\"INSERT INTO ${RESULT_TABLE} ${SELECT_CLAUSE}\"";
-    check_tokenizer_case("Extended tokenizer: database operations pipeline",
-                         input, 7);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: database operations pipeline", input, 7);
   }
 
   // Test 80: Container orchestration pipeline
@@ -10462,8 +8438,8 @@ int main(void) {
         "sleep ${DELAY} && "
         "kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} && "
         "kubectl get pods -n ${NAMESPACE} | grep Running | wc -l";
-    check_tokenizer_case("Extended tokenizer: container orchestration pipeline",
-                         input, 12);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: container orchestration pipeline", input, 12);
   }
 
   // Test 81: Log aggregation and analysis
@@ -10484,8 +8460,8 @@ int main(void) {
         "done && "
         "cat ${REPORT_DIR}/errors_${DATE}.txt | mail -s \"Error Report "
         "${DATE}\" ${ALERT_EMAIL}";
-    check_tokenizer_case("Extended tokenizer: log aggregation and analysis",
-                         input, 15);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: log aggregation and analysis", input, 15);
   }
 
   // Test 82: File processing with subshells and globs
@@ -10500,7 +8476,7 @@ int main(void) {
         "  echo \"Converted: $filename -> $newname\";"
         "' | "
         "tee -a ${LOG_FILE}";
-    check_tokenizer_case(
+    tokenizer_check_tokenizer_case(
         "Extended tokenizer: file processing with subshells and globs", input,
         3);
   }
@@ -10520,8 +8496,8 @@ int main(void) {
         "\\\"processed\\\": true}\" || true; "
         "done | "
         "jq -s '.' > ${OUTPUT_DIR}/processed_${TIMESTAMP}.json";
-    check_tokenizer_case("Extended tokenizer: API data processing pipeline",
-                         input, 10);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: API data processing pipeline", input, 10);
   }
 
   // Test 84: Complete CI/CD pipeline with a PIPESTATUS array reference
@@ -10545,8 +8521,8 @@ int main(void) {
         "  echo \"Tests failed, not deploying\" | slack -c ${SLACK_CHANNEL}; "
         "  exit 1; "
         "fi";
-    check_tokenizer_case("Extended tokenizer: preserve CI/CD structure", input,
-                         16);
+    tokenizer_check_tokenizer_case(
+        "Extended tokenizer: preserve CI/CD structure", input, 16);
   }
 
   printf("\n=== TRANSFORM TESTS ===\n\n");
@@ -10637,7 +8613,7 @@ int main(void) {
     shell_transformed_command_list_free(commands, count);
   }
 
-  static const transform_line_case_t transform_line_cases[] = {
+  static const tokenizer_transform_line_case_t transform_line_cases[] = {
       {"Transform: variable",
        "echo $NAME",
        1,
@@ -10871,9 +8847,9 @@ int main(void) {
        {"  echo $A |", "printf %s $B  "}},
       {"Transform line: empty input", "", 0, {NULL}, 0, {NULL}},
   };
-  run_transform_line_cases(transform_line_cases,
-                           sizeof(transform_line_cases) /
-                               sizeof(transform_line_cases[0]));
+  tokenizer_run_transform_line_cases(transform_line_cases,
+                                     sizeof(transform_line_cases) /
+                                         sizeof(transform_line_cases[0]));
 
   {
     static const struct {
@@ -10943,19 +8919,20 @@ int main(void) {
 
   printf("\n=== STRESS/CRASH TEST CASES ===\n\n");
 
-  static const feature_case_t stress_edge_cases[] = {
+  static const tokenizer_feature_case_t stress_edge_cases[] = {
       {{"Edge: unclosed command substitution", "echo $(cmd", 1}, 0},
       {{"Edge: unclosed arithmetic expansion", "echo $((x+1)", 1}, 0},
       {{"Edge: empty quotes", "echo \"\" ''", 1}, 0},
       {{"Edge: mixed quote characters", "echo \"hello'world\"", 1}, 0},
       {{"Edge: trailing backslash", "echo hello\\", 1}, 0},
-      {{"Edge: adjacent special variables", "echo $$$$$$", 1}, EXPECT_VARIABLE},
+      {{"Edge: adjacent special variables", "echo $$$$$$", 1},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: unclosed bracket glob", "ls file[", 1}, 0},
       {{"Edge: lone bracket glob", "ls [", 1}, 0},
       {{"Edge: unclosed negated bracket glob", "ls file[!", 1}, 0},
       {{"Edge: command substitution containing pipe",
         "echo $(cat file.txt | grep pattern)", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Stress: sixteen pipeline stages", "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p",
         16},
        0},
@@ -10967,7 +8944,7 @@ int main(void) {
        0},
       {{"Edge: variable names containing digits", "echo $VAR123 $ABC_456_DEF",
         1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: lone dollar", "echo $", 1}, 0},
       {{"Edge: unclosed backtick", "echo `", 1}, 0},
       {{"Edge: repeated redirections",
@@ -10978,22 +8955,22 @@ int main(void) {
        0},
       {{"Edge: special parameter family",
         "echo $1 $2 $3 $4 $5 $6 $7 $8 $9 $10 $$ $? $# $-", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: adjacent quoted variables", "echo \"$VAR$VAR2${VAR3}\"", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: variable followed by glob", "ls $DIR/*.txt", 1},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"Edge: multiple glob forms", "ls *.txt *.log *.dat ??.* [abc]*.{cpp,h}",
         1},
-       EXPECT_GLOB},
+       tokenizer_EXPECT_GLOB},
       {{"Edge: arithmetic operator family",
         "echo $((a+b)) $((c-d)) $((e*f)) $((g/h)) $((i%j)) $((k**l))", 1},
-       EXPECT_ARITHMETIC},
+       tokenizer_EXPECT_ARITHMETIC},
       {{"Edge: arithmetic command framing", "(((echo hello)))", 1},
-       EXPECT_ARITHMETIC},
+       tokenizer_EXPECT_ARITHMETIC},
       {{"Edge: alternating quote forms", "echo 'a\"b\"c' \"d'e'e\"", 1}, 0},
       {{"Edge: variable followed by bracket glob", "ls $FILE[0-9]", 1},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"Edge: all sequencing operators", "cmd1 && cmd2 || cmd3 | cmd4 ; cmd5",
         5},
        0},
@@ -11002,21 +8979,22 @@ int main(void) {
         "cat ${FILE1} | grep -E '$PATTERN|${ALT}' | sort -u > ${OUTPUT}.txt && "
         "echo \"Done: $(wc -l < ${OUTPUT}.txt)\"",
         4},
-       EXPECT_VARIABLE | EXPECT_SUBSHELL},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_SUBSHELL},
       {{"Stress: nested substitution containing features",
         "echo $(echo $(echo $VAR *.txt $((x+1))))", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Edge: ordered descriptor duplication", "cmd > file.txt 2>&1 1>&2", 1},
        0},
       {{"Edge: heredoc-shaped multiline input", "cmd <<EOF\nhello\nEOF", 1}, 0},
       {{"Edge: substitution pipe followed by outer pipe",
         "cmd $(echo a | cat) | cmd2", 2},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Stress: all token feature classes",
         "cmd $VAR ${VAR} *.txt $((1+2)) $(cmd) `cmd` $1 | cmd2 < file.txt > "
         "out.txt 2>&1 && cmd3 || cmd4 ; cmd5",
         5},
-       EXPECT_VARIABLE | EXPECT_GLOB | EXPECT_SUBSHELL | EXPECT_ARITHMETIC},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB |
+           tokenizer_EXPECT_SUBSHELL | tokenizer_EXPECT_ARITHMETIC},
       {{"Edge: dash-leading command", "-n echo hello", 1}, 0},
       {{"Edge: escaped space", "echo hello\\ world", 1}, 0},
       {{"Edge: trailing semicolon", "echo hello ;", 1}, 0},
@@ -11024,13 +9002,14 @@ int main(void) {
       {{"Edge: newline in double quotes", "echo \"hello\nworld\"", 1}, 0},
       {{"Edge: unusual arithmetic parentheses", "echo $((x)) $((())) $(((x)))",
         1},
-       EXPECT_ARITHMETIC},
+       tokenizer_EXPECT_ARITHMETIC},
       {{"Edge: command substitution containing semicolons",
         "echo $(cmd1; cmd2; cmd3)", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
   };
-  run_feature_cases(stress_edge_cases,
-                    sizeof(stress_edge_cases) / sizeof(stress_edge_cases[0]));
+  tokenizer_run_feature_cases(stress_edge_cases,
+                              sizeof(stress_edge_cases) /
+                                  sizeof(stress_edge_cases[0]));
 
   // Test 97: Long command (~4x larger than typical)
   {
@@ -11048,7 +9027,8 @@ int main(void) {
     int result = (shell_tokenize_commands(input, strlen(input), &cmds,
                                           &count) == SHELL_TOKENIZE_OK);
     test("Stress: long command (~4x)",
-         result && count == 12 && tokens_are_consistent(input, cmds, count));
+         result && count == 12 &&
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
@@ -11064,7 +9044,7 @@ int main(void) {
     test("Stress: very long token (2KB)",
          result && count == 1 && cmds[0].token_count == 1 &&
              cmds[0].tokens[0].length == sizeof(input) - 1 &&
-             tokens_are_consistent(input, cmds, count));
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
@@ -11081,11 +9061,12 @@ int main(void) {
     int result = (shell_tokenize_commands(input, strlen(input), &cmds,
                                           &count) == SHELL_TOKENIZE_OK);
     test("Stress: very long command (~8x)",
-         result && count == 52 && tokens_are_consistent(input, cmds, count));
+         result && count == 52 &&
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
-  static const processor_case_t processor_cases[] = {
+  static const tokenizer_processor_case_t processor_cases[] = {
       {"Processor: plain command",
        "echo hello",
        1,
@@ -11098,28 +9079,28 @@ int main(void) {
        2,
        {"echo hello |", "grep world"},
        {"echo hello", "grep world"},
-       {PROCESS_PIPE_OUTPUT, PROCESS_PIPE_INPUT},
+       {tokenizer_PROCESS_PIPE_OUTPUT, tokenizer_PROCESS_PIPE_INPUT},
        0x3},
       {"Processor: redirections",
        "cmd > output.txt 2>&1",
        1,
        {"cmd > output.txt 2>&1"},
        {"cmd"},
-       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION | tokenizer_PROCESS_ERROR_REDIRECTION},
        0x1},
       {"Processor: combined redirect marks stderr",
        "cmd &> output.txt",
        1,
        {"cmd &> output.txt"},
        {"cmd"},
-       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION | tokenizer_PROCESS_ERROR_REDIRECTION},
        0x1},
       {"Processor: combined append redirect marks stderr",
        "cmd &>> output.txt",
        1,
        {"cmd &>> output.txt"},
        {"cmd"},
-       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION | tokenizer_PROCESS_ERROR_REDIRECTION},
        0x1},
       {"Processor: sequencing operators",
        "a && b || c ; d",
@@ -11133,43 +9114,43 @@ int main(void) {
        2,
        {"cat < in |", "grep x > out"},
        {"cat", "grep x"},
-       {PROCESS_PIPE_OUTPUT | PROCESS_REDIRECTION,
-        PROCESS_PIPE_INPUT | PROCESS_REDIRECTION},
+       {tokenizer_PROCESS_PIPE_OUTPUT | tokenizer_PROCESS_REDIRECTION,
+        tokenizer_PROCESS_PIPE_INPUT | tokenizer_PROCESS_REDIRECTION},
        0x3},
       {"Processor: descriptor duplication keeps following argument",
        "cmd 2>&1 arg",
        1,
        {"cmd 2>&1 arg"},
        {"cmd arg"},
-       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION | tokenizer_PROCESS_ERROR_REDIRECTION},
        0x1},
       {"Processor: raw close marker keeps adjacent argv",
        "printf x >&-file",
        1,
        {"printf x >&-file"},
        {"printf x file"},
-       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION | tokenizer_PROCESS_ERROR_REDIRECTION},
        0x1},
       {"Processor: here-string operand is shell syntax",
        "cat <<< data",
        1,
        {"cat <<< data"},
        {"cat"},
-       {PROCESS_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION},
        0x1},
       {"Processor: heredoc body is shell syntax",
        "cat <<-'EOF'\n\t$LITERAL\n\tEOF",
        1,
        {"cat <<-'EOF'\n\t$LITERAL\n\tEOF"},
        {"cat"},
-       {PROCESS_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION},
        0x1},
       {"Processor: redirect-only stage has empty DFA input",
        "> output",
        1,
        {"> output"},
        {""},
-       {PROCESS_REDIRECTION},
+       {tokenizer_PROCESS_REDIRECTION},
        0x1},
       {"Processor: variables remain in DFA input",
        "echo $VAR $NAME",
@@ -11229,8 +9210,8 @@ int main(void) {
        0x1},
       {"Processor: empty input", "", 0, {NULL}, {NULL}, {0}, 0},
   };
-  run_processor_cases(processor_cases,
-                      sizeof(processor_cases) / sizeof(processor_cases[0]));
+  tokenizer_run_processor_cases(
+      processor_cases, sizeof(processor_cases) / sizeof(processor_cases[0]));
 
   {
     char input[] = "cat < in | grep x > out";
@@ -11324,7 +9305,7 @@ int main(void) {
                                              '$', '(', 'i', 'd', ')'};
     unsigned char visited[sizeof(expected)] = {0};
     unsigned char written_bytes[sizeof(expected)] = {0};
-    decoded_word_capture_t capture = {
+    tokenizer_decoded_word_capture_t capture = {
         .bytes = visited,
         .capacity = sizeof(visited),
     };
@@ -11333,7 +9314,7 @@ int main(void) {
     size_t written = 0;
     bool valid =
         shell_visit_decoded_word(word, sizeof(word) - 1,
-                                 capture_decoded_word_byte, &capture,
+                                 tokenizer_capture_decoded_word_byte, &capture,
                                  &visited_length) == SHELL_PROCESS_OK &&
         shell_measure_decoded_word(word, sizeof(word) - 1, &measured) ==
             SHELL_PROCESS_OK &&
@@ -11348,9 +9329,9 @@ int main(void) {
     memset(visited, 0, sizeof(visited));
     visited_length = 0;
     valid = valid &&
-            shell_visit_decoded_word(word, sizeof(word) - 1,
-                                     capture_decoded_word_byte, &capture,
-                                     &visited_length) == SHELL_PROCESS_OK &&
+            shell_visit_decoded_word(
+                word, sizeof(word) - 1, tokenizer_capture_decoded_word_byte,
+                &capture, &visited_length) == SHELL_PROCESS_OK &&
             visited_length == 3 && memcmp(visited, expected, 3) == 0;
     test("Decoded-word visitor shares binary-safe syntax decoding", valid);
   }
@@ -11359,34 +9340,34 @@ int main(void) {
     static const char static_word[] = "c'ur'\\l$'\\x00'";
     static const unsigned char expected[] = {'c', 'u', 'r', 'l'};
     unsigned char bytes[sizeof(expected)] = {0};
-    decoded_word_capture_t capture = {
+    tokenizer_decoded_word_capture_t capture = {
         .bytes = bytes,
         .capacity = sizeof(bytes),
     };
     size_t length = SIZE_MAX;
-    bool valid =
-        shell_visit_static_word(static_word, sizeof(static_word) - 1,
-                                capture_decoded_word_byte, &capture, &length) &&
-        length == sizeof(expected) &&
-        memcmp(bytes, expected, sizeof(expected)) == 0;
+    bool valid = shell_visit_static_word(static_word, sizeof(static_word) - 1,
+                                         tokenizer_capture_decoded_word_byte,
+                                         &capture, &length) &&
+                 length == sizeof(expected) &&
+                 memcmp(bytes, expected, sizeof(expected)) == 0;
     capture.stop_after = 1;
     length = SIZE_MAX;
     valid = valid &&
             shell_visit_static_word(
                 "$'a\\0discarded'c", strlen("$'a\\0discarded'c"),
-                capture_decoded_word_byte, &capture, &length) &&
+                tokenizer_capture_decoded_word_byte, &capture, &length) &&
             length == 1 && bytes[0] == 'a';
     length = SIZE_MAX;
     valid = valid &&
             !shell_visit_static_word("\"$command\"", strlen("\"$command\""),
-                                     capture_decoded_word_byte, &capture,
-                                     &length) &&
+                                     tokenizer_capture_decoded_word_byte,
+                                     &capture, &length) &&
             length == 0;
     length = SIZE_MAX;
     valid = valid &&
             !shell_visit_static_word("'unfinished", strlen("'unfinished"),
-                                     capture_decoded_word_byte, &capture,
-                                     &length) &&
+                                     tokenizer_capture_decoded_word_byte,
+                                     &capture, &length) &&
             length == 0;
     test("Static-word visitor rejects runtime and malformed words", valid);
   }
@@ -11599,7 +9580,7 @@ int main(void) {
   {                                                                            \
     {name, input, count}, vars, globs, subs, arith                             \
   }
-  static const stage_case_t pipeline_cases[] = {
+  static const tokenizer_stage_case_t pipeline_cases[] = {
       STAGES("Pipeline: basic 3-stage", "cat file.txt | grep pattern | sort", 3,
              0, 0, 0, 0),
       STAGES("Pipeline: 4-stage", "a | b | c | d", 4, 0, 0, 0, 0),
@@ -11649,8 +9630,8 @@ int main(void) {
              4, UINT64_C(0x5), UINT64_C(0x1), 0, 0),
   };
 #undef STAGES
-  run_stage_cases(pipeline_cases,
-                  sizeof(pipeline_cases) / sizeof(pipeline_cases[0]));
+  tokenizer_run_stage_cases(pipeline_cases,
+                            sizeof(pipeline_cases) / sizeof(pipeline_cases[0]));
 
   printf("\n=== STRESS/CRASH TEST CASES - PART 2 ===\n\n");
 
@@ -11671,52 +9652,57 @@ int main(void) {
                                           &count) == SHELL_TOKENIZE_OK);
     test("Stress: max depth nesting (20 levels)",
          result && count == 1 && cmds[0].has_subshells &&
-             tokens_are_consistent(input, cmds, count));
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
-  static const feature_case_t compound_syntax_cases[] = {
+  static const tokenizer_feature_case_t compound_syntax_cases[] = {
       {{"Stress: nested command substitution (8 levels)",
         "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo hello)))))))",
         1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Edge: process substitution", "diff <(cmd1) <(cmd2)", 1}, 0},
       {{"Edge: heredoc-shaped input", "cat <<EOF\nline1\nline2\nEOF", 1}, 0},
       {{"Edge: heredoc-shaped input with variable", "cat <<EOF\n$VAR\nEOF", 1},
        0},
       {{"Edge: double brackets", "[[ $var == \"test\" ]]", 1},
-       EXPECT_VARIABLE | EXPECT_CONDITIONAL},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_CONDITIONAL},
       {{"Edge: for loop", "for f in *.txt; do echo $f; done", 3},
-       EXPECT_VARIABLE | EXPECT_GLOB | EXPECT_LOOP},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB |
+           tokenizer_EXPECT_LOOP},
       {{"Edge: while loop", "while read line; do echo $line; done < file.txt",
         3},
-       EXPECT_VARIABLE | EXPECT_LOOP},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_LOOP},
       {{"Edge: case statement", "case $var in a) echo a;; esac", 1},
-       EXPECT_VARIABLE | EXPECT_CASE},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_CASE},
       {{"Edge: conditional", "if [ -f file.txt ]; then echo exists; fi", 2},
-       EXPECT_IF},
+       tokenizer_EXPECT_IF},
   };
-  run_feature_cases(compound_syntax_cases,
-                    sizeof(compound_syntax_cases) /
-                        sizeof(compound_syntax_cases[0]));
+  tokenizer_run_feature_cases(compound_syntax_cases,
+                              sizeof(compound_syntax_cases) /
+                                  sizeof(compound_syntax_cases[0]));
 
-  static const feature_case_t parameter_expansion_cases[] = {
-      {{"Edge: array variable", "echo ${array[@]}", 1}, EXPECT_VARIABLE},
+  static const tokenizer_feature_case_t parameter_expansion_cases[] = {
+      {{"Edge: array variable", "echo ${array[@]}", 1},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: default parameter expansion", "echo ${VAR:-default}", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: assignment parameter expansion", "echo ${VAR:=default}", 1},
-       EXPECT_VARIABLE},
-      {{"Edge: parameter length", "echo ${#VAR}", 1}, EXPECT_VARIABLE},
-      {{"Edge: substring expansion", "echo ${VAR:0:5}", 1}, EXPECT_VARIABLE},
-      {{"Edge: pattern removal", "echo ${VAR##*/}", 1}, EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
+      {{"Edge: parameter length", "echo ${#VAR}", 1},
+       tokenizer_EXPECT_VARIABLE},
+      {{"Edge: substring expansion", "echo ${VAR:0:5}", 1},
+       tokenizer_EXPECT_VARIABLE},
+      {{"Edge: pattern removal", "echo ${VAR##*/}", 1},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: pattern substitution", "echo ${VAR/pattern/replace}", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
   };
-  run_feature_cases(parameter_expansion_cases,
-                    sizeof(parameter_expansion_cases) /
-                        sizeof(parameter_expansion_cases[0]));
+  tokenizer_run_feature_cases(parameter_expansion_cases,
+                              sizeof(parameter_expansion_cases) /
+                                  sizeof(parameter_expansion_cases[0]));
 
-  static const tokenizer_case_t syntax_edge_cases[] = {
+  static const tokenizer_tokenizer_case_t syntax_edge_cases[] = {
       {"Edge: numbered file descriptors", "cmd 0<in 1>out 2>err 3>&1", 1},
       {"Edge: nested quote forms", "echo \"hello 'world' \\\"inner\\\"\"", 1},
       {"Edge: escape sequences", "echo \\n\\t\\r\\\\", 1},
@@ -11729,57 +9715,60 @@ int main(void) {
       {"Edge: brace expansion", "echo {a,b,c}.txt", 1},
       {"Edge: function definition", "function foo { echo hello; }", 2},
   };
-  run_tokenizer_cases(syntax_edge_cases,
-                      sizeof(syntax_edge_cases) / sizeof(syntax_edge_cases[0]));
+  tokenizer_run_tokenizer_cases(syntax_edge_cases,
+                                sizeof(syntax_edge_cases) /
+                                    sizeof(syntax_edge_cases[0]));
 
-  static const feature_case_t syntax_feature_cases[] = {
+  static const tokenizer_feature_case_t syntax_feature_cases[] = {
       {{"Edge: backticks containing pipe", "echo `cat file.txt | grep pattern`",
         1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Edge: backticks containing list separator",
         "echo `printf x; printf y`", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Edge: escaped backtick inside substitution",
         "echo `printf \\`literal\\` | cat`", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Edge: variable followed by path suffix", "echo $PATH:/new/path", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: variable embedded in double quotes", "echo \"Cost: $$100\"", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: braced variable embedded in double quotes",
         "echo \"prefix ${VAR} suffix\"", 1},
-       EXPECT_VARIABLE},
+       tokenizer_EXPECT_VARIABLE},
       {{"Edge: escaped dollar in double quotes", "echo \"Cost: \\$100\"", 1},
        0},
       {{"Edge: dollar in single quotes", "echo 'Cost: $100'", 1}, 0},
       {{"Edge: complex command substitution",
         "echo $(cat $FILE *.txt | grep $PATTERN | sort $((N+1)) )", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Edge: local assignment sequence", "local x=5; echo $x", 2},
-       EXPECT_VARIABLE},
-      {{"Quoted command substitution", "echo \"$(id)\"", 1}, EXPECT_SUBSHELL},
+       tokenizer_EXPECT_VARIABLE},
+      {{"Quoted command substitution", "echo \"$(id)\"", 1},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Quoted command substitution with affixes",
         "echo \"prefix$(id)suffix\"", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Quoted backtick substitution", "echo \"prefix`id`suffix\"", 1},
-       EXPECT_SUBSHELL},
+       tokenizer_EXPECT_SUBSHELL},
       {{"Quoted arithmetic expansion", "echo \"$((1 + 2))\"", 1},
-       EXPECT_ARITHMETIC},
+       tokenizer_EXPECT_ARITHMETIC},
       {{"Single-quoted substitution is literal", "echo '$(id)'", 1}, 0},
       {{"Variable inside glob word", "echo prefix${HOME}/*.txt", 1},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"Quoted variable inside glob word", "echo \"${HOME}\"/file*.txt", 1},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"Variable inside extglob word", "echo @($HOME|x)", 1},
-       EXPECT_VARIABLE | EXPECT_GLOB},
+       tokenizer_EXPECT_VARIABLE | tokenizer_EXPECT_GLOB},
       {{"Substitution inside glob word", "echo $(id)*.txt", 1},
-       EXPECT_SUBSHELL | EXPECT_GLOB},
+       tokenizer_EXPECT_SUBSHELL | tokenizer_EXPECT_GLOB},
       {{"Heredoc delimiter is not expanded", "cat <<$ENDMARK\nx\n$ENDMARK\n",
         1},
        0},
   };
-  run_feature_cases(syntax_feature_cases, sizeof(syntax_feature_cases) /
-                                              sizeof(syntax_feature_cases[0]));
+  tokenizer_run_feature_cases(syntax_feature_cases,
+                              sizeof(syntax_feature_cases) /
+                                  sizeof(syntax_feature_cases[0]));
 
   // Test 190: Very long command with many tokens
   {
@@ -11794,7 +9783,7 @@ int main(void) {
                                           &count) == SHELL_TOKENIZE_OK);
     test("Stress: long command (200 args)",
          result && count == 1 && cmds[0].token_count == 201 &&
-             tokens_are_consistent(input, cmds, count));
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
@@ -11815,7 +9804,8 @@ int main(void) {
     for (size_t i = 0; token_counts_match && i < count; i++)
       token_counts_match = cmds[i].token_count == (i + 1 < count ? 5 : 4);
     test("Stress: long pipeline (50 stages)",
-         token_counts_match && tokens_are_consistent(input, cmds, count));
+         token_counts_match &&
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
@@ -11830,7 +9820,7 @@ int main(void) {
                                           &count) == SHELL_TOKENIZE_OK);
     test("Stress: very long variable name (2000 characters)",
          result && count == 1 && cmds[0].has_variables &&
-             tokens_are_consistent(input, cmds, count));
+             tokenizer_tokens_are_consistent(input, cmds, count));
     shell_commands_free(cmds, count);
   }
 
@@ -11838,7 +9828,7 @@ int main(void) {
 
   printf("\n=== PARSER REGRESSION TESTS ===\n\n");
 
-  static const tokenizer_case_t invalid_input_cases[] = {
+  static const tokenizer_tokenizer_case_t invalid_input_cases[] = {
       {"Control character at start is rejected",
        "\x01"
        "cmd",
@@ -11850,8 +9840,9 @@ int main(void) {
       {"High bytes in arithmetic are rejected", "echo $((\x80))", 0},
       {"Bare separator is rejected", "|", 0},
   };
-  run_rejected_cases(invalid_input_cases, sizeof(invalid_input_cases) /
-                                              sizeof(invalid_input_cases[0]));
+  tokenizer_run_rejected_cases(invalid_input_cases,
+                               sizeof(invalid_input_cases) /
+                                   sizeof(invalid_input_cases[0]));
 
   // Test 217: Quotes spanning tokens - actually VALID shell syntax!
   // "text "text" is parsed as "text" (quoted) followed by text (unquoted) - NOT
@@ -11864,7 +9855,8 @@ int main(void) {
                                           &count) == SHELL_TOKENIZE_OK);
     // This is CORRECT behavior - shell parses it as two words
     test("Adjacent quoted and unquoted text is one command",
-         result && count == 1 && tokens_are_consistent(input, cmds, count));
+         result && count == 1 &&
+             tokenizer_tokens_are_consistent(input, cmds, count));
     if (cmds)
       shell_commands_free(cmds, count);
   }
@@ -11879,7 +9871,8 @@ int main(void) {
     int result = (shell_tokenize_commands(input, strlen(input), &cmds,
                                           &count) == SHELL_TOKENIZE_OK);
     test("Tokenizer accepts keyword-shaped command fragments",
-         result && count == 1 && tokens_are_consistent(input, cmds, count));
+         result && count == 1 &&
+             tokenizer_tokens_are_consistent(input, cmds, count));
     if (cmds)
       shell_commands_free(cmds, count);
   }
@@ -12429,24 +10422,26 @@ int main(void) {
   }
 
   test("Grouped redirection processing is allocation-failure atomic",
-       process_commands_allocation_failure_atomic(
+       tokenizer_process_commands_allocation_failure_atomic(
            "{ printf x; } {out}>out {input}<in {both}<>read-write 2>&1"));
 
   test("Flat command processing is allocation-failure atomic",
-       process_command_allocation_failure_atomic(
+       tokenizer_process_command_allocation_failure_atomic(
            ">/tmp/leading; { printf 'two words'; >/tmp/inner; } "
            ">/tmp/group-out; >/tmp/independent"));
 
   test("Command netsequence follows executable heredoc expansions",
-       command_netseq_matches("cat <<EOF\n$(printf child)\nEOF\n",
-                              "6:printf,3:cat,", 2) &&
-           command_netseq_matches("cat <<EOF\n`printf child`\nEOF\n",
-                                  "6:printf,3:cat,", 2) &&
-           command_netseq_matches("cat <<EOF\n${value:-$(printf child)}\nEOF\n",
-                                  "6:printf,3:cat,", 2) &&
-           command_netseq_matches("cat <<'EOF'\n$(printf child)\nEOF\n",
-                                  "3:cat,", 1) &&
-           command_netseq_matches("cat <(printf child)", "6:printf,3:cat,", 2));
+       tokenizer_command_netseq_matches("cat <<EOF\n$(printf child)\nEOF\n",
+                                        "6:printf,3:cat,", 2) &&
+           tokenizer_command_netseq_matches("cat <<EOF\n`printf child`\nEOF\n",
+                                            "6:printf,3:cat,", 2) &&
+           tokenizer_command_netseq_matches(
+               "cat <<EOF\n${value:-$(printf child)}\nEOF\n", "6:printf,3:cat,",
+               2) &&
+           tokenizer_command_netseq_matches(
+               "cat <<'EOF'\n$(printf child)\nEOF\n", "3:cat,", 1) &&
+           tokenizer_command_netseq_matches("cat <(printf child)",
+                                            "6:printf,3:cat,", 2));
 
   /* Direct canonical builders retain binary payloads, while complete source
    * uses Bash's fragment-local truncation. */
@@ -12490,6 +10485,6817 @@ int main(void) {
   }
 
   printf("\n=== SUMMARY ===\n");
-  printf("Results: %d/%d passed\n", pass_count, test_count);
-  return (pass_count == test_count) ? 0 : 1;
+  printf("Results: %d/%d passed\n", tokenizer_pass_count, tokenizer_test_count);
+  return (tokenizer_pass_count == tokenizer_test_count) ? 0 : 1;
+}
+#undef STAGES
+#endif
+
+/* --- parser (from fast_parser_test.c) --- */
+static int parser_test_count = 0;
+static int parser_pass_count = 0;
+
+static void parser_test(const char *name, int result) {
+  parser_test_count++;
+  if (result) {
+    parser_pass_count++;
+    printf("  [PASS] %s\n", name);
+  } else {
+    printf("  [FAIL] %s\n", name);
+    exit(EXIT_FAILURE);
+  }
+}
+
+static void parser_test_has_feature(const char *name,
+                                    const shell_parse_result_t *result,
+                                    uint32_t idx, uint32_t feature) {
+  parser_test_count++;
+  if (idx < result->count &&
+      (result->cmds[idx].features & feature) == feature) {
+    parser_pass_count++;
+    printf("  [PASS] %s\n", name);
+  } else {
+    printf("  [FAIL] %s\n", name);
+  }
+}
+
+static void parser_test_array_assignment_prefix_features(void) {
+  bool valid = true;
+  shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+  strict.strict_mode = true;
+  for (size_t c = 0; c < sizeof(shellsplit_test_array_prefixes) /
+                             sizeof(shellsplit_test_array_prefixes[0]);
+       c++) {
+    const char *source = shellsplit_test_array_prefixes[c].source;
+    shell_parse_result_t parsed;
+    bool item =
+        shell_parse_fast(source, strlen(source), &strict, &parsed) == SHELL_OK;
+    uint32_t features = 0;
+    for (uint32_t i = 0; i < parsed.count; i++)
+      features |= parsed.cmds[i].features;
+    item = item &&
+           !!(features & SHELL_FEAT_ARRAY) ==
+               shellsplit_test_array_prefixes[c].array &&
+           !!(features & SHELL_FEAT_GLOBS) ==
+               shellsplit_test_array_prefixes[c].glob;
+    if (!item)
+      fprintf(stderr, "array prefix mismatch: %s features=%x\n", source,
+              features);
+    valid = item && valid;
+  }
+  parser_test(
+      "Array assignment position follows complete timing and scalar prefixes",
+      valid);
+  valid = true;
+
+  /* Repeated words, fragments within one value, and a long scalar name all
+   * require linear forward work. Counting real source visits catches suffix
+   * probes that a nominal per-input charge would miss. */
+  for (unsigned family = 0; family < 4; family++) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t previous_work = 0;
+#endif
+    for (size_t units = 64; units <= 2048; units *= 2) {
+      static const char prefix[] = "time ";
+      static const char suffix[] = " a[0]=b";
+      char source[16384];
+      size_t used = sizeof(prefix) - 1;
+      memcpy(source, prefix, used);
+      if (family == 1 || family == 3) {
+        const char *assignment = family == 1 ? "A=" : "A[1 + 2]=";
+        size_t prefix_length = strlen(assignment);
+        memcpy(source + used, assignment, prefix_length);
+        used += prefix_length;
+      }
+      for (size_t i = 0; i < units; i++) {
+        const char *part = family == 0 ? "A=\"\" " : family == 2 ? "A" : "'x'";
+        size_t length = strlen(part);
+        memcpy(source + used, part, length);
+        used += length;
+      }
+      if (family == 2) {
+        memcpy(source + used, "=''", 3);
+        used += 3;
+      }
+      memcpy(source + used, suffix, sizeof(suffix));
+      used += sizeof(suffix) - 1;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      shell_parse_result_t parsed;
+      bool item =
+          shell_parse_fast(source, used, &strict, &parsed) == SHELL_OK &&
+          parsed.count == 1 && (parsed.cmds[0].features & SHELL_FEAT_ARRAY) &&
+          !(parsed.cmds[0].features & SHELL_FEAT_GLOBS);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      item = item && work <= 128 * used + 1024 &&
+             (previous_work == 0 || work <= 2 * previous_work + 2048);
+      previous_work = work;
+#endif
+      if (!item)
+        fprintf(stderr,
+                "assignment prefix scaling mismatch: family=%u size=%zu\n",
+                family, units);
+      valid = item && valid;
+    }
+  }
+  parser_test("Assignment-prefix classification has linear source work", valid);
+}
+
+static void parser_test_control_word_boundaries(void) {
+  static const char *const keywords[] = {
+      "while", "until", "for", "select", "if", "then",
+      "elif",  "else",  "fi",  "case",   "in", "esac",
+  };
+  static const char *const forms[] = {
+      "x.%s", "日本.%s",  "日本''%s", "%s.txt",   "'%s'", "\\%s",
+      "%s''", "%s$EMPTY", "name=%s",  "${v:-%s}", ">%s",  "<<<%s",
+  };
+  const uint32_t controls = SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
+                            SHELL_FEAT_IF | SHELL_FEAT_CASE;
+  bool valid = true;
+  for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); ++k) {
+    for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]); ++f) {
+      char word[128], source[192];
+      int word_length = snprintf(word, sizeof(word), forms[f], keywords[k]);
+      int length =
+          snprintf(source, sizeof(source), "printf %%s %s; echo tail", word);
+      bool fits = word_length > 0 && (size_t)word_length < sizeof(word) &&
+                  length > 0 && (size_t)length < sizeof(source);
+      for (unsigned mode = 0; fits && mode < 3; ++mode) {
+        shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+        limits.strict_mode = mode != 0;
+        if (mode == 2)
+          limits.max_subcommands = 1;
+        shell_parse_result_t parsed;
+        shell_error_t error =
+            shell_parse_fast(source, (size_t)length, &limits, &parsed);
+        bool item =
+            error == (mode == 2 ? SHELL_ETRUNC : SHELL_OK) && parsed.count >= 1;
+        for (uint32_t i = 0; i < parsed.count; ++i)
+          item &= (parsed.cmds[i].features & controls) == 0;
+        if (!item)
+          fprintf(stderr, "control word boundary: mode=%u source=%s\n", mode,
+                  source);
+        valid &= item;
+      }
+      valid &= fits;
+      shell_command_t *commands = NULL;
+      size_t count = 0;
+      bool full =
+          fits && shell_tokenize_commands(source, (size_t)length, &commands,
+                                          &count) == SHELL_TOKENIZE_OK;
+      for (size_t i = 0; i < count; ++i)
+        full &= !commands[i].has_loops && !commands[i].has_conditionals &&
+                !commands[i].has_case;
+      if (!full)
+        fprintf(stderr, "tokenizer control word boundary: source=%s\n", source);
+      shell_commands_free(commands, count);
+      valid &= full;
+    }
+  }
+  parser_test("Control spellings use complete words in all range modes", valid);
+
+  valid = true;
+  for (size_t i = 0; i < sizeof(shellsplit_test_control_word_fragments) /
+                             sizeof(shellsplit_test_control_word_fragments[0]);
+       i++) {
+    const char *source = shellsplit_test_control_word_fragments[i].source;
+    for (unsigned strict = 0; strict < 2; strict++) {
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = strict != 0;
+      shell_parse_result_t parsed;
+      bool item = shell_parse_fast(source, strlen(source), &limits, &parsed) ==
+                  SHELL_OK;
+      uint32_t features = 0;
+      for (uint32_t c = 0; c < parsed.count; c++)
+        features |= parsed.cmds[c].features;
+      item &= (features & controls) ==
+              shellsplit_test_control_word_fragments[i].range_control_features;
+      if (!item)
+        fprintf(stderr, "control fragment range: strict=%u source=%s\n", strict,
+                source);
+      valid = item && valid;
+    }
+    shell_command_t *commands = NULL;
+    size_t count = 0;
+    bool item = shell_tokenize_commands(source, strlen(source), &commands,
+                                        &count) == SHELL_TOKENIZE_OK;
+    for (size_t c = 0; c < count; c++)
+      item &= !commands[c].has_conditionals && !commands[c].has_loops &&
+              !commands[c].has_case;
+    shell_commands_free(commands, count);
+    if (!item)
+      fprintf(stderr, "control fragment tokens: source=%s\n", source);
+    valid = item && valid;
+  }
+  parser_test("Keyword-shaped command fragments remain ordinary words", valid);
+
+  static const struct {
+    const char *source;
+    uint32_t expected;
+  } contexts[] = {
+      {"if true; then :; fi", SHELL_FEAT_IF},
+      {"while false; do :; done", SHELL_FEAT_LOOPS},
+      {"case x in x) :;; esac", SHELL_FEAT_CASE},
+      {"printf %s if", SHELL_FEAT_IF},
+      {"printf %s then elif else", SHELL_FEAT_IF},
+      {"printf %s do done", 0},
+      {"printf %s coproc function", 0},
+      {"printf %s 'select' select\"\"", 0},
+      {"printf %s whi\\\nle", SHELL_FEAT_LOOPS},
+      {"echo \"$(if true; then :; fi)\"", SHELL_FEAT_IF},
+      {"echo ${v:-$(while false; do :; done)}", SHELL_FEAT_LOOPS},
+      {"cat <(if true; then :; fi)", SHELL_FEAT_IF},
+      {"echo `if true; then :; fi`", SHELL_FEAT_IF},
+      {"cat <<EOF\n$(if true; then :; fi)\nEOF\n", SHELL_FEAT_IF},
+      {"cat <<<$(if true; then :; fi)", SHELL_FEAT_IF},
+      {"echo ok # if while case\n", 0},
+      {"echo \"$(printf ok # if while case\n)\"", 0},
+      {"cat <<'EOF'\nif while case\nEOF\n", 0},
+      {"cat <<EOF\nif while case\nEOF\n", 0},
+      {"cat <<if\nwhile case\nif\n", 0},
+      {"echo ${v:-if} ${v/case/while} $if", 0},
+      {"printf %s while<()", 0},
+      {"printf %s <()while", 0},
+      {"echo ok >while", 0},
+      {"echo while<()", 0},
+      {"echo <()while", 0},
+  };
+  valid = true;
+  for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]); ++c) {
+    shell_parse_result_t parsed;
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = true;
+    bool item = shell_parse_fast(contexts[c].source, strlen(contexts[c].source),
+                                 &limits, &parsed) == SHELL_OK;
+    uint32_t features = 0;
+    for (uint32_t i = 0; i < parsed.count; ++i)
+      features |= parsed.cmds[i].features;
+    item &= (features & controls) == contexts[c].expected;
+    if (!item)
+      fprintf(stderr, "control context: source=%s features=%x expected=%x\n",
+              contexts[c].source, features & controls, contexts[c].expected);
+    if (!contexts[c].expected) {
+      shell_command_t *commands = NULL;
+      size_t count = 0;
+      item &= shell_tokenize_commands(contexts[c].source,
+                                      strlen(contexts[c].source), &commands,
+                                      &count) == SHELL_TOKENIZE_OK;
+      for (size_t i = 0; i < count; ++i)
+        item &= !commands[i].has_loops && !commands[i].has_conditionals &&
+                !commands[i].has_case;
+      shell_commands_free(commands, count);
+    }
+    valid &= item;
+  }
+  parser_test("Control features distinguish executable children from word data",
+              valid);
+
+  valid = true;
+  for (unsigned family = 0; family < 3; ++family) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t previous = 0;
+#endif
+    for (size_t units = 64; units <= 2048; units *= 2) {
+      char source[16384] = "printf %s ";
+      size_t length = strlen(source);
+      if (family == 2)
+        source[length++] = 'i';
+      const char *fragment = family == 0   ? "x''"
+                             : family == 1 ? "x.if "
+                                           : "\\\n";
+      size_t size = strlen(fragment);
+      for (size_t i = 0; i < units; ++i) {
+        memcpy(source + length, fragment, size);
+        length += size;
+      }
+      const char *tail = family == 2 ? "f" : family == 0 ? "if" : "tail";
+      size_t tail_length = strlen(tail);
+      memcpy(source + length, tail, tail_length + 1);
+      length += tail_length;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      shell_parse_result_t parsed;
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = true;
+      bool item =
+          shell_parse_fast(source, length, &limits, &parsed) == SHELL_OK &&
+          parsed.count == 1 &&
+          (parsed.cmds[0].features & controls) ==
+              (family == 2 ? SHELL_FEAT_IF : 0);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      item &= work <= 128 * length + 1024 &&
+              (!previous || work <= 2 * previous + 2048);
+      previous = work;
+#endif
+      if (!item)
+        fprintf(stderr, "control feature scaling: family=%u units=%zu\n",
+                family, units);
+      valid &= item;
+    }
+  }
+  parser_test("Control-word classification has linear source work", valid);
+
+  valid = true;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+#endif
+  for (size_t depth = 2; depth <= 16; depth *= 2) {
+    char source[1024];
+    size_t length = 0;
+    static const char opener[] = "echo ${v:-$(";
+    for (size_t i = 0; i < depth; ++i) {
+      memcpy(source + length, opener, sizeof(opener) - 1);
+      length += sizeof(opener) - 1;
+    }
+    static const char body[] = "echo 日本''if";
+    memcpy(source + length, body, sizeof(body) - 1);
+    length += sizeof(body) - 1;
+    for (size_t i = 0; i < depth; ++i) {
+      memcpy(source + length, ")}", 2);
+      length += 2;
+    }
+    source[length] = '\0';
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_source_scan_reset();
+#endif
+    shell_parse_result_t parsed;
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = true;
+    bool item =
+        shell_parse_fast(source, length, &limits, &parsed) == SHELL_OK &&
+        parsed.count == 1 && !(parsed.cmds[0].features & controls);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t work = shellsplit_test_source_scan_work();
+    item &= work <= 256 * length + 1024 &&
+            (!previous || work <= 3 * previous + 1024);
+    previous = work;
+#endif
+    if (!item)
+      fprintf(stderr, "nested control feature scaling: depth=%zu\n", depth);
+    valid &= item;
+  }
+  parser_test("Nested control-feature walks visit each executable body once",
+              valid);
+}
+
+typedef struct {
+  const char *name;
+  const char *input;
+  uint32_t expected_count;
+  uint32_t type_index;
+  uint16_t expected_type;
+  uint32_t feature_index;
+  uint32_t required_features;
+  uint32_t forbidden_features;
+} parser_parse_case_t;
+
+#define NO_CHECK UINT32_MAX
+
+static bool parser_valid_command_type(uint16_t type) {
+  switch (type) {
+  case SHELL_TYPE_SIMPLE:
+  case SHELL_TYPE_PIPELINE:
+  case SHELL_TYPE_AND:
+  case SHELL_TYPE_OR:
+  case SHELL_TYPE_SEMICOLON:
+  case SHELL_TYPE_HEREDOC:
+  case SHELL_TYPE_HERESTRING:
+  case SHELL_TYPE_SUBSTITUTION:
+  case SHELL_TYPE_BACKGROUND:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool parser_result_invariants(const char *input, size_t input_len,
+                                     shell_error_t error,
+                                     const shell_parse_result_t *result) {
+  const uint32_t all_features =
+      SHELL_FEAT_VARS | SHELL_FEAT_GLOBS | SHELL_FEAT_SUBSHELL |
+      SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
+      SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
+      SHELL_FEAT_IF | SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE |
+      SHELL_FEAT_PIPELINE | SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND |
+      SHELL_FEAT_EXTGLOB | SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY |
+      SHELL_FEAT_NAMED_FD | SHELL_FEAT_COMBINED_REDIRECT;
+  if (!input || !result || result->count > SHELL_MAX_SUBCOMMANDS ||
+      result->group_count > SHELL_MAX_GROUPS)
+    return false;
+  if ((error == SHELL_OK) != (result->status == SHELL_STATUS_OK) ||
+      (error == SHELL_ETRUNC) != (result->status == SHELL_STATUS_TRUNCATED))
+    return false;
+
+  uint32_t previous_end = 0;
+  for (uint32_t i = 0; i < result->count; i++) {
+    const shell_range_t *range = &result->cmds[i];
+    size_t length = 0;
+    const char *view = shell_subcommand_view(input, range, &length);
+    char copy[64];
+    size_t expected_copy =
+        range->len < sizeof(copy) ? range->len : sizeof(copy) - 1;
+    size_t copied = shell_subcommand_copy(input, range, copy, sizeof(copy));
+    if (range->len == 0 || range->start > input_len ||
+        range->len > input_len - range->start || range->start < previous_end ||
+        !parser_valid_command_type(range->type) ||
+        (range->features & ~all_features) != 0 ||
+        (range->modifiers &
+         ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
+        range->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
+        ((range->pipeline_time_mode != SHELL_PIPE_TIME_NONE) !=
+         ((range->modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0)) ||
+        (range->pipeline_time_direct &&
+         range->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
+        view != input + range->start || length != range->len ||
+        copied != expected_copy || memcmp(copy, view, expected_copy) != 0 ||
+        copy[copied] != '\0' ||
+        shell_source_space((unsigned char)input[range->start]) ||
+        shell_source_space((unsigned char)input[range->start + range->len - 1]))
+      return false;
+    previous_end = range->start + range->len;
+  }
+  if (error != SHELL_OK)
+    return true;
+  for (uint32_t i = 0; i < result->group_count; i++) {
+    const shell_group_t *group = &result->groups[i];
+    if (group->start >= group->end || group->end > input_len ||
+        group->first_command > result->count ||
+        group->command_count > result->count - group->first_command ||
+        (group->kind != SHELL_GROUP_BRACE &&
+         group->kind != SHELL_GROUP_SUBSHELL &&
+         group->kind != SHELL_GROUP_IF) ||
+        group->role > SHELL_RANGE_ROLE_ELSE ||
+        (group->role != SHELL_RANGE_ROLE_NONE &&
+         (group->parent == UINT16_MAX ||
+          result->groups[group->parent].kind != SHELL_GROUP_IF)) ||
+        (group->modifiers &
+         ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
+        group->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
+        ((group->pipeline_time_mode != SHELL_PIPE_TIME_NONE) !=
+         ((group->modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0)) ||
+        (group->pipeline_time_direct &&
+         group->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
+        (group->parent != UINT16_MAX && group->parent >= i))
+      return false;
+    if (group->parent != UINT16_MAX) {
+      const shell_group_t *parent = &result->groups[group->parent];
+      if (group->start < parent->start || group->end > parent->end ||
+          group->first_command < parent->first_command ||
+          group->first_command + group->command_count >
+              parent->first_command + parent->command_count)
+        return false;
+    }
+  }
+  return true;
+}
+
+static shell_error_t parser_parse_checked(const char *input, size_t input_len,
+                                          const shell_limits_t *limits,
+                                          shell_parse_result_t *result) {
+  shell_error_t error = shell_parse_fast(input, input_len, limits, result);
+  if (input && result && (error == SHELL_OK || error == SHELL_ETRUNC) &&
+      !parser_result_invariants(input, input_len, error, result)) {
+    printf("  [FAIL] parser result invariant for %zu-byte input\n", input_len);
+    parser_test_count++;
+  }
+  return error;
+}
+
+#define shell_parse_fast parser_parse_checked
+
+static void parser_extract(const char *input, shell_parse_result_t *result) {
+  shell_parse_fast(input, strlen(input), NULL, result);
+}
+
+/* --- LAYER 1: UNIT TESTS - One feature at a time --- */
+
+static void parser_test_feature_matrix(void) {
+  printf("\n--- Feature Detection Matrix ---\n");
+
+  static const parser_parse_case_t cases[] = {
+      {"single-quoted command", "'ls'", 1, 0, SHELL_TYPE_SIMPLE, 0, 0, 0},
+      {"double-quoted command", "\"ls\"", 1, 0, SHELL_TYPE_SIMPLE, 0, 0, 0},
+      {"quoted command with arguments", "'ls' -la", 1, 0, SHELL_TYPE_SIMPLE, 0,
+       0, 0},
+      {"semicolon in single quotes", "'echo hello; world'", 1, 0,
+       SHELL_TYPE_SIMPLE, 0, 0, 0},
+      {"semicolon in double quotes", "\"echo hello; world\"", 1, 0,
+       SHELL_TYPE_SIMPLE, 0, 0, 0},
+      {"simple variable", "echo $VAR", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
+      {"braced variable", "echo ${VAR}", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
+      {"positional variable", "echo $1", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
+      {"special variables", "echo $? $$ $#", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS,
+       0},
+      {"plain command", "echo hello", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL | SHELL_FEAT_ARITH},
+      {"star glob", "ls *.txt", 1, NO_CHECK, 0, 0, SHELL_FEAT_GLOBS, 0},
+      {"question glob", "ls file?.txt", 1, NO_CHECK, 0, 0, SHELL_FEAT_GLOBS, 0},
+      {"bracket glob", "ls [abc].txt", 1, NO_CHECK, 0, 0, SHELL_FEAT_GLOBS, 0},
+      {"plain filename", "ls file.txt", 1, NO_CHECK, 0, 0, 0, SHELL_FEAT_GLOBS},
+      {"heredoc bracket content", "cat << EOF\n[content]\nEOF", 2, NO_CHECK, 0,
+       NO_CHECK, 0, 0},
+      {"dollar subshell", "echo $(date)", 1, 0, SHELL_TYPE_SUBSTITUTION, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"backtick subshell", "echo `date`", 1, 0, SHELL_TYPE_SUBSTITUTION, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"arithmetic", "echo $((1+2))", 1, NO_CHECK, 0, 0, SHELL_FEAT_ARITH, 0},
+      {"arithmetic variables", "echo $((x + y))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_VARS, 0},
+      {"arithmetic command variables and substitution",
+       "(( $x + $(printf 1) ))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL,
+       SHELL_FEAT_GROUP | SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_GLOBS},
+      {"arithmetic command array", "(( items[0] ))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"arithmetic command child pipeline", "(( $(printf 1 | cat) ))", 1,
+       NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_PIPELINE,
+       SHELL_FEAT_GROUP},
+      {"arithmetic command child loop", "(( $(while false; do :; done) ))", 1,
+       NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_LOOPS, 0},
+      {"arithmetic command child ANSI-C quote", "(( $(printf $'1') ))", 1,
+       NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_ANSI_C_QUOTE, 0},
+      {"arithmetic command adjacent shifts", "((1<<(2) && 8>>(1)))", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_ARITH,
+       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_HEREDOC | SHELL_FEAT_GROUP |
+           SHELL_FEAT_GLOBS | SHELL_FEAT_PIPELINE | SHELL_FEAT_BACKGROUND},
+      {"plain expression", "echo 1+2", 1, NO_CHECK, 0, 0, 0, SHELL_FEAT_ARITH},
+      {"variable pipeline", "echo $VAR | grep pattern", 2, 1,
+       SHELL_TYPE_PIPELINE, 0, SHELL_FEAT_VARS, 0},
+      {"glob pipeline", "ls *.txt | sort", 2, 1, SHELL_TYPE_PIPELINE, 0,
+       SHELL_FEAT_GLOBS, 0},
+      {"subshell pipeline", "$(cmd) | cat", 2, 1, SHELL_TYPE_PIPELINE, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"variable and-chain", "test -n $VAR && echo found", 2, 1, SHELL_TYPE_AND,
+       0, SHELL_FEAT_VARS, 0},
+      {"arithmetic or-chain", "x=$((1+2)) || y=0", 2, 1, SHELL_TYPE_OR, 0,
+       SHELL_FEAT_ARITH, 0},
+      {"double-quoted variable", "echo \"$VAR\"", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, 0},
+      {"double-quoted command substitution", "echo \"$(id)\"", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
+      {"double-quoted combined redirect", "echo \"&>out\"", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_COMBINED_REDIRECT},
+      {"double-quoted extglob", "echo \"@(left|right)\"", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_EXTGLOB | SHELL_FEAT_GROUP},
+      {"double-quoted array syntax", "echo \"items=(one)\"", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_ARRAY | SHELL_FEAT_GROUP},
+      {"double-quoted named descriptor", "echo \"{fd}>out\"", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_NAMED_FD},
+      {"double-quoted process substitution", "echo \"<(producer)\"", 1,
+       NO_CHECK, 0, 0, 0, SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_GROUP},
+      {"single quote inside double substitution", "echo \"'$(id)\"", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
+      {"adjacent substitutions", "echo $(id)$(pwd)", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
+      {"embedded adjacent substitutions", "echo pre$(id)suf$(pwd)", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
+      {"mixed substitutions", "echo $(id)`pwd`", 1, 0, SHELL_TYPE_SUBSTITUTION,
+       0, SHELL_FEAT_SUBSHELL, 0},
+      {"arithmetic with executable substitution", "echo $(( $(id) + 1 ))", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL, 0},
+      {"arithmetic expansion variants",
+       "echo $(( $(id) + ${value} + $1 + $number ))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS, 0},
+      {"ANSI-C quote inside arithmetic substitution",
+       "echo $(( $(printf $'x)') + 1 ))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_ANSI_C_QUOTE, 0},
+      {"indexed array assignment", "items[0]=one", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"associative array assignment with ANSI-C index", "items[$'key]']=one",
+       1, NO_CHECK, 0, 0, SHELL_FEAT_ARRAY | SHELL_FEAT_ANSI_C_QUOTE,
+       SHELL_FEAT_GLOBS},
+      {"parameter array reference", "echo ${items[$'key]']}", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS | SHELL_FEAT_ARRAY | SHELL_FEAT_ANSI_C_QUOTE,
+       SHELL_FEAT_GLOBS},
+      {"parameter default bracket pattern is not an array",
+       "echo ${value:-[x]}", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS,
+       SHELL_FEAT_ARRAY},
+      {"ordinary array-shaped argument is not an array assignment",
+       "echo item[0]=one", 1, NO_CHECK, 0, 0, SHELL_FEAT_GLOBS,
+       SHELL_FEAT_ARRAY},
+      {"array assignment after scalar prefix", "MODE=x items[0]=one command", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"arithmetic array reference", "echo $((items[0] + 1))", 1, NO_CHECK, 0,
+       0, SHELL_FEAT_ARITH | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"quoted arithmetic array reference", "echo \"$((items[0]))\"", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_ARITH | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"mixed parameter array reference", "echo pre\"${items[0]}\"post", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_VARS | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"quoted literal array syntax", "echo '${items[0]}'", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_ARRAY},
+      {"quoted escaped substitution", "echo \"\\$(id)\"", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_SUBSHELL},
+      {"even escaped substitution", "echo \\\\$(id)", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"first-command process substitution", "cat <(id)", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_PROCESS_SUB, 0},
+      /* A process substitution belongs to the command that contains it, not
+       * to the range before the connector. */
+      {"process substitution after AND", "echo ok && cat <(id)", 2, 1,
+       SHELL_TYPE_AND, 1, SHELL_FEAT_PROCESS_SUB, 0},
+      {"no process substitution before AND", "echo ok && cat <(id)", 2,
+       NO_CHECK, 0, 0, 0, SHELL_FEAT_PROCESS_SUB},
+      {"no process substitution before semicolon", "echo ok; cat <(id)", 2,
+       NO_CHECK, 0, 0, 0, SHELL_FEAT_PROCESS_SUB},
+      {"process substitution after semicolon", "echo ok; cat <(id)", 2,
+       NO_CHECK, 0, 1, SHELL_FEAT_PROCESS_SUB, 0},
+      {"no process substitution before newline", "echo ok\ncat <(id)", 2,
+       NO_CHECK, 0, 0, 0, SHELL_FEAT_PROCESS_SUB},
+      {"process substitution after newline", "echo ok\ncat <(id)", 2, NO_CHECK,
+       0, 1, SHELL_FEAT_PROCESS_SUB, 0},
+      {"no process substitution before pipe", "echo ok | cat <(id)", 2,
+       NO_CHECK, 0, 0, 0, SHELL_FEAT_PROCESS_SUB},
+      {"process substitution after pipe", "echo ok | cat <(id)", 2, NO_CHECK, 0,
+       1, SHELL_FEAT_PROCESS_SUB, 0},
+      {"no process substitution before OR", "echo ok || cat >(id)", 2, NO_CHECK,
+       0, 0, 0, SHELL_FEAT_PROCESS_SUB},
+      {"output process substitution after OR", "echo ok || cat >(id)", 2,
+       NO_CHECK, 0, 1, SHELL_FEAT_PROCESS_SUB, 0},
+      {"redirect target output process substitution", "printf value 2> >(cat)",
+       1, 0, SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_PROCESS_SUB, 0},
+      {"special option variable", "echo $-", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS,
+       0},
+      /* A special parameter owns its name byte, so ? and * are not patterns.
+       * Pattern syntax around it still is. */
+      {"status parameter is not a glob", "printf '%s\\n' $?", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, SHELL_FEAT_GLOBS},
+      {"star parameter is not a glob", "echo $*", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, SHELL_FEAT_GLOBS},
+      {"at parameter is not a glob", "echo $@", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, SHELL_FEAT_GLOBS},
+      {"braced status parameter is not a glob", "echo ${?}", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, SHELL_FEAT_GLOBS},
+      {"adjacent status parameters are not globs", "echo $?$?", 1, NO_CHECK, 0,
+       0, SHELL_FEAT_VARS, SHELL_FEAT_GLOBS},
+      {"glob after status parameter", "echo $?*.log", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS | SHELL_FEAT_GLOBS, 0},
+      {"glob after star parameter", "echo $*?", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS | SHELL_FEAT_GLOBS, 0},
+      {"glob after named parameter", "echo $x?", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS | SHELL_FEAT_GLOBS, 0},
+      /* A bracket is a pattern only when its word closes it. */
+      {"lone bracket is not a glob", "echo [", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_GLOBS},
+      {"test command bracket is not a glob", "[ -e /tmp/example ]", 1, NO_CHECK,
+       0, 0, 0, SHELL_FEAT_GLOBS},
+      {"unclosed bracket word is not a glob", "echo [ab", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_GLOBS},
+      {"later bracket word does not close it", "echo [ a ]", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_GLOBS},
+      {"empty bracket is not a glob", "echo []", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_GLOBS},
+      {"bracket pattern is a glob", "echo [ab]", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_GLOBS, 0},
+      {"negated bracket pattern is a glob", "echo [!a]*", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_GLOBS, 0},
+      {"character class pattern is a glob", "echo [[:alpha:]]", 1, NO_CHECK, 0,
+       0, SHELL_FEAT_GLOBS, 0},
+      {"embedded bracket pattern is a glob", "ls a[b-c]d", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_GLOBS, 0},
+      {"quoted bracket pattern is not a glob", "echo '[ab]'", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_GLOBS},
+      {"escaped bracket pattern is not a glob", "echo \\[ab\\]", 1, NO_CHECK, 0,
+       0, 0, SHELL_FEAT_GLOBS},
+      {"loop feature", "while true", 1, NO_CHECK, 0, 0, SHELL_FEAT_LOOPS, 0},
+      {"conditional feature", "[[ true ]]", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_CONDITIONALS, 0},
+      {"if feature", "if true; then :; fi", 2, NO_CHECK, 0, 0, SHELL_FEAT_IF,
+       0},
+      {"case feature", "case value", 1, NO_CHECK, 0, 0, SHELL_FEAT_CASE, 0},
+      {"file command substitution", "echo $(<file)", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE, 0},
+      {"here-string", "cmd <<< string", 2, 1, SHELL_TYPE_HERESTRING, 1,
+       SHELL_FEAT_HERESTRING, 0},
+      {"here-string quoted escape", "cmd <<< \"two\\\" words\"", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, 0},
+      {"here-string escaped space", "cmd <<< two\\ words", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, 0},
+      {"here-string command substitution", "cmd <<< $(printf one)", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_SUBSHELL,
+       0},
+      {"here-string file command substitution", "cmd <<< $(</tmp/input)", 2, 1,
+       SHELL_TYPE_HERESTRING, 1,
+       SHELL_FEAT_HERESTRING | SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE,
+       0},
+      {"here-string backtick substitution", "cmd <<< `printf one`", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_SUBSHELL,
+       0},
+      {"here-string scalar expansion", "cmd <<< \"$value\"", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_VARS, 0},
+      {"here-string process substitution", "cmd <<< <(printf one)", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_PROCESS_SUB,
+       SHELL_FEAT_SUBSHELL},
+      {"here-string literal punctuation", "cmd <<< if*", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING,
+       SHELL_FEAT_GLOBS | SHELL_FEAT_CONDITIONALS},
+      {"here-string literal substitution", "cmd <<< '$(false)'", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, SHELL_FEAT_SUBSHELL},
+      {"single-quoted variable", "echo '$VAR'", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_VARS},
+      {"double-quoted glob", "echo \"*.txt\"", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_GLOBS},
+      {"escaped space", "echo hello\\ world", 1, NO_CHECK, 0, NO_CHECK, 0, 0},
+      {"escaped variable", "echo \\$VAR", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_VARS},
+      {"escaped quoted variable", "echo \"\\$VAR\"", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_VARS},
+      {"array subscript", "echo ${arr[0]}", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS,
+       0},
+      {"parameter expansion", "echo ${var:-default}", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, 0},
+      {"subshell assignment", "var=$(echo hi)", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"arithmetic assignment", "var=$((1+2))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH, 0},
+      {"multiple variables", "echo $a $b $c", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS, 0},
+      {"single-quoted glob", "ls '*.txt'", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_GLOBS},
+      {"nested subshell", "echo $(echo $(date))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"triple subshell", "echo $(a $(b $(c)))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"subshell variable", "x=$(echo $y)", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS, 0},
+      {"nested backticks", "`echo \\`date\\` `", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL, 0},
+      {"string conditional", "if [ \"$a\" = \"b\" ]; then echo yes; fi", 2,
+       NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
+      {"numeric conditional", "if [ $x -gt 0 ]; then echo positive; fi", 2,
+       NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
+      {"regex conditional", "if [[ $x =~ pattern ]]; then match; fi", 2,
+       NO_CHECK, 0, 0, SHELL_FEAT_VARS, 0},
+      {"glob conditional", "if [[ $str == *.* ]]; then echo ext; fi", 2,
+       NO_CHECK, 0, 0, SHELL_FEAT_VARS | SHELL_FEAT_GLOBS, 0},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result;
+    shell_error_t error =
+        shell_parse_fast(cases[i].input, strlen(cases[i].input), NULL, &result);
+    bool valid = parser_result_invariants(
+                     cases[i].input, strlen(cases[i].input), error, &result) &&
+                 error == SHELL_OK && result.status == SHELL_STATUS_OK;
+    if (cases[i].expected_count != NO_CHECK)
+      valid = valid && result.count == cases[i].expected_count;
+    if (cases[i].type_index != NO_CHECK)
+      valid = valid && cases[i].type_index < result.count &&
+              result.cmds[cases[i].type_index].type == cases[i].expected_type;
+    if (cases[i].feature_index != NO_CHECK) {
+      valid = valid && cases[i].feature_index < result.count;
+      if (valid) {
+        uint32_t features = result.cmds[cases[i].feature_index].features;
+        valid = (features & cases[i].required_features) ==
+                    cases[i].required_features &&
+                (features & cases[i].forbidden_features) == 0;
+      }
+    }
+    if (!valid) {
+      printf("    error=%d status=%u count=%u", error, result.status,
+             result.count);
+      if (cases[i].feature_index < result.count)
+        printf(" features[%u]=0x%x", cases[i].feature_index,
+               result.cmds[cases[i].feature_index].features);
+      printf("\n");
+    }
+    parser_test(cases[i].name, valid);
+  }
+
+  shell_parse_result_t metadata;
+  parser_extract("cmd1 & cmd2", &metadata);
+  parser_test_has_feature("Background marks preceding command", &metadata, 0,
+                          SHELL_FEAT_BACKGROUND);
+  parser_extract("(cmd1; cmd2)", &metadata);
+  parser_test("Group metadata and feature are retained",
+              metadata.count == 2 && metadata.cmds[0].group_depth == 1 &&
+                  metadata.cmds[1].group_depth == 1 &&
+                  (metadata.cmds[0].features & SHELL_FEAT_GROUP) != 0);
+
+  parser_extract(
+      "cd /workspace && { sleep 2; printf 'q'; } | ./clock > /tmp/clock.out",
+      &metadata);
+  parser_test("POSIX brace group retains four simple commands",
+              metadata.count == 4 && metadata.group_count == 1 &&
+                  metadata.groups[0].kind == SHELL_GROUP_BRACE &&
+                  metadata.groups[0].parent == UINT16_MAX &&
+                  metadata.groups[0].first_command == 1 &&
+                  metadata.groups[0].command_count == 2 &&
+                  metadata.cmds[0].group_kinds == SHELL_GROUP_NONE &&
+                  metadata.cmds[1].group_depth == 1 &&
+                  metadata.cmds[2].group_depth == 1 &&
+                  metadata.cmds[1].group_kinds == SHELL_GROUP_BRACE &&
+                  metadata.cmds[2].group_kinds == SHELL_GROUP_BRACE &&
+                  metadata.cmds[3].type == SHELL_TYPE_PIPELINE &&
+                  (metadata.cmds[1].features & SHELL_FEAT_GROUP) != 0);
+
+  parser_extract("{( echo )}", &metadata);
+  parser_test("Nested brace descriptors preserve parent and command spans",
+              metadata.count == 1 && metadata.group_count == 2 &&
+                  metadata.groups[0].kind == SHELL_GROUP_BRACE &&
+                  metadata.groups[0].parent == UINT16_MAX &&
+                  metadata.groups[0].first_command == 0 &&
+                  metadata.groups[0].command_count == 1 &&
+                  metadata.groups[1].kind == SHELL_GROUP_SUBSHELL &&
+                  metadata.groups[1].parent == 0 &&
+                  metadata.groups[1].first_command == 0 &&
+                  metadata.groups[1].command_count == 1);
+
+  static const char *const compact_groups[] = {
+      "({ echo ok; })", "({(echo ok)})", "time ({ echo ok; })",
+      "time ({(echo ok)})", "({ echo a; echo b; }) | cat"};
+  for (size_t i = 0; i < sizeof(compact_groups) / sizeof(compact_groups[0]);
+       i++) {
+    shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_error_t error = shell_parse_fast(
+        compact_groups[i], strlen(compact_groups[i]), &limits, &metadata);
+    parser_test("Compact nested delimiters retain lexical group membership",
+                error == SHELL_OK &&
+                    parser_result_invariants(compact_groups[i],
+                                             strlen(compact_groups[i]), error,
+                                             &metadata) &&
+                    metadata.group_count == (i == 1 || i == 3 ? 3 : 2) &&
+                    metadata.groups[0].kind == SHELL_GROUP_SUBSHELL &&
+                    metadata.groups[1].kind == SHELL_GROUP_BRACE &&
+                    metadata.groups[1].parent == 0 &&
+                    metadata.cmds[0].group_depth == (i == 1 || i == 3 ? 3 : 2));
+  }
+
+  parser_extract("exit <<< <(printf '%s' \"$(true)\")", &metadata);
+  parser_test(
+      "Lexical document features still include child-shell substitutions",
+      metadata.count == 2 &&
+          (metadata.cmds[1].features &
+           (SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_SUBSHELL)) ==
+              (SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_SUBSHELL));
+
+  parser_extract("{ cat; cat; } <<< value", &metadata);
+  parser_test("Group here-strings do not create synthetic fast-parser stages",
+              metadata.count == 2 && metadata.group_count == 1 &&
+                  metadata.groups[0].kind == SHELL_GROUP_BRACE &&
+                  metadata.cmds[0].type == SHELL_TYPE_SIMPLE &&
+                  metadata.cmds[1].type == SHELL_TYPE_SEMICOLON);
+}
+
+void test_layer1_utility_functions(void) {
+  printf("\n--- Layer 1: Utility Functions ---\n");
+
+  const shell_range_t range = {.start = 2, .len = 6};
+  const char input[] = "  ls -la";
+  char buf[64];
+
+  size_t copied = shell_subcommand_copy(input, &range, buf, sizeof(buf));
+  parser_test("copy returns exact subcommand",
+              copied == 6 && strcmp(buf, "ls -la") == 0);
+
+  copied = shell_subcommand_copy(input, &range, buf, 3);
+  parser_test("copy truncates and terminates a small buffer",
+              copied == 2 && strcmp(buf, "ls") == 0);
+
+  size_t len = 0;
+  const char *ptr = shell_subcommand_view(input, &range, &len);
+  parser_test("get returns the ranged view", ptr == input + 2 && len == 6);
+
+  const shell_range_t empty = {.start = 0, .len = 0};
+  buf[0] = 'x';
+  copied = shell_subcommand_copy(input, &empty, buf, sizeof(buf));
+  parser_test("Copy preserves an empty subcommand",
+              copied == 0 && buf[0] == '\0');
+
+  ptr = shell_subcommand_view(input, &empty, NULL);
+  parser_test("Ranged view may omit its length output", ptr == input);
+}
+
+void test_layer1_error_handling(void) {
+  printf("\n--- Layer 1: Error Handling ---\n");
+
+  shell_parse_result_t result;
+  const shell_limits_t limits = {.max_subcommands = 1, .strict_mode = false};
+  static const struct {
+    const char *name;
+    const char *input;
+    uint16_t type;
+    uint32_t features;
+  } truncation_cases[] = {
+      {"pipeline truncation", "cmd1 | cmd2", SHELL_TYPE_SIMPLE,
+       SHELL_FEAT_PIPELINE},
+      {"heredoc truncation", "cat <<EOF\nbody\nEOF ; pwd", SHELL_TYPE_SIMPLE,
+       0},
+      {"substitution truncation", "echo $(id); pwd", SHELL_TYPE_SUBSTITUTION,
+       SHELL_FEAT_SUBSHELL},
+      {"process substitution truncation", "diff <(a) <(b); pwd",
+       SHELL_TYPE_SUBSTITUTION, SHELL_FEAT_PROCESS_SUB},
+      {"loop truncation", "for x in a; do echo $x; done ; pwd",
+       SHELL_TYPE_SIMPLE, SHELL_FEAT_LOOPS},
+      {"conditional truncation", "if true; then echo yes; fi ; pwd",
+       SHELL_TYPE_SIMPLE, SHELL_FEAT_IF},
+      {"mixed composition truncation", "a && b || c | d ; e", SHELL_TYPE_SIMPLE,
+       0},
+  };
+  for (size_t i = 0; i < sizeof(truncation_cases) / sizeof(truncation_cases[0]);
+       i++) {
+    shell_error_t error =
+        shell_parse_fast(truncation_cases[i].input,
+                         strlen(truncation_cases[i].input), &limits, &result);
+    parser_test(truncation_cases[i].name,
+                error == SHELL_ETRUNC &&
+                    result.status == SHELL_STATUS_TRUNCATED &&
+                    result.count == 1 &&
+                    result.cmds[0].type == truncation_cases[i].type &&
+                    (result.cmds[0].features & truncation_cases[i].features) ==
+                        truncation_cases[i].features);
+  }
+
+  shell_error_t err;
+
+#if SIZE_MAX > UINT32_MAX
+  memset(&result, 0xa5, sizeof(result));
+  err = shell_parse_fast("x", (size_t)UINT32_MAX + 1, NULL, &result);
+  parser_test("Rejects input too large for range offsets",
+              err == SHELL_EINPUT && result.count == 0 &&
+                  result.status == SHELL_STATUS_ERROR);
+#endif
+}
+
+void test_dialect_oracle(void) {
+  static const struct {
+    const char *input;
+    uint32_t count;
+    uint32_t graph_count;
+    uint16_t first_type;
+    uint16_t second_type;
+  } cases[] = {
+      {"ls", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"ls | wc", 2, 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_PIPELINE},
+      {"ls && pwd", 2, 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_AND},
+      {"ls || pwd", 2, 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_OR},
+      {"echo 'a|b'", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"echo \"a; b\"", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"echo $(id)", 1, 2, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE},
+      {"echo $(id)$(pwd)", 1, 3, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE},
+      {"echo pre$(id)suf$(pwd)", 1, 3, SHELL_TYPE_SUBSTITUTION,
+       SHELL_TYPE_SIMPLE},
+      {"echo $(id)`pwd`", 1, 3, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE},
+      {"echo \"$(id)$(pwd)\"", 1, 3, SHELL_TYPE_SUBSTITUTION,
+       SHELL_TYPE_SIMPLE},
+      {"echo \"\\$(id)\"", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"echo $(cat /tmp/a | sort)", 1, 3, SHELL_TYPE_SUBSTITUTION,
+       SHELL_TYPE_SIMPLE},
+      {"cat <(sort <(cat /tmp/a))", 1, 3, SHELL_TYPE_SUBSTITUTION,
+       SHELL_TYPE_SIMPLE},
+      {"echo $(id) && pwd", 2, 3, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_AND},
+      {"cat <(printf x) | sort", 2, 3, SHELL_TYPE_SUBSTITUTION,
+       SHELL_TYPE_PIPELINE},
+      {"echo $((1+2))", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"cmd ;", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t fast = {0};
+    shell_error_t error =
+        shell_parse_fast(cases[i].input, strlen(cases[i].input), NULL, &fast);
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    bool full_ok = (shell_tokenize_commands(
+                        cases[i].input, strlen(cases[i].input), &commands,
+                        &command_count) == SHELL_TOKENIZE_OK);
+    shell_command_info_t *infos = NULL;
+    size_t info_count = 0;
+    shell_process_status_t process_error = shell_process_command(
+        cases[i].input, strlen(cases[i].input), NULL, &infos, &info_count);
+    shell_dep_graph_t graph;
+    memset(&graph, 0xa5, sizeof(graph));
+    shell_dep_error_t graph_error = shell_dep_graph_parse(
+        cases[i].input, strlen(cases[i].input), ".", NULL, &graph);
+    parser_test("Dialect oracle constructs a complete bounded graph",
+                graph_error == SHELL_DEP_OK &&
+                    graph.node_count <= SHELL_DEP_MAX_NODES);
+    uint32_t graph_commands = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      if (graph.nodes[node].type == SHELL_NODE_CMD)
+        graph_commands++;
+    bool ranges_agree = full_ok && command_count == cases[i].count &&
+                        process_error == SHELL_PROCESS_OK &&
+                        info_count == cases[i].count;
+    for (uint32_t command = 0; ranges_agree && command < fast.count;
+         command++) {
+      const shell_range_t *range = &fast.cmds[command];
+      size_t fast_end = (size_t)range->start + range->len;
+      size_t full_end = commands[command].end_pos;
+      /* The allocating tokenizer omits a closing parenthesis from the
+       * command span when it was consumed as a group delimiter.  The fast
+       * zero-copy range keeps the delimiter in its source slice.  Treat that
+       * one-byte representation difference as equivalent while still
+       * requiring both APIs to agree on command count and start boundaries. */
+      bool full_span_covers_fast =
+          full_end >= fast_end ||
+          (full_end < strlen(cases[i].input) && full_end + 1 >= fast_end &&
+           cases[i].input[full_end] == ')');
+      ranges_agree =
+          commands[command].start_pos <= range->start && full_span_covers_fast;
+      for (size_t token = 0;
+           ranges_agree && token < infos[command].command_token_count;
+           token++) {
+        const shell_token_t *value = &infos[command].command_tokens[token];
+        ranges_agree = value->position <= range->len &&
+                       value->length <= range->len - value->position;
+      }
+    }
+    if (!ranges_agree)
+      printf("    differential mismatch for '%s': fast=%u full=%zu info=%zu\n",
+             cases[i].input, fast.count, command_count, info_count);
+    if (!ranges_agree)
+      for (uint32_t command = 0;
+           command < fast.count && command < command_count &&
+           command < info_count;
+           command++)
+        printf("      %u fast='%.*s' full=[%zu,%zu) info='%s'\n", command,
+               fast.cmds[command].len,
+               cases[i].input + fast.cmds[command].start,
+               commands[command].start_pos, commands[command].end_pos,
+               infos[command].original_command);
+    char name[96];
+    snprintf(name, sizeof(name), "dialect oracle: %s", cases[i].input);
+    bool valid =
+        error == SHELL_OK && fast.count == cases[i].count &&
+        fast.cmds[0].type == cases[i].first_type &&
+        (cases[i].count < 2 || fast.cmds[1].type == cases[i].second_type) &&
+        ranges_agree && graph_error == SHELL_DEP_OK &&
+        graph_commands == cases[i].graph_count;
+    if (!valid)
+      printf("    oracle details: error=%d fast=%u graph_error=%d graph=%u\n",
+             error, fast.count, graph_error, graph_commands);
+    parser_test(name, valid);
+    shell_command_infos_free(infos, info_count);
+    shell_commands_free(commands, command_count);
+  }
+
+  static const char *strict_errors[] = {"echo 'x", "echo \"x", "$(("};
+  for (size_t i = 0; i < sizeof(strict_errors) / sizeof(strict_errors[0]);
+       i++) {
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t result = {0};
+    shell_error_t error = shell_parse_fast(
+        strict_errors[i], strlen(strict_errors[i]), &strict, &result);
+    parser_test("strict dialect rejects incomplete syntax",
+                error == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR);
+  }
+
+  const char non_ascii[] = "echo \xC3\xA9";
+  shell_parse_result_t result = {0};
+  shell_error_t error =
+      shell_parse_fast(non_ascii, sizeof(non_ascii) - 1, NULL, &result);
+  parser_test("fast parser preserves non-ASCII word text",
+              error == SHELL_OK && result.count == 1);
+  shell_command_t *commands = NULL;
+  size_t command_count = 0;
+  parser_test("full tokenizer preserves non-ASCII word text",
+              shell_tokenize_commands(non_ascii, strlen(non_ascii), &commands,
+                                      &command_count) == SHELL_TOKENIZE_OK &&
+                  commands != NULL && command_count == 1);
+  shell_commands_free(commands, command_count);
+}
+
+/* --- LAYER 2: INTERACTION TESTS - MULTIPLE FEATURES --- */
+
+/* --- LAYER 3: LARGE/COMPLEX TESTS --- */
+
+typedef struct {
+  const char *name;
+  const char *input;
+  uint32_t count;
+  uint32_t feature_index;
+  uint32_t features;
+} parser_complex_case_t;
+
+static void parser_test_complex_case_matrix(void) {
+  printf("\n--- Layer 3: Complex Inputs ---\n");
+  static const parser_complex_case_t cases[] = {
+      {"find pipeline",
+       "find . -name '*.txt' -type f | grep -v test | sort | "
+       "uniq -c | head -20",
+       5, 0, 0},
+      {"conditional sequence",
+       "if [ -f config ]; then source config && echo loaded; else echo "
+       "missing; fi",
+       4, 0, 0},
+      {"substitution and boolean operators",
+       "count=$(ls *.log 2>/dev/null | wc -l) && [ $count -gt 0 ] || echo "
+       "'no files'",
+       3, 0, SHELL_FEAT_SUBSHELL | SHELL_FEAT_GLOBS},
+      {"nested substitution and arithmetic", "echo $(( $(date +%s) + 3600 ))",
+       1, 0, SHELL_FEAT_SUBSHELL | SHELL_FEAT_ARITH},
+      {"parameter expansion forms", "echo ${var:-default} ${var:=assigned}", 1,
+       0, SHELL_FEAT_VARS},
+      {"long feature interaction",
+       "echo \"Processing ${files[@]} at $(date +%T)...\" && for f in *.log; "
+       "do grep ERROR $f >> errors.txt; done",
+       4, 0, SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL},
+      {"mixed control flow and pipeline",
+       "if [ -f ~/.bashrc ]; then source ~/.bashrc; fi && export "
+       "PATH=\"$HOME/bin:$PATH\" && find . -name '*.c' -exec gcc -o {} {} "
+       "\\; | grep -v 'Permission denied' || echo 'Build failed'",
+       6, 0, 0},
+      {"array loop and substitutions",
+       "arr=($(ls *.txt | sort)) && for f in \"${arr[@]}\"; do count=$(wc -l "
+       "< \"$f\"); echo \"$f: $count lines\"; done | tee report.txt",
+       6, 0, SHELL_FEAT_SUBSHELL},
+      {"newline separators", "cmd1\ncmd2\ncmd3", 3, 0, 0},
+      {"mixed whitespace and operators",
+       "  cmd1  \t  |  \n  cmd2  \t  ;  \n  cmd3  ", 3, 0, 0},
+      {"function definition", "function foo { echo hello; }", 2, 0, 0},
+      {"function definition shorthand", "foo() { cat $1; }", 2, 0, 0},
+      {"C-style loop", "for ((i=0; i<10; i++)); do echo $i; done", 3, 1,
+       SHELL_FEAT_VARS},
+      {"for loop expansion", "for f in *.txt; do wc -l $f; done", 3, 1,
+       SHELL_FEAT_VARS},
+      {"while loop redirection",
+       "while IFS= read -r line; do echo $line; done < file", 3, 1,
+       SHELL_FEAT_VARS},
+      {"mixed composition operators", "a && b || c | d ; e && f || g | h", 8, 0,
+       0},
+      {"command group", "{ a; b; c; }", 3, 0, 0},
+      {"build loop", "for f in *.c; do gcc -o ${f%.c} $f; done", 3, 1,
+       SHELL_FEAT_VARS},
+      {"substitution followed by cleanup",
+       "tar czf backup.tar.gz $(find . -name '*.log') && rm *.log", 2, 0,
+       SHELL_FEAT_SUBSHELL},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result;
+    shell_error_t error =
+        shell_parse_fast(cases[i].input, strlen(cases[i].input), NULL, &result);
+    bool valid = error == SHELL_OK && result.status == SHELL_STATUS_OK &&
+                 result.count == cases[i].count;
+    if (valid && cases[i].features != 0)
+      valid = cases[i].feature_index < result.count &&
+              (result.cmds[cases[i].feature_index].features &
+               cases[i].features) == cases[i].features;
+    if (!valid)
+      printf("    %s: input='%s', error=%d status=%u count=%u expected=%u\n",
+             cases[i].name, cases[i].input, error, result.status, result.count,
+             cases[i].count);
+    parser_test(cases[i].name, valid);
+  }
+}
+
+/* --- ADDITIONAL LAYER 3 TESTS --- */
+
+static void parser_test_strict_mode(void) {
+  printf("\n--- Strict Mode ---\n");
+
+  static const struct {
+    const char *name;
+    const char *input;
+    bool strict;
+    shell_error_t expected_error;
+  } cases[] = {
+      {"strict rejects unterminated single quote", "echo 'unclosed", true,
+       SHELL_EPARSE},
+      {"strict rejects unterminated double quote", "echo \"unclosed", true,
+       SHELL_EPARSE},
+      {"strict rejects unterminated backtick", "echo `unclosed", true,
+       SHELL_EPARSE},
+      {"strict rejects empty unterminated arithmetic", "$((", true,
+       SHELL_EPARSE},
+      {"strict rejects unterminated arithmetic expression", "$((i++", true,
+       SHELL_EPARSE},
+      {"strict rejects unterminated arithmetic command", "((i++", true,
+       SHELL_EPARSE},
+      {"strict accepts closed arithmetic expression", "$((i++))", true,
+       SHELL_OK},
+      {"strict accepts closed arithmetic command", "((i++))", true, SHELL_OK},
+      {"strict rejects bare opening brace command", "foo; {", true,
+       SHELL_EPARSE},
+      {"strict rejects bare closing brace command", "foo; }", true,
+       SHELL_EPARSE},
+      {"strict rejects unmatched pipeline closer", "foo | )", true,
+       SHELL_EPARSE},
+      {"strict rejects brace argument as group", "echo { foo; }", true,
+       SHELL_EPARSE},
+      {"strict rejects subshell argument", "echo (foo)", true, SHELL_EPARSE},
+      {"strict rejects arithmetic argument", "echo ((1))", true, SHELL_EPARSE},
+      {"strict preserves literal braces", "echo { foo", true, SHELL_OK},
+      {"strict preserves literal closer", "echo }", true, SHELL_OK},
+      {"strict accepts nested group extension", "{( echo )}", true, SHELL_OK},
+      {"permissive accepts unterminated single quote", "echo 'unclosed", false,
+       SHELL_OK},
+      {"permissive accepts unterminated double quote", "echo \"unclosed", false,
+       SHELL_OK},
+      {"permissive accepts unterminated backtick", "echo `unclosed", false,
+       SHELL_OK},
+      {"strict accepts closed single quote", "echo 'valid'", true, SHELL_OK},
+      {"strict accepts closed double quote", "echo \"valid\"", true, SHELL_OK},
+      {"strict accepts spaces in single quotes", "echo 'hello world'", true,
+       SHELL_OK},
+      {"strict accepts escaped double quotes",
+       "echo \"a \\\"quoted\\\" string\"", true, SHELL_OK},
+      {"strict accepts closed backtick in double quotes", "echo \"`date`\"",
+       true, SHELL_OK},
+      {"strict ignores backtick in single quotes", "echo '`'", true, SHELL_OK},
+  };
+  shell_limits_t limits = {.max_subcommands = 64, .strict_mode = false};
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result;
+    limits.strict_mode = cases[i].strict;
+    shell_error_t error = shell_parse_fast(
+        cases[i].input, strlen(cases[i].input), &limits, &result);
+    bool valid = error == cases[i].expected_error;
+    if (cases[i].expected_error == SHELL_OK)
+      valid = valid && result.status == SHELL_STATUS_OK && result.count == 1;
+    parser_test(cases[i].name, valid);
+  }
+
+  shell_parse_result_t arithmetic_after_separator = {0};
+  limits.strict_mode = true;
+  parser_test("strict accepts arithmetic command after separator",
+              shell_parse_fast("foo; ((1))", strlen("foo; ((1))"), &limits,
+                               &arithmetic_after_separator) == SHELL_OK &&
+                  arithmetic_after_separator.status == SHELL_STATUS_OK &&
+                  arithmetic_after_separator.count == 2);
+}
+
+static void parser_test_strict_heredoc_completion(void) {
+  printf("\n--- Strict Heredoc Completion ---\n");
+  static const char *const incomplete[] = {
+      "cat <<EOF\nbody\n",
+      "cat <<-'EOF'\r\n\tbody\r\n",
+      "cat <<A <<B\none\nA\n",
+  };
+  shell_limits_t limits = {.max_subcommands = 64, .strict_mode = true};
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(incomplete) / sizeof(incomplete[0]); i++) {
+    shell_parse_result_t result = {0};
+    valid = valid &&
+            shell_parse_fast(incomplete[i], strlen(incomplete[i]), &limits,
+                             &result) == SHELL_EPARSE &&
+            result.status == SHELL_STATUS_ERROR;
+    limits.strict_mode = false;
+    memset(&result, 0, sizeof(result));
+    valid = valid && shell_parse_fast(incomplete[i], strlen(incomplete[i]),
+                                      &limits, &result) == SHELL_OK;
+    limits.strict_mode = true;
+  }
+  shell_parse_result_t malformed = {0};
+  valid = valid &&
+          shell_parse_fast("cat <<\n", strlen("cat <<\n"), &limits,
+                           &malformed) == SHELL_EPARSE &&
+          malformed.status == SHELL_STATUS_ERROR;
+
+  char capacity[SHELL_MAX_SUBCOMMANDS * 16 + 1] = {0};
+  size_t used = 0;
+  for (uint32_t i = 0; i <= SHELL_MAX_SUBCOMMANDS; i++)
+    used += (size_t)snprintf(capacity + used, sizeof(capacity) - used,
+                             "cat <<E\nx\nE\n");
+  shell_limits_t permissive = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                               .strict_mode = false};
+  memset(&malformed, 0, sizeof(malformed));
+  valid = valid &&
+          shell_parse_fast(capacity, used, &permissive, &malformed) ==
+              SHELL_ETRUNC &&
+          malformed.status == SHELL_STATUS_TRUNCATED;
+
+  static const char complete[] = "cat <<A <<-'B'\r\n"
+                                 "one\r\n"
+                                 "A\n"
+                                 "\ttwo\r\n"
+                                 "\tB\r\n";
+  shell_parse_result_t result = {0};
+  valid = valid &&
+          shell_parse_fast(complete, sizeof(complete) - 1, &limits, &result) ==
+              SHELL_OK &&
+          result.status == SHELL_STATUS_OK;
+  static const char ansi_complete[] = "cat <<$'EO\\x46' <<-$'B'\r\n"
+                                      "one\r\n"
+                                      "EOF\n"
+                                      "\ttwo\r\n"
+                                      "\tB\r\n";
+  memset(&result, 0, sizeof(result));
+  valid = valid &&
+          shell_parse_fast(ansi_complete, sizeof(ansi_complete) - 1, &limits,
+                           &result) == SHELL_OK &&
+          result.status == SHELL_STATUS_OK;
+  parser_test("Strict mode validates quoted, tab-stripped heredoc terminators",
+              valid);
+}
+
+static void parser_test_nested_heredoc_rejection(void) {
+  printf("\n--- Nested Heredoc Dialect Boundary ---\n");
+  static const char *cases[] = {
+      "echo $(cat <<EOF\nbody\nEOF)",
+      "echo $(cat <<'EOF'\n$(id)\nEOF) && pwd",
+      "cat <(cat <<EOF\nbody\nEOF)",
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    for (int strict = 0; strict <= 1; strict++) {
+      shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                               .strict_mode = strict != 0};
+      shell_parse_result_t result = {0};
+      shell_error_t error =
+          shell_parse_fast(cases[i], strlen(cases[i]), &limits, &result);
+      char name[96];
+      snprintf(name, sizeof(name), "%s nested heredoc rejected (%s)",
+               strict ? "strict" : "permissive", cases[i]);
+      parser_test(name, error == SHELL_EPARSE &&
+                            result.status == SHELL_STATUS_ERROR &&
+                            result.count == 0);
+    }
+  }
+
+  static const char *const valid_cases[] = {
+      "echo $(cat <<EOF\n)\nEOF\n)",
+      "echo $(cat <<E'OF'\n)\nEOF\n)",
+      "cat <(cat <<EOF\n)\nEOF\n)",
+  };
+  for (size_t i = 0; i < sizeof(valid_cases) / sizeof(valid_cases[0]); i++) {
+    shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t result = {0};
+    shell_error_t error = shell_parse_fast(
+        valid_cases[i], strlen(valid_cases[i]), &limits, &result);
+    char name[96];
+    snprintf(name, sizeof(name), "nested heredoc accepted (%s)",
+             valid_cases[i]);
+    parser_test(name, error == SHELL_OK && result.status == SHELL_STATUS_OK &&
+                          result.count == 1);
+  }
+}
+
+static bool parser_make_nested_heredoc_substitution(char *command,
+                                                    size_t capacity,
+                                                    bool process_substitution) {
+  int written = snprintf(command, capacity,
+                         process_substitution ? "cat <(cat" : "echo $(cat");
+  if (written < 0 || (size_t)written >= capacity)
+    return false;
+  size_t used = (size_t)written;
+  for (uint32_t i = 0; i < 9; i++) {
+    written = snprintf(command + used, capacity - used, " <<H%u", i);
+    if (written < 0 || (size_t)written >= capacity - used)
+      return false;
+    used += (size_t)written;
+  }
+  written = snprintf(command + used, capacity - used, "\n");
+  if (written < 0 || (size_t)written >= capacity - used)
+    return false;
+  used += (size_t)written;
+  for (uint32_t i = 0; i < 9; i++) {
+    written = snprintf(command + used, capacity - used, "body%u\nH%u\n", i, i);
+    if (written < 0 || (size_t)written >= capacity - used)
+      return false;
+    used += (size_t)written;
+  }
+  written = snprintf(command + used, capacity - used, ")");
+  return written >= 0 && (size_t)written < capacity - used;
+}
+
+static void parser_test_substitution_comment_and_heredoc_capacity(void) {
+  printf("\n--- Substitution Comment and Heredoc Capacity ---\n");
+  shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                           .strict_mode = true};
+  static const struct {
+    const char *name;
+    const char *input;
+    shell_error_t expected;
+  } comment_cases[] = {
+      {"commented command-substitution closer is not syntax",
+       "echo $(printf value # )", SHELL_EPARSE},
+      {"commented process-substitution closer is not syntax",
+       "cat <(printf value # )", SHELL_EPARSE},
+      {"command substitution resumes after a comment",
+       "echo $(printf value # )\nprintf done)", SHELL_OK},
+      {"quoted comment text remains part of a substitution",
+       "echo $(printf '# )')", SHELL_OK},
+      {"escaped comment and parenthesis remain literal",
+       "echo $(printf \\#\\) )", SHELL_OK},
+  };
+  for (size_t i = 0; i < sizeof(comment_cases) / sizeof(comment_cases[0]);
+       i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t error =
+        shell_parse_fast(comment_cases[i].input, strlen(comment_cases[i].input),
+                         &limits, &result);
+    parser_test(comment_cases[i].name,
+                error == comment_cases[i].expected &&
+                    (error != SHELL_OK ||
+                     (result.status == SHELL_STATUS_OK && result.count == 1)));
+  }
+
+  for (int process_substitution = 0; process_substitution <= 1;
+       process_substitution++) {
+    char command[512];
+    shell_parse_result_t result = {0};
+    bool built = parser_make_nested_heredoc_substitution(
+        command, sizeof(command), process_substitution != 0);
+    shell_error_t error =
+        built ? shell_parse_fast(command, strlen(command), &limits, &result)
+              : SHELL_EPARSE;
+    parser_test(process_substitution
+                    ? "nested process substitution accepts nine heredocs"
+                    : "nested command substitution accepts nine heredocs",
+                built && error == SHELL_OK &&
+                    result.status == SHELL_STATUS_OK && result.count == 1);
+  }
+}
+
+static void parser_test_source_scanner_contract(void) {
+  printf("\n--- Shared Source Scanner Contract ---\n");
+  static const char lines[] = "one\r\ntwo\nlast";
+  parser_test(
+      "source scanner retains CR before LF and recognizes final physical lines",
+      shell_source_line_end(lines, sizeof(lines) - 1, 0) == 4 &&
+          shell_source_next_line(lines, sizeof(lines) - 1, 0) == 5 &&
+          shell_source_line_end(lines, sizeof(lines) - 1, 5) == 8 &&
+          shell_source_next_line(lines, sizeof(lines) - 1, 9) ==
+              sizeof(lines) - 1);
+
+  parser_test("source scanner uses logical shell-word comment boundaries",
+              shell_source_comment_starts('#', true) &&
+                  !shell_source_comment_starts('#', false) &&
+                  !shell_source_comment_starts('x', true));
+
+  static const char quoted[] = "\"one \\\"two\\\"\"";
+  parser_test(
+      "source scanner skips quoted text and quoted escapes",
+      shell_source_skip_quoted_text(quoted, sizeof(quoted) - 1, 0, '"') ==
+              sizeof(quoted) - 1 &&
+          shell_source_skip_quoted_text("'unfinished", 11, 0, '\'') == 11);
+
+  shell_source_pending_heredoc_t pending = {0};
+  size_t position = 0;
+  static const char delimiter[] = "- \t\"E\"'O'\\F rest";
+  bool parsed = shell_source_parse_heredoc_delimiter(
+      delimiter, sizeof(delimiter) - 1, &position, &pending);
+  parser_test(
+      "source scanner decodes quoted and tab-stripped heredoc delimiters",
+      parsed && pending.strip_tabs && position < sizeof(delimiter) - 1 &&
+          shell_source_line_is_heredoc_delimiter("\tEOF\n", 5, 0, &pending) &&
+          !shell_source_line_is_heredoc_delimiter("\tEOF\r\n", 6, 0,
+                                                  &pending) &&
+          !shell_source_line_is_heredoc_delimiter("\tEOG\n", 5, 0, &pending));
+  position = 0;
+  static const char escaped_delimiter[] = "\"E\\\"F\"";
+  static const char retained_backslash_delimiter[] = "\"E\\qF\"";
+  static const char empty_delimiter[] = "''";
+  shell_source_pending_heredoc_t escaped_pending = {0};
+  shell_source_pending_heredoc_t retained_backslash_pending = {0};
+  shell_source_pending_heredoc_t empty_pending = {0};
+  bool escaped_parsed = shell_source_parse_heredoc_delimiter(
+      escaped_delimiter, sizeof(escaped_delimiter) - 1, &position,
+      &escaped_pending);
+  position = 0;
+  bool retained_backslash_parsed = shell_source_parse_heredoc_delimiter(
+      retained_backslash_delimiter, sizeof(retained_backslash_delimiter) - 1,
+      &position, &retained_backslash_pending);
+  position = 0;
+  bool empty_parsed = shell_source_parse_heredoc_delimiter(
+      empty_delimiter, sizeof(empty_delimiter) - 1, &position, &empty_pending);
+  parser_test(
+      "source scanner handles escaped and empty delimiter bytes",
+      escaped_parsed &&
+          shell_source_line_is_heredoc_delimiter("E\"F\n", 4, 0,
+                                                 &escaped_pending) &&
+          retained_backslash_parsed &&
+          shell_source_line_is_heredoc_delimiter("E\\qF\n", 5, 0,
+                                                 &retained_backslash_pending) &&
+          empty_parsed &&
+          shell_source_line_is_heredoc_delimiter("\n", 1, 0, &empty_pending));
+  position = 0;
+  parser_test(
+      "declaration boundary retains dangling escapes as incomplete",
+      shell_source_probe_heredoc_delimiter("\\", 1, &position, &pending) ==
+          SHELL_HEREDOC_WORD_INCOMPLETE);
+  static const char ansi_delimiter[] = "$'EO\\x46'";
+  static const char ansi_nul_delimiter[] = "$'E\\0F'";
+  static const char ansi_nul_suffix[] = "$'E\\0F'X$'Y\\0Z'W";
+  shell_source_pending_heredoc_t ansi_pending = {0};
+  shell_source_pending_heredoc_t ansi_nul_pending = {0};
+  shell_source_pending_heredoc_t ansi_suffix_pending = {0};
+  position = 0;
+  bool ansi_parsed = shell_source_parse_heredoc_delimiter(
+      ansi_delimiter, sizeof(ansi_delimiter) - 1, &position, &ansi_pending);
+  position = 0;
+  bool ansi_nul_parsed = shell_source_parse_heredoc_delimiter(
+      ansi_nul_delimiter, sizeof(ansi_nul_delimiter) - 1, &position,
+      &ansi_nul_pending);
+  position = 0;
+  bool ansi_suffix_parsed = shell_source_parse_heredoc_delimiter(
+      ansi_nul_suffix, sizeof(ansi_nul_suffix) - 1, &position,
+      &ansi_suffix_pending);
+  parser_test("source scanner decodes ANSI-C heredoc delimiters",
+              ansi_parsed &&
+                  shell_source_heredoc_delimiter_is_quoted(&ansi_pending) &&
+                  shell_source_line_is_heredoc_delimiter("EOF\n", 4, 0,
+                                                         &ansi_pending) &&
+                  ansi_nul_parsed &&
+                  shell_source_line_is_heredoc_delimiter("E\n", 2, 0,
+                                                         &ansi_nul_pending) &&
+                  !shell_source_line_is_heredoc_delimiter("EF\n", 3, 0,
+                                                          &ansi_nul_pending));
+  parser_test("ANSI-C NUL truncates only its heredoc quote segment",
+              ansi_suffix_parsed &&
+                  shell_source_line_is_heredoc_delimiter(
+                      "EXYW\n", 5, 0, &ansi_suffix_pending) &&
+                  !shell_source_line_is_heredoc_delimiter(
+                      "E\n", 2, 0, &ansi_suffix_pending));
+  bool decoded_nul = false;
+  bool locale_dependent = false;
+  position = 0;
+  parser_test(
+      "ANSI-C NUL probe distinguishes malformed and inactive quotes",
+      shell_source_ansi_c_quote_facts("$'a\\0b'", 7, &position, &decoded_nul,
+                                      &locale_dependent) &&
+          decoded_nul && !locale_dependent && position == 7 &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c(NULL, 0) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("\\$'a\\0b'", 8) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
+                                                            9) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("\\\n$'a\\0b'",
+                                                            10));
+  position = 0;
+  parser_test("ANSI-C syntax boundary rejects an unfinished quote",
+              !shell_source_ansi_c_quote_facts("$'unterminated", 14, &position,
+                                               &decoded_nul,
+                                               &locale_dependent));
+  position = 0;
+  parser_test(
+      "ANSI-C Unicode facts do not conflate byte escapes with code points",
+      shell_source_ansi_c_quote_facts("$'\\u00e9'", 9, &position, &decoded_nul,
+                                      &locale_dependent) &&
+          !decoded_nul && locale_dependent && position == 9 &&
+          shell_source_heredoc_word_has_unsupported_ansi_c("$'\\u00e9'", 9) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("$'\\xE9'", 7));
+  static const char suffix_source[] =
+      "cat <<$'E\\0F'X\npayload\nE\nEX\nprintf done\n";
+  shell_parse_result_t suffix_result = {0};
+  parser_test(
+      "Fast parser keeps heredoc body until concatenated delimiter",
+      shell_parse_fast(suffix_source, sizeof(suffix_source) - 1, NULL,
+                       &suffix_result) == SHELL_OK &&
+          suffix_result.count == 3 &&
+          suffix_result.cmds[2].start ==
+              (uint32_t)(strstr(suffix_source, "printf done") - suffix_source));
+  position = 0;
+  parser_test(
+      "source scanner rejects malformed heredoc delimiters",
+      !shell_source_parse_heredoc_delimiter("-", 1, &position, &pending) &&
+          !shell_source_parse_heredoc_delimiter("\\", 1, &position, &pending) &&
+          !shell_source_parse_heredoc_delimiter("'EOF", 4, &position,
+                                                &pending));
+
+  static const char sequence[] =
+      "cat <<<'not a document' <<E'OF' <<-\\D'ONE'\r\n"
+      "one\r\n"
+      "EOF\n"
+      "\ttwo\r\n"
+      "\tDONE\r\n"
+      "printf retained";
+  const char *first_document = strstr(sequence, "<<E'OF'");
+  const char *trailing = strstr(sequence, "printf retained");
+  size_t sequence_after = 0;
+  bool complete = false;
+  bool skipped =
+      first_document != NULL && trailing != NULL &&
+      shell_source_skip_heredoc_sequence(sequence, sizeof(sequence) - 1,
+                                         (size_t)(first_document - sequence),
+                                         &sequence_after, &complete);
+  parser_test("source scanner skips FIFO mixed-quote heredoc bodies",
+              skipped && complete &&
+                  sequence_after == (size_t)(trailing - sequence));
+
+  static const char *const opaque_header_cases[] = {
+      "cat <<EOF \\x\nbody\nEOF\n",
+      "cat <<EOF 'ignored'\nbody\nEOF\n",
+      "cat <<EOF # ignored\nbody\nEOF\n",
+      "cat <<EOF $((1 << 2))\nbody\nEOF\n",
+      "cat <<EOF $(printf value)\nbody\nEOF\n",
+      "cat <<EOF <<<word\nbody\nEOF\n",
+  };
+  const shell_source_pending_heredoc_t plain_pending = {.word = "EOF",
+                                                        .word_length = 3};
+  bool opaque_headers =
+      !shell_source_heredoc_delimiter_is_quoted(&plain_pending);
+  for (size_t i = 0; opaque_headers && i < sizeof(opaque_header_cases) /
+                                               sizeof(opaque_header_cases[0]);
+       i++) {
+    size_t opaque_after = 0;
+    bool opaque_complete = false;
+    const char *opaque = opaque_header_cases[i];
+    opaque_headers = shell_source_skip_heredoc_sequence(
+        opaque, strlen(opaque), (size_t)(strstr(opaque, "<<EOF") - opaque),
+        &opaque_after, &opaque_complete);
+    opaque_headers =
+        opaque_headers && opaque_complete && opaque_after == strlen(opaque);
+  }
+  parser_test(
+      "source scanner keeps opaque header syntax out of heredoc matching",
+      opaque_headers);
+
+  static const char unterminated_sequence[] = "cat <<E'OF'\nbody\n";
+  first_document = strstr(unterminated_sequence, "<<E'OF'");
+  sequence_after = 0;
+  complete = true;
+  skipped = first_document != NULL &&
+            shell_source_skip_heredoc_sequence(
+                unterminated_sequence, sizeof(unterminated_sequence) - 1,
+                (size_t)(first_document - unterminated_sequence),
+                &sequence_after, &complete);
+  parser_test("source scanner distinguishes incomplete heredoc bodies",
+              skipped && !complete &&
+                  sequence_after == sizeof(unterminated_sequence) - 1);
+
+  static const struct {
+    const char *input;
+    bool balanced;
+  } parentheses[] = {
+      {"(plain)", true},
+      {"(')')", true},
+      {"(\\))", true},
+      {"(# )\nprintf done)", true},
+      {"(cat <<EOF\n)\nEOF\n)", true},
+      {"($((1 << 2)))", true},
+      {"(unterminated", false},
+  };
+  bool balanced_contract = true;
+  for (size_t i = 0; i < sizeof(parentheses) / sizeof(parentheses[0]); i++) {
+    size_t after = 0;
+    bool balanced = shell_source_find_balanced_parentheses(
+        parentheses[i].input, strlen(parentheses[i].input), 0, &after);
+    balanced_contract = balanced_contract &&
+                        balanced == parentheses[i].balanced &&
+                        (!balanced || after == strlen(parentheses[i].input));
+  }
+  parser_test(
+      "source scanner keeps nested data opaque while balancing parentheses",
+      balanced_contract);
+
+  size_t after = 0;
+  parser_test(
+      "source scanner balances arithmetic expansions and rejects bad starts",
+      shell_source_skip_arithmetic_expansion("$((1 + $(printf 2)))", 20, 0,
+                                             &after) &&
+          after == 20 &&
+          shell_source_skip_arithmetic_expansion(
+              "$(( 'x' + 2))", strlen("$(( 'x' + 2))"), 0, &after) &&
+          !shell_source_skip_arithmetic_expansion("$((1 + 2)", 10, 0, &after) &&
+          !shell_source_skip_arithmetic_expansion("(1 + 2)", 7, 0, &after));
+  static const char ansi_arithmetic[] = "$(( $'()' + 1 ))";
+  static const char malformed_ansi_arithmetic[] = "$(( $'unterminated ))";
+  parser_test("source scanner balances ANSI-C quotes in arithmetic expansions",
+              shell_source_skip_arithmetic_expansion(
+                  ansi_arithmetic, sizeof(ansi_arithmetic) - 1, 0, &after) &&
+                  after == sizeof(ansi_arithmetic) - 1 &&
+                  !shell_source_skip_arithmetic_expansion(
+                      malformed_ansi_arithmetic,
+                      sizeof(malformed_ansi_arithmetic) - 1, 0, &after));
+  static const char continued_assignment[] = "N\\\nAME=value";
+  shell_source_decoded_assignment_t assignment = {0};
+  parser_test(
+      "source scanner preserves assignment positions after LF continuation",
+      shell_source_scan_decoded_assignment(continued_assignment,
+                                           sizeof(continued_assignment) - 1,
+                                           NULL, NULL, &assignment) &&
+          assignment.name_length == 4 && assignment.source_delimiter &&
+          assignment.equals == 6 && assignment.name_end == 6 &&
+          !assignment.append);
+  parser_test(
+      "source scanner rejects malformed nested and direct scanner inputs",
+      !shell_source_find_balanced_parentheses(NULL, 0, 0, &after) &&
+          shell_source_find_balanced_parentheses("(`quoted`)", 10, 0, &after) &&
+          !shell_source_find_balanced_parentheses("($((broken)", 11, 0,
+                                                  &after) &&
+          !shell_source_skip_arithmetic_expansion(
+              "$(( $((1) ))", strlen("$(( $((1) ))"), 0, &after) &&
+          !shell_source_skip_arithmetic_expansion(
+              "$(( $(echo ", strlen("$(( $(echo "), 0, &after) &&
+          !shell_source_find_balanced_parentheses("(cat <<\n)", 9, 0, &after) &&
+          shell_source_skip_redirect_word("$((broken", 0, 9) == 9);
+
+  static const char substitution_word[] =
+      "prefix$(printf 'one; two'; printf three)suffix next";
+  static const char arithmetic_word[] = "$((1 << 2)) next";
+  size_t substitution_after = 0;
+  size_t arithmetic_after = 0;
+  size_t word_after = 0;
+  bool skips_substitution = shell_source_skip_shell_word(
+      substitution_word, sizeof(substitution_word) - 1, 0, &substitution_after);
+  bool skips_arithmetic = shell_source_skip_shell_word(
+      arithmetic_word, sizeof(arithmetic_word) - 1, 0, &arithmetic_after);
+  bool rejects_null_input =
+      !shell_source_skip_shell_word(NULL, 0, 0, &word_after);
+  bool rejects_null_result = !shell_source_skip_shell_word(
+      substitution_word, sizeof(substitution_word) - 1, 0, NULL);
+  bool rejects_past_end = !shell_source_skip_shell_word(
+      substitution_word, sizeof(substitution_word) - 1,
+      sizeof(substitution_word), &word_after);
+  bool rejects_dangling_escape =
+      !shell_source_skip_shell_word("word\\", 5, 0, &word_after);
+  bool rejects_unclosed_quote =
+      !shell_source_skip_shell_word("'unterminated", 13, 0, &word_after);
+  bool rejects_unclosed_substitution =
+      !shell_source_skip_shell_word("$(printf", 8, 0, &word_after);
+  bool rejects_unclosed_arithmetic =
+      !shell_source_skip_shell_word("$((1 + 2)", 9, 0, &word_after);
+  parser_test(
+      "source scanner keeps shell words intact and rejects incomplete ones",
+      skips_substitution &&
+          substitution_after == sizeof(substitution_word) - sizeof(" next") &&
+          skips_arithmetic &&
+          arithmetic_after == sizeof(arithmetic_word) - sizeof(" next") &&
+          rejects_null_input && rejects_null_result && rejects_past_end &&
+          rejects_dangling_escape && rejects_unclosed_quote &&
+          rejects_unclosed_substitution && rejects_unclosed_arithmetic);
+
+  static const struct {
+    const char *expansion;
+    size_t trailing_word_bytes;
+  } parameter_expansions[] = {
+      {"${value:-left|&right}", 0},
+      {"${value:-left>file}", 0},
+      {"${value:-${fallback:-one}}", 0},
+      {"${value#prefix${suffix}}", 0},
+      {"${value##prefix${suffix}}", 0},
+      {"${value%prefix${suffix}}", 0},
+      {"${value%%prefix${suffix}}", 0},
+      {"${value/pattern/${replacement}}", 0},
+      {"${value:-{left,right}}", 1},
+      {"${value:-${fallback:-{}}", 0},
+      {"${value:-{}", 0},
+      {"${value#{}", 0},
+      {"${value/{}", 0},
+      {"${array[${index}]}", 0},
+      {"${#value}", 0},
+      {"${##prefix}", 0},
+      {"${!prefix*}", 0},
+      {"${!prefix@}", 0},
+      {"${10}", 0},
+      {"${?}", 0},
+      {"${#?}", 0},
+      {"${value:-$'a|b'}", 0},
+      {"${value:-$((1 | 2))}", 0},
+      {"${value:-$(printf '|')}", 0},
+      {"${value:-<(printf '|')}", 0},
+  };
+  bool parameter_contract = true;
+  for (size_t i = 0;
+       parameter_contract &&
+       i < sizeof(parameter_expansions) / sizeof(parameter_expansions[0]);
+       i++) {
+    const char *expansion = parameter_expansions[i].expansion;
+    size_t parameter_after = 0;
+    parameter_contract =
+        shell_source_skip_parameter_expansion(expansion, strlen(expansion), 0,
+                                              &parameter_after) &&
+        parameter_after ==
+            strlen(expansion) - parameter_expansions[i].trailing_word_bytes;
+  }
+  parser_test(
+      "source scanner keeps nested parameter words opaque",
+      parameter_contract &&
+          !shell_source_skip_parameter_expansion("${}", 3, 0, &after) &&
+          !shell_source_skip_parameter_expansion("${VAR${SUFFIX}}", 15, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${${suffix}}", 12, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${VAR$SUFFIX}", 13, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${VAR.suffix}", 13, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${?suffix}", 10, 0, &after) &&
+          !shell_source_skip_parameter_expansion("${10suffix}", 11, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${array[broken}", 15, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${value:-$'unterminated}", 24,
+                                                 0, &after) &&
+          !shell_source_skip_parameter_expansion("${value:-$(broken}", 18, 0,
+                                                 &after));
+
+  static const char *const bracket_patterns[] = {
+      "[[:alpha:]]", "[[.x.]]", "[[=x=]]",   "[]a]",
+      "[!ab]",       "[a\\|b]", "[[:\\|:]]",
+  };
+  bool bracket_contract = true;
+  for (size_t i = 0; bracket_contract &&
+                     i < sizeof(bracket_patterns) / sizeof(bracket_patterns[0]);
+       i++) {
+    const char *pattern = bracket_patterns[i];
+    size_t bracket_after = 0;
+    bracket_contract = shell_source_skip_glob_bracket(pattern, strlen(pattern),
+                                                      0, &bracket_after) &&
+                       bracket_after == strlen(pattern);
+  }
+  parser_test(
+      "source scanner recognizes non-structural glob bracket candidates",
+      bracket_contract && !shell_source_skip_glob_bracket(NULL, 0, 0, &after) &&
+          !shell_source_skip_extglob(NULL, 0, 0, &after) &&
+          !shell_source_skip_glob_bracket("[a b]", 5, 0, &after) &&
+          !shell_source_skip_glob_bracket("[[:alpha:]", 10, 0, &after) &&
+          !shell_source_skip_glob_bracket("[[:alpha", 8, 0, &after) &&
+          !shell_source_skip_glob_bracket("[a|b]", 5, 0, &after) &&
+          !shell_source_skip_glob_bracket("[[:|:]]", 7, 0, &after) &&
+          !shell_source_skip_glob_bracket("[a&&b]", 6, 0, &after) &&
+          !shell_source_skip_glob_bracket("[", 1, 0, &after));
+
+  parser_test("source scanner keeps extglob alternatives inside one word",
+              shell_source_skip_extglob("@(left|right)", 13, 0, &after) &&
+                  after == 13 &&
+                  shell_source_skip_extglob("prefix@(left|right)suffix", 25, 6,
+                                            &after) &&
+                  after == 19 &&
+                  !shell_source_skip_extglob(NULL, 0, 0, &after) &&
+                  !shell_source_skip_extglob("@(", 2, 0, &after) &&
+                  !shell_source_skip_extglob("@(left|right", 12, 0, &after));
+
+  static const char *const opaque_word_fragments[] = {
+      "prefix${value:-left|&right}suffix next",
+      "prefix@(left|right)suffix next",
+      "prefix\\{left\\|right\\}suffix next",
+      "prefix'[left|right]'suffix next",
+  };
+  bool opaque_word_contract = true;
+  for (size_t i = 0;
+       opaque_word_contract &&
+       i < sizeof(opaque_word_fragments) / sizeof(opaque_word_fragments[0]);
+       i++) {
+    const char *word = opaque_word_fragments[i];
+    size_t word_end = strcspn(word, " ");
+    size_t word_after = 0;
+    opaque_word_contract =
+        shell_source_skip_shell_word(word, strlen(word), 0, &word_after) &&
+        word_after == word_end &&
+        shell_source_skip_redirect_word(word, 0, strlen(word)) == word_end;
+  }
+  parser_test(
+      "source scanner preserves real shell-word fragments in word scanners",
+      opaque_word_contract);
+
+  static const char *const structural_word_fragments[] = {
+      "prefix{left|right}suffix next",
+      "prefix[left|right]suffix next",
+  };
+  bool structural_word_contract = true;
+  for (size_t i = 0;
+       structural_word_contract && i < sizeof(structural_word_fragments) /
+                                           sizeof(structural_word_fragments[0]);
+       i++) {
+    const char *word = structural_word_fragments[i];
+    size_t operator_at = strcspn(word, "|&;<>");
+    size_t word_after = 0;
+    structural_word_contract =
+        shell_source_skip_shell_word(word, strlen(word), 0, &word_after) &&
+        word_after == operator_at &&
+        shell_source_skip_redirect_word(word, 0, strlen(word)) == operator_at;
+  }
+  parser_test("source scanner leaves brace and bracket operators structural",
+              structural_word_contract);
+
+  parser_test("source scanner rejects incomplete parameter words consistently",
+              !shell_source_skip_shell_word("${", 2, 0, &after) &&
+                  shell_source_skip_redirect_word("${", 0, 2) == 2);
+
+  static const char escaped_arithmetic_word[] = "$((1\\+2))";
+  size_t escaped_arithmetic_after = 0;
+  bool skips_escaped_arithmetic = shell_source_skip_shell_word(
+      escaped_arithmetic_word, sizeof(escaped_arithmetic_word) - 1, 0,
+      &escaped_arithmetic_after);
+  bool rejects_unclosed_process_redirect =
+      shell_source_skip_redirect(">(broken", 0, sizeof(">(broken") - 1) == 0;
+  bool rejects_invalid_redirect_list =
+      !shell_source_redirect_list_before_group("not-a-redirect", 0, 14);
+  shell_source_pending_heredoc_t missing_document;
+  size_t delimiter_after = 0;
+  bool parsed_delimiter = shell_source_parse_heredoc_delimiter(
+      "EOF", 3, &delimiter_after, &missing_document);
+  bool rejects_missing_pending_document =
+      parsed_delimiter &&
+      !shell_source_skip_pending_heredoc_bodies(
+          "body\n", 5, 0, &missing_document, 1, &word_after) &&
+      word_after == 5;
+  parser_test(
+      "source scanner rejects invalid redirect and document boundaries",
+      skips_escaped_arithmetic &&
+          escaped_arithmetic_after == sizeof(escaped_arithmetic_word) - 1 &&
+          rejects_unclosed_process_redirect && rejects_invalid_redirect_list &&
+          rejects_missing_pending_document);
+
+  static const struct {
+    const char *input;
+    size_t expected;
+  } redirect_words[] = {
+      {"plain next", 5},
+      {"\"two words\" > out", sizeof("\"two words\"") - 1},
+      {"'two words'|next", sizeof("'two words'") - 1},
+      {"`printf x`;next", sizeof("`printf x`") - 1},
+      {"prefix$(printf 'a b')suffix>next",
+       sizeof("prefix$(printf 'a b')suffix") - 1},
+      {"$((1 << 2)) next", sizeof("$((1 << 2))") - 1},
+      {"<(printf input) next", sizeof("<(printf input)") - 1},
+      {"word\\ value;next", sizeof("word\\ value") - 1},
+      {"# comment", 0},
+      {"word#literal next", sizeof("word#literal") - 1},
+  };
+  bool redirect_contract = true;
+  for (size_t i = 0; i < sizeof(redirect_words) / sizeof(redirect_words[0]);
+       i++)
+    redirect_contract =
+        redirect_contract &&
+        shell_source_skip_redirect_word(redirect_words[i].input, 0,
+                                        strlen(redirect_words[i].input)) ==
+            redirect_words[i].expected;
+  parser_test("source scanner keeps complete redirect operands intact",
+              redirect_contract);
+}
+
+static void parser_test_extglob_expansion_features(void) {
+  for (unsigned conditional = 0; conditional < 2; ++conditional) {
+    for (size_t i = 0; i < sizeof(shellsplit_test_extglob_features) /
+                               sizeof(shellsplit_test_extglob_features[0]);
+         ++i) {
+      char source[256];
+      snprintf(source, sizeof(source),
+               conditional ? "[[ -n %s ]]" : "printf %s",
+               shellsplit_test_extglob_features[i].word);
+      shell_parse_result_t parsed = {0};
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = true;
+      bool valid = shell_parse_fast(source, strlen(source), &limits, &parsed) ==
+                   SHELL_OK;
+      uint32_t features = 0;
+      for (uint32_t c = 0; c < parsed.count; ++c)
+        features |= parsed.cmds[c].features;
+      uint32_t expected = shellsplit_test_extglob_features[i].features |
+                          (conditional ? SHELL_FEAT_CONDITIONALS : 0);
+      parser_test(source,
+                  valid && parsed.count == 1 &&
+                      (features & shellsplit_test_extglob_feature_mask) ==
+                          expected);
+    }
+  }
+}
+
+static void parser_test_incomplete_control_delimiters(void) {
+  /* Shellsplit does not model control-flow execution, but the range parser
+   * must still reject unfinished compounds. Reserved terminators in a simple
+   * command's argument position do not close those compounds. */
+  static const char *const cases[] = {
+      "if true; then printf fi",
+      "while true; do printf done",
+      "case item in item) printf esac",
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t error =
+        shell_parse_fast(cases[i], strlen(cases[i]), NULL, &result);
+    char name[96];
+    snprintf(name, sizeof(name), "reject incomplete control: %s", cases[i]);
+    parser_test(name,
+                error == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR);
+  }
+}
+
+static void parser_test_fast_parser_limitations(void) {
+  printf("\n--- Fast Parser Regression Tests ---\n");
+
+  static const char high_bytes[] = {(char)0x80, (char)0x81, 'c', 'm', 'd'};
+  static const char embedded_high_byte[] = {'c', 'm', 'd', (char)0x80, 'x'};
+  static const char quoted_high_byte[] = {'e', 'c',  'h',       'o',
+                                          ' ', '\'', (char)0xff};
+  static const char arithmetic_high_byte[] = {'$',        '(', '(', 'x',
+                                              (char)0xfe, ')', ')'};
+  static const struct {
+    const char *name;
+    const char *input;
+    size_t len;
+    shell_status_t expected_status;
+    uint32_t expected_count;
+  } cases[] = {
+      {"reject control character",
+       "\x01"
+       "cmd",
+       sizeof("\x01"
+              "cmd") -
+           1,
+       SHELL_STATUS_ERROR, 0},
+      {"reject multiple control characters", "\x07\x1btext",
+       sizeof("\x07\x1btext") - 1, SHELL_STATUS_ERROR, 0},
+      {"retain high bytes", high_bytes, sizeof(high_bytes), SHELL_STATUS_OK, 1},
+      {"reject embedded control character", "cmd\x01suffix",
+       sizeof("cmd\x01suffix") - 1, SHELL_STATUS_ERROR, 0},
+      {"retain embedded high byte", embedded_high_byte,
+       sizeof(embedded_high_byte), SHELL_STATUS_OK, 1},
+      {"permissive parse retains unfinished quoted byte", quoted_high_byte,
+       sizeof(quoted_high_byte), SHELL_STATUS_OK, 1},
+      {"reject high byte in arithmetic", arithmetic_high_byte,
+       sizeof(arithmetic_high_byte), SHELL_STATUS_ERROR, 0},
+      {"accept adjacent quoted and unquoted text", "\"text \"text",
+       sizeof("\"text \"text") - 1, SHELL_STATUS_OK, 1},
+      {"accept keyword-shaped command fragments", "echo if if cmd",
+       sizeof("echo if if cmd") - 1, SHELL_STATUS_OK, 1},
+      {"reject bare separator", "|", 1, SHELL_STATUS_ERROR, 0},
+      {"accept trailing backslash", "cmd\\", sizeof("cmd\\") - 1,
+       SHELL_STATUS_OK, 1},
+      {"reject empty parameter braces", "${}", sizeof("${}") - 1,
+       SHELL_STATUS_ERROR, 0},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result;
+    shell_error_t error =
+        shell_parse_fast(cases[i].input, cases[i].len, NULL, &result);
+    bool valid = result.status == cases[i].expected_status &&
+                 result.count == cases[i].expected_count;
+    valid = valid && (cases[i].expected_status == SHELL_STATUS_OK
+                          ? error == SHELL_OK
+                          : error == SHELL_EPARSE);
+    parser_test(cases[i].name, valid);
+  }
+}
+
+/* --- FEATURE FLAGS API TESTS --- */
+
+static uint32_t parser_feature_flags_mask(const shell_feature_flags_t *flags) {
+  return (flags->has_vars ? SHELL_FEAT_VARS : 0) |
+         (flags->has_globs ? SHELL_FEAT_GLOBS : 0) |
+         (flags->has_subshell ? SHELL_FEAT_SUBSHELL : 0) |
+         (flags->has_arith ? SHELL_FEAT_ARITH : 0) |
+         (flags->has_heredoc ? SHELL_FEAT_HEREDOC : 0) |
+         (flags->has_herestring ? SHELL_FEAT_HERESTRING : 0) |
+         (flags->has_process_sub ? SHELL_FEAT_PROCESS_SUB : 0) |
+         (flags->has_loops ? SHELL_FEAT_LOOPS : 0) |
+         (flags->has_conditionals ? SHELL_FEAT_CONDITIONALS : 0) |
+         (flags->has_case ? SHELL_FEAT_CASE : 0) |
+         (flags->has_subshell_file ? SHELL_FEAT_SUBSHELL_FILE : 0) |
+         (flags->has_pipeline ? SHELL_FEAT_PIPELINE : 0) |
+         (flags->has_group ? SHELL_FEAT_GROUP : 0) |
+         (flags->has_background ? SHELL_FEAT_BACKGROUND : 0);
+}
+
+static void parser_test_feature_flags(void) {
+  printf("\n--- Feature Flags API ---\n");
+
+  /* NULL is an explicit no-op convenience contract. */
+  shell_feature_flags_from_bits(UINT32_MAX, NULL);
+
+  uint32_t masks[] = {
+      SHELL_FEAT_NONE,
+      SHELL_FEAT_VARS,
+      SHELL_FEAT_GLOBS,
+      SHELL_FEAT_SUBSHELL,
+      SHELL_FEAT_ARITH,
+      SHELL_FEAT_HEREDOC,
+      SHELL_FEAT_HERESTRING,
+      SHELL_FEAT_PROCESS_SUB,
+      SHELL_FEAT_LOOPS,
+      SHELL_FEAT_CONDITIONALS,
+      SHELL_FEAT_CASE,
+      SHELL_FEAT_SUBSHELL_FILE,
+      SHELL_FEAT_PIPELINE,
+      SHELL_FEAT_GROUP,
+      SHELL_FEAT_BACKGROUND,
+      SHELL_FEAT_VARS | SHELL_FEAT_GLOBS,
+      (uint32_t)((SHELL_FEAT_SUBSHELL_FILE << 1) - 1),
+  };
+  for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); i++) {
+    shell_feature_flags_t flags;
+    shell_feature_flags_from_bits(masks[i], &flags);
+    char name[80];
+    snprintf(name, sizeof(name), "feature mask 0x%03x round-trips", masks[i]);
+    parser_test(name, parser_feature_flags_mask(&flags) == masks[i]);
+  }
+}
+
+static void parser_test_source_io_number_contract(void) {
+  static const char maximum[] = "2147483647";
+  static const char overflow[] = "214748364800";
+  static const char maximum_redirect[] = "2147483647>out";
+  static const char overflow_redirect[] = "2147483648>out";
+  static const char spaced_process_output[] = "> >(cat)";
+  static const char spaced_process_input[] = "< <(printf data)";
+  size_t after = SIZE_MAX;
+  uint32_t descriptor = UINT32_MAX;
+  bool valid = shell_source_parse_io_number(NULL, 0, 0, &after, &descriptor) ==
+                   SHELL_SOURCE_IO_NUMBER_NONE &&
+               after == 0 && descriptor == 0;
+
+  after = SIZE_MAX;
+  descriptor = UINT32_MAX;
+  valid = valid &&
+          shell_source_parse_io_number("word", 0, strlen("word"), &after,
+                                       &descriptor) ==
+              SHELL_SOURCE_IO_NUMBER_NONE &&
+          after == 0 && descriptor == 0;
+
+  after = SIZE_MAX;
+  descriptor = 0;
+  valid = valid &&
+          shell_source_parse_io_number(maximum, 0, sizeof(maximum) - 1, &after,
+                                       &descriptor) ==
+              SHELL_SOURCE_IO_NUMBER_VALID &&
+          after == sizeof(maximum) - 1 && descriptor == SHELL_DEP_FD_MAX;
+
+  after = 0;
+  descriptor = 0;
+  valid = valid &&
+          shell_source_parse_io_number(overflow, 0, sizeof(overflow) - 1,
+                                       &after, &descriptor) ==
+              SHELL_SOURCE_IO_NUMBER_OVERFLOW &&
+          after == sizeof(overflow) - 1 && descriptor == 0 &&
+          shell_source_skip_redirect(NULL, 0, 0) == 0 &&
+          shell_source_skip_redirect(overflow_redirect, 0,
+                                     sizeof(overflow_redirect) - 1) == 0 &&
+          shell_source_skip_redirect(maximum_redirect, 0,
+                                     sizeof(maximum_redirect) - 1) ==
+              sizeof(maximum_redirect) - 1 &&
+          shell_source_skip_redirect(spaced_process_output, 0,
+                                     sizeof(spaced_process_output) - 1) ==
+              sizeof(spaced_process_output) - 1 &&
+          shell_source_skip_redirect(spaced_process_input, 0,
+                                     sizeof(spaced_process_input) - 1) ==
+              sizeof(spaced_process_input) - 1;
+  parser_test("Shared io_number parser preserves fd bounds and redirect syntax",
+              valid);
+}
+
+/* Only shell syntax that actually quotes its contents may hide a list
+ * operator. Exercise those boundaries, and the complementary ordinary brace
+ * and bracket cases, through every public parsing surface. */
+static void parser_test_word_fragment_operator_boundaries(void) {
+  static const char *const opaque_word_cases[] = {
+      "echo ${value:-left|&right}",          "echo ${value:-left>file}",
+      "echo ${value:-left\\|right}",         "echo ${value:-'left|right'}",
+      "echo ${value:-$'left|right'}",        "echo ${value:-$((1 | 2))}",
+      "echo ${value:-{left|right}}",         "echo prefix@(left|right)suffix",
+      "echo prefix\\{left\\|right\\}suffix", "echo prefix'[left|right]'suffix",
+  };
+  static const char *const escaped_cases[] = {
+      "echo \\|",
+      "echo \\&",
+      "echo \\;",
+      "echo \\|\\&",
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t set = 0; set < 2; set++) {
+    const char *const *cases = set == 0 ? opaque_word_cases : escaped_cases;
+    size_t count =
+        set == 0 ? sizeof(opaque_word_cases) / sizeof(opaque_word_cases[0])
+                 : sizeof(escaped_cases) / sizeof(escaped_cases[0]);
+    for (size_t i = 0; valid && i < count; i++) {
+      const char *input = cases[i];
+      shell_parse_result_t fast = {0};
+      shell_command_t *commands = NULL;
+      size_t command_count = 0;
+      shell_processed_commands_t processed = {0};
+      shell_dep_graph_t graph = {0};
+      valid =
+          shell_source_skip_shell_word(input, strlen(input), 5, &(size_t){0}) &&
+          shell_parse_fast(input, strlen(input), &strict, &fast) == SHELL_OK &&
+          fast.count == 1 && fast.cmds[0].type == SHELL_TYPE_SIMPLE &&
+          fast.cmds[0].pipe_input_mode == SHELL_PIPE_MODE_NONE &&
+          shell_tokenize_commands(input, strlen(input), &commands,
+                                  &command_count) == SHELL_TOKENIZE_OK &&
+          command_count == 1 &&
+          shell_process_commands(input, strlen(input), NULL, &processed) ==
+              SHELL_PROCESS_OK &&
+          processed.command_count == 1 &&
+          !processed.commands[0].has_pipe_input &&
+          !processed.commands[0].has_pipe_output &&
+          shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+              SHELL_DEP_OK &&
+          graph.edge_count == 3 && shell_dep_graph_validate(&graph).valid;
+      shell_commands_free(commands, command_count);
+      shell_processed_commands_free(&processed);
+    }
+  }
+  parser_test(
+      "Quoted and expansion word fragments keep operators out of list parsing",
+      valid);
+
+  static const char *const structural_word_cases[] = {
+      "echo prefix{left|right}suffix",
+      "echo [left|right]",
+      "echo [[:alpha:]|]",
+      "echo []|]",
+      "echo [!left|right]",
+  };
+  bool structural = true;
+  for (size_t i = 0; structural && i < sizeof(structural_word_cases) /
+                                           sizeof(structural_word_cases[0]);
+       i++) {
+    const char *input = structural_word_cases[i];
+    shell_parse_result_t fast = {0};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    uint32_t pipe_count = 0;
+    structural =
+        shell_parse_fast(input, strlen(input), &strict, &fast) == SHELL_OK &&
+        fast.count == 2 && fast.cmds[1].type == SHELL_TYPE_PIPELINE &&
+        fast.cmds[1].pipe_input_mode == SHELL_PIPE_MODE_STDOUT &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == 2 &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 2 && processed.commands[0].has_pipe_output &&
+        processed.commands[1].has_pipe_input &&
+        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; structural && edge < graph.edge_count; edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    structural = structural && pipe_count == 1;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+  }
+  parser_test("Brace and bracket text leave list operators structural",
+              structural);
+
+  static const struct {
+    const char *input;
+    uint32_t commands;
+    uint32_t pipes;
+  } redirect_fragment_cases[] = {
+      {"printf x >out@(left|right)", 1, 0},
+      /* An explicit stdout redirect wins over the syntactic pipeline's data
+       * route, so the graph correctly has no PIPE relation. */
+      {"printf x >out{left|right}", 2, 0},
+      {"printf x >out[left|right]", 2, 0},
+  };
+  bool redirect_fragments = true;
+  for (size_t i = 0;
+       redirect_fragments &&
+       i < sizeof(redirect_fragment_cases) / sizeof(redirect_fragment_cases[0]);
+       i++) {
+    const char *input = redirect_fragment_cases[i].input;
+    shell_parse_result_t fast = {0};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    uint32_t pipe_count = 0;
+    redirect_fragments =
+        shell_parse_fast(input, strlen(input), &strict, &fast) == SHELL_OK &&
+        fast.count == redirect_fragment_cases[i].commands &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == redirect_fragment_cases[i].commands &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == redirect_fragment_cases[i].commands &&
+        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; redirect_fragments && edge < graph.edge_count;
+         edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    redirect_fragments =
+        redirect_fragments && pipe_count == redirect_fragment_cases[i].pipes;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+  }
+  parser_test("Redirect operands preserve only true shell-word syntax",
+              redirect_fragments);
+
+  const shell_process_limits_t short_string = {
+      .max_string_bytes = 1,
+      .max_total_bytes = SIZE_MAX,
+  };
+  const shell_process_limits_t short_total = {
+      .max_string_bytes = SIZE_MAX,
+      .max_total_bytes = 1,
+  };
+  shell_processed_commands_t limited = {0};
+  bool limits_are_atomic =
+      shell_process_commands("echo value", strlen("echo value"), &short_string,
+                             &limited) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      limited.commands == NULL && limited.command_count == 0 &&
+      shell_process_commands("echo one; echo two", strlen("echo one; echo two"),
+                             &short_total,
+                             &limited) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      limited.commands == NULL && limited.command_count == 0;
+  parser_test("Processed command limits clear partial output",
+              limits_are_atomic);
+
+  static const char *const malformed_word_cases[] = {
+      "echo ${}",
+      "echo ${VAR${SUFFIX}}",
+      "echo ${${suffix}}",
+      "echo ${value:-$'unterminated}",
+      "echo ${value:-$(broken}",
+  };
+  bool rejects_malformed = true;
+  for (size_t i = 0;
+       rejects_malformed &&
+       i < sizeof(malformed_word_cases) / sizeof(malformed_word_cases[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
+    size_t command_count = SIZE_MAX;
+    rejects_malformed =
+        shell_parse_fast(malformed_word_cases[i],
+                         strlen(malformed_word_cases[i]), &strict,
+                         &parsed) == SHELL_EPARSE &&
+        parsed.status == SHELL_STATUS_ERROR &&
+        shell_tokenize_commands(malformed_word_cases[i],
+                                strlen(malformed_word_cases[i]), &commands,
+                                &command_count) == SHELL_TOKENIZE_EPARSE &&
+        commands == NULL && command_count == 0;
+  }
+  parser_test("Word fragments reject incomplete structural subsyntax",
+              rejects_malformed);
+}
+
+static void parser_test_pipeline_time_metadata(void) {
+  static const struct {
+    const char *source;
+    uint32_t count;
+    shell_pipeline_time_mode_t mode;
+    uint32_t negations;
+  } reserved[] = {
+      {"time echo x", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p echo x | cat", 2, SHELL_PIPE_TIME_POSIX, 0},
+      {"time -- echo x", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"time time echo x", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p time echo x", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"time time -p true", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"! time ! echo x | cat", 2, SHELL_PIPE_TIME_DEFAULT, 2},
+      {"time>/tmp/timing echo x", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time</dev/null cat", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p>/tmp/timing true", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"time -->/tmp/timing true", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"ti\\\nme true", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"\\\ntime true", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time\\\n>/tmp/timing true", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time !", 1, SHELL_PIPE_TIME_DEFAULT, 1},
+      {"! time", 1, SHELL_PIPE_TIME_DEFAULT, 1},
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    shell_error_t status = shell_parse_fast(
+        reserved[i].source, strlen(reserved[i].source), NULL, &parsed);
+    bool item = status == SHELL_OK && parsed.count == reserved[i].count;
+    for (uint32_t command = 0; item && command < parsed.count; command++) {
+      item =
+          (parsed.cmds[command].modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0 &&
+          parsed.cmds[command].pipeline_time_mode == reserved[i].mode &&
+          parsed.cmds[command].pipeline_negation_count == reserved[i].negations;
+    }
+    if (!item)
+      fprintf(stderr,
+              "time metadata mismatch: %s status=%d count=%u modifiers=%u "
+              "mode=%u negations=%u\n",
+              reserved[i].source, (int)status, parsed.count,
+              parsed.count ? parsed.cmds[0].modifiers : 0,
+              parsed.count ? parsed.cmds[0].pipeline_time_mode : 0,
+              parsed.count ? parsed.cmds[0].pipeline_negation_count : 0);
+    valid = valid && item;
+  }
+  parser_test("Fast parser retains Bash time pipeline metadata", valid);
+
+  static const struct {
+    const char *source;
+    uint8_t kind;
+  } timed_groups[] = {
+      {"time { printf x; } | cat", SHELL_GROUP_BRACE},
+      {"time -p (printf x; cat) | sort", SHELL_GROUP_SUBSHELL},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(timed_groups) / sizeof(timed_groups[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    bool item =
+        shell_parse_fast(timed_groups[i].source, strlen(timed_groups[i].source),
+                         NULL, &parsed) == SHELL_OK &&
+        parsed.group_count == 1 && parsed.count >= 2 &&
+        parsed.groups[0].kind == timed_groups[i].kind &&
+        (parsed.groups[0].modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0 &&
+        parsed.groups[0].pipeline_time_direct &&
+        parsed.groups[0].pipeline_time_mode ==
+            (i == 0 ? SHELL_PIPE_TIME_DEFAULT : SHELL_PIPE_TIME_POSIX) &&
+        parsed.cmds[parsed.count - 1].type == SHELL_TYPE_PIPELINE &&
+        parsed.cmds[parsed.count - 1].pipeline_time_mode ==
+            parsed.groups[0].pipeline_time_mode;
+    if (!item) {
+      fprintf(stderr,
+              "timed group mismatch: %s count=%u groups=%u group_mod=%u "
+              "group_mode=%u last_type=%u last_mod=%u last_mode=%u\n",
+              timed_groups[i].source, parsed.count, parsed.group_count,
+              parsed.group_count ? parsed.groups[0].modifiers : 0,
+              parsed.group_count ? parsed.groups[0].pipeline_time_mode : 0,
+              parsed.count ? parsed.cmds[parsed.count - 1].type : 0,
+              parsed.count ? parsed.cmds[parsed.count - 1].modifiers : 0,
+              parsed.count ? parsed.cmds[parsed.count - 1].pipeline_time_mode
+                           : 0);
+    }
+    valid = valid && item;
+  }
+  parser_test("Fast parser attaches time to compound pipeline roots", valid);
+
+  const char *compound_member =
+      "time printf x | { time -p cat; printf tail; } | sort";
+  shell_parse_result_t compound = {0};
+  valid = shell_parse_fast(compound_member, strlen(compound_member), NULL,
+                           &compound) == SHELL_OK &&
+          compound.count == 4 && compound.group_count == 1 &&
+          compound.cmds[0].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT &&
+          compound.cmds[0].pipeline_time_direct &&
+          compound.groups[0].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT &&
+          !compound.groups[0].pipeline_time_direct &&
+          compound.cmds[1].pipeline_time_mode == SHELL_PIPE_TIME_POSIX &&
+          compound.cmds[1].pipeline_time_direct &&
+          compound.cmds[2].pipeline_time_mode == SHELL_PIPE_TIME_NONE &&
+          compound.cmds[3].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT &&
+          !compound.cmds[3].pipeline_time_direct;
+  parser_test("Compound pipeline members separate outer and nested timing",
+              valid);
+
+  static const struct {
+    const char *source;
+    uint16_t modifier;
+  } nested_groups[] = {
+      {"{ time { echo nested; }; echo outer; }", SHELL_CMD_MOD_PIPE_TIMED},
+      {"{ ! { echo nested; }; echo outer; }", SHELL_CMD_MOD_PIPE_NEGATED},
+      {"time { time -p { echo nested; }; echo outer; }",
+       SHELL_CMD_MOD_PIPE_TIMED},
+      {"! { ! { echo nested; }; echo outer; }", SHELL_CMD_MOD_PIPE_NEGATED},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(nested_groups) / sizeof(nested_groups[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    bool item = shell_parse_fast(nested_groups[i].source,
+                                 strlen(nested_groups[i].source), NULL,
+                                 &parsed) == SHELL_OK &&
+                parsed.group_count == 2 && parsed.count == 2;
+    uint32_t direct = 0;
+    for (uint32_t group = 0; item && group < parsed.group_count; group++)
+      direct +=
+          (parsed.groups[group].modifiers & nested_groups[i].modifier) != 0;
+    item = item && direct >= 1;
+    if (!item)
+      fprintf(stderr,
+              "nested pipeline modifier mismatch: %s count=%u "
+              "groups=%u direct=%u\n",
+              nested_groups[i].source, parsed.count, parsed.group_count,
+              direct);
+    valid = valid && item;
+  }
+  parser_test("Nested brace groups retain reserved pipeline modifiers", valid);
+
+  static const struct {
+    const char *source;
+    uint32_t negations;
+    shell_pipeline_time_mode_t mode;
+  } redirected_groups[] = {
+      {"time { echo x; } 2>err | cat", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time -p (echo x) {fd}>out |& cat", 0, SHELL_PIPE_TIME_POSIX},
+      {"time { echo x; } &>all | cat", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time { cat; } <<<body | cat", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time { cat; } <<EOF | cat\nbody\nEOF\n", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"! { echo x; } >out | cat", 1, SHELL_PIPE_TIME_NONE},
+      {"! ! (echo x) <in |& cat", 2, SHELL_PIPE_TIME_NONE},
+      {"time echo x | { cat; } 2>err | sort", 0, SHELL_PIPE_TIME_DEFAULT},
+  };
+  valid = true;
+  for (size_t i = 0;
+       i < sizeof(redirected_groups) / sizeof(redirected_groups[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    bool item = shell_parse_fast(redirected_groups[i].source,
+                                 strlen(redirected_groups[i].source), NULL,
+                                 &parsed) == SHELL_OK &&
+                parsed.count >= 2;
+    const shell_range_t *last = item ? &parsed.cmds[parsed.count - 1] : NULL;
+    item = item && last->type == SHELL_TYPE_PIPELINE &&
+           last->pipeline_negation_count == redirected_groups[i].negations &&
+           last->pipeline_time_mode == redirected_groups[i].mode;
+    if (!item)
+      fprintf(stderr,
+              "redirected group modifier mismatch: %s count=%u "
+              "last-type=%u negations=%u mode=%u\n",
+              redirected_groups[i].source, parsed.count, last ? last->type : 0,
+              last ? last->pipeline_negation_count : 0,
+              last ? last->pipeline_time_mode : 0);
+    valid = valid && item;
+  }
+  parser_test("Group redirect tails preserve outer pipeline modifiers", valid);
+
+  static const char *const ordinary[] = {
+      "VALUE=x time echo x",
+      ">out time echo x",
+      "command time echo x",
+      "\\time echo x",
+      "'time' echo x",
+      "echo | time cat",
+      "<<<body time echo x",
+      "echo | <<<body time",
+      "<<<one 3<<<two time",
+      "<<<one time <<<two cat",
+      "<<<one time -p 3<<<two cat <&3",
+      "<<<one time \\\n<<<two cat",
+      "<<EOF time <<<two cat\none\nEOF\n",
+      "<<<one time <<EOF cat\ntwo\nEOF\n",
+      "true | time <<<one <<<two cat",
+      "{fd}<<<body time",
+      "<<EOF time\nbody\nEOF\n",
+      "time$(echo x)",
+      "time`echo x`",
+      "time$((1))",
+      "time$'x'",
+      "time>(true)",
+      "time<(true)",
+      "time{fd}>out",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid && shell_parse_fast(ordinary[i], strlen(ordinary[i]), NULL,
+                                      &parsed) == SHELL_OK;
+    for (uint32_t command = 0; valid && command < parsed.count; command++)
+      valid =
+          (parsed.cmds[command].modifiers & SHELL_CMD_MOD_PIPE_TIMED) == 0 &&
+          parsed.cmds[command].pipeline_time_mode == SHELL_PIPE_TIME_NONE;
+  }
+  parser_test(
+      "Time remains an ordinary word outside reserved pipeline position",
+      valid);
+
+  shell_parse_result_t document_negator = {0};
+  valid = shell_parse_fast("<<<body ! true", strlen("<<<body ! true"), NULL,
+                           &document_negator) == SHELL_OK &&
+          document_negator.count == 2;
+  for (uint32_t command = 0; valid && command < document_negator.count;
+       command++)
+    valid = document_negator.cmds[command].pipeline_negation_count == 0 &&
+            (document_negator.cmds[command].modifiers &
+             SHELL_CMD_MOD_PIPE_NEGATED) == 0;
+  parser_test("Negator after a leading document remains an ordinary word",
+              valid);
+
+  static const char *const continued_negator[] = {
+      "<<<one ! <<<two cat", "<<<one ! 3<<<two cat",
+      "<<EOF ! <<<two cat\none\nEOF\n"};
+  valid = true;
+  for (size_t i = 0;
+       i < sizeof(continued_negator) / sizeof(continued_negator[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(continued_negator[i], strlen(continued_negator[i]),
+                             NULL, &parsed) == SHELL_OK;
+    for (uint32_t range = 0; valid && range < parsed.count; range++)
+      valid = parsed.cmds[range].pipeline_negation_count == 0;
+  }
+  parser_test("Document fragments do not restart reserved negator recognition",
+              valid);
+
+  static const struct {
+    const char *source;
+    shell_pipeline_time_mode_t mode;
+    uint32_t negations;
+  } document_lines[] = {
+      {"printf one <<<one\ntime <<<two cat", SHELL_PIPE_TIME_DEFAULT, 0},
+      {"printf one <<<one\r\ntime -p <<<two cat", SHELL_PIPE_TIME_POSIX, 0},
+      {"printf one <<<one\n! <<<two cat", SHELL_PIPE_TIME_NONE, 1},
+      {"printf one <<<one\n#comment\n! time <<<two cat",
+       SHELL_PIPE_TIME_DEFAULT, 1},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(document_lines) / sizeof(document_lines[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    bool item = shell_parse_fast(document_lines[i].source,
+                                 strlen(document_lines[i].source), NULL,
+                                 &parsed) == SHELL_OK &&
+                parsed.count == 4;
+    if (item)
+      item = parsed.cmds[2].type == SHELL_TYPE_HERESTRING &&
+             parsed.cmds[2].pipeline_time_mode == document_lines[i].mode &&
+             parsed.cmds[2].pipeline_negation_count ==
+                 document_lines[i].negations &&
+             parsed.cmds[0].pipeline_time_mode == SHELL_PIPE_TIME_NONE;
+    valid = valid && item;
+  }
+  parser_test("Real document line endings restore pipeline-prefix context",
+              valid);
+
+  static const char *const option_fragments[] = {
+      "time -p$(echo x)", "time -p`echo x`",  "time -p$'x'",
+      "time -p>(true)",   "time --$(echo x)",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(option_fragments) / sizeof(option_fragments[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(option_fragments[i], strlen(option_fragments[i]),
+                             NULL, &parsed) == SHELL_OK &&
+            parsed.count != 0 &&
+            parsed.cmds[0].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT;
+  }
+  parser_test("Time options require complete logical words", valid);
+
+  static const char *const invalid_post_pipe_compounds[] = {
+      "echo | time { cat; }",
+      "echo | time (cat)",
+      "echo | ! { cat; }",
+      "echo | ! (cat)",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(invalid_post_pipe_compounds) /
+                             sizeof(invalid_post_pipe_compounds[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid && shell_parse_fast(invalid_post_pipe_compounds[i],
+                                      strlen(invalid_post_pipe_compounds[i]),
+                                      NULL, &parsed) == SHELL_EPARSE;
+  }
+  parser_test("Post-pipe modifiers cannot introduce compound stages", valid);
+}
+
+/* Document redirects may carry Bash's named descriptor allocator. They are
+ * redirect syntax, never an argv fragment, and a bare document redirect can
+ * be the pipeline stage modified by one or more leading `!` reserved words. */
+static void parser_test_named_document_and_negation_metadata(void) {
+  static const struct {
+    const char *input;
+    uint16_t document_type;
+    uint32_t negation_count;
+    shell_pipeline_time_mode_t time_mode;
+  } cases[] = {
+      {"printf x {fd}<<<body", SHELL_TYPE_HERESTRING, 0, SHELL_PIPE_TIME_NONE},
+      {"printf x {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0,
+       SHELL_PIPE_TIME_NONE},
+      {"! <<<body", SHELL_TYPE_HERESTRING, 1, SHELL_PIPE_TIME_NONE},
+      {"! ! <<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 2, SHELL_PIPE_TIME_NONE},
+      {"! <<<body | cat", SHELL_TYPE_HERESTRING, 1, SHELL_PIPE_TIME_NONE},
+      {"{ cat; } {fd}<<<body", SHELL_TYPE_HERESTRING, 0, SHELL_PIPE_TIME_NONE},
+      {"{ cat; } {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0,
+       SHELL_PIPE_TIME_NONE},
+      {"time <<<body", SHELL_TYPE_HERESTRING, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time -p ! 3<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 1,
+       SHELL_PIPE_TIME_POSIX},
+  };
+  const shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid && shell_parse_fast(cases[i].input, strlen(cases[i].input),
+                                      &strict, &parsed) == SHELL_OK;
+    uint32_t document = UINT32_MAX;
+    for (uint32_t range = 0; range < parsed.count; range++)
+      if (parsed.cmds[range].type & cases[i].document_type)
+        document = range;
+    if (i == 5) {
+      /* A trailing group here-string is recorded in group I/O metadata rather
+       * than as a synthetic command range. */
+      valid = valid && parsed.count == 1 && document == UINT32_MAX;
+    } else {
+      valid =
+          valid && document != UINT32_MAX &&
+          parsed.cmds[document].pipeline_negation_count ==
+              cases[i].negation_count &&
+          (!!(parsed.cmds[document].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) ==
+           (cases[i].negation_count != 0)) &&
+          parsed.cmds[document].pipeline_time_mode == cases[i].time_mode &&
+          (!!(parsed.cmds[document].modifiers & SHELL_CMD_MOD_PIPE_TIMED) ==
+           (cases[i].time_mode != SHELL_PIPE_TIME_NONE));
+    }
+    if (i < 2)
+      valid = valid && parsed.count == 2 &&
+              parsed.cmds[0].len == strlen("printf x");
+    if (i == 4)
+      valid = valid && parsed.count == 2 &&
+              parsed.cmds[1].type == SHELL_TYPE_PIPELINE &&
+              parsed.cmds[1].pipeline_negation_count == 1;
+    if (i == 6)
+      valid = valid && parsed.count == 2;
+  }
+  parser_test(
+      "Fast parser classifies named and modified document redirect stages",
+      valid);
+}
+
+static void parser_test_document_pipeline_modifiers(void) {
+  static const char *const cases[] = {
+      "time -p ! cat <<<body | cat",
+      "time -p ! cat <<EOF | cat\nbody\nEOF\n",
+      "time -p ! cat <<<body argument | cat",
+      "time -p ! cat <<<one 3<<<two |& cat",
+      "time -p ! cat | <<<body",
+      "time -p ! cat | <<EOF\nbody\nEOF\n",
+      "time -p ! { cat; } | <<<body",
+      "time -p ! <<<body | cat",
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    bool item =
+        shell_parse_fast(cases[i], strlen(cases[i]), NULL, &parsed) == SHELL_OK;
+    uint32_t stages = 0;
+    for (uint32_t range = 0; item && range < parsed.count; range++) {
+      const shell_range_t *member = &parsed.cmds[range];
+      if (member->pipe_input_mode == SHELL_PIPE_MODE_NONE)
+        continue;
+      stages++;
+      item = member->pipeline_time_mode == SHELL_PIPE_TIME_POSIX &&
+             member->pipeline_negation_count == 1 &&
+             (member->features & SHELL_FEAT_PIPELINE) != 0;
+    }
+    item = item && stages == 1 && parsed.count != 0 &&
+           (parsed.cmds[0].features & SHELL_FEAT_PIPELINE) != 0;
+    if (!item)
+      fprintf(stderr, "Document pipeline metadata: %s\n", cases[i]);
+    valid = valid && item;
+  }
+  parser_test("Document fragments preserve timed and negated pipeline stages",
+              valid);
+}
+
+/* These semantic classifiers sit below the public processor adapters. Exercise
+ * their quote, expansion, and unsupported-control boundaries directly so the
+ * adapters cannot accidentally narrow the lexical contract. */
+static void parser_test_semantic_classifier_boundaries(void) {
+  static const struct {
+    const char *input;
+    bool unsupported;
+  } source_cases[] = {
+      {"", false},
+      {"printf '%s' while", false},
+      {"while true; do :; done", true},
+      {"echo items[0]", false},
+      {"echo ${items[0]}", true},
+      {"echo $(while true; do :; done)", true},
+      {"echo <(while true; do :; done)", true},
+      {"echo `while true; do :; done`", true},
+      {"echo ${value:-$(while true; do :; done)}", true},
+      {"echo $((items[0]))", true},
+      {"echo \"\\$(while true; do :; done)\"", false},
+      {"echo \"$(printf x)\"", false},
+      {"echo $'while'", false},
+      {"echo $'$\"localized\"'", false},
+      {"echo \\$\"localized\"", false},
+      {"echo x # $\"localized\"", false},
+      {"cat <<'EOF'\n$\"localized\"\nEOF", false},
+      {"echo $\"localized\"", true},
+      {"echo prefix$\"localized\"suffix", true},
+      {"echo ${value:-$\"fallback\"}", true},
+      {"echo \"${value:-$\"localized\"}\"", true},
+      {"echo \"${outer:-${inner:-$\"localized\"}}\"", true},
+      {"echo \"${value:-\\$\"literal\"}\"", false},
+      {"echo \"${value:-'$\"literal\"'}\"", false},
+      {"declare arr[0]", true},
+      {"declare 'arr[0]'", true},
+      {"declare arr\\[0\\]", true},
+      {"declare arr$'[0]'", true},
+      {"declare ar\"r\"[0]", true},
+      {"declare arr[$((0))]", true},
+      {"declare arr[${index}]", true},
+      {"declare arr[`printf 0`]", true},
+      {"declare ar\\\nr[0]", true},
+      {"f\\\nd=shadow declare -a values", true},
+      {"de$'clare' -a values", true},
+      {"command -$'p' de$'clare' -a values", true},
+      {"declare -$'a' values", true},
+      {"echo de$'clare' -a values", false},
+      {"$tool -a values", false},
+      {"typeset map[key]", true},
+      {"command -- declare \"arr[$(printf 0)]\"", true},
+      {"declare scalar='[literal]'", false},
+      {SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("/tmp/x"), true},
+      {"VALUE=x [[ $VALUE == x ]]", false},
+      {">out [[ x ]]", false},
+      {"VALUE=x then", false},
+      {">out then", false},
+      {"{ [[ -n value ]]; }", false},
+      {"echo $( " SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("/tmp/x") " )",
+       true},
+      {"(( count += 1 ))", true},
+      {"! (( 1 ))", false},
+      {"{ (( 1 )); }", false},
+      {"time echo x", false},
+      {"time eval echo hidden", true},
+      {"time coproc echo hidden", true},
+      {"time " SHELLSPLIT_TEST_UNMODELED_BINARY_CONDITION("/tmp/x"), true},
+      {"time (( count += 1 ))", true},
+      {"time shopt -s varredir_close", true},
+      {"time command declare -a values", true},
+      {"echo \"$(time eval echo hidden)\"", true},
+      {"VALUE=x time -p echo x", false},
+      {"! time false", false},
+      {"command time echo x", false},
+      {"\"time\" echo x", false},
+      {"echo $'unterminated", false},
+  };
+  static const struct {
+    const char *input;
+    bool array_semantics;
+  } arithmetic_cases[] = {
+      {"1 + value", false},
+      {"\\items[0]", true},
+      {"items[0] + 1", true},
+      {"'items[0]'", false},
+      {"\"items[0]\"", true},
+      {"$'literal' items[0]", true},
+      {"${items[0]}", true},
+      {"${value:-$(while true; do :; done)}", true},
+      {"`while true; do :; done`", true},
+      {"$(while true; do :; done)", true},
+      {"$((items[0]))", true},
+      {"$'unterminated", false},
+  };
+  bool valid = !shell_tokenizer_arithmetic_has_array_semantics(NULL, 0) &&
+               shell_tokenizer_has_unsupported_semantics(NULL, 0);
+  shell_tokenizer_state_t escaped_glob_state;
+  shell_token_t escaped_glob = {0};
+  valid = valid &&
+          shell_tokenizer_init(&escaped_glob_state, "[a\\]]", strlen("[a\\]]"),
+                               NULL) &&
+          shell_tokenizer_next(&escaped_glob_state, &escaped_glob) &&
+          escaped_glob.type == SHELL_TOKEN_GLOB;
+  for (size_t i = 0; i < sizeof(source_cases) / sizeof(source_cases[0]); i++) {
+    bool got = shell_tokenizer_has_unsupported_semantics(
+        source_cases[i].input, strlen(source_cases[i].input));
+    if (got != source_cases[i].unsupported)
+      fprintf(stderr,
+              "semantic classification mismatch: %s got=%d expected=%d\n",
+              source_cases[i].input, got, source_cases[i].unsupported);
+    valid = got == source_cases[i].unsupported && valid;
+  }
+  for (size_t i = 0; i < sizeof(arithmetic_cases) / sizeof(arithmetic_cases[0]);
+       i++) {
+    bool got = shell_tokenizer_arithmetic_has_array_semantics(
+        arithmetic_cases[i].input, strlen(arithmetic_cases[i].input));
+    valid = got == arithmetic_cases[i].array_semantics && valid;
+  }
+  char too_many_commands[2 * (SHELL_MAX_SUBCOMMANDS + 1)] = {0};
+  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++) {
+    too_many_commands[2 * i] = 'x';
+    if (i + 1 < SHELL_MAX_SUBCOMMANDS + 1)
+      too_many_commands[2 * i + 1] = ';';
+  }
+  shell_processed_commands_t too_many = {
+      .commands = (shell_command_info_t *)(uintptr_t)1,
+      .command_count = SIZE_MAX,
+  };
+  valid = valid && shell_process_commands(
+                       too_many_commands, strlen(too_many_commands), NULL,
+                       &too_many) == SHELL_PROCESS_EOUTPUT_LIMIT;
+  valid = valid && too_many.commands == NULL && too_many.command_count == 0;
+
+  char unsupported_after_capacity[2 * (SHELL_MAX_SUBCOMMANDS + 1) +
+                                  sizeof("time eval echo hidden")] = {0};
+  size_t capacity_used = 0;
+  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++)
+    capacity_used += (size_t)snprintf(
+        unsupported_after_capacity + capacity_used,
+        sizeof(unsupported_after_capacity) - capacity_used, "x;");
+  capacity_used +=
+      (size_t)snprintf(unsupported_after_capacity + capacity_used,
+                       sizeof(unsupported_after_capacity) - capacity_used,
+                       "time eval echo hidden");
+  too_many = (shell_processed_commands_t){
+      .commands = (shell_command_info_t *)(uintptr_t)1,
+      .command_count = SIZE_MAX,
+  };
+  valid = valid && capacity_used < sizeof(unsupported_after_capacity) &&
+          shell_process_commands(unsupported_after_capacity, capacity_used,
+                                 NULL, &too_many) == SHELL_PROCESS_EPARSE &&
+          too_many.commands == NULL && too_many.command_count == 0;
+  parser_test("Semantic classifiers retain quote and expansion boundaries",
+              valid);
+}
+
+/* Exercise transformation after tokenization has established source spans.
+ * In particular, a short variable spelling expands to a longer display token,
+ * so both string and aggregate output limits need independent coverage. */
+static void parser_test_transform_contract_boundaries(void) {
+  shell_transformed_command_t *transformed =
+      (shell_transformed_command_t *)(uintptr_t)1;
+  shell_command_t *tokenized = NULL;
+  size_t tokenized_count = 0;
+  const shell_transform_limits_t display_limit = {
+      .max_string_bytes = 2,
+      .max_total_bytes = SIZE_MAX,
+  };
+  const shell_transform_limits_t total_limit = {
+      .max_string_bytes = SIZE_MAX,
+      .max_total_bytes = 20,
+  };
+  bool valid =
+      shell_tokenize_commands("$X", 2, &tokenized, &tokenized_count) ==
+          SHELL_TOKENIZE_OK &&
+      tokenized_count == 1 &&
+      shell_transform_command(&tokenized[0], &display_limit, &transformed) ==
+          SHELL_TRANSFORM_EOUTPUT_LIMIT &&
+      transformed == NULL &&
+      shell_transform_command(&tokenized[0], &total_limit, &transformed) ==
+          SHELL_TRANSFORM_EOUTPUT_LIMIT &&
+      transformed == NULL;
+  shell_commands_free(tokenized, tokenized_count);
+  shell_transformed_command_t **commands =
+      (shell_transformed_command_t **)(uintptr_t)1;
+  size_t count = SIZE_MAX;
+  valid = valid &&
+          shell_transform_command_line("", 0, NULL, &commands, &count) ==
+              SHELL_TRANSFORM_BLANK &&
+          commands == NULL && count == 0;
+  parser_test("Transform contracts retain expansion and output boundaries",
+              valid);
+}
+
+/* Abstraction is a diagnostic adapter, but it still consumes the same lexical
+ * spans as canonical processing. Exercise it from both library variants so
+ * path, expansion, redirect, and accessor contracts cannot drift. */
+static void parser_test_abstract_adapter_contract(void) {
+  shell_abstract_command_t *abstracted =
+      (shell_abstract_command_t *)(uintptr_t)1;
+  const char source[] =
+      "printf $HOME /etc/passwd ./relative ~/home *.c $(id) $((1 + 2)) >out";
+  shell_abstract_status_t null_status =
+      shell_abstract_command_parse("", 0, &abstracted);
+  bool null_cleared = abstracted == NULL;
+  shell_abstract_status_t malformed_status =
+      shell_abstract_command_parse("echo '", strlen("echo '"), &abstracted);
+  bool malformed_cleared = abstracted == NULL;
+  shell_abstract_status_t parse_status =
+      shell_abstract_command_parse(source, sizeof(source) - 1, &abstracted);
+  bool valid = null_status == SHELL_ABSTRACT_EINPUT && null_cleared &&
+               malformed_status == SHELL_ABSTRACT_EPARSE && malformed_cleared &&
+               parse_status == SHELL_ABSTRACT_OK && abstracted != NULL &&
+               abstracted->original != NULL &&
+               abstracted->display_text != NULL && abstracted->has_variables &&
+               abstracted->has_paths && abstracted->has_abs_paths &&
+               abstracted->has_rel_paths && abstracted->has_home_paths &&
+               abstracted->has_globs && abstracted->has_cmd_subst &&
+               abstracted->has_arithmetic && abstracted->has_redirects;
+  parser_test("Abstract adapter establishes every required output", valid);
+  size_t element_count = 0;
+  const shell_abstract_element_t *const *elements =
+      shell_abstract_command_get_elements(abstracted, &element_count);
+  valid =
+      valid && elements != NULL && element_count > 0 &&
+      shell_abstract_command_get_element(abstracted, element_count) == NULL &&
+      shell_abstract_command_find_element(abstracted, "$missing") == NULL &&
+      shell_classify_raw_token("/tmp/file", strlen("/tmp/file")) ==
+          SHELL_TOKEN_ARGUMENT &&
+      shell_path_category_from_path("/tmp/file") == SHELL_PATH_TMP &&
+      strcmp(shell_abstract_type_name((shell_abstract_type_t)99), "UNKNOWN") ==
+          0 &&
+      strcmp(shell_path_category_name((shell_path_category_t)99), "UNKNOWN") ==
+          0;
+  /* Raw classification accepts a token span rather than a command line. Keep
+   * malformed and boundary spellings distinct from the richer parsed input
+   * above. */
+  valid = valid && shell_classify_raw_token("", 0) == SHELL_TOKEN_END &&
+          shell_classify_raw_token("$", 1) == SHELL_TOKEN_ARGUMENT &&
+          shell_classify_raw_token("${x}", 4) == SHELL_TOKEN_VARIABLE &&
+          shell_classify_raw_token("${12}", 5) == SHELL_TOKEN_SPECIAL_VAR &&
+          shell_classify_raw_token("$?", 2) == SHELL_TOKEN_SPECIAL_VAR &&
+          shell_classify_raw_token("$(x)", 4) == SHELL_TOKEN_SUBSHELL &&
+          shell_classify_raw_token("$((1))", 6) == SHELL_TOKEN_ARITHMETIC &&
+          shell_classify_raw_token("~other", 6) == SHELL_TOKEN_ARGUMENT &&
+          shell_classify_raw_token("relative/path", strlen("relative/path")) ==
+              SHELL_TOKEN_ARGUMENT &&
+          shell_classify_raw_token("--option", strlen("--option")) ==
+              SHELL_TOKEN_ARGUMENT;
+  const char *const environment[] = {"HOME=/home/example", "HOMEVAR=value",
+                                     NULL};
+  shell_runtime_context_t runtime = {
+      .env = environment,
+      .cwd = "/work/base",
+      .resolve_symlinks = false,
+  };
+  valid = valid && shell_abstract_command_expand(abstracted, &runtime);
+  shell_abstract_command_free(abstracted);
+  parser_test("Abstract adapter preserves lexical and accessor contracts",
+              valid);
+}
+
+/* These are distinct malformed source boundaries, not merely different
+ * spellings of a trailing operator.  Exercise them through both the shipping
+ * and allocator-instrumented fast-parser targets: redirects must have a word
+ * operand, group prefixes cannot masquerade as command arguments, and a
+ * redirect-only syntax is kept distinct from an executable command range. */
+static void parser_test_strict_redirect_and_group_rejection(void) {
+  static const char *const cases[] = {
+      "command >",
+      "command > (consumer)",
+      "command > | next",
+      "command << (delimiter)",
+      ">output { command; }",
+      ">output (printf x)",
+      "2>>output (printf x)",
+      "{ command }",
+      "command |",
+      "command &&",
+  };
+  const shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool rejected = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t status =
+        shell_parse_fast(cases[i], strlen(cases[i]), &strict, &result);
+    bool case_rejected =
+        status == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR;
+    if (!case_rejected)
+      fprintf(stderr,
+              "strict redirect/group case accepted: %s (status=%d, "
+              "parser-status=%d)\n",
+              cases[i], status, result.status);
+    rejected = rejected && case_rejected;
+  }
+  parser_test(
+      "Strict fast parser rejects malformed redirect and group boundaries",
+      rejected);
+
+  shell_parse_result_t redirect_only = {0};
+  parser_test("Fast parser retains redirect-only structural syntax",
+              shell_parse_fast(">output", strlen(">output"), &strict,
+                               &redirect_only) == SHELL_OK &&
+                  redirect_only.count == 1 &&
+                  redirect_only.cmds[0].type == SHELL_TYPE_SIMPLE);
+}
+
+/* --- MAIN --- */
+
+static void parser_test_nested_double_quote_boundaries(void) {
+  static const char *const valid_sources[] = {
+      "echo \"${value:-\"x;y\"}\"",
+      "echo \"$(printf \"x;y\")\"",
+      "echo \"`printf \"x;y\"`\"",
+      "echo \"${value:-\"x;y\"}\"; next",
+  };
+  shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                           .strict_mode = true};
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(valid_sources) / sizeof(valid_sources[0]);
+       i++) {
+    shell_parse_result_t result = {0};
+    const char *source = valid_sources[i];
+    valid = valid &&
+            shell_parse_fast(source, strlen(source), &strict, &result) ==
+                SHELL_OK &&
+            result.count == (i == 3 ? 2u : 1u);
+  }
+  parser_test("Nested quote scopes preserve outer command boundaries", valid);
+
+  const char *quoted_operator = "echo \"${value:-\"x&y\"}\"";
+  shell_parse_result_t feature_result = {0};
+  bool feature_ok = shell_parse_fast(quoted_operator, strlen(quoted_operator),
+                                     &strict, &feature_result) == SHELL_OK &&
+                    feature_result.count == 1 &&
+                    !(feature_result.cmds[0].features & SHELL_FEAT_BACKGROUND);
+  parser_test("Nested quoted ampersand is not a background feature",
+              feature_ok);
+
+  static const char *const parameter_punctuation[] = {
+      "echo ${value:-x&y}",
+      "echo \"${value:-x&y}\"",
+      "echo \"${value:-\"x&y\"}\"",
+  };
+  bool parameter_features_ok = true;
+  for (size_t i = 0;
+       i < sizeof(parameter_punctuation) / sizeof(parameter_punctuation[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    parameter_features_ok &=
+        shell_parse_fast(parameter_punctuation[i],
+                         strlen(parameter_punctuation[i]), &strict,
+                         &parsed) == SHELL_OK &&
+        parsed.count == 1 && (parsed.cmds[0].features & SHELL_FEAT_VARS) != 0 &&
+        (parsed.cmds[0].features & SHELL_FEAT_BACKGROUND) == 0;
+  }
+  parser_test(
+      "Parameter-word ampersands do not mark outer background execution",
+      parameter_features_ok);
+
+  const char *nested_background = "echo ${value:-$(sleep 1 & wait)}";
+  shell_parse_result_t nested_features = {0};
+  parser_test(
+      "Executable commands inside parameter words retain background metadata",
+      shell_parse_fast(nested_background, strlen(nested_background), &strict,
+                       &nested_features) == SHELL_OK &&
+          nested_features.count == 1 &&
+          (nested_features.cmds[0].features & SHELL_FEAT_SUBSHELL) != 0 &&
+          (nested_features.cmds[0].features & SHELL_FEAT_BACKGROUND) != 0);
+
+  static const struct {
+    const char *source;
+    uint32_t required;
+    uint32_t forbidden;
+  } operand_features[] = {
+      {"echo ${value:-`printf hi`}", SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL,
+       SHELL_FEAT_BACKGROUND},
+      {"echo ${value:-<(printf hi)}", SHELL_FEAT_VARS | SHELL_FEAT_PROCESS_SUB,
+       SHELL_FEAT_BACKGROUND},
+      {"echo \"${value:-\"<(printf hi)\"}\"", SHELL_FEAT_VARS,
+       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_BACKGROUND},
+      {"echo ${value:-$(printf one)$(printf two)}",
+       SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL, SHELL_FEAT_BACKGROUND},
+  };
+  bool operand_features_ok = true;
+  for (size_t i = 0; i < sizeof(operand_features) / sizeof(operand_features[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    operand_features_ok &=
+        shell_parse_fast(operand_features[i].source,
+                         strlen(operand_features[i].source), &strict,
+                         &parsed) == SHELL_OK &&
+        parsed.count == 1 &&
+        (parsed.cmds[0].features & operand_features[i].required) ==
+            operand_features[i].required &&
+        (parsed.cmds[0].features & operand_features[i].forbidden) == 0;
+  }
+  parser_test(
+      "Parameter operands retain executable features without leaking syntax",
+      operand_features_ok);
+
+  static const char *const incomplete_nested[] = {
+      "echo \"${value:-\"x;y\"\"",
+      "echo \"$(printf \"x;y\"\"",
+      "echo \"`printf x\"",
+  };
+  bool invalid = true;
+  for (size_t i = 0;
+       i < sizeof(incomplete_nested) / sizeof(incomplete_nested[0]); i++) {
+    shell_parse_result_t rejected = {0};
+    invalid = invalid && shell_parse_fast(incomplete_nested[i],
+                                          strlen(incomplete_nested[i]), &strict,
+                                          &rejected) == SHELL_EPARSE;
+  }
+  parser_test("Incomplete expansions cannot borrow the outer quote delimiter",
+              invalid);
+
+  const char *incomplete = "echo $'foo\\'";
+  shell_parse_result_t result = {0};
+  parser_test("Escaped final ANSI-C apostrophe is not a closing delimiter",
+              shell_parse_fast(incomplete, strlen(incomplete), &strict,
+                               &result) == SHELL_EPARSE);
+  const char *complete = "echo $'foo\\\\'";
+  parser_test("Paired ANSI-C backslashes permit a closing apostrophe",
+              shell_parse_fast(complete, strlen(complete), &strict, &result) ==
+                      SHELL_OK &&
+                  result.count == 1);
+}
+
+static void parser_test_prefix_scan_scaling(void) {
+  static const struct {
+    const char *prefix;
+    const char *suffix;
+    size_t document_anchor;
+  } cases[] = {
+      {"printf x | ", "<<<word cat", SIZE_MAX},
+      {"! printf x | ", "<<<word cat", SIZE_MAX},
+      {"time printf x | ", "<<<word cat", SIZE_MAX},
+      {"! time printf x |& ", "<<<word cat", SIZE_MAX},
+      {"true; # ignored time !\n ! ", "<<<word cat", 24},
+      {"true && time ! ", "<<<word cat", 8},
+      {"true; time ", "{fd}<<<word cat", 6},
+      {"printf x | { time ! ", "<<<word cat; }", 13},
+      {"time ", "{ printf x; }", SIZE_MAX},
+      {"! time ", "(printf x)", SIZE_MAX},
+  };
+  bool valid = true;
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    for (size_t padding = 256; padding <= 8192; padding *= 2) {
+      size_t prefix = strlen(cases[c].prefix);
+      size_t suffix = strlen(cases[c].suffix);
+      size_t length = prefix + padding + suffix;
+      char *source = malloc(length + 1);
+      if (!source) {
+        valid = false;
+        break;
+      }
+      memcpy(source, cases[c].prefix, prefix);
+      memset(source + prefix, ' ', padding);
+      memcpy(source + prefix + padding, cases[c].suffix, suffix + 1);
+      shell_parse_result_t parsed;
+      shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+      strict.strict_mode = true;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      bool item =
+          shell_parse_fast(source, length, &strict, &parsed) == SHELL_OK;
+      shell_execution_map_t execution;
+      if (item) {
+        shell_execution_map_build(source, length, &parsed, &execution);
+        if (cases[c].document_anchor != SIZE_MAX) {
+          bool found = false;
+          for (uint32_t i = 0; i < parsed.count; i++)
+            if (shell_execution_document(&parsed.cmds[i])) {
+              found = true;
+              item = item && execution.anchor[i] == cases[c].document_anchor;
+              break;
+            }
+          item = item && found;
+        }
+      }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      item = item && shellsplit_test_source_scan_work() <= 32 * length;
+#endif
+      if (!item)
+        fprintf(stderr, "prefix scaling mismatch: case=%zu padding=%zu\n", c,
+                padding);
+      valid = valid && item;
+      free(source);
+    }
+  }
+  parser_test("Pipeline and document prefix scans have a linear work budget",
+              valid);
+
+  /* Nested compounds make both the group count and flattened range count grow.
+   * Index construction must visit those tables in one sweep; a per-range group
+   * search or per-group range scan would make this family quadratic. */
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous_work = 0;
+#endif
+  for (size_t depth = 4; depth <= 32; depth *= 2) {
+    char source[4096];
+    size_t used = 0;
+    for (size_t group = 0; group < depth; group++) {
+      static const char prefix[] = "{ printf x; ";
+      memcpy(source + used, prefix, sizeof(prefix) - 1);
+      used += sizeof(prefix) - 1;
+    }
+    source[used++] = ':';
+    for (size_t group = 0; group < depth; group++) {
+      static const char suffix[] = "; }";
+      memcpy(source + used, suffix, sizeof(suffix) - 1);
+      used += sizeof(suffix) - 1;
+    }
+    source[used] = '\0';
+
+    shell_parse_result_t parsed = {0};
+    shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+    strict.strict_mode = true;
+    bool item = shell_parse_fast(source, used, &strict, &parsed) == SHELL_OK &&
+                parsed.group_count == depth && parsed.count == depth + 1;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_source_scan_reset();
+#endif
+    shell_execution_map_t execution;
+    if (item)
+      shell_execution_map_build(source, used, &parsed, &execution);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t work = shellsplit_test_source_scan_work();
+    item = item && work <= 64 * (parsed.count + parsed.group_count) + 256 &&
+           (previous_work == 0 || work <= 3 * previous_work + 128);
+    previous_work = work;
+#endif
+    if (!item)
+      fprintf(stderr, "pipeline index scaling mismatch: depth=%zu\n", depth);
+    valid = valid && item;
+  }
+  parser_test("Pipeline indexing scales with groups and ranges", valid);
+}
+
+/* `if` is a group from its `if` word through its `fi` word. The keywords belong
+ * to no range, and each range says which list of the `if` it is in. */
+static void parser_test_if_structure(void) {
+  printf("\n--- If groups ---\n");
+  typedef struct {
+    const char *text;
+    uint8_t role, arm;
+  } expected_range_t;
+  static const struct {
+    const char *name;
+    const char *input;
+    uint32_t ranges, groups;
+    expected_range_t first[6];
+  } cases[] = {
+      {"if then fi",
+       "if a; then b; fi",
+       2,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0}, {"b", SHELL_RANGE_ROLE_THEN, 0}}},
+      {"if else",
+       "if a; then b; else c; fi",
+       3,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_THEN, 0},
+        {"c", SHELL_RANGE_ROLE_ELSE, 1}}},
+      {"elif chain",
+       "if a; then b; elif c; then d; elif e; then f; else g; fi",
+       7,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_THEN, 0},
+        {"c", SHELL_RANGE_ROLE_CONDITION, 1},
+        {"d", SHELL_RANGE_ROLE_THEN, 1},
+        {"e", SHELL_RANGE_ROLE_CONDITION, 2},
+        {"f", SHELL_RANGE_ROLE_THEN, 2}}},
+      {"newlines separate sections",
+       "if a\nthen\n  b\nelse\n  c\nfi",
+       3,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_THEN, 0},
+        {"c", SHELL_RANGE_ROLE_ELSE, 1}}},
+      {"a condition may be a list",
+       "if a && b; then c; fi",
+       3,
+       1,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"c", SHELL_RANGE_ROLE_THEN, 0}}},
+      {"a nested group takes the role of its section",
+       "if a; then { b; }; else ( c ); fi",
+       3,
+       3,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_NONE, 0},
+        {"c", SHELL_RANGE_ROLE_NONE, 0}}},
+      {"a nested if has its own sections",
+       "if a; then if b; then c; fi; fi",
+       3,
+       2,
+       {{"a", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"b", SHELL_RANGE_ROLE_CONDITION, 0},
+        {"c", SHELL_RANGE_ROLE_THEN, 0}}},
+      {"keyword words as arguments are ordinary",
+       "echo if then elif else fi",
+       1,
+       0,
+       {{"echo if then elif else fi", SHELL_RANGE_ROLE_NONE, 0}}},
+      {"a keyword after an assignment is not reserved",
+       "x=1 if",
+       1,
+       0,
+       {{"x=1 if", SHELL_RANGE_ROLE_NONE, 0}}},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = true;
+    shell_parse_result_t result;
+    bool ok = shell_parse_fast(cases[i].input, strlen(cases[i].input), &limits,
+                               &result) == SHELL_OK &&
+              result.count == cases[i].ranges &&
+              result.group_count == cases[i].groups;
+    for (uint32_t r = 0; ok && r < result.count && r < 6; r++) {
+      const shell_range_t *range = &result.cmds[r];
+      const expected_range_t *want = &cases[i].first[r];
+      ok = range->len == strlen(want->text) &&
+           memcmp(cases[i].input + range->start, want->text, range->len) == 0 &&
+           range->role == want->role && range->arm == want->arm;
+    }
+    parser_test(cases[i].name, ok);
+  }
+
+  /* The group spans from `if` to the end of `fi`, and a nested group knows the
+   * section of the `if` it sits in. */
+  static const char nested[] = "if a; then { b; }; else ( c ); fi";
+  shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+  limits.strict_mode = true;
+  shell_parse_result_t result;
+  bool ok = shell_parse_fast(nested, sizeof(nested) - 1, &limits, &result) ==
+                SHELL_OK &&
+            result.group_count == 3 &&
+            result.groups[0].kind == SHELL_GROUP_IF &&
+            result.groups[0].start == 0 &&
+            result.groups[0].end == sizeof(nested) - 1 &&
+            result.groups[0].parent == UINT16_MAX &&
+            result.groups[1].kind == SHELL_GROUP_BRACE &&
+            result.groups[1].parent == 0 &&
+            result.groups[1].role == SHELL_RANGE_ROLE_THEN &&
+            result.groups[1].arm == 0 &&
+            result.groups[2].kind == SHELL_GROUP_SUBSHELL &&
+            result.groups[2].role == SHELL_RANGE_ROLE_ELSE &&
+            result.groups[2].arm == 1;
+  parser_test("a nested group records its section", ok);
+
+  /* The keywords are structure only in order; anything else is rejected. */
+  static const char *const invalid[] = {
+      "if a; fi",
+      "if a; then b; else c; else d; fi",
+      "if a; then b; else c; elif d; then e; fi",
+      "if a; then b; fi; fi",
+      "if a; then b",
+      "{ if a; then b; }; fi",
+      "if a; then b; ) fi",
+  };
+  bool rejected = true;
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    shell_parse_result_t unused;
+    rejected = rejected && shell_parse_fast(invalid[i], strlen(invalid[i]),
+                                            &limits, &unused) != SHELL_OK;
+  }
+  parser_test("out-of-order and unterminated if sources are rejected",
+              rejected);
+}
+
+static int run_parser(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  printf("=== FAST PARSER API TESTS ===\n");
+  printf("Testing shell_parse_fast() and related functions\n\n");
+
+  printf("=== LAYER 1: UNIT TESTS (~50 tests) ===\n");
+  parser_test_feature_matrix();
+  parser_test_extglob_expansion_features();
+  parser_test_control_word_boundaries();
+  parser_test_array_assignment_prefix_features();
+  test_layer1_utility_functions();
+  test_layer1_error_handling();
+  test_dialect_oracle();
+  parser_test_if_structure();
+
+  printf("\n=== LAYER 2: INTERACTION TESTS (~100 tests) ===\n");
+
+  printf("\n=== LAYER 3: LARGE/COMPLEX TESTS (~100 tests) ===\n");
+  parser_test_complex_case_matrix();
+
+  printf("\n=== ADDITIONAL LAYER 1 TESTS ===\n");
+
+  printf("\n=== ADDITIONAL LAYER 3 TESTS ===\n");
+
+  printf("\n=== FEATURE FLAGS API TESTS ===\n");
+  parser_test_feature_flags();
+  parser_test_source_io_number_contract();
+  parser_test_word_fragment_operator_boundaries();
+  parser_test_pipeline_time_metadata();
+  parser_test_prefix_scan_scaling();
+  parser_test_named_document_and_negation_metadata();
+  parser_test_document_pipeline_modifiers();
+  parser_test_semantic_classifier_boundaries();
+  parser_test_nested_double_quote_boundaries();
+  parser_test_transform_contract_boundaries();
+  parser_test_abstract_adapter_contract();
+  parser_test_strict_redirect_and_group_rejection();
+
+  parser_test_fast_parser_limitations();
+
+  parser_test_strict_mode();
+  parser_test_strict_heredoc_completion();
+  parser_test_nested_heredoc_rejection();
+  parser_test_substitution_comment_and_heredoc_capacity();
+  parser_test_source_scanner_contract();
+  parser_test_incomplete_control_delimiters();
+
+  printf("\n=== SUMMARY ===\n");
+  printf("Results: %d/%d passed\n", parser_pass_count, parser_test_count);
+  if (parser_pass_count == parser_test_count) {
+    printf("  [PASS] All tests\n");
+    return 0;
+  } else {
+    printf("  [FAIL] %d tests failed\n", parser_test_count - parser_pass_count);
+    return 1;
+  }
+}
+#undef NO_CHECK
+#undef shell_parse_fast
+
+/* --- boundary (from boundary_test.c) --- */
+#define CHECK(condition)                                                       \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition);          \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+static uint32_t boundary_command(const shell_dep_graph_t *graph,
+                                 const char *name) {
+  size_t length = strlen(name);
+  for (uint32_t i = 0; i < graph->node_count; i++) {
+    const shell_dep_node_t *node = &graph->nodes[i];
+    if (node->type == SHELL_NODE_CMD && node->cmd.token_count &&
+        node->cmd.token_lens[0] == length &&
+        !memcmp(node->cmd.tokens[0], name, length))
+      return i;
+  }
+  return UINT32_MAX;
+}
+
+static bool boundary_route(const shell_dep_graph_t *graph, uint32_t owner,
+                           uint32_t fd, bool input, uint32_t inherited) {
+  for (uint32_t i = 0; i < graph->edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    uint32_t endpoint = input ? edge->from : edge->to;
+    if (edge->type == (input ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) &&
+        (input ? edge->to : edge->from) == owner &&
+        (input ? edge->target_fd : edge->source_fd) == fd &&
+        graph->nodes[endpoint].type == SHELL_NODE_FD &&
+        graph->nodes[endpoint].fd.number == inherited)
+      return true;
+  }
+  return false;
+}
+
+static void boundary_parse(const char *source, shell_dep_limits_t *limits,
+                           shell_dep_graph_t *graph) {
+  shell_dep_error_t status =
+      shell_dep_graph_parse(source, strlen(source), "/", limits, graph);
+  if (status != SHELL_DEP_OK)
+    fprintf(stderr, "source: %s\nstatus: %d\n", source, status);
+  CHECK(status == SHELL_DEP_OK);
+  /* The invariant helper validates successful graphs before inspecting them. */
+  CHECK(shellsplit_test_depgraph_invariants(source, strlen(source), status,
+                                            graph, limits));
+  for (uint32_t i = 0; i < graph->node_count; i++)
+    if (graph->nodes[i].type == SHELL_NODE_FD)
+      for (uint32_t j = 0; j < i; j++)
+        CHECK(graph->nodes[j].type != SHELL_NODE_FD ||
+              graph->nodes[j].fd.number != graph->nodes[i].fd.number);
+}
+
+static uint32_t boundary_implicit_input(const shell_dep_graph_t *graph) {
+  uint32_t result = UINT32_MAX;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_DOC &&
+        (graph->nodes[node].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)) {
+      CHECK(result == UINT32_MAX);
+      result = node;
+      CHECK(graph->nodes[node].doc.kind == SHELL_DOC_FILE);
+      CHECK(graph->nodes[node].doc.flags == SHELL_DEP_DOC_FLAG_IMPLICIT);
+      CHECK(graph->nodes[node].doc.path_len == 9);
+      CHECK(!memcmp(graph->nodes[node].doc.path, "/dev/null", 9));
+      CHECK(graph->nodes[node].doc.value == NULL &&
+            graph->nodes[node].doc.name == NULL);
+      bool used = false;
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+        CHECK(graph->edges[edge].to != node);
+        if (graph->edges[edge].from == node) {
+          CHECK(graph->edges[edge].type == SHELL_EDGE_READ);
+          used = true;
+        }
+      }
+      CHECK(used);
+    }
+  return result;
+}
+
+static bool boundary_reads_implicit(const shell_dep_graph_t *graph,
+                                    uint32_t owner, uint32_t fd) {
+  uint32_t input = boundary_implicit_input(graph);
+  for (;;) {
+    uint32_t parent = UINT32_MAX;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      if (item->type == SHELL_EDGE_READ && item->from == input &&
+          item->to == owner && item->target_fd == fd)
+        return true;
+      if (item->type == SHELL_EDGE_GROUP && item->to == owner)
+        parent = item->from;
+    }
+    if (parent == UINT32_MAX)
+      return false;
+    owner = parent;
+  }
+}
+
+static void boundary_background_newlines(shell_dep_limits_t *limits,
+                                         shell_dep_graph_t *graph,
+                                         shell_dep_graph_t *other) {
+  static const char *const separators[] = {" ", "\n", " # note\n", "\n\n"};
+  static const struct {
+    const char *source;
+    bool implicit;
+  } stages[] = {{"wc -c", true},          {"true | wc -c", false},
+                {"true |& wc -c", false}, {"time wc -c", true},
+                {"true && wc -c", true},  {"false || wc -c", true},
+                {"{ wc -c; }", true},     {"(wc -c)", true}};
+  for (size_t stage = 0; stage < sizeof(stages) / sizeof(stages[0]); stage++)
+    for (size_t separator = 0;
+         separator < sizeof(separators) / sizeof(separators[0]); separator++) {
+      char source[256];
+      snprintf(source, sizeof(source), "%s &%swait", stages[stage].source,
+               separators[separator]);
+      boundary_parse(source, limits, graph);
+      uint32_t wc = boundary_command(graph, "wc"),
+               wait = boundary_command(graph, "wait");
+      CHECK(wc != UINT32_MAX && wait != UINT32_MAX);
+      CHECK(graph->nodes[wc].cmd.backgrounded &&
+            !graph->nodes[wait].cmd.backgrounded);
+      CHECK(boundary_implicit_input(graph) != UINT32_MAX);
+      if (boundary_reads_implicit(graph, wc, 0) != stages[stage].implicit)
+        fprintf(stderr, "background stdin case: %s\n", source);
+      CHECK(boundary_reads_implicit(graph, wc, 0) == stages[stage].implicit);
+      CHECK(!boundary_reads_implicit(graph, wait, 0) &&
+            boundary_route(graph, wait, 0, true, 0));
+      unsigned backgrounds = 0;
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+        if (graph->edges[edge].type == SHELL_EDGE_BACKGROUND) {
+          CHECK(graph->edges[edge].to == wait);
+          backgrounds++;
+        }
+      CHECK(backgrounds == 1);
+      shell_parse_result_t fast;
+      CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+      CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                            &fast, other) == SHELL_DEP_OK);
+      CHECK(shellsplit_test_graph_equal(graph, other));
+    }
+
+  static const char *const recursive[] = {
+      "printf '%%s' \"$(wc -c &%swait)\"", "cat <(wc -c &%swait)",
+      "{ wc -c &%swait; }", "(wc -c &%swait)"};
+  for (size_t item = 0; item < sizeof(recursive) / sizeof(recursive[0]); item++)
+    for (size_t separator = 0;
+         separator < sizeof(separators) / sizeof(separators[0]); separator++) {
+      char source[256];
+      snprintf(source, sizeof(source), recursive[item], separators[separator]);
+      boundary_parse(source, limits, graph);
+      CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+      uint32_t wait = boundary_command(graph, "wait");
+      unsigned backgrounds = 0;
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+        backgrounds += graph->edges[edge].type == SHELL_EDGE_BACKGROUND &&
+                       graph->edges[edge].to == wait;
+      CHECK(backgrounds == 1);
+      shell_parse_result_t fast;
+      CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+      CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                            &fast, other) == SHELL_DEP_OK);
+      CHECK(shellsplit_test_graph_equal(graph, other));
+    }
+
+  static const char *const tails[] = {"\n", " # end\n", "\n\n# end\n"};
+  for (size_t tail = 0; tail < sizeof(tails) / sizeof(tails[0]); tail++) {
+    char source[128];
+    snprintf(source, sizeof(source), "wc -c &%s", tails[tail]);
+    boundary_parse(source, limits, graph);
+    CHECK(graph->nodes[boundary_command(graph, "wc")].cmd.backgrounded);
+    CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+  }
+
+  static const char *const documents[] = {"wc -c 3<<EOF &\nbody\nEOF\nwait",
+                                          "wc -c 3<<<body & # note\n\nwait"};
+  for (size_t item = 0; item < sizeof(documents) / sizeof(documents[0]);
+       item++) {
+    boundary_parse(documents[item], limits, graph);
+    CHECK(!boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+    uint32_t wait = boundary_command(graph, "wait");
+    unsigned backgrounds = 0;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+      backgrounds += graph->edges[edge].type == SHELL_EDGE_BACKGROUND &&
+                     graph->edges[edge].to == wait;
+    CHECK(backgrounds == 1 && boundary_route(graph, wait, 0, true, 0));
+  }
+
+  static const char *const isolated[] = {
+      "exec 0<&- && true &%scat", "false || exec 0<&- &%scat",
+      "cd /tmp && true &%scat", "cd /tmp && exec 0<&- &%scat",
+      "exec 0<&- && true &%scd /tmp && true &\ncat"};
+  for (size_t item = 0; item < sizeof(isolated) / sizeof(isolated[0]); item++)
+    for (size_t separator = 0;
+         separator < sizeof(separators) / sizeof(separators[0]); separator++) {
+      char source[256];
+      snprintf(source, sizeof(source), isolated[item], separators[separator]);
+      boundary_parse(source, limits, graph);
+      uint32_t cat = boundary_command(graph, "cat");
+      CHECK(cat != UINT32_MAX && boundary_route(graph, cat, 0, true, 0));
+      CHECK(!boundary_reads_implicit(graph, cat, 0));
+      CHECK(
+          graph->nodes[cat].cmd.cwd_known &&
+          !strcmp(graph->cwd_buf.data + graph->nodes[cat].cmd.cwd_offset, "/"));
+    }
+
+  /* A newline after `&` retains its source span but advances Bash's input
+   * unit. Newlines after binary connectors remain in the current unit. */
+  static const struct {
+    const char *source;
+    uint16_t connector;
+    uint32_t input_unit;
+  } connectors[] = {{"wc &\nwait", SHELL_TYPE_BACKGROUND, 1},
+                    {"wc & # note\n\nwait", SHELL_TYPE_BACKGROUND, 2},
+                    {"true |\nwc", SHELL_TYPE_PIPELINE, 0},
+                    {"true |&\nwc", SHELL_TYPE_PIPELINE, 0},
+                    {"true &&\nwc", SHELL_TYPE_AND, 0},
+                    {"false ||\nwc", SHELL_TYPE_OR, 0}};
+  for (size_t item = 0; item < sizeof(connectors) / sizeof(connectors[0]);
+       item++) {
+    shell_parse_result_t fast;
+    shell_pipeline_index_t index;
+    const char *source = connectors[item].source;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    CHECK(fast.count == 2);
+    shell_pipeline_index_connectors(source, strlen(source), &fast, &index);
+    CHECK(index.range_successor[0] == connectors[item].connector);
+    CHECK(index.range_connector[1] == connectors[item].connector);
+    CHECK(index.range_input_unit[0] == 0 &&
+          index.range_input_unit[1] == connectors[item].input_unit);
+  }
+  /* A separator after a closed group must not reassign the pipeline head's
+   * successor. Newline-separated lists match their one-line spelling. */
+  static const struct {
+    const char *lines;
+    const char *inline_source;
+  } after_group[] = {
+      {"cd /tmp | (:);\ncat", "cd /tmp | (:); cat"},
+      {"cd /tmp | { :; };\ncat", "cd /tmp | { :; }; cat"},
+      {"cd /tmp | (:);\n\ncat", "cd /tmp | (:); cat"},
+      {"cd /tmp | (:)\n\ncat", "cd /tmp | (:); cat"},
+  };
+  for (size_t item = 0; item < sizeof(after_group) / sizeof(after_group[0]);
+       item++) {
+    shell_parse_result_t fast;
+    shell_pipeline_index_t index;
+    const char *source = after_group[item].lines;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    shell_pipeline_index_connectors(source, strlen(source), &fast, &index);
+    CHECK(index.range_successor[0] == SHELL_TYPE_PIPELINE &&
+          index.group_connector[0] == SHELL_TYPE_PIPELINE);
+    boundary_parse(source, limits, graph);
+    uint32_t cat = boundary_command(graph, "cat");
+    CHECK(cat != UINT32_MAX && graph->nodes[cat].cmd.cwd_known &&
+          !strcmp(graph->cwd_buf.data + graph->nodes[cat].cmd.cwd_offset, "/"));
+    boundary_parse(after_group[item].inline_source, limits, other);
+    CHECK(graph->node_count == other->node_count &&
+          graph->edge_count == other->edge_count);
+  }
+  static const char group_source[] = "wc & # note\n\n{ wait; }";
+  shell_parse_result_t fast;
+  shell_pipeline_index_t index;
+  CHECK(shell_parse_fast(group_source, sizeof(group_source) - 1, NULL, &fast) ==
+        SHELL_OK);
+  CHECK(fast.group_count == 1);
+  shell_pipeline_index_connectors(group_source, sizeof(group_source) - 1, &fast,
+                                  &index);
+  CHECK(index.group_connector[0] == SHELL_TYPE_BACKGROUND &&
+        index.group_connector_start[0] == 3 &&
+        index.group_connector_end[0] == 4 && index.group_input_unit[0] == 2);
+}
+
+static void boundary_async_completion(shell_dep_limits_t *limits,
+                                      shell_dep_graph_t *graph,
+                                      shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    bool reached;
+  } cases[] = {
+      {"{ false & } || printf bad >out", false},
+      {"{ true & } || printf bad >out", false},
+      {"{ exit 1 & } || printf bad >out", false},
+      {"{ false & } && printf good >out", true},
+      {"{ false & } && true || printf bad >out", false},
+      {"{ false && true & } || printf bad >out", false},
+      {"{ false || true & } || printf bad >out", false},
+      {"{ { false; } & } || printf bad >out", false},
+      {"{ (false) & } || printf bad >out", false},
+      {"{ false | true & } || printf bad >out", false},
+      {"{ time false & } || printf bad >out", false},
+      {"{ ! true & } || printf bad >out", false},
+      {"(false &) || printf bad >out", false},
+      {"(false &) && printf good >out", true},
+      {"{ { false & }; } || printf bad >out", false},
+      {"{ (false &); } || printf bad >out", false},
+      {"! { false & } && printf bad >out", false},
+      {"! { false & } || printf good >out", true},
+      {"time { false & } || printf bad >out", false},
+      {"{ false &\n} || printf bad >out", false},
+      {"{ false & # note\n\n} || printf bad >out", false},
+      {"{ false & } || { printf bad >out; }", false},
+      {"echo \"$( { false & } || printf bad >out )\"", false},
+      {"echo \"$( { false & } && printf good >out )\"", true},
+      {"cat <({ false & } || printf bad >out)", false},
+      {"{ false; } || printf good >out", true},
+      {"{ true; } || printf bad >out", false},
+      {"{ false & true; } || printf bad >out", false},
+      {"{ true & false; } || printf good >out", true},
+      {"exit 0; { false & } && printf bad >out", false},
+      {"UID=1; { false & } && printf bad >out", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i].source, limits, graph);
+    uint32_t marker = boundary_command(graph, "printf");
+    CHECK(marker != UINT32_MAX);
+    bool effects = false;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      if ((item->type == SHELL_EDGE_READ && item->to == marker) ||
+          (item->type == SHELL_EDGE_WRITE && item->from == marker))
+        effects = true;
+    }
+    if (effects != cases[i].reached) {
+      fprintf(stderr, "asynchronous completion: %s\n", cases[i].source);
+      shell_dep_graph_dump(graph, stderr);
+    }
+    CHECK(effects == cases[i].reached);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                           &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(cases[i].source,
+                                          strlen(cases[i].source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+  boundary_parse("{ false & } || exec 0<&-; cat", limits, graph);
+  CHECK(boundary_route(graph, boundary_command(graph, "cat"), 0, true, 0));
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+    CHECK(graph->edges[edge].type != SHELL_EDGE_FD_CLOSE);
+  boundary_parse("{ false & } || cd /tmp; cat", limits, graph);
+  uint32_t cat = boundary_command(graph, "cat");
+  CHECK(cat != UINT32_MAX && graph->nodes[cat].cmd.cwd_known &&
+        !strcmp(graph->cwd_buf.data + graph->nodes[cat].cmd.cwd_offset, "/"));
+  boundary_parse("{ false & } || export MARK=value; cat", limits, graph);
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+    CHECK(graph->edges[edge].type != SHELL_EDGE_ENV);
+}
+
+static void boundary_standard_directions(shell_dep_limits_t *limits,
+                                         shell_dep_graph_t *graph,
+                                         shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    uint32_t local_fd, inherited;
+    bool input, group;
+  } cases[] = {
+      {"wc 0>&1", 0, 1, false, false},
+      {"wc 1<&0", 1, 0, true, false},
+      {"wc 2<&0", 2, 0, true, false},
+      {"wc 0>&1 1>&-", 0, 1, false, false},
+      {"wc 1<&0 0<&-", 1, 0, true, false},
+      {"wc 0>&1 0>&-", 0, SHELL_DEP_FD_NONE, false, false},
+      {"wc 1<&0 1<&-", 1, SHELL_DEP_FD_NONE, true, false},
+      {"wc 0>&1 0>&2", 0, 2, false, false},
+      {"wc 1<&0 1<&2", 1, 2, true, false},
+      {"exec 0>&1; wc", 0, 1, false, false},
+      {"exec 1<&0; wc", 1, 0, true, false},
+      {"exec 3>&1; wc 0>&3-", 0, 1, false, false},
+      /* A self move leaves the descriptor unchanged and needs no sparse use. */
+      {"wc 0>&0-", 0, SHELL_DEP_FD_NONE, false, false},
+      {"{ wc; } 0>&1", 0, 1, false, true},
+      {"{ wc; } 1<&0", 1, 0, true, true},
+      {"echo \"$(wc 1<&0)\"", 1, 0, true, false},
+      {"cat <(wc 1<&0)", 1, 0, true, false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i].source, limits, graph);
+    uint32_t owner = boundary_command(graph, "wc");
+    CHECK(owner != UINT32_MAX);
+    if (cases[i].group)
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+        if (graph->edges[edge].type == SHELL_EDGE_GROUP &&
+            graph->edges[edge].to == owner) {
+          owner = graph->edges[edge].from;
+          break;
+        }
+    unsigned count = 0;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      if (item->type != (cases[i].input ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) ||
+          (cases[i].input ? item->to : item->from) != owner ||
+          (cases[i].input ? item->target_fd : item->source_fd) !=
+              cases[i].local_fd)
+        continue;
+      const shell_dep_node_t *resource =
+          &graph->nodes[cases[i].input ? item->from : item->to];
+      CHECK(resource->type == SHELL_NODE_FD &&
+            resource->fd.number == cases[i].inherited);
+      count++;
+    }
+    if (count != (cases[i].inherited != SHELL_DEP_FD_NONE ? 1u : 0u)) {
+      fprintf(stderr, "standard direction case: %s\n", cases[i].source);
+      shell_dep_graph_dump(graph, stderr);
+    }
+    CHECK(count == (cases[i].inherited != SHELL_DEP_FD_NONE ? 1u : 0u));
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                           &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(cases[i].source,
+                                          strlen(cases[i].source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+
+  static const struct {
+    const char *source;
+    bool input;
+    uint32_t fd;
+  } files[] = {{"wc 0>out", false, 0},
+               {"wc 1<input", true, 1},
+               {"wc 2<input", true, 2},
+               {"wc 0<input 1>&0", true, 1},
+               {"wc 0<input 1<&0-", true, 1}};
+  for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    boundary_parse(files[i].source, limits, graph);
+    uint32_t owner = boundary_command(graph, "wc");
+    unsigned count = 0;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      /* Opening read-only stderr can itself fail before installing that
+       * route. Its shell diagnostic still uses the inherited writable fd 2. */
+      bool setup_diagnostic = files[i].fd == 2 &&
+                              item->type == SHELL_EDGE_WRITE &&
+                              item->from == owner && item->source_fd == 2 &&
+                              graph->nodes[item->to].type == SHELL_NODE_FD;
+      CHECK(setup_diagnostic ||
+            !(item->type ==
+                  (files[i].input ? SHELL_EDGE_WRITE : SHELL_EDGE_READ) &&
+              (files[i].input ? item->from : item->to) == owner &&
+              (files[i].input ? item->source_fd : item->target_fd) ==
+                  files[i].fd));
+      if (item->type == (files[i].input ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) &&
+          (files[i].input ? item->to : item->from) == owner &&
+          (files[i].input ? item->target_fd : item->source_fd) == files[i].fd) {
+        CHECK(graph->nodes[files[i].input ? item->from : item->to].type ==
+              SHELL_NODE_DOC);
+        count++;
+      }
+    }
+    CHECK(count == 1);
+  }
+  boundary_parse("wc 0>&1 | cat", limits, graph);
+  uint32_t writer = boundary_command(graph, "wc"),
+           reader = boundary_command(graph, "cat");
+  unsigned copies = 0;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->type == SHELL_EDGE_PIPE && item->from == writer &&
+        item->to == reader && item->source_fd == 0 && item->target_fd == 0)
+      copies++;
+  }
+  CHECK(copies == 1);
+  boundary_parse("echo \"$(wc 0>&1)\"", limits, graph);
+  writer = boundary_command(graph, "wc");
+  copies = 0;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->from == writer && item->source_fd == 0 &&
+        (item->type == SHELL_EDGE_WRITE || item->type == SHELL_EDGE_SUBST))
+      copies++;
+  }
+  CHECK(copies == 1);
+}
+
+static void boundary_async_inputs(shell_dep_limits_t *limits,
+                                  shell_dep_graph_t *graph,
+                                  shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    bool implicit;
+  } cases[] = {
+      {"wc -c &", true},
+      {"wc -c <&0 &", false},
+      {"wc -c 3<&0 &", true},
+      {"wc -c 3</dev/null &", false},
+      {": 3<<<\"$(wc -c)\" &", false},
+      {"{ wc -c; } 3<<<value &", false},
+      {"wc -c 0>&0 &", true},
+      {"wc -c 0>&- &", false},
+      {"wc -c 3<&0 0<&3- &", true},
+      {"wc -c 3<&0 0<&\"3\"- &", true},
+      {"wc -c 3<&0 0<&3\\- &", true},
+      {"{ wc -c <&0; } &", true},
+      {"{ wc -c & } &", true},
+      {"{ { wc -c; } & } &", true},
+      {"{ wc -c; } <&0 &", false},
+      {"{ wc -c & wait; } <&0", false},
+      {"{ :; } <&0; wc -c &", false},
+      {"{ :; } <&0\nwc -c &", false},
+      {"{ :; } <&0; (true); wc -c &", false},
+      {"{ :; } <&0; (wc -c & wait)", true},
+      {"{ :; } <&0; { :; } 2>&1; wc -c &", true},
+      {"cat | { wc -c & wait; }", false},
+      {"{ :; } <&0; true | (true); wc -c &", false},
+      {"cat <(wc -c)", false},
+      {"printf '%s' \"$(wc -c)\" &", false},
+      {"value=$(wc -c) &", false},
+      {"! printf '%s' \"$(wc -c)\" &", false},
+      {"printf '%s' \"$(wc -c)\" | cat &", false},
+      {"time printf '%s' \"$(wc -c)\" &", true},
+      {"true && printf '%s' \"$(wc -c)\" &", true},
+      {"false || printf '%s' \"$(wc -c)\" &", true},
+      {": 3>\"$(wc -c >&2; printf /dev/null)\" &", true},
+      {"{ { printf '%s' \"$(wc -c)\"; }; } &", true},
+      {"exec {fd}<&0; wc -c <&$fd &", false},
+      {"UID=1\nwc -c & wait", true},
+      {"UID=1\ntime wc -c & wait", true},
+      {"UID=1\n{ wc -c; } & wait", true},
+      {"UID=1\ntrue && wc -c & wait", true},
+      {"UID=1\nfalse || wc -c & wait", true},
+      {"UID=1\ntrue && printf '%s' \"$(wc -c)\" & wait", true},
+      {"UID=1\nvalue=$(wc -c) & wait", false},
+      {"UID=1\n: 3>\"$(wc -c >&2; printf /dev/null)\" & wait", true},
+      {"UID=1; time wc -c & wait", false},
+      {"UID=1; : &\nwc -c &\nwait", true},
+      {"UID=1; : & # note\n\nwc -c &\nwait", true},
+      {"UID=1; { :; } &\nwc -c &\nwait", true},
+      {"UID=1; time : &\nwc -c &\nwait", true},
+      {"UID=1; : &\ntrue && wc -c &\nwait", true},
+      {"UID=1; : & wc -c &\nwait", false},
+      {"exit 0; : &\nwc -c &\nwait", false},
+      {"exit 0\ntime wc -c & wait", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i].source, limits, graph);
+    uint32_t wc = boundary_command(graph, "wc");
+    CHECK(wc != UINT32_MAX);
+    if (boundary_reads_implicit(graph, wc, 0) != cases[i].implicit)
+      fprintf(stderr, "async case: %s\n", cases[i].source);
+    CHECK(boundary_reads_implicit(graph, wc, 0) == cases[i].implicit);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                           &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(cases[i].source,
+                                          strlen(cases[i].source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+  boundary_parse("wc -c &", limits, graph);
+  uint32_t wc = boundary_command(graph, "wc");
+  CHECK(boundary_route(graph, wc, 0, true,
+                       0)); /* Nonfatal implicit-open failure. */
+  CHECK(boundary_reads_implicit(graph, wc, 0));
+  uint32_t implicit = boundary_implicit_input(graph);
+  *other = *graph;
+  other->nodes[implicit].doc.path = NULL;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->nodes[implicit].doc.flags |= SHELL_DEP_DOC_FLAG_TRANSIENT;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->nodes[other->node_count++] = graph->nodes[implicit];
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->edges[other->edge_count - 1].type = SHELL_EDGE_WRITE;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  boundary_parse("wc -c 3<&0 &", limits, graph);
+  CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 3));
+  boundary_parse("wc -c & cat", limits, graph);
+  CHECK(!boundary_reads_implicit(graph, boundary_command(graph, "cat"), 0));
+  CHECK(boundary_route(graph, boundary_command(graph, "cat"), 0, true, 0));
+  boundary_parse("true && exec 0<&- & cat", limits, graph);
+  CHECK(boundary_route(graph, boundary_command(graph, "cat"), 0, true, 0));
+  CHECK(!boundary_reads_implicit(graph, boundary_command(graph, "cat"), 0));
+  boundary_parse("cd /tmp && true & cat", limits, graph);
+  uint32_t cat = boundary_command(graph, "cat");
+  CHECK(graph->nodes[cat].cmd.cwd_known &&
+        !strcmp(graph->cwd_buf.data + graph->nodes[cat].cmd.cwd_offset, "/"));
+  boundary_parse("exec 0<before || exit; UID=1\n"
+                 "cd /tmp && true & cat",
+                 limits, graph);
+  cat = boundary_command(graph, "cat");
+  CHECK(graph->nodes[cat].cmd.cwd_known &&
+        !strcmp(graph->cwd_buf.data + graph->nodes[cat].cmd.cwd_offset, "/"));
+  unsigned parent_reads = 0;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->type == SHELL_EDGE_READ && item->to == cat &&
+        item->target_fd == 0) {
+      const shell_dep_node_t *resource = &graph->nodes[item->from];
+      CHECK(resource->type == SHELL_NODE_DOC && resource->doc.path_len == 6 &&
+            !memcmp(resource->doc.path, "before", 6));
+      parent_reads++;
+    }
+  }
+  CHECK(parent_reads == 1 && !boundary_reads_implicit(graph, cat, 0));
+  boundary_parse("true || wc -c &", limits, graph);
+  CHECK(boundary_implicit_input(graph) !=
+        UINT32_MAX); /* true executes in the wrapper. */
+  boundary_parse("false && { wc; } &", limits, graph);
+  CHECK(!boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+  boundary_parse("exec 0<&-; wc -c &", limits, graph);
+  CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+  boundary_parse(">out &", limits, graph);
+  CHECK(boundary_implicit_input(graph) == UINT32_MAX);
+  boundary_parse("exec 2>&1 &", limits, graph);
+  CHECK(boundary_implicit_input(graph) == UINT32_MAX);
+  boundary_parse("time { exec 2<&0; wc; } &", limits, graph);
+  CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+  bool unavailable = false;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_TIME)
+      unavailable |= (graph->nodes[node].time.report_route_flags &
+                      SHELL_TIME_REPORT_ROUTE_UNAVAILABLE) != 0;
+  CHECK(unavailable);
+  boundary_parse("{ : >& }; wc; }", limits, graph);
+  bool literal_closer = false;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    literal_closer |= graph->nodes[node].type == SHELL_NODE_DOC &&
+                      graph->nodes[node].doc.kind == SHELL_DOC_FILE &&
+                      graph->nodes[node].doc.path_len == 1 &&
+                      graph->nodes[node].doc.path[0] == '}';
+  CHECK(literal_closer);
+  static const char malformed[] = "{ wc && }";
+  CHECK(shell_dep_graph_parse(malformed, sizeof(malformed) - 1, "/", limits,
+                              graph) == SHELL_DEP_EPARSE);
+  CHECK(graph->node_count == 0 && graph->edge_count == 0);
+}
+
+static void boundary_timing_destinations(shell_dep_limits_t *limits,
+                                         shell_dep_graph_t *graph,
+                                         shell_dep_graph_t *other) {
+  static const char source[] = "probe && exec 2>&1; time wc";
+  boundary_parse(source, limits, graph);
+  uint32_t timer = UINT32_MAX, first = UINT32_MAX, second = UINT32_MAX;
+  uint32_t unused_destination = UINT32_MAX;
+  for (uint32_t node = 0; node < graph->node_count; node++) {
+    if (graph->nodes[node].type == SHELL_NODE_TIME)
+      timer = node;
+    if (graph->nodes[node].type == SHELL_NODE_FD &&
+        graph->nodes[node].fd.number == 0)
+      unused_destination = node;
+  }
+  CHECK(timer != UINT32_MAX && unused_destination != UINT32_MAX);
+  CHECK(graph->nodes[timer].time.report_external_fd_count == 2);
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+    if (graph->edges[edge].from == timer &&
+        graph->edges[edge].type == SHELL_EDGE_WRITE &&
+        graph->nodes[graph->edges[edge].to].type == SHELL_NODE_FD) {
+      if (first == UINT32_MAX)
+        first = edge;
+      else {
+        CHECK(second == UINT32_MAX);
+        second = edge;
+      }
+    }
+  CHECK(first != UINT32_MAX && second != UINT32_MAX);
+  *other = *graph;
+  other->edges[second].to = other->edges[first].to;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->edges[second] = other->edges[--other->edge_count];
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->edges[second].to = unused_destination;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  shell_dep_time_t *time = &other->nodes[timer].time;
+  uint32_t swap = time->report_external_fds[0];
+  time->report_external_fds[0] = time->report_external_fds[1];
+  time->report_external_fds[1] = swap;
+  CHECK(shell_dep_graph_validate(other).valid);
+  CHECK(shellsplit_test_depgraph_invariants(source, sizeof(source) - 1,
+                                            SHELL_DEP_OK, other, limits));
+  *other = *graph;
+  other->edges[second] = other->edges[--other->edge_count];
+  time = &other->nodes[timer].time;
+  time->report_external_fd_count = 1;
+  time->report_external_fds[0] = other->nodes[other->edges[first].to].fd.number;
+  time->report_route_flags |= SHELL_TIME_REPORT_ROUTE_UNKNOWN;
+  other->status = SHELL_DEP_STATUS_TRUNCATED;
+  CHECK(shell_dep_graph_validate(other).valid);
+  CHECK(shellsplit_test_depgraph_invariants(source, sizeof(source) - 1,
+                                            SHELL_DEP_ETRUNC, other, limits));
+}
+
+typedef struct {
+  const char *word;
+  unsigned calls;
+} boundary_recovery_resolution_t;
+
+static shell_expand_status_t
+boundary_recovery_resolve(const shell_expand_word_request_t *request,
+                          const char **netargv, size_t *length, void *context) {
+  boundary_recovery_resolution_t *fixture = context;
+  CHECK(request->purpose == SHELL_EXPAND_WORD_REDIRECT_PATH);
+  CHECK(request->source + request->word_offset == fixture->word &&
+        request->word_length == strlen("\"$(wc -c)\""));
+  CHECK(request->cwd_known && request->cwd_absolute &&
+        !strcmp(request->cwd, "/"));
+  fixture->calls++;
+  *netargv = "3:out,";
+  *length = sizeof("3:out,") - 1;
+  return SHELL_EXPAND_RESOLVED;
+}
+
+static void boundary_recovery_resolution(shell_dep_limits_t *limits,
+                                         shell_dep_graph_t *graph,
+                                         shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    unsigned calls;
+    bool implicit;
+  } cases[] = {
+      {"UID=1\ntime : >\"$(wc -c)\" & cat", 1, true},
+      {"UID=1\ntrue && : >\"$(wc -c)\" & cat", 1, true},
+      {"{ false & } || : >\"$(wc -c)\"; cat", 0, false},
+      {"(false &) || : >\"$(wc -c)\"; cat", 0, false},
+      {"{ { false & }; } || : >\"$(wc -c)\"; cat", 0, false},
+      {"{ false & } && : >\"$(wc -c)\"; cat", 1, false},
+      {"! { false & } || : >\"$(wc -c)\"; cat", 1, false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    boundary_recovery_resolution_t fixture = {strstr(source, "\"$(wc -c)\""),
+                                              0};
+    uint8_t unresolved[SHELL_DEP_MAX_NODES];
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         graph, boundary_recovery_resolve,
+                                         &fixture, unresolved) == SHELL_DEP_OK);
+    CHECK(fixture.calls == cases[i].calls &&
+          shell_dep_graph_validate(graph).valid);
+    CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0) ==
+          cases[i].implicit);
+    CHECK(!boundary_reads_implicit(graph, boundary_command(graph, "cat"), 0));
+    if (!cases[i].calls)
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+        CHECK(graph->edges[edge].type != SHELL_EDGE_SUBST);
+    for (uint32_t node = 0; node < SHELL_DEP_MAX_NODES; node++)
+      CHECK(unresolved[node] == 0);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    fixture.calls = 0;
+    shell_expand_cache_t cache;
+    shell_dep_limits_t graph_limits = *limits;
+    CHECK(shell_expand_cache_init(
+        boundary_recovery_resolve, &fixture, source, strlen(source), false,
+        limits->workspace, limits->workspace_size, &cache,
+        &graph_limits.workspace, &graph_limits.workspace_size));
+    shell_dep_word_resolver_t resolver = {shell_expand_resolve, &cache};
+    CHECK(shell_dep_graph_parse_with_fast_resolver(
+              source, strlen(source), "/", &graph_limits, &fast, other,
+              &resolver, unresolved) == SHELL_DEP_OK);
+    CHECK(cache.error == SHELL_DEP_OK && fixture.calls == cases[i].calls &&
+          shellsplit_test_graph_equal(graph, other));
+  }
+}
+
+typedef struct {
+  const char *netargv;
+  shell_expand_status_t status;
+  unsigned paths, later;
+} boundary_diagnostic_resolution_t;
+
+static shell_expand_status_t
+boundary_diagnostic_resolve(const shell_expand_word_request_t *request,
+                            const char **netargv, size_t *length,
+                            void *context) {
+  boundary_diagnostic_resolution_t *fixture = context;
+  if (request->purpose != SHELL_EXPAND_WORD_REDIRECT_PATH)
+    return SHELL_EXPAND_UNRESOLVED;
+  const char *word = request->source + request->word_offset;
+  if (request->word_length == 7 && !memcmp(word, "\"$path\"", 7)) {
+    fixture->paths++;
+    if (fixture->status == SHELL_EXPAND_RESOLVED) {
+      *netargv = fixture->netargv;
+      *length = strlen(*netargv);
+    }
+    return fixture->status;
+  }
+  CHECK(request->word_length == 8 && !memcmp(word, "\"$later\"", 8));
+  fixture->later++;
+  *netargv = "4:next,";
+  *length = 7;
+  return SHELL_EXPAND_RESOLVED;
+}
+
+static void boundary_diagnostic_resolution(shell_dep_limits_t *limits,
+                                           shell_dep_graph_t *graph,
+                                           shell_dep_graph_t *other) {
+  static const struct {
+    const char *value;
+    shell_expand_status_t status;
+    bool stopped;
+  } cases[] = {{"", SHELL_EXPAND_RESOLVED, true},
+               {"0:,", SHELL_EXPAND_RESOLVED, true},
+               {"1:a,1:b,", SHELL_EXPAND_RESOLVED, true},
+               {"3:out,", SHELL_EXPAND_RESOLVED, false},
+               {NULL, SHELL_EXPAND_UNRESOLVED, false}};
+  const char *source = "sh -c \"$(echo 2>&1 >\"$path\" >\"$later\")\"";
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_diagnostic_resolution_t fixture = {cases[i].value, cases[i].status,
+                                                0, 0};
+    uint8_t unresolved[SHELL_DEP_MAX_NODES];
+    /* An empty or ambiguous resolved path certainly fails setup: a
+     * shell-level error which no dependency graph models. */
+    if (cases[i].stopped) {
+      CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                           graph, boundary_diagnostic_resolve,
+                                           &fixture,
+                                           unresolved) == SHELL_DEP_EUNMODELED);
+      CHECK(fixture.paths == 1 && fixture.later == 0);
+      continue;
+    }
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         graph, boundary_diagnostic_resolve,
+                                         &fixture, unresolved) == SHELL_DEP_OK);
+    CHECK(fixture.paths == 1 && fixture.later == !cases[i].stopped);
+    bool diagnostic = false, body = false;
+    uint32_t echo = boundary_command(graph, "echo");
+    for (uint32_t e = 0; e < graph->edge_count; e++) {
+      const shell_dep_edge_t *edge = &graph->edges[e];
+      diagnostic |= edge->type == SHELL_EDGE_SUBST && edge->from == echo &&
+                    edge->source_fd == 2;
+      body |= edge->type == SHELL_EDGE_READ && edge->to == echo;
+    }
+    CHECK(diagnostic && body == !cases[i].stopped);
+    CHECK(shell_dep_graph_validate(graph).valid);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    fixture.paths = fixture.later = 0;
+    shell_expand_cache_t cache;
+    shell_dep_limits_t graph_limits = *limits;
+    CHECK(shell_expand_cache_init(
+        boundary_diagnostic_resolve, &fixture, source, strlen(source), false,
+        limits->workspace, limits->workspace_size, &cache,
+        &graph_limits.workspace, &graph_limits.workspace_size));
+    shell_dep_word_resolver_t resolver = {shell_expand_resolve, &cache};
+    CHECK(shell_dep_graph_parse_with_fast_resolver(
+              source, strlen(source), "/", &graph_limits, &fast, other,
+              &resolver, unresolved) == SHELL_DEP_OK);
+    CHECK(fixture.paths == 1 && fixture.later == !cases[i].stopped);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+  boundary_diagnostic_resolution_t failure = {NULL, SHELL_EXPAND_FAILED, 0, 0};
+  uint8_t unresolved[SHELL_DEP_MAX_NODES];
+  CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                       graph, boundary_diagnostic_resolve,
+                                       &failure,
+                                       unresolved) == SHELL_DEP_EEXPAND);
+  CHECK(failure.paths == 1 && failure.later == 0);
+}
+
+static void boundary_cd_commands(shell_dep_limits_t *limits,
+                                 shell_dep_graph_t *graph,
+                                 shell_dep_graph_t *other) {
+  static const struct {
+    const char *source, *spelling, *cwd;
+  } cases[] = {
+      {"cd /tmp; pwd", "cd", NULL},
+      {"c'd' /tmp; pwd", "c'd'", NULL},
+      {"command cd /tmp; pwd", "command", NULL},
+      {"builtin cd /tmp; pwd", "builtin", NULL},
+      {"cd one two; pwd", "cd", "/"},
+      {"false && cd /tmp; pwd", "cd", "/"},
+      {"(cd /tmp); pwd", "cd", "/"},
+      {"cd /tmp | true; pwd", "cd", "/"},
+      {"cd /tmp & pwd", "cd", "/"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i].source, limits, graph);
+    uint32_t cd = boundary_command(graph, cases[i].spelling);
+    uint32_t pwd = boundary_command(graph, "pwd");
+    CHECK(cd != UINT32_MAX && pwd != UINT32_MAX);
+    CHECK(graph->nodes[cd].cmd.cwd_known &&
+          !strcmp(graph->cwd_buf.data + graph->nodes[cd].cmd.cwd_offset, "/"));
+    CHECK(graph->nodes[pwd].cmd.cwd_known == (cases[i].cwd != NULL));
+    if (cases[i].cwd)
+      CHECK(!strcmp(graph->cwd_buf.data + graph->nodes[pwd].cmd.cwd_offset,
+                    cases[i].cwd));
+    bool cwd_edge = false;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+      cwd_edge |= graph->edges[edge].type == SHELL_EDGE_CWD &&
+                  graph->edges[edge].from == cd && graph->edges[edge].to == cd;
+    CHECK(cwd_edge == (i != 5));
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                           &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(cases[i].source,
+                                          strlen(cases[i].source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+  }
+
+  static const struct {
+    const char *source;
+    bool capture;
+  } captures[] = {
+      {"sh -c \"$(exec 2>&1; cd one two)\"", true},
+      {"sh -c \"$(cd /; cd -)\"", true},
+      {"sh -c \"$({ exec 2>&1; cd one two; })\"", true},
+      {"sh -c \"$(exec 2>&1; command cd one two)\"", true},
+      {"sh -c \"$(exec 2>&1; builtin cd one two)\"", true},
+      {"sh -c \"$(exec 1>&- 2>&-; cd one two)\"", false},
+      {"sh -c \"$(false >&- 2>&- && cd one two)\"", false},
+  };
+  for (size_t i = 0; i < sizeof(captures) / sizeof(captures[0]); i++) {
+    const char *source = captures[i].source;
+    boundary_parse(source, limits, graph);
+    bool capture = false;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+      capture |= graph->edges[edge].type == SHELL_EDGE_SUBST;
+    if (capture != captures[i].capture)
+      fprintf(stderr, "cd capture: %s\n", source);
+    CHECK(capture == captures[i].capture);
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         other, NULL, NULL,
+                                         NULL) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    for (uint32_t nodes = 0; nodes <= graph->node_count; nodes++)
+      for (uint32_t edges = 0; edges <= graph->edge_count; edges++) {
+        shell_dep_limits_t bounded = *limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        shell_dep_error_t status =
+            shell_dep_graph_parse(source, strlen(source), "/", &bounded, other);
+        CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
+        CHECK(other->node_count <= nodes && other->edge_count <= edges &&
+              shell_dep_graph_validate(other).valid);
+        if (status == SHELL_DEP_OK)
+          CHECK(shellsplit_test_graph_equal(graph, other));
+      }
+  }
+
+  boundary_parse("exec 2>error; cd one two", limits, graph);
+  uint32_t cd = boundary_command(graph, "cd");
+  bool stderr_file = false;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    const shell_dep_node_t *to = &graph->nodes[item->to];
+    stderr_file |= item->type == SHELL_EDGE_WRITE && item->from == cd &&
+                   item->source_fd == 2 && to->type == SHELL_NODE_DOC &&
+                   to->doc.path_len == 5 && !memcmp(to->doc.path, "error", 5);
+  }
+  CHECK(stderr_file);
+}
+
+static void boundary_owner_stream_inventory(shell_dep_limits_t *limits,
+                                            shell_dep_graph_t *graph,
+                                            shell_dep_graph_t *other) {
+  static const char *const cases[] = {
+      "exec 30>&1; printf data 31>&30 31>&- 31>&30",
+      "exec 30>&1; printf data 31>&30 | cat",
+      "exec 30>out; printf data 31>&30",
+      "exec 30>&1; { printf data 31>&30; } 2>&1",
+      "sh -c \"$(exec 30>&1; printf data 31>&30 31>&- 31>&30)\"",
+      "exec {fd}>&1; printf data >&$fd",
+      "exec 30>&1; printf data 0>&30 1<&0 2>&-",
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i], limits, graph);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(cases[i], strlen(cases[i]), NULL, &fast) ==
+          SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(cases[i], strlen(cases[i]), "/",
+                                          limits, &fast,
+                                          other) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    CHECK(shell_dep_graph_parse_resolved(cases[i], strlen(cases[i]), "/",
+                                         limits, other, NULL, NULL,
+                                         NULL) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    uint32_t owner = boundary_command(graph, "printf");
+    CHECK(owner != UINT32_MAX);
+    if (i < 2 || i == 3)
+      CHECK(boundary_route(graph, owner, 31, false, 1));
+    if (i == 6)
+      CHECK(boundary_route(graph, owner, 0, false, 1) &&
+            boundary_route(graph, owner, 1, false, 1) &&
+            !boundary_route(graph, owner, 2, false, 2));
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  for (unsigned family = 0; family < 2; family++) {
+    size_t previous = 0;
+    for (unsigned count = 4; count <= 32; count *= 2) {
+      char source[2048] = "";
+      size_t length = 0;
+      for (unsigned i = 0; i < count; i++)
+        length += (size_t)snprintf(source + length, sizeof(source) - length,
+                                   "exec %u>&1; %s", 30 + i,
+                                   family == 0 ? ":; " : "");
+      if (family == 1)
+        for (unsigned i = 0; i < count; i++)
+          strcat(source, ":; ");
+      shellsplit_test_source_scan_reset();
+      boundary_parse(source, limits, graph);
+      size_t work =
+          shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_OWNER_STREAMS);
+      CHECK(work > 0 && work <= 96 * count &&
+            (!previous || work <= 3 * previous));
+      previous = work;
+    }
+  }
+#endif
+}
+
+static void boundary_assignment_effects(shell_dep_limits_t *limits,
+                                        shell_dep_graph_t *graph,
+                                        shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    uint32_t environments, substitutions;
+  } cases[] = {
+      {"UID=1 true", 0, 0},
+      {"UID+=1 true", 0, 0},
+      {"U\\\nID=1 true", 0, 0},
+      {"UID=1 command true", 0, 0},
+      {"UID=1 builtin true", 0, 0},
+      {"first=ok UID=1 last=ok true", 2, 0},
+      {"first=ok UID=1 last=ok", 1, 0},
+      {"UID=1 EUID=2 true", 0, 0},
+      {"x=$(printf data) UID=$(printf ignored) last=ok true", 2, 1},
+      {"UID=$(printf skipped) true", 0, 0},
+      {"UID=$(printf data) $missing", 0, 1},
+      {"UID=$(printf data) $(true)", 0, 2},
+      {"UID=$(printf marker >&2; printf data) $(true)", 0, 2},
+      {"UID=$(printf data) $first $second", 0, 1},
+      {"UID=$(printf data) \"$@\"", 0, 1},
+      {"UID=$(printf data) \"${!prefix@}\"", 0, 1},
+      {"UID=$(printf data) ${!prefix*}", 0, 1},
+      {"UID=$(printf data) ${@:-}", 0, 1},
+      {"UID=$(printf data) \"${@:+data}\"", 0, 1},
+      {"UID=$(printf data) \"${@:99}\"", 0, 1},
+      {"UID=$(printf skipped) \"${!prefix*}\"", 0, 0},
+      {"UID=$(printf skipped) \"${!pre\\\nfix\\\n*}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@-data}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:-data}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@-}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:-}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:-\"$@\"}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@?error}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:?error}\"", 0, 0},
+      {"UID=$(printf skipped) \"${\\\n@:\\\n-data}\"", 0, 0},
+      {"UID=$(printf skipped) \"${!prefix@}\"suffix", 0, 0},
+      {"UID=$(printf data) {,}", 0, 1},
+      {"UID=$(printf skipped) \"$missing\"", 0, 0},
+      {"UID=$(printf skipped) \"${missing:-}\"", 0, 0},
+      {"UID=$(printf skipped) \"$(true)\"", 0, 1},
+      {"UID=$(printf skipped) $missing true", 0, 0},
+      {"UID=$(printf skipped) $missing \"\"", 0, 0},
+      {"UID=$(printf skipped) \"$@\"\"\"", 0, 0},
+      {"UID=$(printf skipped) literal$missing", 0, 0},
+      {"UID=$(printf skipped) $missing-suffix", 0, 0},
+      {"UID=$(printf skipped) *", 0, 0},
+      {"UID=$(printf skipped) {,}suffix", 0, 0},
+      {"UID=$(printf skipped) {a,b}", 0, 0},
+      {"UID=$(printf skipped) {a,$missing}", 0, 0},
+      {"UID=$(printf skipped) {\"\",}", 0, 0},
+      {"x=$(printf first) UID=$(printf data) last=$(printf last) $maybe", 2, 3},
+      {"UID=$(printf data) EUID=$(printf skipped) $maybe", 0, 1},
+      {"UID=$(printf data) $maybe 3>$(printf /dev/null)", 0, 1},
+      {"false && UID=$(printf skipped) $maybe", 0, 0},
+      {"(UID=$(printf data) $maybe)", 0, 1},
+      {"{ UID=$(printf data) $maybe; }", 0, 1},
+      {"UID=$(printf data) $maybe | true", 0, 1},
+      {"UID=$(printf data) $maybe & true", 0, 1},
+      {"UID=${missing:?skipped} true; x=kept", 1, 0},
+      {"UID=$(printf data) later=$(printf skipped)", 0, 1},
+      {"export UID=$(printf data)", 0, 1},
+      {"export -Z x=$(printf data)", 0, 1},
+      {"export UID=1", 0, 0},
+      {"export -p UID=1 x=2", 1, 0},
+      {"export -- UID=1 EUID+=2 x=3", 1, 0},
+      {"export 'U''ID=1' x=2", 1, 0},
+      {"command export UID=1 x=2", 1, 0},
+      {"builtin export UID=1 x=2", 1, 0},
+      {"export -Z x=1", 0, 0},
+      {"export -f UID=1 x=2", 0, 0},
+      {"false && UID=1 true", 0, 0},
+      {"false && export x=1", 0, 0},
+      {"sh -c \"$(exec 2>&1; UID=$(printf skipped) true 1>&- 2>&-)\"", 0, 1},
+  };
+  /* A statically empty command name certainly fails its lookup, a
+   * shell-level error which no dependency graph models. */
+  static const char *const empty_names[] = {"UID=$(printf skipped) ''",
+                                            "UID=$(printf skipped) $''"};
+  for (size_t i = 0; i < sizeof(empty_names) / sizeof(empty_names[0]); i++)
+    CHECK(shell_dep_graph_parse(empty_names[i], strlen(empty_names[i]), "/",
+                                limits, graph) == SHELL_DEP_EUNMODELED);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    boundary_parse(source, limits, graph);
+    uint32_t environments = 0, substitutions = 0;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      environments += graph->edges[edge].type == SHELL_EDGE_ENV;
+      substitutions +=
+          graph->edges[edge].type == SHELL_EDGE_SUBST &&
+          (graph->edges[edge].flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
+    }
+    if (environments != cases[i].environments ||
+        substitutions != cases[i].substitutions)
+      fprintf(stderr, "assignment effects: %s (%u ENV, %u SUBST)\n", source,
+              environments, substitutions);
+    CHECK(environments == cases[i].environments &&
+          substitutions == cases[i].substitutions);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         other, NULL, NULL,
+                                         NULL) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    for (uint32_t nodes = 0; nodes <= graph->node_count; nodes++)
+      for (uint32_t edges = 0; edges <= graph->edge_count; edges++) {
+        shell_dep_limits_t bounded = *limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        shell_dep_error_t status =
+            shell_dep_graph_parse(source, strlen(source), "/", &bounded, other);
+        CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
+        CHECK(other->node_count <= nodes && other->edge_count <= edges &&
+              shell_dep_graph_validate(other).valid);
+        if (status == SHELL_DEP_OK)
+          CHECK(shellsplit_test_graph_equal(graph, other));
+      }
+  }
+}
+
+static void boundary_assignment_streams(shell_dep_limits_t *limits,
+                                        shell_dep_graph_t *graph,
+                                        shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    bool captured, diagnostic;
+  } cases[] = {
+      {"sh -c \"$(x=1)\"", false, false},
+      {"sh -c \"$(exec 2>&1; x=1)\"", false, false},
+      {"sh -c \"$(x=$(printf data))\"", false, false},
+      {"sh -c \"$(<<<\"$(printf data)\")\"", false, true},
+      {"sh -c \"$(UID=1)\"", false, true},
+      {"sh -c \"$(UID=1 2>&1)\"", false, true},
+      {"sh -c \"$(exec 2>&1; UID=1)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID+=1)\"", true, true},
+      {"sh -c \"$(exec 2>&1; U\\\nID=1)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID=1 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 1>&- 2>&-; UID=1)\"", false, false},
+      {"sh -c \"$(false >&- 2>&- && UID=1)\"", false, false},
+      {"sh -c \"$(exec 2>&1; UID=1 true 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID=1 command true 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID=1 builtin true 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 1>&- 2>&-; UID=1 true 1>&- 2>&-)\"", false, false},
+      {"sh -c \"$({ UID=1 true 1>&- 2>&-; } 2>&1)\"", true, true},
+      {"sh -c \"$(>out 2>&1)\"", false, true},
+      {"sh -c \"$(2>&1 >out)\"", true, true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    boundary_parse(source, limits, graph);
+    uint32_t shell = boundary_command(graph, "sh");
+    bool captured = false, diagnostic = false;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      captured |= item->type == SHELL_EDGE_SUBST && item->to == shell &&
+                  (item->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
+      const shell_dep_node_t *owner = &graph->nodes[item->from];
+      bool assignment_owner = owner->type == SHELL_NODE_GROUP;
+      if (owner->type == SHELL_NODE_CMD) {
+        const shell_dep_cmd_t *stage = &owner->cmd;
+        assignment_owner = stage->token_count == 0 ||
+                           (stage->token_lens[0] == 4 &&
+                            !memcmp(stage->tokens[0], "true", 4)) ||
+                           (stage->token_lens[0] == 7 &&
+                            (!memcmp(stage->tokens[0], "command", 7) ||
+                             !memcmp(stage->tokens[0], "builtin", 7)));
+      }
+      diagnostic |=
+          item->source_fd == 2 &&
+          (item->type == SHELL_EDGE_SUBST || item->type == SHELL_EDGE_WRITE) &&
+          item->from != shell && assignment_owner;
+    }
+    if (captured != cases[i].captured || diagnostic != cases[i].diagnostic) {
+      fprintf(stderr, "assignment stream: %s\n", source);
+      shell_dep_graph_dump(graph, stderr);
+    }
+    CHECK(captured == cases[i].captured && diagnostic == cases[i].diagnostic);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         other, NULL, NULL,
+                                         NULL) == SHELL_DEP_OK &&
+          shellsplit_test_graph_equal(graph, other));
+    for (uint32_t nodes = 0; nodes <= graph->node_count; nodes++)
+      for (uint32_t edges = 0; edges <= graph->edge_count; edges++) {
+        shell_dep_limits_t bounded = *limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        shell_dep_error_t status =
+            shell_dep_graph_parse(source, strlen(source), "/", &bounded, other);
+        CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
+        CHECK(other->node_count <= nodes && other->edge_count <= edges &&
+              shell_dep_graph_validate(other).valid);
+        if (status == SHELL_DEP_OK)
+          CHECK(shellsplit_test_graph_equal(graph, other));
+      }
+  }
+  boundary_parse("UID=1", limits, graph);
+  CHECK(boundary_route(graph, 0, 2, false, 2));
+  CHECK(!boundary_route(graph, 0, 1, false, 1) &&
+        !boundary_route(graph, 0, 0, true, 0));
+  boundary_parse("x=1", limits, graph);
+  CHECK(graph->node_count == 2 && graph->edge_count == 1 &&
+        graph->edges[0].type == SHELL_EDGE_ENV);
+  boundary_parse("exec 2>error; UID=1", limits, graph);
+  bool file_diagnostic = false;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    const shell_dep_node_t *target = &graph->nodes[item->to];
+    file_diagnostic |= item->type == SHELL_EDGE_WRITE && item->source_fd == 2 &&
+                       graph->nodes[item->from].type == SHELL_NODE_CMD &&
+                       graph->nodes[item->from].cmd.token_count == 0 &&
+                       target->type == SHELL_NODE_DOC &&
+                       target->doc.path_len == 5 &&
+                       !memcmp(target->doc.path, "error", 5);
+  }
+  CHECK(file_diagnostic);
+  static const struct {
+    const char *source;
+    bool capture;
+  } process_setup[] = {
+      {"< <(true)", false},
+      {"> >(true)", false},
+      /* Bash's file-command shortcut actually reads the process descriptor. */
+      {"sh -c \"$(< <(true))\"", true},
+      /* The consumer's own stdout still inherits the enclosing capture. */
+      {"sh -c \"$(> >(true))\"", true}};
+  for (size_t i = 0; i < sizeof(process_setup) / sizeof(process_setup[0]);
+       i++) {
+    boundary_parse(process_setup[i].source, limits, graph);
+    bool setup = false, capture = false;
+    uint32_t shell = boundary_command(graph, "sh");
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      setup |= item->type == SHELL_EDGE_FD_OPEN;
+      capture |= item->type == SHELL_EDGE_SUBST && item->to == shell &&
+                 (item->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
+    }
+    CHECK((setup || i == 2) && capture == process_setup[i].capture);
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[1024] = "";
+    for (unsigned i = 0; i < count; i++)
+      strcat(source, "UID=1 true;");
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, limits, graph);
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_DIAGNOSTIC_ROUTES);
+    unsigned height = 0;
+    for (unsigned n = count; n; n >>= 1)
+      height++;
+    CHECK(work > 0 && work <= 64 * count * height &&
+          (!previous || work <= 3 * previous));
+    previous = work;
+  }
+#endif
+}
+
+typedef struct {
+  unsigned arguments, paths;
+  bool fail;
+} boundary_nullable_resolution_t;
+
+static shell_expand_status_t
+boundary_nullable_resolve(const shell_expand_word_request_t *request,
+                          const char **netargv, size_t *length, void *context) {
+  boundary_nullable_resolution_t *fixture = context;
+  const char *word = request->source + request->word_offset;
+  if (request->purpose == SHELL_EXPAND_WORD_ARGUMENT) {
+    CHECK(request->word_length == sizeof("\"$payload\"") - 1 &&
+          !memcmp(word, "\"$payload\"", request->word_length));
+    fixture->arguments++;
+  } else {
+    CHECK(request->purpose == SHELL_EXPAND_WORD_REDIRECT_PATH &&
+          request->word_length == sizeof("\"$path\"") - 1 &&
+          !memcmp(word, "\"$path\"", request->word_length));
+    fixture->paths++;
+  }
+  *netargv = NULL;
+  *length = 0;
+  return fixture->fail ? SHELL_EXPAND_FAILED : SHELL_EXPAND_UNRESOLVED;
+}
+
+static void boundary_nullable_assignments(shell_dep_limits_t *limits,
+                                          shell_dep_graph_t *graph,
+                                          shell_dep_graph_t *other) {
+  static const struct {
+    const char *word;
+    bool survives;
+  } words[] = {
+      {"$missing", false},
+      {"${missing:-}", false},
+      {"$(true)", false},
+      {"`true`", false},
+      {"$((1+2))", false},
+      {"\"$@\"", false},
+      {"\"${@}\"", false},
+      {"\"${!prefix@}\"", false},
+      {"${!prefix*}", false},
+      {"${@:-}", false},
+      {"\"${@+data}\"", false},
+      {"\"${@:+data}\"", false},
+      {"\"${@#prefix}\"", false},
+      {"\"${@:99}\"", false},
+      {"{,}", false},
+      {"\\\n$missing\\\n", false},
+      {"''", true},
+      {"\"\"", true},
+      {"$''", true},
+      {"$'\\0'", true},
+      {"\"$missing\"", true},
+      {"\"${missing:-$@}\"", true},
+      {"\"$(true)\"", true},
+      {"\"`true`\"", true},
+      {"\"$((1+2))\"", true},
+      {"\"$*\"", true},
+      {"\"${#@}\"", true},
+      {"\"${!prefix*}\"", true},
+      {"\"${!pre\\\nfix\\\n*}\"", true},
+      {"\"${@-data}\"", true},
+      {"\"${@:-data}\"", true},
+      {"\"${@-}\"", true},
+      {"\"${@:-}\"", true},
+      {"\"${@:-\"$@\"}\"", true},
+      {"\"${@?error}\"", true},
+      {"\"${@:?error}\"", true},
+      {"\"${\\\n@:\\\n-data}\"", true},
+      {"\"${!prefix@}\"suffix", true},
+      {"\"$@\"''", true},
+      {"literal$missing", true},
+      {"$missing-suffix", true},
+      {"$missing\\ ", true},
+      {"{,}suffix", true},
+      {"{{literal}}", true},
+      {"{{,},}", false},
+      {"{a,b}", true},
+      {"{a,$missing}", true},
+      {"{\"\",}", true},
+      {"{\"$@\",}", false},
+      {"{{},}", true},
+      {"*", true},
+      {"[a]", true},
+      {"~", true},
+      {"<(true)", true},
+      {"\\$missing", true},
+      {"$", true},
+  };
+  for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+    CHECK(shell_builtin_word_guarantees_argument(
+              words[i].word, strlen(words[i].word)) == words[i].survives);
+  /* Nonempty lists need not be scalar: getopts still cannot prove which
+   * expanded word supplies its destination. Keep its exact-word boundary. */
+  const char *multiple = "getopts \"${@:-ab}\" option";
+  CHECK(!shell_builtin_parameter_is_scalar("${@:-ab}", sizeof("${@:-ab}") - 1));
+  CHECK(shell_dep_graph_parse(multiple, strlen(multiple), "/", limits, graph) ==
+        SHELL_DEP_EPARSE);
+  CHECK(graph->node_count == 0 && graph->edge_count == 0);
+  static const struct {
+    const char *source;
+    bool cwd_known;
+  } continuation[] = {
+      {"UID=${missing:?rhs} $maybe; printf after", false},
+      {"UID=${missing:?rhs} $maybe && printf after", false},
+      {"! UID=${missing:?rhs} $maybe || printf after", false},
+      {"{ UID=${missing:?rhs} $maybe; } && printf after", false},
+      {"(UID=${missing:?rhs} $maybe); printf after", true},
+      {"UID=${missing:?rhs} $maybe & printf after", true},
+      {"UID=$(printf data) $maybe 1>&- 2>&-; printf after", false},
+      {"exec 3>&1; UID=${missing:?rhs} $maybe 3>&-; printf after >&3", false},
+      /* The setup may succeed, so `$maybe` may run and change directory. */
+      {"IFS=0123456789 UID=1 $maybe 4>fail\n"
+       "exec {fd}>&1; printf after >&\"$fd\"",
+       false},
+  };
+  for (unsigned i = 0; i < sizeof(continuation) / sizeof(continuation[0]);
+       i++) {
+    boundary_parse(continuation[i].source, limits, graph);
+    uint32_t after = UINT32_MAX;
+    for (uint32_t node = 0; node < graph->node_count; node++)
+      if (graph->nodes[node].type == SHELL_NODE_CMD &&
+          graph->nodes[node].cmd.token_count == 2 &&
+          graph->nodes[node].cmd.token_lens[1] == 5 &&
+          !memcmp(graph->nodes[node].cmd.tokens[1], "after", 5))
+        after = node;
+    CHECK(after != UINT32_MAX && boundary_route(graph, after, 1, false, 1));
+    CHECK(graph->nodes[after].cmd.cwd_known == continuation[i].cwd_known);
+  }
+
+  /* A rejected RHS runs only on the null path, where preceding IFS commits
+   * are visible. Its printf then meets an ambiguous redirect: a certain
+   * shell-level error, so no dependency graph models the input. */
+  {
+    static const char source[] =
+        "IFS=0123456789 UID=$(exec {fd}>&1; printf rhs >&$fd) $maybe";
+    CHECK(shell_dep_graph_parse(source, sizeof(source) - 1, "/", limits,
+                                graph) == SHELL_DEP_EUNMODELED);
+  }
+
+  /* A prefix committed before the readonly error invalidates its old named
+   * descriptor proof. Mixed IFS/descriptor facts must not select the valid
+   * executable alternative and silently discard the null one. */
+  static const char *const unresolved[] = {
+      "exec {fd}>out; fd=changed UID=$(printf rhs >&\"$fd\") $maybe",
+      "IFS=0123456789 x=$(exec {fd}>&1; printf rhs >&$fd) UID=1 $maybe",
+      ("IFS=0123456789 UID=1 $maybe 4>fail\n"
+       "exec {fd}>&1; printf after >&$fd"),
+  };
+  for (unsigned i = 0; i < sizeof(unresolved) / sizeof(unresolved[0]); i++) {
+    CHECK(shell_dep_graph_parse(unresolved[i], strlen(unresolved[i]), "/",
+                                limits, graph) == SHELL_DEP_EPARSE);
+    CHECK(graph->node_count == 0 && graph->edge_count == 0);
+  }
+  /* A certainly failing setup is a shell-level error: no model. */
+  {
+    static const char source[] =
+        "exec {fd}>out; fd=changed UID=1 $maybe 4>\"\" || "
+        "printf after >&\"$fd\"";
+    CHECK(shell_dep_graph_parse(source, sizeof(source) - 1, "/", limits,
+                                graph) == SHELL_DEP_EUNMODELED);
+  }
+
+  static const char *const resolved[] = {
+      "UID=$(printf '%s' \"$payload\") $maybe >\"$path\"",
+      "UID=$(printf '%s' \"$payload\") \"$maybe\" >\"$path\"",
+      "UID=$(printf '%s' \"$payload\") \"${!prefix*}\" >\"$path\"",
+      "UID=$(printf '%s' \"$payload\") \"${!prefix@}\" >\"$path\"",
+      "UID=$(printf '%s' \"$payload\") \"${@:-data}\" >\"$path\"",
+  };
+  for (unsigned i = 0; i < sizeof(resolved) / sizeof(resolved[0]); i++) {
+    boundary_nullable_resolution_t fixture = {0};
+    boundary_parse(resolved[i], limits, graph);
+    CHECK(shell_dep_graph_parse_resolved(
+              resolved[i], strlen(resolved[i]), "/", limits, other,
+              boundary_nullable_resolve, &fixture, NULL) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+    CHECK(fixture.arguments == (i == 0 || i == 3 ? 1u : 0u) &&
+          fixture.paths == 1);
+  }
+  boundary_nullable_resolution_t failure = {.fail = true};
+  CHECK(shell_dep_graph_parse_resolved(resolved[0], strlen(resolved[0]), "/",
+                                       limits, other, boundary_nullable_resolve,
+                                       &failure, NULL) == SHELL_DEP_EEXPAND);
+  CHECK(other->node_count == 0 && other->edge_count == 0);
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+  for (unsigned count = 32; count <= 256; count *= 2) {
+    char source[4096] = "UID=$(printf data) ";
+    for (unsigned word = 0; word < count; word++)
+      strcat(source, "$missing\\\n");
+    strcat(source, "$missing");
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, limits, graph);
+    size_t work = shellsplit_test_source_scan_work();
+    CHECK(work > 0 && work <= 256 * strlen(source) &&
+          (!previous || work <= 3 * previous));
+    CHECK(boundary_command(graph, "printf") != UINT32_MAX);
+    previous = work;
+  }
+  previous = 0;
+  for (unsigned count = 32; count <= 256; count *= 2) {
+    char source[4096] = "UID=$(printf skipped) \"${!";
+    for (unsigned byte = 0; byte < count; byte++)
+      strcat(source, "p\\\n");
+    strcat(source, "*}\"");
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, limits, graph);
+    size_t work = shellsplit_test_source_scan_work();
+    CHECK(work > 0 && work <= 256 * strlen(source) &&
+          (!previous || work <= 3 * previous));
+    CHECK(boundary_command(graph, "printf") == UINT32_MAX);
+    previous = work;
+  }
+#endif
+}
+
+static void boundary_diagnostic_flows(shell_dep_limits_t *limits,
+                                      shell_dep_graph_t *graph,
+                                      shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    bool capture;
+  } cases[] = {
+      {"sh -c \"$(echo 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(echo >/missing/x 2>&1)\"", false},
+      {"sh -c \"$(echo >/missing/x)\"", false},
+      {"sh -c \"$(echo 2>&- >/missing/x)\"", false},
+      {"sh -c \"$(2>&1 >/missing/x)\"", true},
+      {"sh -c \"$({ echo body; } 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$( (echo body) 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(time echo 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(false && echo 2>&1 >/missing/x)\"", false},
+      {"sh -c \"$(true || echo 2>&1 >/missing/x)\"", false},
+      {"sh -c \"$(echo 2>&1 >/missing/x)\"", true},
+      {"sh -c \"$(echo >/missing/x 2>&1)\"", false},
+      {"cat <(echo 2>&1 >/missing/x)", true},
+      {"cat <(echo >/missing/x 2>&1)", false},
+      {"sh -c \"$(echo 2>&1 1>/missing/x)\"", true},
+      {"sh -c \"$(echo 2>&1 {fd}>/missing/x)\"", true},
+      {"sh -c \"$(exec 2>&1; echo ok &)\"", true},
+      {"exec 10>&-; sh -c \"$(: 2>&1 10>&- 4>/missing/x)\"", true},
+      {"exec 63<<<seed; sh -c \"$(read -u63 -n0 probe; "
+       "{ true 2>&1 5>left 6>right 7>/missing/x; })\"",
+       true},
+      {"exec 63<<<seed; sh -c \"$(read -u63 -n0 probe; "
+       "{ true 5>left 6>right 2>&- 7>/missing/x; })\"",
+       false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i].source, limits, graph);
+    bool capture = false;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      capture |= item->type == SHELL_EDGE_SUBST && item->source_fd == 2;
+      if (item->type == SHELL_EDGE_WRITE && item->source_fd == 2 &&
+          graph->nodes[item->to].type == SHELL_NODE_ENDPOINT)
+        for (uint32_t out = 0; out < graph->edge_count; out++)
+          capture |= graph->edges[out].type == SHELL_EDGE_SUBST &&
+                     graph->edges[out].from == item->to;
+    }
+    if (capture != cases[i].capture)
+      fprintf(stderr, "diagnostic capture: %s\n", cases[i].source);
+    CHECK(capture == cases[i].capture);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(cases[i].source, strlen(cases[i].source), NULL,
+                           &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(cases[i].source,
+                                          strlen(cases[i].source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_failure_cleanup_reference(true);
+    boundary_parse(cases[i].source, limits, other);
+    shellsplit_test_failure_cleanup_reference(false);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+#endif
+  }
+  /* The group saves fd 2 at fd 10, and the persistent close destroys that
+   * save: Bash cannot restore fd 2 (reference Bash captures "10: Bad file
+   * descriptor"). No dependency model. */
+  static const char destroyed[] =
+      "exec 10>&-; sh -c \"$({ exec 10>&-; } 2>&1)\"";
+  CHECK(shell_dep_graph_parse(destroyed, sizeof(destroyed) - 1, "/", limits,
+                              graph) == SHELL_DEP_EUNMODELED);
+  boundary_parse("echo 2>&1 >/missing/x | cat", limits, graph);
+  uint32_t echo = boundary_command(graph, "echo"),
+           cat = boundary_command(graph, "cat");
+  bool piped = false;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    piped |= item->type == SHELL_EDGE_PIPE && item->from == echo &&
+             item->to == cat && item->source_fd == 2 && item->target_fd == 0;
+  }
+  CHECK(piped);
+  /* More than 16 distinct prefix sinks fit the graph. Split into three
+   * owners to stay within the independent per-command lexical token bound. */
+  char source[1024] = ":;";
+  for (unsigned owner = 0; owner < 3; owner++) {
+    strcat(source, " echo");
+    for (unsigned i = 0; i < 8; i++) {
+      char redirect[32];
+      snprintf(redirect, sizeof(redirect), " 2>error%u", owner * 8 + i);
+      strcat(source, redirect);
+    }
+    strcat(source, " >/missing/x;");
+  }
+  boundary_parse(source, limits, graph);
+  unsigned destinations = 0;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->type == SHELL_EDGE_WRITE &&
+        graph->nodes[item->from].type == SHELL_NODE_CMD &&
+        item->source_fd == 2 && graph->nodes[item->to].type == SHELL_NODE_DOC)
+      destinations++;
+  }
+  CHECK(destinations == 24);
+  for (unsigned nodes = 0; nodes <= 8; nodes++)
+    for (unsigned edges = 0; edges <= 12; edges++) {
+      shell_dep_limits_t bounded = *limits;
+      bounded.max_nodes = nodes;
+      bounded.max_edges = edges;
+      const char *limited_source = cases[0].source;
+      shell_dep_error_t status = shell_dep_graph_parse(
+          limited_source, strlen(limited_source), "/", &bounded, other);
+      CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
+      CHECK(other->node_count <= nodes && other->edge_count <= edges &&
+            shell_dep_graph_validate(other).valid);
+      if (status == SHELL_DEP_OK) {
+        bool captured = false;
+        for (uint32_t edge = 0; edge < other->edge_count; edge++)
+          captured |= other->edges[edge].type == SHELL_EDGE_SUBST &&
+                      other->edges[edge].source_fd == 2;
+        CHECK(captured);
+      }
+    }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  shellsplit_test_failure_cleanup_reference(true);
+  boundary_parse(source, limits, other);
+  shellsplit_test_failure_cleanup_reference(false);
+  CHECK(shellsplit_test_graph_equal(graph, other));
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    strcpy(source, ":;");
+    for (unsigned i = 0; i < count; i++) {
+      char stage[40];
+      snprintf(stage, sizeof(stage), " echo 2>error%u >/missing/x;", i);
+      strcat(source, stage);
+    }
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, limits, graph);
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_DIAGNOSTIC_ROUTES);
+    unsigned height = 0;
+    for (unsigned size = count; size; size >>= 1)
+      height++;
+    CHECK(work > 0 && work <= 64 * count * height &&
+          (!previous || work <= 3 * previous));
+    previous = work;
+  }
+#endif
+}
+
+/* UINT32_MAX selects any consumer. Index collectors once so exact-consumer
+ * assertions do not rescan the edge stream for every diagnostic producer. */
+static bool boundary_captured_stderr(const shell_dep_graph_t *graph,
+                                     uint32_t consumer) {
+  bool collectors[SHELL_DEP_MAX_NODES] = {false};
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->type != SHELL_EDGE_SUBST ||
+        (consumer != UINT32_MAX && item->to != consumer))
+      continue;
+    if (item->source_fd == 2)
+      return true;
+    collectors[item->from] = true;
+  }
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->type == SHELL_EDGE_WRITE && item->source_fd == 2 &&
+        graph->nodes[item->to].type == SHELL_NODE_ENDPOINT &&
+        collectors[item->to])
+      return true;
+  }
+  return false;
+}
+
+static void boundary_expansion_diagnostics(shell_dep_limits_t *limits,
+                                           shell_dep_graph_t *graph,
+                                           shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    bool capture;
+  } cases[] = {
+      {"sh -c \"$(exec 2>&1; x=${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(exec 2>&1; x=$((1/0)))\"", true},
+      {"sh -c \"$(exec 2>&1; x=${value:1/0})\"", true},
+      {"sh -c \"$(exec 2>&1; x=${missing:?expansion-marker} 1>&- 2>&-)\"",
+       true},
+      {"sh -c \"$(exec 2>&1; : ${missing:?expansion-marker} 1>&- 2>&-)\"",
+       true},
+      {"sh -c \"$(exec 2>&1; x=$((1/0)) true 1>&- 2>&-)\"", true},
+      {"sh -c \"$(exec 2>&1; export x=${missing:?expansion-marker} 1>&- "
+       "2>&-)\"",
+       true},
+      {"sh -c \"$(x=${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$(exec 2>&-; x=${missing:?expansion-marker})\"", false},
+      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && "
+       "x=${missing:?expansion-marker})\"",
+       false},
+      {"sh -c \"$(exec 2>&1; true 1>&- 2>&- || x=$((1/0)))\"", false},
+      {"sh -c \"$(exec 2>&1; UID=${missing:?expansion-marker} true 1>&- "
+       "2>&-)\"",
+       true},
+      {"sh -c \"$(x=1)\"", false},
+      {"sh -c \"$(exec 2>&1; x='${missing:?literal}')\"", false},
+      {"sh -c \"$(: 2>&1 >${missing:?expansion-marker} 2>&-)\"", true},
+      {"sh -c \"$(: >${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$(: 2>&- >${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$(: 2>&1 >/missing/x >${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(: 2>&1 <<<$((1/0)) 2>&-)\"", true},
+      {"sh -c \"$(: <<<$((1/0)) 2>&1 1>&- 2>&-)\"", false},
+      {"sh -c \"$(: 2>&1 <<EOF 2>&-\n${missing:?expansion-marker}\nEOF\n)\"",
+       true},
+      {"sh -c \"$(: <<EOF 2>&1 1>&- "
+       "2>&-\n${missing:?expansion-marker}\nEOF\n)\"",
+       false},
+      {"sh -c \"$(: <<'EOF' 1>&- 2>&-\n${missing:?literal}\nEOF\n)\"", false},
+      {"sh -c \"$(exec 2<input; x=${missing:?expansion-marker})\"", false},
+      {"sh -c \"$({ :; } 2>&1 >${missing:?expansion-marker})\"", true},
+      {"sh -c \"$({ :; } >${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$( (x=${missing:?expansion-marker}) 2>&1)\"", true},
+      {"cat <(exec 2>&1; x=$((1/0)))", true},
+      {"sh -c \"$(exec 2>&1; x=$(exec 2>&1; y=$((1/0))))\"", true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    boundary_parse(source, limits, graph);
+    if (boundary_captured_stderr(graph, UINT32_MAX) != cases[i].capture)
+      fprintf(stderr, "expansion diagnostic: %s\n", source);
+    CHECK(boundary_captured_stderr(graph, UINT32_MAX) == cases[i].capture);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+
+  /* A failed RHS is shell stderr, even when there is no executable argv.
+   * Its incoming binding must survive the command's later close operations. */
+  boundary_parse("exec 2>&1; x=$((1/0)) 1>&- 2>&-", limits, graph);
+  uint32_t assignment = UINT32_MAX;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_CMD &&
+        !graph->nodes[node].cmd.token_count)
+      assignment = node;
+  CHECK(assignment != UINT32_MAX &&
+        boundary_route(graph, assignment, 2, false, 1));
+  CHECK(!boundary_route(graph, assignment, 0, true, 0) &&
+        !boundary_route(graph, assignment, 1, false, 1));
+
+  boundary_parse("exec 2>errors; x=$((1/0)) 2>&-", limits, graph);
+  bool written = false;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    if (item->type == SHELL_EDGE_WRITE && item->source_fd == 2 &&
+        graph->nodes[item->to].type == SHELL_NODE_DOC &&
+        graph->nodes[item->to].doc.path_len == 6 &&
+        !memcmp(graph->nodes[item->to].doc.path, "errors", 6))
+      written = true;
+  }
+  CHECK(written);
+  boundary_parse("{ x=$((1/0)); } 2>&1 | cat", limits, graph);
+  bool piped = false;
+  for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph->edges[edge];
+    piped |= item->type == SHELL_EDGE_PIPE && item->source_fd == 2 &&
+             item->to == boundary_command(graph, "cat") && item->target_fd == 0;
+  }
+  CHECK(piped);
+
+  static const char *const limited_sources[] = {
+      "sh -c \"$(exec 2>&1; x=${missing:?expansion-marker})\"",
+      "sh -c \"$(exec 2>&1; x=$((1/0)))\"",
+      "sh -c \"$(: 2>&1 >${missing:?expansion-marker} 2>&-)\"",
+      "sh -c \"$(: 2>&1 <<<$((1/0)) 2>&-)\"",
+      "sh -c \"$(: 2>&1 <<EOF 2>&-\n${missing:?expansion-marker}\nEOF\n)\"",
+  };
+  for (size_t i = 0; i < sizeof(limited_sources) / sizeof(limited_sources[0]);
+       i++) {
+    const char *source = limited_sources[i];
+    for (unsigned nodes = 0; nodes <= 12; nodes++)
+      for (unsigned edges = 0; edges <= 18; edges++) {
+        shell_dep_limits_t bounded = *limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        shell_dep_error_t status =
+            shell_dep_graph_parse(source, strlen(source), "/", &bounded, other);
+        CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
+        CHECK(other->node_count <= nodes && other->edge_count <= edges &&
+              shell_dep_graph_validate(other).valid);
+        CHECK(status != SHELL_DEP_OK ||
+              boundary_captured_stderr(other, UINT32_MAX));
+      }
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[4096] = "";
+    for (unsigned i = 0; i < count; i++) {
+      strcat(source, ": <<<$((1/0));");
+    }
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, limits, graph);
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_DIAGNOSTIC_ROUTES);
+    unsigned height = 0;
+    for (unsigned size = count; size; size >>= 1)
+      height++;
+    CHECK(work > 0 && work <= 128 * count * height &&
+          (!previous || work <= 3 * previous));
+    previous = work;
+  }
+#endif
+}
+
+typedef struct {
+  const char *value;
+  shell_expand_status_t status;
+  unsigned calls;
+} boundary_file_diagnostic_resolution_t;
+
+static shell_expand_status_t
+boundary_file_diagnostic_resolve(const shell_expand_word_request_t *request,
+                                 const char **netargv, size_t *length,
+                                 void *context) {
+  boundary_file_diagnostic_resolution_t *fixture = context;
+  if (request->purpose != SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH)
+    return SHELL_EXPAND_UNRESOLVED;
+  fixture->calls++;
+  *netargv = fixture->value;
+  *length = fixture->value ? strlen(fixture->value) : 0;
+  return fixture->status;
+}
+
+static void boundary_file_diagnostics(shell_dep_limits_t *limits,
+                                      shell_dep_graph_t *graph,
+                                      shell_dep_graph_t *other) {
+  static const struct {
+    const char *source;
+    bool captured;
+  } cases[] = {
+      {"sh -c \"$(exec 2>&1; x=$(<input))\"", true},
+      {"sh -c \"$(x=$(<input))\"", false},
+      {"sh -c \"$(exec 2>&-; x=$(<input))\"", false},
+      {"sh -c \"$(exec 2<input; x=$(<input))\"", false},
+      {"sh -c \"$(exec 2>&1; x=$(<input) 1>&- 2>&-)\"", true},
+      {"sh -c \"$(x=$(<input) 2>&1)\"", false},
+      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && x=$(<input))\"", false},
+      {"sh -c \"$(exec 2>&1; x=$(< <(true 1>&- 2>&-)))\"", true},
+      {"sh -c \"$(exec 2>&1; x=$(<$(printf input)))\"", true},
+      {"sh -c \"$(: 2>&1 >$(<input) 1>&- 2>&-)\"", true},
+      {"sh -c \"$(: >$(<input) 2>&1 1>&- 2>&-)\"", false},
+      {"sh -c \"$(: 2>&1 <<<\"$(<input)\" 1>&- 2>&-)\"", true},
+      {"sh -c \"$({ :; } 2>&1 >$(<input))\"", true},
+      {"sh -c \"$(exec 2>&1; x=$(y=$(<input)))\"", true},
+      {"sh -c \"$(x=$(exec 2>&1; y=$(<input)))\"", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    boundary_parse(source, limits, graph);
+    uint32_t shell = boundary_command(graph, "sh");
+    CHECK(shell != UINT32_MAX);
+    if (boundary_captured_stderr(graph, shell) != cases[i].captured)
+      fprintf(stderr, "file diagnostic receiver: %s\n", source);
+    CHECK(boundary_captured_stderr(graph, shell) == cases[i].captured);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/", limits,
+                                          &fast, other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         other, NULL, NULL,
+                                         NULL) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+
+  static const struct {
+    const char *word, *value;
+    shell_expand_status_t status;
+    bool failed;
+  } values[] = {
+      {"\"$FILE\"", "0:,", SHELL_EXPAND_RESOLVED, true},
+      {"\"$@\"", NULL, SHELL_EXPAND_RESOLVED, true},
+      {"\"$@\"", "1:a,1:b,", SHELL_EXPAND_RESOLVED, true},
+      {"\"$FILE\"", "10:/tmp/input,", SHELL_EXPAND_RESOLVED, false},
+      {"\"$FILE\"", NULL, SHELL_EXPAND_UNRESOLVED, false},
+  };
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    char source[128];
+    snprintf(source, sizeof(source), "sh -c \"$(exec 2>&1; x=$(<%s))\"",
+             values[i].word);
+    boundary_file_diagnostic_resolution_t fixture = {values[i].value,
+                                                     values[i].status, 0};
+    /* A resolved pathname which is empty or several words certainly fails:
+     * a shell-level error which no dependency graph models. */
+    if (values[i].failed) {
+      CHECK(shell_dep_graph_parse_resolved(
+                source, strlen(source), "/", limits, graph,
+                boundary_file_diagnostic_resolve, &fixture,
+                NULL) == SHELL_DEP_EUNMODELED);
+      CHECK(fixture.calls == 1);
+      continue;
+    }
+    CHECK(shell_dep_graph_parse_resolved(source, strlen(source), "/", limits,
+                                         graph,
+                                         boundary_file_diagnostic_resolve,
+                                         &fixture, NULL) == SHELL_DEP_OK);
+    CHECK(fixture.calls == 1 && shell_dep_graph_validate(graph).valid);
+    uint32_t shell = boundary_command(graph, "sh");
+    CHECK(shell != UINT32_MAX && boundary_captured_stderr(graph, shell));
+    unsigned content = 0;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      content += item->type == SHELL_EDGE_SUBST &&
+                 graph->nodes[item->from].type == SHELL_NODE_DOC;
+    }
+    CHECK(content == !values[i].failed);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+    shell_expand_cache_t cache;
+    shell_dep_limits_t resolved = *limits;
+    fixture.calls = 0;
+    CHECK(shell_expand_cache_init(
+        boundary_file_diagnostic_resolve, &fixture, source, strlen(source),
+        false, limits->workspace, limits->workspace_size, &cache,
+        &resolved.workspace, &resolved.workspace_size));
+    shell_dep_word_resolver_t resolver = {shell_expand_resolve, &cache};
+    uint8_t unresolved[SHELL_DEP_MAX_NODES];
+    CHECK(shell_dep_graph_parse_with_fast_resolver(
+              source, strlen(source), "/", &resolved, &fast, other, &resolver,
+              unresolved) == SHELL_DEP_OK);
+    CHECK(fixture.calls == 1 && shellsplit_test_graph_equal(graph, other));
+    for (unsigned nodes = 0; nodes <= 10; nodes++)
+      for (unsigned edges = 0; edges <= 14; edges++) {
+        shell_dep_limits_t bounded = *limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        fixture.calls = 0;
+        shell_dep_error_t error = shell_dep_graph_parse_resolved(
+            source, strlen(source), "/", &bounded, other,
+            boundary_file_diagnostic_resolve, &fixture, NULL);
+        CHECK(error == SHELL_DEP_OK || error == SHELL_DEP_ETRUNC);
+        CHECK(fixture.calls <= 1 && other->node_count <= nodes &&
+              other->edge_count <= edges &&
+              shell_dep_graph_validate(other).valid);
+        CHECK(error != SHELL_DEP_OK ||
+              shellsplit_test_graph_equal(graph, other));
+      }
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[4096] = "";
+    for (unsigned i = 0; i < count; i++)
+      strcat(source, "x=$(<input);");
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, limits, graph);
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_DIAGNOSTIC_ROUTES);
+    unsigned height = 0;
+    for (unsigned size = count; size; size >>= 1)
+      height++;
+    CHECK(work > 0 && work <= 128 * count * height &&
+          (!previous || work <= 3 * previous));
+    previous = work;
+  }
+#endif
+}
+
+static void boundary_terminal_pipe_capacity(shell_dep_limits_t *limits,
+                                            shell_dep_graph_t *graph,
+                                            shell_dep_graph_t *other) {
+  const char *regression = "echo 2>&1 >/missing/x | cat <input";
+  shell_dep_limits_t bounded = *limits;
+  bounded.max_nodes = 5;
+  bounded.max_edges = 3;
+  CHECK(shell_dep_graph_parse(regression, strlen(regression), "/", &bounded,
+                              other) == SHELL_DEP_ETRUNC);
+  CHECK(other->node_count <= 5 && other->edge_count <= 3 &&
+        shell_dep_graph_validate(other).valid);
+
+  static const struct {
+    const char *source;
+    uint32_t producers;
+    bool diagnostic, timer_pipe;
+  } cases[] = {
+      {"echo 2>&1 >/missing/x | cat <input", 1, true, false},
+      {"echo 2>&1 >/missing/x | cat <&-", 1, true, false},
+      {"{ echo 2>&1 >/missing/x; } | cat <input", 2, true, false},
+      {"(echo 2>&1 >/missing/x) | cat <input", 2, true, false},
+      {"time echo 2>&1 >/missing/x | cat <input", 1, true, false},
+      {"echo | : <&-", 1, false, false},
+      {"echo | cat <input", 1, false, false},
+      {"{ echo one; echo two; } 2>&1 | cat <input", 2, false, false},
+      {"{ time echo; } 2>&1 | cat <input", 3, false, true},
+      {"printf '%s' \"$(echo 2>&1 >/missing/x | cat <input)\"", 1, true, false},
+      {"cat <(echo 2>&1 >/missing/x | cat <input)", 1, true, false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    size_t length = strlen(source);
+    boundary_parse(source, limits, graph);
+    uint32_t terminal = UINT32_MAX;
+    for (uint32_t node = 0; node < graph->node_count; node++)
+      if (graph->nodes[node].type == SHELL_NODE_ENDPOINT) {
+        CHECK(terminal == UINT32_MAX);
+        terminal = node;
+      }
+    CHECK(terminal != UINT32_MAX);
+    uint32_t producers = 0;
+    uint32_t echo = boundary_command(graph, "echo");
+    bool diagnostic_pipe = false, timer_pipe = false;
+    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph->edges[edge];
+      if (item->type == SHELL_EDGE_PIPE && item->to == terminal) {
+        CHECK(item->target_fd == 0 && item->flags == 0);
+        producers++;
+        diagnostic_pipe |= item->from == echo && item->source_fd == 2;
+        if (graph->nodes[item->from].type == SHELL_NODE_TIME) {
+          const shell_dep_time_t *time = &graph->nodes[item->from].time;
+          CHECK(item->source_fd == 2 &&
+                time->report_route == SHELL_TIME_REPORT_GRAPH &&
+                time->report_external_fd_count == 0);
+          timer_pipe = true;
+        }
+      }
+    }
+    CHECK(producers == cases[i].producers &&
+          timer_pipe == cases[i].timer_pipe &&
+          (!cases[i].diagnostic || diagnostic_pipe));
+
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+    for (uint32_t nodes = 0; nodes <= graph->node_count + 1; nodes++)
+      for (uint32_t edges = 0; edges <= graph->edge_count + 1; edges++) {
+        bounded = *limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        for (unsigned api = 0; api < 3; api++) {
+          shell_dep_error_t status =
+              api == 0
+                  ? shell_dep_graph_parse(source, length, "/", &bounded, other)
+              : api == 1
+                  ? shell_dep_graph_parse_with_fast(source, length, "/",
+                                                    &bounded, &fast, other)
+                  : shell_dep_graph_parse_resolved(
+                        source, length, "/", &bounded, other, NULL, NULL, NULL);
+          bool valid =
+              (status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC) &&
+              other->node_count <= nodes && other->edge_count <= edges &&
+              shellsplit_test_depgraph_invariants(source, length, status, other,
+                                                  &bounded);
+          if (!valid)
+            fprintf(stderr,
+                    "terminal capacity: %s (api=%u nodes=%u edges=%u "
+                    "status=%d)\n",
+                    source, api, nodes, edges, status);
+          CHECK(valid);
+          if (status == SHELL_DEP_OK)
+            CHECK(shellsplit_test_graph_equal(graph, other));
+        }
+      }
+  }
+}
+
+static int run_boundary(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  shellsplit_graph_fixture_t fixture;
+  CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_RESOLVED,
+                                      4096, 2, false, 0));
+  shell_dep_limits_t limits = fixture.limits;
+  shell_dep_graph_t *graph = fixture.graph[0];
+  shell_dep_graph_t *other = fixture.graph[1];
+  boundary_background_newlines(&limits, graph, other);
+  boundary_async_completion(&limits, graph, other);
+  boundary_async_inputs(&limits, graph, other);
+  boundary_standard_directions(&limits, graph, other);
+  boundary_timing_destinations(&limits, graph, other);
+  boundary_recovery_resolution(&limits, graph, other);
+  boundary_cd_commands(&limits, graph, other);
+  boundary_owner_stream_inventory(&limits, graph, other);
+  boundary_assignment_effects(&limits, graph, other);
+  boundary_assignment_streams(&limits, graph, other);
+  boundary_nullable_assignments(&limits, graph, other);
+  boundary_diagnostic_flows(&limits, graph, other);
+  boundary_expansion_diagnostics(&limits, graph, other);
+  boundary_file_diagnostics(&limits, graph, other);
+  boundary_terminal_pipe_capacity(&limits, graph, other);
+  boundary_diagnostic_resolution(&limits, graph, other);
+  char exact[512] = "";
+  for (unsigned i = 0; i < 64; i++)
+    strcat(exact, i == 0 ? "wc" : ";wc");
+  static const char *const trivia[] = {"", ";", " \n", "; \n# end\n"};
+  size_t exact_length = strlen(exact);
+  for (unsigned i = 0; i < sizeof(trivia) / sizeof(trivia[0]); i++) {
+    strcpy(exact + exact_length, trivia[i]);
+    boundary_parse(exact, &limits, graph);
+    CHECK(graph->node_count == 67 && graph->edge_count == 255);
+  }
+  strcpy(exact + exact_length, ";wc");
+  CHECK(shell_dep_graph_parse(exact, strlen(exact), "/", &limits, graph) ==
+        SHELL_DEP_ETRUNC);
+  CHECK(graph->node_count == 67 && graph->edge_count == 255 &&
+        shell_dep_graph_validate(graph).valid);
+
+  static const char *const async_capacity[] = {
+      "wc &",
+      "wc &\nwait",
+      "exec 0<&- && true &\ncat",
+      "{ wc; } &",
+      "time wc &",
+      "true && wc &",
+      "printf '%s' \"$(wc)\" &",
+      "wc 0>&1",
+      "wc 1<&0",
+      "UID=1\ntrue && wc & wait",
+      "probe && exec 2>&1; time wc",
+  };
+  for (unsigned source = 0;
+       source < sizeof(async_capacity) / sizeof(async_capacity[0]); source++)
+    for (unsigned nodes = 0; nodes <= 8; nodes++)
+      for (unsigned edges = 0; edges <= 15; edges++) {
+        shell_dep_limits_t bounded = limits;
+        bounded.max_nodes = nodes;
+        bounded.max_edges = edges;
+        shell_dep_error_t error = shell_dep_graph_parse(
+            async_capacity[source], strlen(async_capacity[source]), "/",
+            &bounded, graph);
+        CHECK(error == SHELL_DEP_OK || error == SHELL_DEP_ETRUNC);
+        CHECK(graph->node_count <= nodes && graph->edge_count <= edges &&
+              shell_dep_graph_validate(graph).valid);
+        (void)boundary_implicit_input(graph);
+      }
+
+  static const struct {
+    const char *source;
+    uint32_t stdout_fd, stderr_fd;
+    const char *stdout_file, *stderr_file;
+  } cases[] = {
+      {"wc -l file.txt", 1, 2, NULL, NULL},
+      {"wc -l file.txt 2>&1", 1, 1, NULL, NULL},
+      {"wc -l file.txt 1>&2", 2, 2, NULL, NULL},
+      {"wc -l file.txt 2>&1 >out", SHELL_DEP_FD_NONE, 1, "out", NULL},
+      {"wc -l file.txt >out 2>&1", SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE, "out",
+       "out"},
+      {"wc -l file.txt 2>&-", 1, SHELL_DEP_FD_NONE, NULL, NULL},
+      {"wc -l file.txt 2>&2-", 1, 2, NULL, NULL},
+      {"exec 3>&1; wc -l file.txt 1>&3-", 1, 2, NULL, NULL},
+      {"exec {fd}>&1; wc -l file.txt 2>&$fd", 1, 1, NULL, NULL},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    boundary_parse(cases[i].source, &limits, graph);
+    uint32_t owner = boundary_command(graph, "wc");
+    CHECK(owner != UINT32_MAX && boundary_route(graph, owner, 0, true, 0));
+    for (uint32_t fd = 1; fd <= 2; fd++) {
+      uint32_t inherited = fd == 1 ? cases[i].stdout_fd : cases[i].stderr_fd;
+      const char *file = fd == 1 ? cases[i].stdout_file : cases[i].stderr_file;
+      unsigned destinations = 0;
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
+        const shell_dep_edge_t *item = &graph->edges[edge];
+        if (item->type != SHELL_EDGE_WRITE || item->from != owner ||
+            item->source_fd != fd)
+          continue;
+        const shell_dep_node_t *target = &graph->nodes[item->to];
+        bool failed_open = i == 4 && fd == 2 && target->type == SHELL_NODE_FD &&
+                           target->fd.number == 2;
+        if (file && !failed_open)
+          CHECK(target->type == SHELL_NODE_DOC &&
+                target->doc.kind == SHELL_DOC_FILE &&
+                target->doc.path_len == strlen(file) &&
+                !memcmp(target->doc.path, file, strlen(file)));
+        else if (!failed_open)
+          CHECK(target->type == SHELL_NODE_FD &&
+                target->fd.number == inherited);
+        destinations++;
+      }
+      CHECK(destinations == (file || inherited != SHELL_DEP_FD_NONE ? 1u : 0u) +
+                                (i == 4 && fd == 2 ? 1u : 0u));
+    }
+  }
+
+  boundary_parse("wc -l file.txt", &limits, graph);
+  CHECK(graph->node_count == 5 && graph->edge_count == 4);
+  boundary_parse("wc -l file.txt 2>&1", &limits, graph);
+  /* Both sparse stdout/stderr slots retain their available read/write halves.
+   */
+  CHECK(graph->node_count == 4 && graph->edge_count == 6);
+  uint32_t external = UINT32_MAX;
+  for (uint32_t i = 0; i < graph->node_count; i++)
+    if (graph->nodes[i].type == SHELL_NODE_FD)
+      external = i;
+  CHECK(external != UINT32_MAX);
+  *other = *graph;
+  other->nodes[external].fd.number = SHELL_DEP_FD_NONE;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->nodes[other->node_count++] = graph->nodes[external];
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->nodes[other->node_count++] =
+      (shell_dep_node_t){.type = SHELL_NODE_FD, .fd = {.number = 3}};
+  CHECK(!shell_dep_graph_validate(other).valid);
+  *other = *graph;
+  other->edges[other->edge_count - 1].type = SHELL_EDGE_PIPE;
+  CHECK(!shell_dep_graph_validate(other).valid);
+  boundary_parse("time wc", &limits, graph);
+  *other = *graph;
+  for (uint32_t i = 0; i < other->node_count; i++)
+    if (other->nodes[i].type == SHELL_NODE_TIME)
+      other->nodes[i].time.report_external_fds[0] = 1;
+  CHECK(!shell_dep_graph_validate(other).valid);
+
+  static const char *const scopes[] = {
+      "{ wc -l file.txt; echo ok; } 2>&1",
+      "( wc -l file.txt; echo ok ) 2>&1",
+      "{ { wc -l file.txt; }; } 2>&1",
+      "{ wc -l file.txt 2>&1; echo ok; }",
+      "echo \"$(wc -l file.txt)\"",
+      "echo \"$(wc -l file.txt 2>&1)\"",
+      "echo `wc -l file.txt`",
+      "cat <(wc -l file.txt)",
+      "cat > >(wc -l file.txt)",
+      "wc -l file.txt | cat",
+      "wc -l file.txt |& cat",
+      "probe && exec 2>&1; wc -l file.txt",
+      "time wc -l file.txt",
+      "echo \"$(exec 3>&2; time wc 2>&3)\"",
+      "time { wc; } 2>&1",
+      "echo \"$( { wc; } )\"",
+      "true || wc -l file.txt",
+      ">out",
+      "exec 2>&1",
+      "time",
+  };
+  for (size_t i = 0; i < sizeof(scopes) / sizeof(scopes[0]); i++) {
+    boundary_parse(scopes[i], &limits, graph);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(scopes[i], strlen(scopes[i]), NULL, &fast) ==
+          SHELL_OK);
+    CHECK(shell_dep_graph_parse_with_fast(scopes[i], strlen(scopes[i]), "/",
+                                          &limits, &fast,
+                                          other) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(graph, other));
+  }
+  boundary_parse(" ", &limits, graph);
+  CHECK(graph->node_count == 0 && graph->edge_count == 0);
+  boundary_parse("echo \"$(wc -l file.txt 2>&1)\"", &limits, graph);
+  uint32_t owner = boundary_command(graph, "wc");
+  CHECK(boundary_route(graph, owner, 0, true, 0));
+  CHECK(!boundary_route(graph, owner, 1, false, 1) &&
+        !boundary_route(graph, owner, 2, false, 1));
+  boundary_parse("probe && exec 2>&1; wc -l file.txt", &limits, graph);
+  owner = boundary_command(graph, "wc");
+  CHECK(boundary_route(graph, owner, 2, false, 1) &&
+        boundary_route(graph, owner, 2, false, 2));
+  boundary_parse("true || wc -l file.txt", &limits, graph);
+  owner = boundary_command(graph, "wc");
+  CHECK(!boundary_route(graph, owner, 0, true, 0) &&
+        !boundary_route(graph, owner, 1, false, 1));
+  boundary_parse("echo \"$( { wc; } )\"", &limits, graph);
+  uint32_t child_group = UINT32_MAX;
+  for (uint32_t i = 0; i < graph->node_count; i++)
+    if (graph->nodes[i].type == SHELL_NODE_GROUP)
+      child_group = i;
+  owner = boundary_command(graph, "wc");
+  CHECK(child_group != UINT32_MAX &&
+        boundary_route(graph, child_group, 0, true, 0) &&
+        boundary_route(graph, child_group, 2, false, 2));
+  CHECK(!boundary_route(graph, owner, 0, true, 0) &&
+        !boundary_route(graph, owner, 2, false, 2));
+  boundary_parse("{ >out; }", &limits, graph);
+  for (uint32_t i = 0; i < graph->node_count; i++)
+    if (graph->nodes[i].type == SHELL_NODE_FD)
+      CHECK(graph->nodes[i].fd.number == 2);
+  /* No body needs stdin/stdout. Only the possible open-error diagnostic has
+   * an inherited stream relation. */
+  unsigned diagnostic_boundaries = 0;
+  for (uint32_t i = 0; i < graph->edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    if (graph->nodes[edge->to].type == SHELL_NODE_FD) {
+      CHECK(edge->type == SHELL_EDGE_WRITE && edge->source_fd == 2);
+      diagnostic_boundaries++;
+    }
+    CHECK(graph->nodes[edge->from].type != SHELL_NODE_FD);
+  }
+  CHECK(diagnostic_boundaries == 1);
+
+  /* Repeated nested exposures are coalesced before retained-edge budgeting. */
+  char nested[512] = "";
+  for (unsigned i = 0; i < 16; i++)
+    strcat(nested, "{ ");
+  strcat(nested, "wc;");
+  for (unsigned i = 0; i < 16; i++)
+    strcat(nested, " }; ");
+  boundary_parse(nested, &limits, graph);
+  uint32_t boundaries = 0;
+  for (uint32_t i = 0; i < graph->edge_count; i++)
+    boundaries += graph->nodes[graph->edges[i].from].type == SHELL_NODE_FD ||
+                  graph->nodes[graph->edges[i].to].type == SHELL_NODE_FD;
+  CHECK(boundaries == 3);
+
+  /* Many conditional routes shared by deeply nested groups must not consume
+   * the public edge budget once per redundant intermediate exposure. The
+   * executor contract opens only 0, 1 and 2 as external descriptors. */
+  char alternatives[2048] = "probe && exec 2>&1; probe && exec 2>&0; ";
+  for (unsigned i = 0; i < 60; i++)
+    strcat(alternatives, "{ ");
+  strcat(alternatives, "wc;");
+  for (unsigned i = 0; i < 60; i++)
+    strcat(alternatives, " }; ");
+  boundary_parse(alternatives, &limits, graph);
+  uint32_t outer = UINT32_MAX;
+  for (uint32_t i = 0; i < graph->node_count; i++)
+    if (graph->nodes[i].type == SHELL_NODE_GROUP &&
+        graph->nodes[i].group.parent == UINT32_MAX) {
+      CHECK(outer == UINT32_MAX);
+      outer = i;
+    }
+  CHECK(outer != UINT32_MAX);
+  CHECK(boundary_route(graph, outer, 0, true, 0) &&
+        boundary_route(graph, outer, 1, false, 1));
+  for (unsigned fd = 0; fd <= 2; fd++)
+    CHECK(boundary_route(graph, outer, 2, false, fd));
+
+  for (uint32_t max_nodes = 1; max_nodes <= 4; max_nodes++)
+    for (uint32_t max_edges = 0; max_edges <= 3; max_edges++) {
+      shell_dep_limits_t bounded = limits;
+      bounded.max_nodes = max_nodes;
+      bounded.max_edges = max_edges;
+      shell_dep_error_t status =
+          shell_dep_graph_parse("wc", 2, "/", &bounded, graph);
+      CHECK(status == ((max_nodes == 4 && max_edges == 3) ? SHELL_DEP_OK
+                                                          : SHELL_DEP_ETRUNC));
+      CHECK(graph->node_count <= max_nodes && graph->edge_count <= max_edges);
+      CHECK(shell_dep_graph_validate(graph).valid);
+    }
+  static const char stopped_join[] =
+      "exec 3>/tmp/move-a 4>/tmp/move-b || exit; "
+      "exec 10>&3 11>&- 12>&- 13>&-; exec 3>&10- 11>&4 10>&-; "
+      ": \"$(echo next >&11)\"";
+  shell_dep_limits_t limited = limits;
+  limited.max_edges = 1;
+  CHECK(shell_dep_graph_parse(stopped_join, sizeof(stopped_join) - 1, "/",
+                              &limited, graph) == SHELL_DEP_ETRUNC);
+  CHECK(graph->node_count == 0 && graph->edge_count == 0 &&
+        shell_dep_graph_validate(graph).valid);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  /* Completing nested compounds ending in background units projects each
+   * final outcome once, rather than searching their prefixes or ancestors. */
+  for (unsigned family = 0; family < 2; family++) {
+    size_t previous_work = 0;
+    for (unsigned count = 4; count <= 32; count *= 2) {
+      char source[1024] = "";
+      for (unsigned i = 0; i < count; i++)
+        strcat(source, "{ ");
+      strcat(source, "false &");
+      for (unsigned i = 1; i < count; i++)
+        strcat(source, family == 0 ? " };" : " } &");
+      strcat(source, " } || printf bad >out");
+      shellsplit_test_source_scan_reset();
+      boundary_parse(source, &limits, graph);
+      uint32_t marker = boundary_command(graph, "printf");
+      CHECK(marker != UINT32_MAX);
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+        CHECK(!((graph->edges[edge].type == SHELL_EDGE_READ &&
+                 graph->edges[edge].to == marker) ||
+                (graph->edges[edge].type == SHELL_EDGE_WRITE &&
+                 graph->edges[edge].from == marker)));
+      size_t work =
+          shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_CONTROL_ENDPOINTS);
+      CHECK(work > 0 && work <= 256 * count &&
+            (!previous_work || work <= 3 * previous_work));
+      previous_work = work;
+    }
+  }
+  /* Exercise the connector walk directly so route publication cannot mask a
+   * repeated source scan. Both stage and trivia growth must remain linear. */
+  for (unsigned family = 0; family < 2; family++) {
+    size_t previous_work = 0;
+    for (unsigned count = 4; count <= 32; count *= 2) {
+      char source[1024] = "wc &\n";
+      for (unsigned i = 1; i < count; i++)
+        strcat(source, family == 0 ? "wc &\n\n# note\n" : "\n# note\n");
+      strcat(source, "wait");
+      shell_parse_result_t fast;
+      shell_pipeline_index_t index;
+      CHECK(shell_parse_fast(source, strlen(source), NULL, &fast) == SHELL_OK);
+      shellsplit_test_source_scan_reset();
+      shell_pipeline_index_connectors(source, strlen(source), &fast, &index);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work > 0 && work <= 64 * strlen(source) &&
+            (!previous_work || work <= 3 * previous_work));
+      CHECK(index.range_successor[0] == SHELL_TYPE_BACKGROUND &&
+            index.range_connector[fast.count - 1] == SHELL_TYPE_BACKGROUND);
+      previous_work = work;
+    }
+  }
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[1024] = "";
+    for (unsigned i = 0; i < count; i++)
+      strcat(source, "wc; ");
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, &limits, graph);
+    size_t work = shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_BOUNDARY);
+    unsigned height = 0;
+    for (unsigned size = count; size; size >>= 1)
+      height++;
+    CHECK(work > 0 && work <= 96 * count * height &&
+          (!previous || work <= 3 * previous));
+    previous = work;
+  }
+  previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[1024] = "";
+    for (unsigned group = 0; group < count; group++)
+      strcat(source, "{ ");
+    strcat(source, "wc;");
+    for (unsigned group = 0; group < count; group++)
+      strcat(source, " } &");
+    shellsplit_test_source_scan_reset();
+    boundary_parse(source, &limits, graph);
+    CHECK(boundary_reads_implicit(graph, boundary_command(graph, "wc"), 0));
+    size_t work = shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_BOUNDARY);
+    unsigned height = 0;
+    for (unsigned size = count; size; size >>= 1)
+      height++;
+    CHECK(work > 0 && work <= 120 * count * height &&
+          (!previous || work <= 3 * previous));
+    previous = work;
+  }
+#endif
+  shellsplit_graph_fixture_destroy(&fixture);
+  puts("inherited boundary graph tests passed");
+  return 0;
+}
+#undef CHECK
+
+/* --- corpus (from corpus_test.c) --- */
+/* Cross-surface regression coverage for the anonymous coding-agent corpus.
+ * Fixtures are data only: this test only parses and models them. */
+
+static unsigned corpus_passed;
+static unsigned corpus_failed;
+
+#define ARRAY_COUNT(values) (sizeof(values) / sizeof((values)[0]))
+
+#define CHECK(condition)                                                       \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      printf("    FAIL: %s at %s:%d\n", #condition, __FILE__, __LINE__);       \
+      return false;                                                            \
+    }                                                                          \
+  } while (0)
+
+#define TEST(name) static bool test_##name(void)
+#define RUN(name)                                                              \
+  do {                                                                         \
+    printf("  %-42s ", #name);                                                 \
+    if (test_##name()) {                                                       \
+      puts("PASS");                                                            \
+      corpus_passed++;                                                         \
+    } else {                                                                   \
+      corpus_failed++;                                                         \
+    }                                                                          \
+  } while (0)
+
+static bool corpus_valid_netsequence(const shell_netstring_buffer_t *sequence,
+                                     size_t expected_records) {
+  size_t records = 0;
+  return sequence->data != NULL && sequence->length != 0 &&
+         shell_netstring_validate(sequence->data, sequence->length, &records) ==
+             SHELL_NETSTRING_OK &&
+         records == expected_records;
+}
+
+/* Anomaly netsequences are the sole canonical transport that retains an
+ * argv-less stage. Its raw record is empty and its corresponding typed record
+ * contains exactly one empty argv[0]. Check both forms together so a later
+ * refactor cannot silently turn that structural stage into an executable. */
+static bool
+corpus_anomaly_empty_stage_count(const shell_netstring_buffer_t *raw,
+                                 const shell_netstring_buffer_t *typed,
+                                 size_t *out_count) {
+  if (!raw || !typed || !out_count)
+    return false;
+  *out_count = 0;
+  shell_netstring_iter_t raw_records;
+  shell_netstring_iter_t typed_records;
+  if (shell_netstring_iter_init(&raw_records, raw->data, raw->length) !=
+          SHELL_NETSTRING_OK ||
+      shell_netstring_iter_init(&typed_records, typed->data, typed->length) !=
+          SHELL_NETSTRING_OK)
+    return false;
+  for (;;) {
+    shell_netstring_view_t raw_record;
+    shell_netstring_view_t typed_record;
+    shell_netstring_status_t raw_status =
+        shell_netstring_iter_next(&raw_records, &raw_record);
+    shell_netstring_status_t typed_status =
+        shell_netstring_iter_next(&typed_records, &typed_record);
+    if (raw_status == SHELL_NETSTRING_DONE ||
+        typed_status == SHELL_NETSTRING_DONE)
+      return raw_status == SHELL_NETSTRING_DONE &&
+             typed_status == SHELL_NETSTRING_DONE;
+    if (raw_status != SHELL_NETSTRING_OK || typed_status != SHELL_NETSTRING_OK)
+      return false;
+    if (raw_record.payload_length != 0)
+      continue;
+    shell_netstring_iter_t argv;
+    shell_netstring_view_t argv0;
+    if (shell_netstring_iter_init(&argv, typed_record.payload,
+                                  typed_record.payload_length) !=
+            SHELL_NETSTRING_OK ||
+        shell_netstring_iter_next(&argv, &argv0) != SHELL_NETSTRING_OK ||
+        argv0.payload_length != 0 ||
+        shell_netstring_iter_next(&argv, &argv0) != SHELL_NETSTRING_DONE)
+      return false;
+    (*out_count)++;
+  }
+}
+
+TEST(canonical_processing_surfaces_agree) {
+  for (size_t i = 0; i < SHELLCLAVE_COMMAND_CORPUS_COUNT; i++) {
+    const char *input = shellclave_command_corpus_commands[i];
+    size_t length = strlen(input);
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t fast = {0};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
+    shell_dep_graph_t graph = {0};
+    size_t netargv_count = 0;
+    size_t command_count_out = 0;
+    size_t type_count = 0;
+    size_t anomaly_count = 0;
+    bool features = false;
+
+    bool valid =
+        shell_parse_fast(input, length, &strict, &fast) == SHELL_OK &&
+        fast.count > 0 &&
+        shell_tokenize_commands(input, length, &commands, &command_count) ==
+            SHELL_TOKENIZE_OK &&
+        command_count >= fast.count &&
+        shell_process_commands(input, length, NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count > 0 &&
+        shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                            &netargv_count,
+                                            &features) == SHELL_PROCESS_OK &&
+        netargv_count == processed.command_count &&
+        corpus_valid_netsequence(&netargv, netargv_count) &&
+        shell_build_command_netseq_buffer(input, length, NULL, &command_netseq,
+                                          &command_count_out) ==
+            SHELL_PROCESS_OK &&
+        command_count_out >= processed.command_count &&
+        corpus_valid_netsequence(&command_netseq, command_count_out) &&
+        shell_build_type_netseq_buffer(input, length, NULL, &type_netseq,
+                                       &type_count) == SHELL_PROCESS_OK &&
+        type_count == command_count_out &&
+        corpus_valid_netsequence(&type_netseq, type_count) &&
+        shell_build_anomaly_netseqs_buffer(
+            input, length, NULL, &anomaly_commands, &anomaly_types,
+            &anomaly_count) == SHELL_PROCESS_OK &&
+        anomaly_count == command_count_out &&
+        corpus_valid_netsequence(&anomaly_commands, anomaly_count) &&
+        corpus_valid_netsequence(&anomaly_types, anomaly_count) &&
+        shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+
+    if (!valid) {
+      printf("    fixture %zu failed: %s\n", i, input);
+      shell_netstring_buffer_free(&netargv);
+      shell_netstring_buffer_free(&command_netseq);
+      shell_netstring_buffer_free(&type_netseq);
+      shell_netstring_buffer_free(&anomaly_commands);
+      shell_netstring_buffer_free(&anomaly_types);
+      shell_processed_commands_free(&processed);
+      shell_commands_free(commands, command_count);
+      return false;
+    }
+    shell_netstring_iter_t records;
+    valid = shell_netstring_iter_init(&records, netargv.data, netargv.length) ==
+            SHELL_NETSTRING_OK;
+    for (size_t c = 0; valid && c < processed.command_count; c++) {
+      shell_netstring_view_t record;
+      shell_netstring_buffer_t rendered = {0};
+      valid =
+          shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_OK &&
+          shell_render_netargv_buffer(&processed.commands[c], NULL,
+                                      &rendered) == SHELL_PROCESS_OK &&
+          record.payload_length == rendered.length &&
+          memcmp(record.payload, rendered.data, rendered.length) == 0;
+      shell_netstring_buffer_free(&rendered);
+    }
+    valid =
+        valid && command_netseq.length == anomaly_commands.length &&
+        type_netseq.length == anomaly_types.length &&
+        memcmp(command_netseq.data, anomaly_commands.data,
+               command_netseq.length) == 0 &&
+        memcmp(type_netseq.data, anomaly_types.data, type_netseq.length) == 0;
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
+    shell_processed_commands_free(&processed);
+    shell_commands_free(commands, command_count);
+    CHECK(valid);
+  }
+  return true;
+}
+
+TEST(supported_syntax_model_matrix) {
+  /* These are compact representatives for paths that are uncommon in the
+   * anonymized corpus. Keep them as parser inputs only; none is executed.
+   * Descriptors above 2 start closed (SHELL_DEP_EUNMODELED), so a copied
+   * descriptor is opened first. */
+  static const char *const cases[] = {
+      "printf x >out",
+      "printf x >>out",
+      "cat <in",
+      "cat <>read-write",
+      "printf x >|forced",
+      "printf x 2>err 3>>trace 4>&1 5<&0 6>&-",
+      "printf x &>all",
+      "printf x &>>all",
+      "printf x >&combined",
+      "printf x 1>&\"combined name\"",
+      "printf x >&\\$literal",
+      "exec 7>seven; printf x >&\"7\"",
+      "exec 7>seven; printf x >&$'7'",
+      "printf x >&\"-\"",
+      "printf x {trace}>out {input}<in {both}<>read-write",
+      "cat <<EOF\nbody\nEOF\n",
+      "cat <<-'EOF'\n\tbody\n\tEOF\n",
+      "cat <<<\"body\"",
+      "printf x > >(cat)",
+      "cat < <(printf x)",
+      "cat <(printf x)",
+      "printf x | cat",
+      "printf x |& cat",
+      "! printf x |& cat | sort",
+      "printf x && cat",
+      "printf x || cat",
+      "printf x & cat",
+      "printf x; cat",
+      "{ printf x; } | { cat; }",
+      "{ printf x; } |& { cat; }",
+      "{ printf x; } >out 2>&1",
+      "{ printf x; } &>all",
+      "{ printf x; } &>>all",
+      "{ printf x; } &> >(cat)",
+      "{ printf x; } >&combined",
+      "exec 7>seven; { printf x; } >&\"7\"",
+      "exec 7>seven; { printf x; } >&$'7'",
+      "{ printf x; } >&\"-\"",
+      "{ printf x; } {trace}>out {input}<in {both}<>read-write",
+      "{ cat; } <<EOF\nbody\nEOF\n",
+      "(printf x) | cat",
+      "echo $(printf x)",
+      "echo $(<input)",
+      "echo `printf x`",
+      "echo \"$(( 1 + 2 ))\"",
+      "echo ${value:-$(printf x)}",
+      "echo $'a\\tb'",
+      "echo @(foo|bar)",
+      "echo prefix@(foo|bar)suffix",
+      "echo !(foo)",
+      "echo \\! \"!\" '!'",
+      "VAR=value command",
+      "export VAR=$(printf x)",
+      "exec {out}>out; exec {copy}<&$out; printf x >&$copy",
+      "exec {in}<in; exec {copy}>&$in; cat <&$copy",
+      "cd /tmp && pwd",
+      "cd ./relative; pwd",
+  };
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    const char *input = cases[i];
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    bool valid = shell_process_commands(input, strlen(input), NULL,
+                                        &processed) == SHELL_PROCESS_OK &&
+                 shell_dep_graph_parse(input, strlen(input), "/work/base", NULL,
+                                       &graph) == SHELL_DEP_OK &&
+                 shell_dep_graph_validate(&graph).valid;
+    if (!valid) {
+      printf("    syntax case %zu failed: %s\n", i, input);
+      shell_processed_commands_free(&processed);
+      return false;
+    }
+    shell_processed_commands_free(&processed);
+  }
+  return true;
+}
+
+/* Run the less common, but fully supported, spellings through every exported
+ * representation.  The fixture corpus deliberately favours short everyday
+ * commands; this compact matrix makes the shipping and allocator-linked test
+ * libraries exercise the same substitution, word-shape, and redirection
+ * paths without treating any diagnostic display as shell input. */
+TEST(cross_surface_edge_syntax) {
+  static const char *const cases[] = {
+      "printf /a/${VALUE:-$(producer)}/$1",
+      "printf x >&literal{path}",
+      "cat < <(producer) |& sed x > >(consumer)",
+      "cat < prefix<(producer)",
+      "cat > >(consumer)suffix",
+      "{ cat; } <> <(producer)suffix",
+      "cat < <(producer)<(consumer)",
+      "echo $(<prefix<(producer))",
+      "cat < prefix<(producer)$(printf path)",
+      "printf x 2>&1 3>&- {out}>out {in}<in {both}<>read-write",
+      "printf x {out\\\nfd}>out {in\\\nfd}<in",
+      "cat >out\\\nsuffix next",
+      "$'c'3>out;cat \"x\"${y}z;my\\\ncommand value",
+      "printf prefix$'literal'${NAME} \"$ONE$TWO\"",
+      "cat <<EOF\n$(producer)\nEOF\n",
+      "cat <<EOF\nwhile true; do :; done\n$\"locale\"\n\\$(literal)\n"
+      "\\${items[0]}\n$(printf value)\n$((1 + 2))\nEOF\n",
+      "cat <<'EOF'\n$(while true; do :; done)\n${items[0]}\n"
+      "$((items[0]))\n$\"locale\"\nEOF\n",
+      "cat <<${items[0]}\nbody\n${items[0]}\n",
+      "cat <<EOF <<-'LITERAL'\r\n$(printf value)\r\nEOF\n"
+      "\t$(while true; do :; done)\r\n\tLITERAL\r\n",
+      "printf $'a\\tb' @(left|right)",
+      "printf ${VALUE#prefix${SUFFIX:-$(producer)}}",
+      "printf ${VALUE##prefix${SUFFIX}} ${VALUE%tail${SUFFIX}}",
+      "printf ${VALUE%%tail${SUFFIX}} ${VALUE/pattern/${REPLACEMENT}}",
+      "printf ${VALUE:-{left,right}}",
+      "printf ${VALUE:-{}",
+      "printf ${VALUE#{}",
+      "printf ${VALUE/{}",
+      "printf ${VALUE:-${FALLBACK:-{}}",
+  };
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    const char *input = cases[i];
+    size_t length = strlen(input);
+    shell_processed_commands_t processed = {0};
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
+    shell_transformed_command_t **transformed = NULL;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {0};
+    size_t netargv_count = 0;
+    size_t command_count = 0;
+    size_t type_count = 0;
+    size_t anomaly_count = 0;
+    size_t transformed_count = 0;
+    bool features = false;
+
+    bool valid =
+        shell_process_commands(input, length, NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count > 0 &&
+        shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                            &netargv_count,
+                                            &features) == SHELL_PROCESS_OK &&
+        netargv_count == processed.command_count &&
+        corpus_valid_netsequence(&netargv, netargv_count) &&
+        shell_build_command_netseq_buffer(input, length, NULL, &command_netseq,
+                                          &command_count) == SHELL_PROCESS_OK &&
+        command_count >= processed.command_count &&
+        corpus_valid_netsequence(&command_netseq, command_count) &&
+        shell_build_type_netseq_buffer(input, length, NULL, &type_netseq,
+                                       &type_count) == SHELL_PROCESS_OK &&
+        type_count == command_count &&
+        corpus_valid_netsequence(&type_netseq, type_count) &&
+        shell_build_anomaly_netseqs_buffer(
+            input, length, NULL, &anomaly_commands, &anomaly_types,
+            &anomaly_count) == SHELL_PROCESS_OK &&
+        anomaly_count == command_count &&
+        corpus_valid_netsequence(&anomaly_commands, anomaly_count) &&
+        corpus_valid_netsequence(&anomaly_types, anomaly_count) &&
+        shell_transform_command_line(input, length, NULL, &transformed,
+                                     &transformed_count) ==
+            SHELL_TRANSFORM_OK &&
+        transformed_count == processed.command_count &&
+        shell_abstract_command_parse(input, length, &abstract) ==
+            SHELL_ABSTRACT_OK &&
+        abstract != NULL &&
+        shell_dep_graph_parse(input, length, "/work/base", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+    shell_processed_commands_free(&processed);
+    if (!valid) {
+      printf("    cross-surface case %zu failed: %s\n", i, input);
+      return false;
+    }
+  }
+  return true;
+}
+
+/* Redirect-only shell operations are meaningful graph nodes even though they
+ * have no executable argv. Keep that distinction visible at every public
+ * boundary: executable argv output rejects any composition containing such a
+ * stage, while the anomaly sequences preserve it with their empty argv[0]
+ * sentinel and the graph retains its I/O operation. */
+TEST(redirect_only_stages_remain_graph_visible) {
+  static const struct {
+    const char *input;
+    size_t processed_count;
+    size_t anomaly_stage_count;
+    uint32_t minimum_reads;
+    uint32_t minimum_writes;
+  } cases[] = {
+      {">output", 0, 1, 0, 1},
+      {"<input >output", 0, 1, 1, 1},
+      {"printf x; >output", 1, 2, 0, 1},
+      {"{ cat; } >out; >a; >b", 1, 3, 0, 3},
+      {"{ cat; } >out\n>a", 1, 2, 0, 2},
+      {"{ cat; }\n>a", 1, 2, 0, 1},
+      {"{ cat; }; >a", 1, 2, 0, 1},
+      {"{ cat; } # comment\n>a", 1, 2, 0, 1},
+      {"{ cat; } >out && >a", 1, 2, 0, 2},
+      {"{ cat; } >out || >a", 1, 2, 0, 2},
+      {"{ cat; } >out & >a", 1, 2, 0, 2},
+      {"{ cat; } >out | >a", 1, 2, 0, 2},
+      {"{ cat; } >out |& >a", 1, 2, 0, 2},
+      {"{ { cat; } >out; >a; }", 1, 2, 0, 2},
+      {"echo 3\n>out", 1, 2, 0, 1},
+      {"{ cat; } <<EOF\nbody\nEOF\n>out", 1, 2, 1, 1},
+      {"{ cat; } 0<<EOF\nbody\nEOF\n>out", 1, 2, 1, 1},
+      {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n>out", 1, 2, 1, 1},
+      {"{ cat; } <<-'EOF'\n\tbody\n\tEOF\n# separate stage\n>out", 1, 2, 1, 1},
+  };
+
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    const char *input = cases[i].input;
+    size_t length = strlen(input);
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t fast = {0};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
+    shell_dep_graph_t graph = {0};
+    size_t netargv_count = SIZE_MAX;
+    bool features = true;
+    uint32_t empty_commands = 0;
+    uint32_t reads = 0;
+    uint32_t writes = 0;
+    size_t empty_anomaly_stages = SIZE_MAX;
+
+    bool valid = shell_parse_fast(input, length, &strict, &fast) == SHELL_OK &&
+                 fast.count > 0 &&
+                 shell_tokenize_commands(input, length, &commands,
+                                         &command_count) == SHELL_TOKENIZE_OK &&
+                 command_count > 0 &&
+                 shell_process_commands(input, length, NULL, &processed) ==
+                     SHELL_PROCESS_OK &&
+                 processed.command_count == cases[i].processed_count &&
+                 (processed.command_count == 0 ? processed.commands == NULL
+                                               : processed.commands != NULL) &&
+                 shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
+                     SHELL_DEP_OK &&
+                 shell_dep_graph_validate(&graph).valid;
+    shell_process_status_t netargv_status = shell_build_netargv_sequence_buffer(
+        input, length, NULL, &netargv, &netargv_count, &features);
+    size_t anomaly_count = SIZE_MAX;
+    valid = valid && netargv_status == SHELL_PROCESS_EPARSE &&
+            netargv.data == NULL && netargv.length == 0 && netargv_count == 0 &&
+            !features &&
+            shell_build_anomaly_netseqs_buffer(
+                input, length, NULL, &anomaly_commands, &anomaly_types,
+                &anomaly_count) == SHELL_PROCESS_OK &&
+            anomaly_count == cases[i].anomaly_stage_count &&
+            corpus_valid_netsequence(&anomaly_commands, anomaly_count) &&
+            corpus_valid_netsequence(&anomaly_types, anomaly_count) &&
+            corpus_anomaly_empty_stage_count(&anomaly_commands, &anomaly_types,
+                                             &empty_anomaly_stages);
+    for (uint32_t node = 0; valid && node < graph.node_count; node++)
+      empty_commands += graph.nodes[node].type == SHELL_NODE_CMD &&
+                        graph.nodes[node].cmd.token_count == 0;
+    for (uint32_t edge = 0; valid && edge < graph.edge_count; edge++) {
+      reads += graph.edges[edge].type == SHELL_EDGE_READ;
+      writes += graph.edges[edge].type == SHELL_EDGE_WRITE;
+    }
+    valid = valid &&
+            empty_commands ==
+                cases[i].anomaly_stage_count - cases[i].processed_count &&
+            empty_anomaly_stages ==
+                cases[i].anomaly_stage_count - cases[i].processed_count &&
+            reads >= cases[i].minimum_reads &&
+            writes >= cases[i].minimum_writes;
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
+    shell_processed_commands_free(&processed);
+    shell_commands_free(commands, command_count);
+    if (!valid) {
+      printf("    redirect-only case %zu failed: %s\n", i, input);
+      return false;
+    }
+  }
+  return true;
+}
+
+/* A syntax rejection must agree at every canonical boundary. In particular,
+ * a malformed modern operator cannot be retained by the processor or graph
+ * after the fast parser rejects it. */
+TEST(malformed_syntax_is_rejected_atomically) {
+  static const char *const cases[] = {
+      "printf x |&",
+      "printf x |& | cat",
+      "printf x | # note",
+      "printf x |& \\\n",
+      "printf x && # note",
+      "printf x ||\n",
+      "! # note\nprintf x",
+      "! \nprintf x",
+      "! !",
+      "echo then { x; }",
+      "echo one; }",
+      "echo one | )",
+      "echo one { literal; }",
+      "echo one (cat)",
+      "echo one ((1))",
+      "printf x > (consumer)",
+      "printf x && && cat",
+      "printf $'unterminated",
+      "printf $(unterminated",
+      "cat < prefix<(unterminated",
+      "cat >",
+      "cat >;echo hi",
+      "cat 0<<<",
+      "cat 0<<<&1 echo hi",
+      "cat 0<<",
+      "cat 3<<-",
+      "cat 0<<EOF\nunterminated\n",
+      "{ cat; } 0<<<",
+      "{ cat; } 0<<<;echo hi",
+      "{ cat; } >;echo hi",
+      "printf ${VALUE${SUFFIX}}",
+      "printf ${VALUE$SUFFIX}",
+      "printf ${VALUE.suffix}",
+      "printf ${?suffix}",
+      "printf ${10suffix}",
+      "while true; do :; done",
+  };
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    const char *input = cases[i];
+    shell_processed_commands_t processed = {
+        .commands = (shell_command_info_t *)(uintptr_t)1,
+        .command_count = SIZE_MAX,
+    };
+    shell_netstring_buffer_t netargv = {0};
+    shell_dep_graph_t graph = {0};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t fast = {0};
+    shell_error_t fast_status =
+        shell_parse_fast(input, strlen(input), &strict, &fast);
+    CHECK(strcmp(input, "while true; do :; done") == 0
+              ? fast_status == SHELL_OK
+              : fast_status == SHELL_EPARSE);
+    CHECK(shell_process_commands(input, strlen(input), NULL, &processed) ==
+          SHELL_PROCESS_EPARSE);
+    CHECK(processed.commands == NULL && processed.command_count == 0);
+    size_t subcommands = SIZE_MAX;
+    bool features = true;
+    CHECK(shell_build_netargv_sequence_buffer(
+              input, strlen(input), NULL, &netargv, &subcommands, &features) ==
+          SHELL_PROCESS_EPARSE);
+    CHECK(netargv.data == NULL && netargv.length == 0 && subcommands == 0 &&
+          !features);
+    CHECK(shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+          SHELL_DEP_EPARSE);
+    CHECK(graph.node_count == 0 && graph.edge_count == 0 &&
+          graph.cwd_buf.len == 0 &&
+          (graph.status & SHELL_DEP_STATUS_ERROR) != 0);
+  }
+  return true;
+}
+
+/* These sources are valid shell syntax and must remain lexically available for
+ * diagnostics. The semantic adapters deliberately reject them together: they
+ * must never flatten definition, control, or array semantics into executable
+ * argv records. This test runs against both Shellsplit library variants. */
+TEST(unsupported_semantics_are_rejected_atomically) {
+  static const char *const cases[] = {
+      "worker () { :; }",
+      "worker ( ) { :; }",
+      "worker\t(\t) ( : )",
+      "worker\\\n() { :; }",
+      "function worker () { :; }",
+      "function worker ( ) ( : )",
+      "select item in one; do :; done",
+      "coproc worker { :; }",
+      "items=(one two)",
+      "declare -a items",
+      "declare arr[0]",
+      "declare 'arr[0]'",
+      "declare arr\\[0\\]",
+      "declare arr$'[0]'",
+      "typeset map[key]",
+      "command -- declare \"arr[$(printf 0)]\"",
+      "printf '%s' \"${items[0]}\"",
+      "echo \"${value:-$\"localized\"}\"",
+      "echo \"${outer:-${inner:-$\"localized\"}}\"",
+      "cat <<EOF\n$(while true; do :; done)\nEOF\n",
+      "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
+      "cat <<EOF\n${items[0]}\nEOF\n",
+      "cat <<EOF\n$((items[0]))\nEOF\n",
+      "cat <<EOF\n\"${items[0]}\"\nEOF\n",
+      "echo $(cat <<EOF\n$(while true; do :; done)\nEOF\n)",
+      "case value in x) : ;& esac",
+      "case value in x) : ;;& esac",
+  };
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    const char *input = cases[i];
+    size_t length = strlen(input);
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t fast = {0};
+    shell_command_t *lexical = NULL;
+    size_t lexical_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
+    shell_transformed_command_t **transformed = NULL;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {0};
+    size_t count = SIZE_MAX;
+    size_t transformed_count = SIZE_MAX;
+    bool features = true;
+
+    /* The fast parser intentionally remains a bounded structural scanner:
+     * accepted lexical extensions may report either its retained range or an
+     * unsupported grammar result. The complete tokenizer is the contract that
+     * must preserve these valid spellings for later semantic rejection. */
+    shell_error_t fast_status = shell_parse_fast(input, length, &strict, &fast);
+    CHECK(fast_status == SHELL_OK || fast_status == SHELL_EPARSE);
+    shell_tokenize_status_t lexical_status =
+        shell_tokenize_commands(input, length, &lexical, &lexical_count);
+    if (lexical_status != SHELL_TOKENIZE_OK) {
+      printf("    lexical unsupported case %zu: status=%d for %s\n", i,
+             (int)lexical_status, input);
+      return false;
+    }
+    CHECK(lexical != NULL && lexical_count != 0);
+    shell_commands_free(lexical, lexical_count);
+
+    CHECK(shell_process_commands(input, length, NULL, &processed) ==
+          SHELL_PROCESS_EPARSE);
+    CHECK(processed.commands == NULL && processed.command_count == 0 &&
+          processed.groups == NULL && processed.group_count == 0 &&
+          processed.group_io_ops == NULL && processed.group_io_op_count == 0);
+    CHECK(shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                              &count, &features) ==
+          SHELL_PROCESS_EPARSE);
+    CHECK(netargv.data == NULL && netargv.length == 0 && count == 0 &&
+          !features);
+    count = SIZE_MAX;
+    CHECK(shell_build_command_netseq_buffer(input, length, NULL,
+                                            &command_netseq,
+                                            &count) == SHELL_PROCESS_EPARSE);
+    CHECK(command_netseq.data == NULL && command_netseq.length == 0 &&
+          count == 0);
+    count = SIZE_MAX;
+    CHECK(shell_build_type_netseq_buffer(input, length, NULL, &type_netseq,
+                                         &count) == SHELL_PROCESS_EPARSE);
+    CHECK(type_netseq.data == NULL && type_netseq.length == 0 && count == 0);
+    count = SIZE_MAX;
+    CHECK(shell_build_anomaly_netseqs_buffer(input, length, NULL,
+                                             &anomaly_commands, &anomaly_types,
+                                             &count) == SHELL_PROCESS_EPARSE);
+    CHECK(anomaly_commands.data == NULL && anomaly_commands.length == 0 &&
+          anomaly_types.data == NULL && anomaly_types.length == 0 &&
+          count == 0);
+    CHECK(shell_transform_command_line(input, length, NULL, &transformed,
+                                       &transformed_count) ==
+          SHELL_TRANSFORM_EPARSE);
+    CHECK(transformed == NULL && transformed_count == 0);
+    CHECK(shell_abstract_command_parse(input, length, &abstract) ==
+          SHELL_ABSTRACT_EPARSE);
+    CHECK(abstract == NULL);
+    CHECK(shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
+          SHELL_DEP_EPARSE);
+    CHECK(graph.node_count == 0 && graph.edge_count == 0 &&
+          graph.cwd_buf.len == 0 &&
+          (graph.status & SHELL_DEP_STATUS_ERROR) != 0);
+  }
+  return true;
+}
+
+/* Named descriptors retain process-substitution structure through every
+ * canonical surface. Direct forms create symbolic descriptor routes; composite
+ * operands remain dynamic filename expressions, just as their numeric-FD
+ * counterparts do. */
+TEST(named_fd_process_substitutions_are_canonical) {
+  static const char *const cases[] = {
+      "cmd {fd}< <(producer)",  "cmd {fd}< prefix<(producer)",
+      "cmd {fd}> >(consumer)",  "cmd {fd}> prefix>(consumer)",
+      "cmd {fd}>> >(consumer)", "cmd {fd}>> prefix>(consumer)",
+      "cmd {fd}<> <(producer)", "cmd {fd}<> prefix<(producer)",
+      "cmd {fd}<> >(consumer)",
+  };
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    const char *input = cases[i];
+    size_t length = strlen(input);
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
+    shell_parse_result_t fast = {0};
+    shell_processed_commands_t processed = {0};
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
+    shell_transformed_command_t **transformed = NULL;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {0};
+    size_t count = SIZE_MAX;
+    size_t transformed_count = SIZE_MAX;
+    bool features = true;
+
+    CHECK(shell_parse_fast(input, length, &strict, &fast) == SHELL_OK);
+    CHECK(shell_process_commands(input, length, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    CHECK(processed.commands != NULL && processed.command_count >= 1);
+    CHECK(shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                              &count,
+                                              &features) == SHELL_PROCESS_OK);
+    CHECK(count >= 1 && features && corpus_valid_netsequence(&netargv, count));
+    count = SIZE_MAX;
+    CHECK(shell_build_command_netseq_buffer(input, length, NULL,
+                                            &command_netseq,
+                                            &count) == SHELL_PROCESS_OK);
+    CHECK(count >= 1 && corpus_valid_netsequence(&command_netseq, count));
+    count = SIZE_MAX;
+    CHECK(shell_build_type_netseq_buffer(input, length, NULL, &type_netseq,
+                                         &count) == SHELL_PROCESS_OK);
+    CHECK(count >= 1 && corpus_valid_netsequence(&type_netseq, count));
+    count = SIZE_MAX;
+    CHECK(shell_build_anomaly_netseqs_buffer(input, length, NULL,
+                                             &anomaly_commands, &anomaly_types,
+                                             &count) == SHELL_PROCESS_OK);
+    CHECK(count >= 1 && corpus_valid_netsequence(&anomaly_commands, count) &&
+          corpus_valid_netsequence(&anomaly_types, count));
+    CHECK(shell_transform_command_line(input, length, NULL, &transformed,
+                                       &transformed_count) ==
+          SHELL_TRANSFORM_OK);
+    CHECK(transformed != NULL && transformed_count >= 1);
+    CHECK(shell_abstract_command_parse(input, length, &abstract) ==
+          SHELL_ABSTRACT_OK);
+    CHECK(abstract != NULL);
+    CHECK(shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
+          SHELL_DEP_OK);
+    CHECK(graph.node_count >= 1 && shell_dep_graph_validate(&graph).valid);
+    shell_processed_commands_free(&processed);
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+  }
+  return true;
+}
+
+static bool corpus_check_redirect_command_boundary(const char *input) {
+  shell_netstring_buffer_t sequence = {0};
+  size_t count = 0;
+  bool features = false;
+  CHECK(shell_build_netargv_sequence_buffer(input, strlen(input), NULL,
+                                            &sequence, &count,
+                                            &features) == SHELL_PROCESS_OK);
+  static const char expected[] = "6:3:cat,,12:4:echo,2:hi,,";
+  bool valid = count == 2 && sequence.length == sizeof(expected) - 1 &&
+               memcmp(sequence.data, expected, sizeof(expected) - 1) == 0;
+  shell_netstring_buffer_free(&sequence);
+  CHECK(valid);
+
+  shell_netstring_buffer_t anomaly = {0};
+  count = 0;
+  CHECK(shell_build_command_netseq_buffer(input, strlen(input), NULL, &anomaly,
+                                          &count) == SHELL_PROCESS_OK);
+  /* Process substitutions and expandable here-strings add child execution
+   * stages ahead of the two top-level commands. The redirect-boundary matrix
+   * is intentionally shared by both forms, so preserve the top-level netargv
+   * assertion above and check the full anomaly sequence separately. */
+  valid = count >= 2 && corpus_valid_netsequence(&anomaly, count);
+  CHECK(valid);
+
+  shell_netstring_buffer_t raw = {0}, typed = {0};
+  size_t paired_count = 0;
+  CHECK(shell_build_anomaly_netseqs_buffer(input, strlen(input), NULL, &raw,
+                                           &typed,
+                                           &paired_count) == SHELL_PROCESS_OK);
+  valid = valid && paired_count == count && raw.length == anomaly.length &&
+          memcmp(raw.data, anomaly.data, raw.length) == 0 &&
+          corpus_valid_netsequence(&typed, paired_count);
+  shell_netstring_buffer_free(&anomaly);
+  shell_netstring_buffer_free(&raw);
+  shell_netstring_buffer_free(&typed);
+  CHECK(valid);
+  return true;
+}
+
+TEST(redirect_separator_boundaries) {
+  static const char *separators[] = {";", "|", "|&", "&&", "||", "&", "\n"};
+  static const char *prefixes[] = {"cat >out", "{ cat; } >out"};
+  static const char *spacing[] = {"", " "};
+  for (size_t prefix = 0; prefix < ARRAY_COUNT(prefixes); prefix++)
+    for (size_t i = 0; i < ARRAY_COUNT(separators); i++) {
+      for (size_t space = 0; space < ARRAY_COUNT(spacing); space++) {
+        char input[128];
+        snprintf(input, sizeof(input), "%s%s%secho hi", prefixes[prefix],
+                 separators[i], spacing[space]);
+        CHECK(corpus_check_redirect_command_boundary(input));
+      }
+    }
+  return true;
+}
+
+TEST(descriptor_graph_routes_and_identities) {
+  static const struct {
+    const char *input;
+    const char *argument;
+    uint32_t fd;
+    bool write;
+  } cases[] = {
+      {"cat $'x'3>out", "x3", 1, true},
+      {"cat ''3>out", "3", 1, true},
+      {"cat \"\"0<<<body", "0", 0, false},
+      {"cat $'x'0<<EOF\nbody\nEOF\n", "x0", 0, false},
+      {"cat 1\\\n2>out", NULL, 12, true},
+      {"cat 1\\\n2<<<body", NULL, 12, false},
+      {"cat 1\\\n2<<EOF\nbody\nEOF\n", NULL, 12, false},
+      {"cat 1\\\n2<<-'EOF'\n\tbody\n\tEOF\n", NULL, 12, false},
+      {"{ cat; } 1\\\n2<<<body", NULL, 12, false},
+      {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n", NULL, 12, false},
+      {"(cat)3>out", NULL, 3, true},
+  };
+  for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
+    shell_dep_graph_t graph = {0};
+    CHECK(shell_dep_graph_parse(cases[i].input, strlen(cases[i].input), ".",
+                                NULL, &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    uint32_t commands = 0, routes = 0;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      if (graph.nodes[n].type != SHELL_NODE_CMD)
+        continue;
+      const shell_dep_cmd_t *cmd = &graph.nodes[n].cmd;
+      commands++;
+      CHECK(cmd->token_count == (cases[i].argument ? 2u : 1u));
+      CHECK(cmd->token_lens[0] == 3 && memcmp(cmd->tokens[0], "cat", 3) == 0);
+      if (cases[i].argument) {
+        char decoded[16];
+        size_t written = 0;
+        CHECK(shell_write_decoded_word(cmd->tokens[1], cmd->token_lens[1],
+                                       decoded, sizeof(decoded),
+                                       &written) == SHELL_PROCESS_OK);
+        CHECK(written == strlen(cases[i].argument) &&
+              memcmp(decoded, cases[i].argument, written) == 0);
+      }
+    }
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const shell_dep_edge_t *edge = &graph.edges[e];
+      if (graph.nodes[edge->from].type == SHELL_NODE_FD ||
+          graph.nodes[edge->to].type == SHELL_NODE_FD)
+        continue;
+      if (cases[i].write && edge->type == SHELL_EDGE_WRITE) {
+        CHECK(edge->source_fd == cases[i].fd);
+        CHECK(graph.nodes[edge->from].type ==
+              (cases[i].input[0] == '(' ? SHELL_NODE_GROUP : SHELL_NODE_CMD));
+        routes++;
+      } else if (!cases[i].write && edge->type == SHELL_EDGE_READ) {
+        CHECK(edge->target_fd == cases[i].fd);
+        CHECK(graph.nodes[edge->to].type ==
+              (cases[i].input[0] == '{' ? SHELL_NODE_GROUP : SHELL_NODE_CMD));
+        routes++;
+      }
+    }
+    if (commands != 1 || routes != 1) {
+      fprintf(stderr, "Descriptor graph case: %s (commands=%u routes=%u)\n",
+              cases[i].input, commands, routes);
+      return false;
+    }
+  }
+  return true;
+}
+
+static int run_corpus(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  puts("shellsplit corpus tests");
+  RUN(canonical_processing_surfaces_agree);
+  RUN(supported_syntax_model_matrix);
+  RUN(cross_surface_edge_syntax);
+  RUN(redirect_only_stages_remain_graph_visible);
+  RUN(malformed_syntax_is_rejected_atomically);
+  RUN(unsupported_semantics_are_rejected_atomically);
+  RUN(named_fd_process_substitutions_are_canonical);
+  RUN(redirect_separator_boundaries);
+  RUN(descriptor_graph_routes_and_identities);
+  printf("\n%u passed, %u failed\n", corpus_passed, corpus_failed);
+  return corpus_failed == 0 ? 0 : 1;
+}
+#undef ARRAY_COUNT
+#undef CHECK
+#undef TEST
+#undef RUN
+
+int main(int argc, char **argv) {
+  int status = 0;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  status |= run_tokenizer(argc, argv);
+#endif
+  status |= run_parser(argc, argv);
+  status |= run_boundary(argc, argv);
+  status |= run_corpus(argc, argv);
+  return status != 0;
 }

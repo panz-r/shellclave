@@ -2624,6 +2624,8 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_apply(
       if (dep_fd_op_may_allocate(op, changes) &&
           !dep_fd_domain_views(&entry, changes, views, origins, &view_count))
         return false;
+      DEP_TRACE(SHELLSPLIT_TRACE_ALLOC_VIEWS,
+                view_count | (origins[view_count - 1] ? 8u : 0u));
       for (uint32_t view = 0; view < view_count; view++) {
         one = views[view];
         unsigned origin = origins[view];
@@ -2638,6 +2640,8 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_apply(
                             DEP_FD_ACCESS_SCRATCH)
                 .count)
           effective.undo_observable = true;
+        DEP_TRACE(SHELLSPLIT_TRACE_OPERATION,
+                  dep_fd_operation_outcomes(&effective, &one, changes) & 31u);
         if (!(dep_fd_operation_outcomes(&effective, &one, changes) &
               DEP_STATUS_MAY_SUCCEED))
           continue;
@@ -2679,6 +2683,9 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_apply(
           if (!dep_named_allocation_choices(&one, changes, &effective,
                                             &choices))
             return false;
+          DEP_TRACE(SHELLSPLIT_TRACE_ALLOC_MODES,
+                    (choices.slots[0].count ? 1u : 0u) |
+                        (choices.slots[1].count ? 2u : 0u));
           for (uint32_t mode = 0; mode < 2; mode++)
             for (uint32_t slot = 0; slot < choices.slots[mode].count; slot++) {
               dep_fd_route_t selected = choices.slots[mode].slots[slot];
@@ -3813,6 +3820,8 @@ static bool dep_fd_force_fact(dep_fd_union_t *u, dep_fd_ref_t fd,
                               dep_route_set_t *out) {
   dep_route_set_t routes = *left, additional = *right;
   bool equal = dep_route_sets_equal(&routes, &additional);
+  if (!equal)
+    DEP_TRACE(SHELLSPLIT_TRACE_FORCE, DEP_ACCESS_INDEX(access));
   *out = routes;
   if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
     dep_fd_route_t a = routes.count ? routes.routes[0]
@@ -4358,6 +4367,8 @@ static uint32_t dep_fd_exact_leaf(void *context, uint64_t key, uint32_t left,
     return exact->roots ? 0 : DEP_EXACT_CONTEXT;
   dep_fd_merge_relation_t relation = {0};
   dep_fd_key_exact(journal, NULL, fd, access, a, b, &relation);
+  if (relation.apart)
+    DEP_TRACE(SHELLSPLIT_TRACE_APART, DEP_ACCESS_INDEX(access));
   return relation.apart ? DEP_EXACT_APART : 0;
 }
 
@@ -4382,6 +4393,8 @@ static uint32_t dep_fd_exact_roots_leaf(void *context, uint64_t key,
     return 0;
   dep_fd_merge_relation_t relation = {0};
   dep_fd_key_exact(journal, exact->roots, fd, access, &a, &b, &relation);
+  if (relation.apart)
+    DEP_TRACE(SHELLSPLIT_TRACE_APART, DEP_ACCESS_INDEX(access));
   return relation.apart ? DEP_EXACT_APART : 0;
 }
 
@@ -4406,6 +4419,8 @@ static bool dep_fd_exact_context_key(void *context, dep_fd_ref_t fd,
                         : dep_fd_raw_root_own_fact(walk->roots.right, journal,
                                                    fd, access);
   dep_fd_key_exact(journal, &walk->roots, fd, access, &a, &b, walk->relation);
+  if (walk->relation->apart)
+    DEP_TRACE(SHELLSPLIT_TRACE_APART, DEP_ACCESS_INDEX(access));
   return !walk->relation->apart;
 }
 
@@ -4469,17 +4484,21 @@ static SHELL_NONNULL(1, 2,
                                                dep_route_journal_t *journal,
                                                uint32_t source_root,
                                                bool *apart) {
-  if (destination->root == source_root)
+  if (destination->root == source_root) {
+    DEP_TRACE(SHELLSPLIT_TRACE_MERGE, 0);
     return true;
+  }
   uint32_t left_root = destination->root;
   uint32_t low = left_root < source_root ? left_root : source_root;
   uint32_t high = left_root < source_root ? source_root : left_root;
   dep_route_join_t *cached = dep_fd_join_cache(journal, left_root, source_root);
   if (cached->left == low && cached->right == high) {
     if (cached->result == UINT32_MAX) {
+      DEP_TRACE(SHELLSPLIT_TRACE_MERGE, 1);
       *apart = true;
       return true;
     }
+    DEP_TRACE(SHELLSPLIT_TRACE_MERGE, 2);
     destination->root = cached->result;
     return true;
   }
@@ -4488,6 +4507,7 @@ static SHELL_NONNULL(1, 2,
   if (!*apart && !dep_fd_force_join_roots(journal, left_root, source_root,
                                           &destination->root))
     return false;
+  DEP_TRACE(SHELLSPLIT_TRACE_MERGE, *apart ? 3 : 4);
   /* UINT32_MAX caches an unfactorable association, not a journal root. */
   *cached =
       (dep_route_join_t){low, high, *apart ? UINT32_MAX : destination->root};
@@ -4635,8 +4655,10 @@ static SHELL_NONNULL(1, 2) bool dep_fd_widen(dep_route_state_t *state,
       if (budget > DEP_ROUTE_MERGE_BUDGET && !best_high) {
         best_low = 0;
         best_high = 1;
+        DEP_TRACE(SHELLSPLIT_TRACE_WIDEN, 2);
       }
     }
+    DEP_TRACE(SHELLSPLIT_TRACE_WIDEN, 1);
     dep_route_state_t joined = dep_route_state_single(roots[best_low]);
     if (!dep_fd_join_root(&joined, journal, roots[best_high]))
       return false;
@@ -4893,6 +4915,8 @@ static SHELL_NONNULL(1, 2,
   dep_fd_flow_t *flow = &stream->scope[group + 1];
   if (section[0] != SHELL_RANGE_ROLE_NONE) {
     if (role == SHELL_RANGE_ROLE_THEN) {
+      DEP_TRACE(SHELLSPLIT_TRACE_IF,
+                (flow->mask & DEP_STATUS_MAY_FAIL) ? 0 : 1);
       stream->if_failure[group] = (dep_fd_flow_t){0};
       if (flow->mask & DEP_STATUS_MAY_FAIL) {
         stream->if_failure[group].mask = DEP_STATUS_MAY_FAIL;
@@ -4900,6 +4924,7 @@ static SHELL_NONNULL(1, 2,
         flow->mask &= (uint8_t)~DEP_STATUS_MAY_FAIL;
       }
     } else {
+      DEP_TRACE(SHELLSPLIT_TRACE_IF, 2);
       for (unsigned outcome = 0; outcome < 5; outcome++)
         if ((flow->mask & (1u << outcome)) &&
             !dep_fd_add(&stream->if_exit[group], outcome, flow->state[outcome],
@@ -4928,6 +4953,11 @@ static SHELL_NONNULL(1, 2, 4) bool dep_fd_if_finish(
     if ((flow->mask & (1u << outcome)) &&
         !dep_fd_add(exit, outcome, flow->state[outcome], journal))
       return false;
+  DEP_TRACE(SHELLSPLIT_TRACE_IF,
+            stream->if_section[group][0] == SHELL_RANGE_ROLE_THEN &&
+                    (stream->if_failure[group].mask & DEP_STATUS_MAY_FAIL)
+                ? 3
+                : 4);
   if (stream->if_section[group][0] == SHELL_RANGE_ROLE_THEN &&
       (stream->if_failure[group].mask & DEP_STATUS_MAY_FAIL) &&
       !dep_fd_add(exit, 0, stream->if_failure[group].state[1], journal))

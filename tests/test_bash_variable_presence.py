@@ -22,7 +22,7 @@ class VariablePresence(unittest.TestCase):
                               capture_output=True, timeout=10)
 
     def model(self, source, builtin=False):
-        result = subprocess.run([self.probe, "--test" if builtin else "--truth", source],
+        result = subprocess.run([*self.probe, "--test" if builtin else "--truth", source],
                                 capture_output=True, check=True, timeout=10)
         return int(result.stdout)
 
@@ -31,7 +31,7 @@ class VariablePresence(unittest.TestCase):
         has no dependency model (SHELL_DEP_EUNMODELED). bash_error asserts
         that the pinned Bash reports a shell-level error for it."""
         with self.subTest(source=source, unmodeled=True):
-            result = subprocess.run([self.probe, "--status", source],
+            result = subprocess.run([*self.probe, "--status", source],
                                     capture_output=True, check=True, timeout=10)
             self.assertEqual(int(result.stdout), -6)
             if bash_error:
@@ -466,7 +466,7 @@ class VariablePresence(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bash", required=True)
-    parser.add_argument("--probe", required=True)
+    parser.add_argument("--probe", nargs="+", required=True)
     args, remaining = parser.parse_known_args()
     VariablePresence.bash = args.bash
     VariablePresence.probe = args.probe
