@@ -12822,6 +12822,40 @@ static void parser_test_word_fragment_operator_boundaries(void) {
               rejects_malformed);
 }
 
+/* A pipe after a `>` is a pipeline operator only when the `>` is a word byte:
+ * an unescaped `>|` is the clobber redirection and consumes the pipe. */
+static void parser_test_pipe_after_escaped_redirect_byte(void) {
+  static const struct {
+    const char *source;
+    uint32_t commands;
+  } cases[] = {
+      {"x \\>| y", 2},   {"x \\>|y", 2}, {"x \\>|\\>| y", 3},
+      {"x \\\\>| y", 1}, {"x >| y", 1},  {"x 2>| y", 1},
+  };
+  bool valid = true;
+  for (size_t strict = 0; strict < 2; strict++)
+    for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+      const char *source = cases[i].source;
+      shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                               .strict_mode = strict != 0};
+      shell_parse_result_t fast = {0};
+      shell_processed_commands_t processed = {0};
+      valid = shell_parse_fast(source, strlen(source), &limits, &fast) ==
+                  SHELL_OK &&
+              fast.count == cases[i].commands &&
+              (cases[i].commands == 1 ||
+               fast.cmds[1].type == SHELL_TYPE_PIPELINE) &&
+              shell_process_commands(source, strlen(source), NULL,
+                                     &processed) == SHELL_PROCESS_OK &&
+              processed.command_count == cases[i].commands &&
+              processed.commands[0].has_pipe_output == (cases[i].commands > 1);
+      shell_processed_commands_free(&processed);
+    }
+  parser_test(
+      "An escaped redirection byte leaves the following pipe an operator",
+      valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -13937,6 +13971,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_feature_flags();
   parser_test_source_io_number_contract();
   parser_test_word_fragment_operator_boundaries();
+  parser_test_pipe_after_escaped_redirect_byte();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();

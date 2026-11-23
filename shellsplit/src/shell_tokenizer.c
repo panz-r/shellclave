@@ -2662,7 +2662,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       }
 
       // Handle |
-      if (c == '|' && !(pos > 0 && cmd[pos - 1] == '>')) {
+      if (c == '|') {
         // End current subcommand (trim whitespace)
         if (subcmd_start < pos) {
           uint32_t s = subcmd_start;
