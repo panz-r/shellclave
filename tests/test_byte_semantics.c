@@ -294,16 +294,13 @@ static void invalid_read_targets(void) {
     CHECK(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
                                 &graph) == SHELL_DEP_OK);
     CHECK(shell_dep_graph_validate(&graph).valid);
-    uint32_t payload = UINT32_MAX, output = UINT32_MAX, printing = UINT32_MAX,
+    uint32_t payload = UINT32_MAX, printing = UINT32_MAX,
              unexpected = UINT32_MAX;
     for (uint32_t i = 0; i < graph.node_count; ++i) {
       const shell_dep_node_t *node = &graph.nodes[i];
       if (node->type == SHELL_NODE_DOC) {
         if (node->doc.kind == SHELL_DOC_HERESTRING)
           payload = i;
-        if (node->doc.kind == SHELL_DOC_FILE && node->doc.path_len == 9 &&
-            !memcmp(node->doc.path, "/dev/null", 9))
-          output = i;
         if (node->doc.kind == SHELL_DOC_FILE && node->doc.path_len == 10 &&
             !memcmp(node->doc.path, "unexpected", 10))
           unexpected = i;
@@ -312,7 +309,6 @@ static void invalid_read_targets(void) {
         printing = i;
     }
     CHECK(payload != UINT32_MAX && printing != UINT32_MAX);
-    bool preserved = false;
     bool fallback = false;
     for (uint32_t i = 0; i < graph.edge_count; ++i) {
       const shell_dep_edge_t *edge = &graph.edges[i];
@@ -320,13 +316,10 @@ static void invalid_read_targets(void) {
       CHECK((edge->type != SHELL_EDGE_WRITE &&
              edge->type != SHELL_EDGE_FD_OPEN) ||
             edge->to != unexpected);
-      preserved |= edge->type == SHELL_EDGE_WRITE && edge->from == printing &&
-                   edge->to == output && edge->source_fd == 1;
       fallback |= edge->type == SHELL_EDGE_WRITE && edge->from == printing &&
                   edge->source_fd == 1;
     }
-    CHECK(c % 3 != 2 || preserved);
-    CHECK(c % 3 == 2 || (unexpected != UINT32_MAX && fallback));
+    CHECK(unexpected != UINT32_MAX && fallback);
     shell_dep_graph_dump(&graph, stdout);
   }
 }

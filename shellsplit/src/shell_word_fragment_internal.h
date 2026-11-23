@@ -181,16 +181,31 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_decode_ansi_escape(
     }
     break;
   case 'x': {
+    /* `\x{` takes every hex digit up to an optional closing brace, keeping the
+     * low byte, as Bash does; `\x` alone takes at most two digits. */
+    bool braced = *position < length && text[*position] == '{';
+    if (braced) {
+      SHELL_SOURCE_WORD_SCAN(1);
+      (*position)++;
+    }
     unsigned value = 0;
     size_t consumed = 0;
-    while (consumed < 2 && *position < length) {
+    while ((braced || consumed < 2) && *position < length) {
       SHELL_SOURCE_WORD_SCAN(1);
       int digit = shell_source_ansi_hex_value(text[*position]);
       if (digit < 0)
         break;
-      value = (value << 4) | (unsigned)digit;
+      value = ((value << 4) | (unsigned)digit) & 0xffu;
       (*position)++;
       consumed++;
+    }
+    if (braced) {
+      if (*position < length && text[*position] == '}') {
+        SHELL_SOURCE_WORD_SCAN(1);
+        (*position)++;
+      }
+      decoded = (unsigned char)value;
+      break;
     }
     if (consumed == 0) {
       if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))

@@ -12882,6 +12882,37 @@ static void parser_test_escaped_backslash_before_newline(void) {
               valid);
 }
 
+/* `\x{` in an ANSI-C string takes every hex digit up to an optional closing
+ * brace and keeps the low byte, as Bash does; a plain `\x` takes at most two
+ * digits and stays literal when none follow. */
+static void parser_test_ansi_c_braced_hex_escape(void) {
+  static const struct {
+    const char *word;
+    const char *expected;
+    size_t length;
+  } cases[] = {
+      {"$'\\x{41}'", "A", 1},     {"$'\\x{414243}'", "C", 1},
+      {"$'\\x{000041}'", "A", 1}, {"$'\\x{100}'", "\0", 1},
+      {"$'\\x{4}1'", "\0041", 2}, {"$'\\x{4g}'", "\004g}", 3},
+      {"$'\\x{41'", "A", 1},      {"$'\\x{41}}'", "A}", 2},
+      {"$'\\x{}'", "\0", 1},      {"$'\\x{ 41}'", "\0 41}", 5},
+      {"$'\\x41'", "A", 1},       {"$'\\x414'", "A4", 2},
+      {"$'\\xg'", "\\xg", 3},     {"$'\\x'", "\\x", 2},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char *decoded = NULL;
+    size_t length = 0;
+    valid = shell_decode_word(cases[i].word, strlen(cases[i].word), &decoded,
+                              &length) == SHELL_PROCESS_OK &&
+            length == cases[i].length &&
+            memcmp(decoded, cases[i].expected, length) == 0;
+    free(decoded);
+  }
+  parser_test("ANSI-C braced hex escapes take every digit up to the brace",
+              valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -13999,6 +14030,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_word_fragment_operator_boundaries();
   parser_test_pipe_after_escaped_redirect_byte();
   parser_test_escaped_backslash_before_newline();
+  parser_test_ansi_c_braced_hex_escape();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();

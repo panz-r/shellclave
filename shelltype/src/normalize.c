@@ -1177,13 +1177,13 @@ static bool span_is_hostname(st_text_span_t token) {
       !shell_ascii_alnum((unsigned char)token.data[token.length - 1]))
     return false;
   bool has_dot = false;
-  bool has_hyphen_before_dot = false;
   size_t last_dot = 0;
   for (size_t i = 0; i < token.length; i++) {
     char c = token.data[i];
     if (c == '-') {
+      /* A label neither ends nor begins with a hyphen. */
       if (i + 1 < token.length && token.data[i + 1] == '.')
-        has_hyphen_before_dot = true;
+        return false;
       if (i != 0 && token.data[i - 1] == '-')
         return false;
     } else if (c == '.') {
@@ -1191,14 +1191,14 @@ static bool span_is_hostname(st_text_span_t token) {
       last_dot = i;
       if (i != 0 && token.data[i - 1] == '.')
         return false;
+      if (i + 1 < token.length && token.data[i + 1] == '-')
+        return false;
     } else if (!shell_ascii_alnum((unsigned char)c)) {
       return false;
     }
   }
   if (!has_dot)
     return false;
-  if (has_hyphen_before_dot)
-    return true;
   st_text_span_t tld = {token.data + last_dot + 1, token.length - last_dot - 1};
   for (const char *const *known = known_tlds; *known; known++)
     if (span_eq_ci(tld, *known))
