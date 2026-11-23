@@ -241,7 +241,7 @@ typedef struct {
  * It otherwise retains the full tokenizer's tolerant lexical handling for
  * incomplete parenthesized source, but rejects impossible list-operator chains
  * just like the structured APIs. shell_process_commands() requires a complete
- * form it can model. Recognized control compounds (loops, if constructs,
+ * form it can model. Recognized control compounds other than `if` (loops,
  * `case`, `select`, `coproc`, and function declarations), shell-semantic array
  * assignments, references, declarations, and element targets (including
  * `printf -v name[0]` and `read -a name`), and unmodeled current-shell forms
@@ -250,10 +250,11 @@ typedef struct {
  * forms (wider `[[ … ]]` predicates, dynamic/mutating arithmetic commands,
  * locale quotes `$"…"`, and case
  * fall-through `;&` / `;;&`) also return SHELL_PROCESS_EPARSE. Supported
- * compound groups contain simple-command lists, pipelines, and nested
- * brace/subshell groups; callers must not infer support for control compounds
- * from group support. Blank source returns SHELL_PROCESS_BLANK. On failure or
- * blank source, writable outputs are set to NULL and zero.
+ * compound groups are brace, subshell and `if` groups; they contain
+ * simple-command lists, pipelines, and nested supported groups. Callers must
+ * not infer support for the other control compounds from group support. Blank
+ * source returns SHELL_PROCESS_BLANK. On failure or blank source, writable
+ * outputs are set to NULL and zero.
  */
 shell_process_status_t
 shell_process_command(const char *command_line, size_t command_length,
@@ -262,14 +263,15 @@ shell_process_command(const char *command_line, size_t command_length,
                       size_t *command_count) SHELL_NONNULL(1, 4, 5);
 
 /** Process supported canonical command records and return the complete
- * brace/subshell group descriptors from the same source. The fixed semantic
- * model accepts at most SHELL_MAX_SUBCOMMANDS ranges and returns
+ * brace/subshell/`if` group descriptors from the same source. The fixed
+ * semantic model accepts at most SHELL_MAX_SUBCOMMANDS ranges and returns
  * SHELL_PROCESS_EOUTPUT_LIMIT beyond that capacity or when bounded syntax
  * analysis cannot finish. Syntax-analysis stops supply no qualified output.
  * Group contents may be simple-command lists, pipelines, and nested groups.
  * Redirect-only simple
  * operations are omitted from `result->commands` as documented on
- * shell_processed_commands_t. Control compounds return SHELL_PROCESS_EPARSE.
+ * shell_processed_commands_t. Control compounds other than `if` return
+ * SHELL_PROCESS_EPARSE.
  * Valid blank source (empty, whitespace, comments, escaped line endings) has no
  * command record and returns SHELL_PROCESS_BLANK, not a parse error.
  * The result owns all returned storage and is cleared on failure or blank. */

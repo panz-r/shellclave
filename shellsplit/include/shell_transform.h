@@ -104,10 +104,10 @@ shell_transform_status_t shell_transform_command(
  * unlike lexical diagnostic iteration, unfinished source is not transformed.
  *
  * Shellsplit only transforms modeled simple-command lists, pipelines, and
- * brace/subshell groups. Control compounds (including function declarations,
- * `select`, and `coproc`), shell-semantic array forms, and wider Bash
- * `[[ … ]]` predicates, dynamic/mutating arithmetic commands, `$"…"`, and `;&`
- * / `;;&` forms return SHELL_TRANSFORM_EPARSE.
+ * brace/subshell/`if` groups. Other control compounds (loops, `case`,
+ * `select`, `coproc`, and function declarations), shell-semantic array forms,
+ * wider Bash `[[ … ]]` predicates, dynamic/mutating arithmetic commands,
+ * `$"…"`, and `;&` / `;;&` forms return SHELL_TRANSFORM_EPARSE.
  *
  * Blank source returns SHELL_TRANSFORM_BLANK. On failure or blank source,
  * writable outputs are reset to NULL and zero.

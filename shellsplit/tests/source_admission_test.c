@@ -4397,43 +4397,6 @@ static void source_delimiter_workspace(void) {
   free(scratch);
 }
 
-typedef struct {
-  const char *source;
-  size_t length, prefix, data, data_length;
-  unsigned calls;
-  bool nested;
-  shell_dep_limits_t child_limits;
-  shell_dep_graph_t *child_graph;
-} source_overlapping_source_t;
-
-static shell_expand_status_t
-source_overlapping_source(const shell_expand_word_request_t *request,
-                          const char **records, size_t *record_length,
-                          void *context) {
-  (void)request;
-  (void)records;
-  (void)record_length;
-  source_overlapping_source_t *input = context;
-  input->calls++;
-  CHECK(shell_parse_draft(input->source, input->prefix, NULL, &source_draft) ==
-        SHELL_SOURCE_INCOMPLETE);
-  CHECK(source_draft.heredoc_count == 1 && !source_draft.heredocs[0].complete);
-  CHECK(shell_parse_draft(input->source + input->data, input->data_length, NULL,
-                          &source_draft) == SHELL_SOURCE_UNSUPPORTED);
-  CHECK(shell_parse_draft(input->source, input->length, NULL, &source_draft) ==
-        SHELL_SOURCE_COMPLETE);
-  CHECK(source_draft.heredoc_count == 1 && source_draft.heredocs[0].complete);
-  if (!input->nested) {
-    input->nested = true;
-    CHECK(shell_dep_graph_parse_resolved(
-              input->source, input->length, "/workspace", &input->child_limits,
-              input->child_graph, source_overlapping_source, input,
-              NULL) == SHELL_DEP_OK);
-    CHECK(shell_dep_graph_validate(input->child_graph).valid);
-  }
-  return SHELL_EXPAND_UNRESOLVED;
-}
-
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 static void source_supplied_fast_reuse(void) {
   static const char opening[] = "cat <<'EOF'\n";

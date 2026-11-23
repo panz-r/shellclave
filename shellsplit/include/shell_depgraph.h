@@ -953,12 +953,12 @@ typedef struct {
  * changes. Skipped descriptor-duplication operands retain nested substitution
  * syntax without inventing a FILE resource or an effective
  * descriptor/substitution edge. Active runtime-expanded duplication targets
- * remain unsupported. Control compounds (including function declarations,
- * `select`, and `coproc`), shell-semantic array forms (including array element
- * targets), and unmodeled current-shell forms (`mapfile`/`readarray`, `wait
- * -p`, Readline-enabled `read -e`/`-E`, and mutating arithmetic expansions)
- * return SHELL_DEP_EPARSE, as do
- * active parameter-assignment operators (=/:=), prompt transformations
+ * remain unsupported. Control compounds other than `if` (loops, `case`,
+ * `select`, `coproc`, and function declarations), shell-semantic array forms
+ * (including array element targets), and unmodeled current-shell forms
+ * (`mapfile`/`readarray`, `wait -p`, Readline-enabled `read -e`/`-E`, and
+ * mutating arithmetic expansions) return SHELL_DEP_EPARSE, as do active
+ * parameter-assignment operators (=/:=), prompt transformations
  * (`${value@P}`), and actual indirect dereferences (`${!ref}`). These can
  * mutate bindings or evaluate value data as shell syntax without a modeled
  * runtime source. Ordinary expansion and prefix-name enumeration do not

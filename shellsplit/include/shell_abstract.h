@@ -180,10 +180,10 @@ typedef enum {
 } shell_abstract_status_t;
 
 /* Shellsplit abstracts modeled simple-command lists, pipelines, and
- * brace/subshell groups. Control compounds (including function declarations,
- * `select`, and `coproc`), shell-semantic array forms, and wider Bash
- * `[[ … ]]` predicates, dynamic/mutating arithmetic commands, `$"…"`, and `;&`
- * / `;;&` forms return SHELL_ABSTRACT_EPARSE. */
+ * brace/subshell/`if` groups. Other control compounds (loops, `case`,
+ * `select`, `coproc`, and function declarations), shell-semantic array forms,
+ * wider Bash `[[ … ]]` predicates, dynamic/mutating arithmetic commands,
+ * `$"…"`, and `;&` / `;;&` forms return SHELL_ABSTRACT_EPARSE. */
 shell_abstract_status_t
 shell_abstract_command_parse(const char *command, size_t command_length,
                              shell_abstract_command_t **out)

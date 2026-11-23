@@ -25,13 +25,13 @@ extern "C" {
  * record starts at the executable and has_shell_features is set. A stage of
  * only assignments likewise contributes no record and sets that flag. Enclosing
  * group I/O cannot turn an empty timing endpoint into a policy subject.
- * Supported compound groups contain simple-command lists, pipelines and nested
- * brace/subshell groups. Control compounds, function declarations, array
- * semantics, dynamic/mutating arithmetic, wider [[ … ]] predicates, $"…", ;&
- * and
- * ;;&, and active legacy backtick bodies requiring escape-layer removal
- * return SHELL_PROCESS_EPARSE;
- * see shell_depgraph.h for the supported-source contract.
+ * Supported compound groups are brace, subshell and `if` groups; they contain
+ * simple-command lists, pipelines and nested supported groups. Loops, `case`,
+ * `select`, `coproc`, function declarations, array semantics,
+ * dynamic/mutating arithmetic, wider [[ … ]] predicates, $"…", ;& and ;;&, and
+ * active legacy backtick bodies requiring escape-layer removal return
+ * SHELL_PROCESS_EPARSE; see shell_depgraph.h for the supported-source
+ * contract.
  * Exceeding SHELL_MAX_SUBCOMMANDS returns SHELL_PROCESS_EOUTPUT_LIMIT even
  * without limits. A nonzero max_group_io_ops checks source group I/O even
  * though group metadata is not returned.
@@ -61,13 +61,13 @@ shell_process_status_t shell_build_netargv_sequence_buffer(
  * construction proves support. Byte limits apply to the final encoded sequence,
  * not unreturned arguments or other borrowed source text. A nonzero
  * max_group_io_ops is one cumulative budget across the immediate list and all
- * collected nested execution bodies. Control compounds, function declarations,
- * array semantics, dynamic or mutating arithmetic, and wider Bash `[[ … ]]`
- * predicates, `$"…"`, and `;&` / `;;&` forms are rejected with
- * SHELL_PROCESS_EPARSE. The result is binary-safe. `sequence` must be empty
- * (initialized to {0} or released with shell_netstring_buffer_free()) and is
- * empty on failure. Release a successful result before reusing it as an output
- * argument. */
+ * collected nested execution bodies. Loops, `case`, `select`, `coproc`,
+ * function declarations, array semantics, dynamic or mutating arithmetic, and
+ * wider Bash `[[ … ]]` predicates, `$"…"`, and `;&` / `;;&` forms are rejected
+ * with SHELL_PROCESS_EPARSE. The result is binary-safe. `sequence` must be
+ * empty (initialized to {0} or released with shell_netstring_buffer_free()) and
+ * is empty on failure. Release a successful result before reusing it as an
+ * output argument. */
 shell_process_status_t shell_build_command_netseq_buffer(
     const char *command_line, size_t command_length,
     const shell_process_limits_t *limits, shell_netstring_buffer_t *sequence,
@@ -82,7 +82,7 @@ shell_process_status_t shell_build_command_netseq_buffer(
  * anomaly-only and is never a policy-evaluable netargv. An arithmetic stage
  * extends this signature with AR after the empty argv[0]; a conditional
  * stage uses CT.
- * Control compounds, function declarations, array semantics,
+ * Loops, `case`, `select`, `coproc`, function declarations, array semantics,
  * wider Bash `[[ … ]]` predicates, dynamic/mutating arithmetic commands,
  * `$"…"`, and `;&` /
  * `;;&` forms are rejected with SHELL_PROCESS_EPARSE. `sequence` must be empty
@@ -100,8 +100,8 @@ shell_build_type_netseq_buffer(const char *command_line, size_t command_length,
  * child-before-parent, source-order analysis order. An argv-less redirect-only
  * or structural empty Bash `time` stage contributes the anomaly-only empty
  * argv[0] sentinel and context-free supported-source boundary described above.
- * Each output independently observes `limits`. Control
- * compounds, function declarations, array semantics, and wider Bash
+ * Each output independently observes `limits`. Loops, `case`, `select`,
+ * `coproc`, function declarations, array semantics, and wider Bash
  * `[[ … ]]` predicates, dynamic/mutating arithmetic commands, `$"…"`, and `;&`
  * / `;;&` forms are rejected with SHELL_PROCESS_EPARSE. All outputs are
  * required and must point to distinct storage. These are caller preconditions.
