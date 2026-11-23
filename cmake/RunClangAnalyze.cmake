@@ -85,6 +85,21 @@ else()
       message(FATAL_ERROR "Missing analyzer tool: ${required}")
     endif()
   endforeach()
+  # The analyzer build compiles the tests, whatever the outer BUILD_TESTING,
+  # and configuring them needs the pinned reference Bash. Fail here, before
+  # the long analysis, rather than inside its nested configuration.
+  if(NOT DEFINED SHELLCLAVE_ANALYZE_FIXTURE)
+    include("${CMAKE_CURRENT_LIST_DIR}/ReferenceBash.cmake")
+    if(NOT DEFINED SHELLCLAVE_BASH_EXECUTABLE OR
+       "${SHELLCLAVE_BASH_EXECUTABLE}" STREQUAL "")
+      message(FATAL_ERROR
+        "clang-analyze compiles the tests, which need Bash "
+        "${SHELLCLAVE_REFERENCE_BASH_VERSION}. Run "
+        "./scripts/prepare-reference-bash and configure with "
+        "-DSHELLCLAVE_BASH_EXECUTABLE=<its printed path>.")
+    endif()
+    shellclave_require_reference_bash("${SHELLCLAVE_BASH_EXECUTABLE}")
+  endif()
   # Keep analyzer reports and its temporary files out of /tmp.
   file(MAKE_DIRECTORY "${SHELLCLAVE_ANALYZE_BINARY}/reports"
                       "${SHELLCLAVE_ANALYZE_BINARY}/tmp")

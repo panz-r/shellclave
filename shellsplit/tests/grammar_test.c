@@ -12913,6 +12913,31 @@ static void parser_test_ansi_c_braced_hex_escape(void) {
               valid);
 }
 
+/* Zero-length input is invalid input for the structured processor, while
+ * whitespace, comments and escaped line endings are valid blank source. */
+static void parser_test_structured_blank_and_empty_source(void) {
+  static const struct {
+    const char *source;
+    shell_process_status_t status;
+  } cases[] = {
+      {"", SHELL_PROCESS_EINPUT},
+      {" \t\n", SHELL_PROCESS_BLANK},
+      {"# comment", SHELL_PROCESS_BLANK},
+      {"\\\n", SHELL_PROCESS_BLANK},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_processed_commands_t processed = {0};
+    valid = shell_process_commands(cases[i].source, strlen(cases[i].source),
+                                   NULL, &processed) == cases[i].status &&
+            processed.commands == NULL && processed.command_count == 0;
+    shell_processed_commands_free(&processed);
+  }
+  parser_test(
+      "The structured processor reports empty input as invalid, not blank",
+      valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -14031,6 +14056,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_pipe_after_escaped_redirect_byte();
   parser_test_escaped_backslash_before_newline();
   parser_test_ansi_c_braced_hex_escape();
+  parser_test_structured_blank_and_empty_source();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();

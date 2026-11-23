@@ -413,7 +413,8 @@ artifacts are preserved. Timeout exits with status 124.
 Run the Clang Static Analyzer:
 
 ```sh
-cmake -S . -B build-analyze -DBUILD_TESTING=OFF
+cmake -S . -B build-analyze -DBUILD_TESTING=OFF \
+  -DSHELLCLAVE_BASH_EXECUTABLE="$(./scripts/prepare-reference-bash)"
 cmake --build build-analyze --target clang-analyze
 ```
 

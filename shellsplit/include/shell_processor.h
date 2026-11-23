@@ -195,9 +195,11 @@ typedef enum {
   SHELL_PROCESS_ENOMEM,
   SHELL_PROCESS_EOVERFLOW,
   SHELL_PROCESS_EOUTPUT_LIMIT,
-  /* The source is valid but blank: empty, or only whitespace, comments and
-   * escaped line endings. It has no command record to return, which is not a
-   * parse error. Outputs are cleared exactly as for a failure. */
+  /* The source is valid but blank: only whitespace, comments and escaped line
+   * endings, or also empty for shell_process_command(). It has no command
+   * record to return, which is not a parse error. Outputs are cleared exactly
+   * as for a failure. The structured APIs report zero-length input as
+   * SHELL_PROCESS_EINPUT. */
   SHELL_PROCESS_BLANK
 } shell_process_status_t;
 
@@ -272,8 +274,9 @@ shell_process_command(const char *command_line, size_t command_length,
  * operations are omitted from `result->commands` as documented on
  * shell_processed_commands_t. Control compounds other than `if` return
  * SHELL_PROCESS_EPARSE.
- * Valid blank source (empty, whitespace, comments, escaped line endings) has no
+ * Valid blank source (whitespace, comments, escaped line endings) has no
  * command record and returns SHELL_PROCESS_BLANK, not a parse error.
+ * Zero-length input returns SHELL_PROCESS_EINPUT.
  * The result owns all returned storage and is cleared on failure or blank. */
 shell_process_status_t
 shell_process_commands(const char *command_line, size_t command_length,
