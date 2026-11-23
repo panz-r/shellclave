@@ -6966,6 +6966,34 @@ TEST(bayesian_combination_transitions) {
 
 /* --- MAIN --- */
 
+/* A FILE name supplied by a substitution route is dynamic substitution I/O,
+ * and its pathname is also unresolved. A name that is only an unresolved
+ * parameter reports the unresolved pathname and no substitution I/O. */
+TEST(substitution_supplied_filename_dynamic_io) {
+  static const struct {
+    const char *command;
+    bool dynamic_io;
+    bool unresolved_path;
+  } cases[] = {
+      {"echo ok >\"$(printf out)\"", true, true},
+      {"cat < <(printf out)", true, false},
+      {"echo ok >\"$OUT\"", false, true},
+  };
+  const char *rules[] = {"echo *", "printf *", "cat"};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_gate_t *gate = gate_with_rules(rules, 3);
+    ASSERT(gate != NULL);
+    ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+    ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
+    ASSERT(result.has_dynamic_substitution_io == cases[i].dynamic_io);
+    ASSERT(((result.unresolved_expansion_flags &
+             SG_EXPANSION_UNRESOLVED_PATH) != 0) == cases[i].unresolved_path);
+    sg_gate_free(gate);
+  }
+}
+
 TEST(substitution_capacity_fails_closed) {
   sg_gate_t *gate =
       gate_with_rules((const char *[]){"exec", "probe", "echo *", "cat *",
@@ -7155,6 +7183,7 @@ int main(int argc, char **argv) {
   RUN(anomaly_model_load_resets_calibration);
   RUN(anomaly_calibration_failure_atomicity);
   RUN(bayesian_combination_transitions);
+  RUN(substitution_supplied_filename_dynamic_io);
 
   cleanup_temp_files();
   printf("\n========================================\n");

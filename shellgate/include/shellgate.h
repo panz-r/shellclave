@@ -223,9 +223,10 @@ typedef struct {
    * topology and sets nothing. Empty when nothing is outstanding. */
   uint32_t requirements;
   /* True when any represented dynamic substitution route reaches this command
-   * or an enclosing compound group. This includes dynamic FILE names, ordinary
-   * process-substitution I/O, and setup-only input redirects such as
-   * `exec {fd}< <(producer)` or `< <(producer)`. Output setup is source-only
+   * or an enclosing compound group. This includes FILE names supplied by
+   * substitution routes, ordinary process-substitution I/O, and setup-only
+   * input redirects such as `exec {fd}< <(producer)` or `< <(producer)`.
+   * Output setup is source-only
    * and marks its downstream substitution consumer instead. Setup is topology
    * only: it does not by itself state a requirement or claim code execution or
    * risk. */
@@ -297,8 +298,10 @@ typedef struct {
    * are satisfied: the gate never folds them into it. */
   uint32_t requirements;
   /* True when any represented dynamic substitution I/O path exists, including
-   * dynamic FILE names and process-substitution descriptor setup/routes whose
-   * endpoint was not retained in the bounded result prefix. This is not a risk
+   * FILE names supplied by substitution routes and process-substitution
+   * descriptor setup/routes whose endpoint was not retained in the bounded
+   * result prefix. A FILE name that is only an unresolved parameter sets
+   * `unresolved_expansion_flags`, not this flag. This is not a risk
    * classification. */
   bool has_dynamic_substitution_io;
   /* Aggregate unresolved argv/path/conditional/arithmetic information over the
