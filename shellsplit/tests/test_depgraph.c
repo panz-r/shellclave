@@ -7060,6 +7060,42 @@ TEST(resource_limit_cross_product_matrix) {
 /* Document readers and CWD tracking expose bounded, caller-visible state.
  * Cover tab stripping and the resource boundaries through the public graph
  * contract rather than depending on incidental parser storage. */
+/* A document is transient when its setup was evaluated and no byte flows
+ * through it. A command that never executes evaluates nothing and keeps no
+ * setup edge, so its documents carry no flag. */
+TEST(unreached_documents_are_not_transient) {
+  static const struct {
+    const char *source;
+    bool transient;
+  } cases[] = {
+      {"exec 3<<<x", true},
+      {"exec 3<<EOF\nx\nEOF", true},
+      {"exec {fd}<<<x; exec {fd}<&-", true},
+      {"true && exec 3<<<x", true},
+      {"false && exec 3<<<x", false},
+      {"false && exec 3<<EOF\nx\nEOF", false},
+      {"false && cat <<EOF\nx\nEOF", false},
+      {"true || cat <<<x", false},
+      {"false && exec {fd}<<<x", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    ASSERT(parse(cases[i].source, &graph) == SHELL_DEP_OK);
+    uint32_t documents = 0, transient = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      if (graph.nodes[node].type != SHELL_NODE_DOC ||
+          (graph.nodes[node].doc.kind != SHELL_DOC_HEREDOC &&
+           graph.nodes[node].doc.kind != SHELL_DOC_HERESTRING))
+        continue;
+      documents++;
+      transient +=
+          (graph.nodes[node].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0;
+    }
+    ASSERT(documents == 1 && transient == (cases[i].transient ? 1u : 0u));
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+}
+
 TEST(document_and_cwd_boundary_contract) {
   static const char content[] = "\tfirst\n\tsecond\n";
   shell_dep_doc_t document = {
@@ -7298,6 +7334,7 @@ int main(int argc, char **argv) {
   RUN(validation_defensive_diagnostics_matrix);
   RUN(resource_limit_cross_product_matrix);
   RUN(document_and_cwd_boundary_contract);
+  RUN(unreached_documents_are_not_transient);
 
   printf("\nComplex:\n");
   RUN(graph_dump_contract);

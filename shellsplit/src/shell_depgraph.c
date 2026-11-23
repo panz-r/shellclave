@@ -11076,6 +11076,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7) void dep_mark_transient_documents(
     bool *live_named_documents, uint32_t entry_root) {
   bool effective_documents[SHELL_DEP_MAX_NODES] = {false};
   bool numeric_setup_documents[SHELL_DEP_MAX_NODES] = {false};
+  bool retained_setup_documents[SHELL_DEP_MAX_NODES] = {false};
   memset(named_setup_documents, 0,
          SHELL_DEP_MAX_NODES * sizeof(named_setup_documents[0]));
   memset(live_named_documents, 0,
@@ -11127,6 +11128,10 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7) void dep_mark_transient_documents(
       effective_documents[edge->to] = true;
     if (edge->type != SHELL_EDGE_FD_OPEN)
       continue;
+    retained_setup_documents[edge->from] |=
+        graph->nodes[edge->from].type == SHELL_NODE_DOC;
+    retained_setup_documents[edge->to] |=
+        graph->nodes[edge->to].type == SHELL_NODE_DOC;
     if (graph->nodes[edge->from].type == SHELL_NODE_DOC &&
         edge->target_fd != SHELL_DEP_FD_NAMED)
       numeric_setup_documents[edge->from] = true;
@@ -11149,7 +11154,10 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7) void dep_mark_transient_documents(
         document->doc.flags |= SHELL_DEP_DOC_FLAG_TRANSIENT;
     } else if ((document->doc.kind == SHELL_DOC_HEREDOC ||
                 document->doc.kind == SHELL_DOC_HERESTRING) &&
-               !effective && !live_named_documents[node]) {
+               !effective && !live_named_documents[node] &&
+               retained_setup_documents[node]) {
+      /* A document of a command that never executes keeps no setup edge and
+       * was not evaluated. */
       document->doc.flags |= SHELL_DEP_DOC_FLAG_TRANSIENT;
     }
   }
