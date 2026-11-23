@@ -36,7 +36,7 @@ void shell_interop_free(shell_interop_handle_t *handle);
  *   SHELL_FEAT_HEREDOC    = 0x10  // << delimiter
  *   SHELL_FEAT_HERESTRING = 0x20  // <<< here-string
  *   SHELL_FEAT_PROCESS_SUB   = 0x040 // <(cmd), >(cmd)
- *   SHELL_FEAT_LOOPS         = 0x080 // for, while, until
+ *   SHELL_FEAT_LOOPS         = 0x080 // for, while, until, select
  *   SHELL_FEAT_CONDITIONALS  = 0x100 // [[ ... ]]
  *   SHELL_FEAT_CASE          = 0x200 // case/esac
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
@@ -48,6 +48,7 @@ void shell_interop_free(shell_interop_handle_t *handle);
  *   SHELL_FEAT_ARRAY           = 0x10000 // Bash array syntax
  *   SHELL_FEAT_NAMED_FD        = 0x20000 // Bash {name} redirection
  *   SHELL_FEAT_COMBINED_REDIRECT = 0x40000 // Bash &> or &>> redirect
+ *   SHELL_FEAT_IF            = 0x80000 // if/then/elif/else/fi
  *
  * Command types (upper bits of type) describe the operator or structural
  * marker associated with one subcommand. The outer separator takes precedence

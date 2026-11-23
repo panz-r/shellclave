@@ -168,7 +168,7 @@ typedef struct {
 
   // Track keywords for feature detection
   int if_depth;   // Track if/then/fi nesting
-  int loop_depth; // Track while/for/until nesting
+  int loop_depth; // Track while/for/until/select nesting
   int case_depth; // Track case/esac nesting
   /* Forward lexical grammar context, maintained by next(). Braces in an
    * ordinary command word or redirect operand are not reserved delimiters.

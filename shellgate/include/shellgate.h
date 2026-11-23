@@ -45,20 +45,25 @@ extern "C" {
 #else
 #define SG_STATIC_ASSERT _Static_assert
 #endif
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 3)) != 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_ARITH) != 0,
                  "ARITH bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 4)) != 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_HEREDOC) != 0,
                  "HEREDOC bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 5)) != 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_HERESTRING) != 0,
                  "HERESTRING bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 7)) != 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_LOOPS) != 0,
                  "LOOPS bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 8)) != 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_CONDITIONALS) != 0,
                  "CONDITIONALS bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_CASE) != 0,
                  "CASE bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 19)) == 0,
+SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & SHELL_FEAT_IF) == 0,
                  "IF is modeled and allowed by default");
+SG_STATIC_ASSERT(SG_REJECT_MASK_DEFAULT ==
+                     (SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC |
+                      SHELL_FEAT_HERESTRING | SHELL_FEAT_LOOPS |
+                      SHELL_FEAT_CONDITIONALS | SHELL_FEAT_CASE),
+                 "the default mask holds exactly these features");
 #undef SG_STATIC_ASSERT
 
 /* Baseline capacity for diagnostic-only buffers. A successful evaluation also
@@ -838,7 +843,9 @@ sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
  * output buffer or bounded subcommand result array was too small (partial
  * results are still valid), or syntax analysis exhausted its capacity. Syntax
  * exhaustion supplies no subcommand results and sets `subcommand_truncated`
- * with an UNDETERMINED verdict. Returns
+ * with an UNDETERMINED verdict. Returns SG_ERR_UNMODELED, with verdict
+ * SG_VERDICT_REJECT, when the source parses but the dependency model cannot
+ * capture every requirement for running it safely, and
  * SG_ERR_INVALID for invalid source or buffer sizes.
  * The error code reports the primary failure: `truncated` independently
  * reports incomplete result or diagnostic rendering, so it can also be true

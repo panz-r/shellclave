@@ -196,7 +196,7 @@ typedef enum {
   SHELL_FEAT_HEREDOC = 1 << 4,          // << delimiter (in subcommand)
   SHELL_FEAT_HERESTRING = 1 << 5,       // <<< here-string (in subcommand)
   SHELL_FEAT_PROCESS_SUB = 1 << 6,      // <(cmd), >(cmd)
-  SHELL_FEAT_LOOPS = 1 << 7,            // while, for, until loops
+  SHELL_FEAT_LOOPS = 1 << 7,            // while, for, until, select loops
   SHELL_FEAT_CONDITIONALS = 1 << 8,     // [[...]] conditional commands
   SHELL_FEAT_CASE = 1 << 9,             // case/esac statements
   SHELL_FEAT_SUBSHELL_FILE = 1 << 10,   // $(<file) - read from file
