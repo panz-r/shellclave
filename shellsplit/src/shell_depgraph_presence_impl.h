@@ -131,7 +131,11 @@ static SHELL_NONNULL(1, 2, 5) bool dep_presence_store(
 }
 
 /* Observe only an unchanged inherited scalar. Equal-valued writes carry a
- * distinct identity, so a child's assignment cannot constrain its parent. */
+ * distinct identity, so a child's assignment cannot constrain its parent.
+ * The name must be in the read-observation inventory. A `test`/`[` -v operand
+ * qualifies because admission refuses every lookup whose operator or operand
+ * a resolver could still supply, so each name reaching here was observed
+ * during the scan; nothing here rechecks that. */
 static SHELL_NONNULL(1, 2, 5) bool dep_presence_assume(
     dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t name,
     unsigned presence, bool *possible) {

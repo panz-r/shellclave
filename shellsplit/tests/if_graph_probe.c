@@ -1,35 +1,29 @@
-/* Print the graph of the source in argv[1], run from the directory argv[2]
- * ("/" without it): a status line, then one line per
- * node (a command's first word, a file document's path) and per edge, with
- * "required" on an open the graph states as a requirement, and each command's
- * working directory when the graph knows it. The
- * differential test against pinned Bash (tests/test_bash_if_descriptors.py)
- * reads it. */
+/* Print the graph of a source: a status line, then one line per node (a
+ * command's first word, a file document's path) and per edge, with "required"
+ * on an open the graph states as a requirement, and each command's working
+ * directory when the graph knows it. Run from the directory argv[2] ("/"
+ * without it) on the source in argv[1].
+ *
+ * With argv[1] "--batch" the sources are NUL-terminated records on standard
+ * input and each report ends with a line "--": one process serves a whole
+ * differential run. The differential test against pinned Bash
+ * (tests/test_bash_if_descriptors.py) reads it. */
 #include "shell_depgraph.h"
 #include "shell_source.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int main(int argc, char **argv) {
-  if (argc != 2 && argc != 3)
-    return 2;
+/* Report the graph of the NUL-terminated source of length bytes; workspace
+ * holds at least what workspace_for gives for that length. */
+static void report(const char *source, size_t length, const char *cwd,
+                   void *workspace, size_t workspace_size) {
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  size_t size = 0, delimiters = 0, alignment = shell_dep_workspace_alignment();
-  if (!shell_dep_workspace_size(&limits, &size) ||
-      !shell_source_workspace_size(strlen(argv[1]), &delimiters) ||
-      delimiters > SIZE_MAX - size)
-    return 2;
-  size += delimiters;
-  void *workspace =
-      aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
-  if (!workspace)
-    return 2;
   limits.workspace = workspace;
-  limits.workspace_size = size;
+  limits.workspace_size = workspace_size;
   static shell_dep_graph_t graph;
-  shell_dep_error_t error = shell_dep_graph_parse(
-      argv[1], strlen(argv[1]), argc == 3 ? argv[2] : "/", &limits, &graph);
+  shell_dep_error_t error =
+      shell_dep_graph_parse(source, length, cwd, &limits, &graph);
   printf("rc=%d\n", (int)error);
   if (error == SHELL_DEP_OK) {
     for (uint32_t i = 0; i < graph.node_count; i++) {
@@ -51,6 +45,71 @@ int main(int argc, char **argv) {
              graph.edges[i].flags & SHELL_DEP_EDGE_FLAG_REQUIRED ? " required"
                                                                  : "");
   }
+}
+
+/* The workspace size a source of at most max_length bytes needs; nonzero
+ * when it overflows. */
+static int workspace_for(size_t max_length, size_t *size) {
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  size_t delimiters = 0;
+  if (!shell_dep_workspace_size(&limits, size) ||
+      !shell_source_workspace_size(max_length, &delimiters) ||
+      delimiters > SIZE_MAX - *size)
+    return 1;
+  *size += delimiters;
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2 && argc != 3)
+    return 2;
+  const char *cwd = argc == 3 ? argv[2] : "/";
+  bool batch = !strcmp(argv[1], "--batch");
+  char *input = NULL;
+  size_t used = 0, capacity = 0;
+  if (batch) {
+    for (;;) {
+      if (used + 1 >= capacity) {
+        capacity = capacity ? capacity * 2 : 1 << 16;
+        input = realloc(input, capacity);
+        if (!input)
+          return 2;
+      }
+      size_t got = fread(input + used, 1, capacity - used - 1, stdin);
+      if (!got)
+        break;
+      used += got;
+    }
+    if (input)
+      input[used] = 0; /* ends an unterminated last record */
+  }
+  size_t longest = 0;
+  if (batch) {
+    for (size_t at = 0; at < used;) {
+      size_t length = strlen(input + at);
+      if (length > longest)
+        longest = length;
+      at += length + 1;
+    }
+  } else
+    longest = strlen(argv[1]);
+  size_t size, alignment = shell_dep_workspace_alignment();
+  if (workspace_for(longest, &size))
+    return 2;
+  void *workspace =
+      aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
+  if (!workspace)
+    return 2;
+  if (!batch)
+    report(argv[1], strlen(argv[1]), cwd, workspace, size);
+  else
+    for (size_t at = 0; at < used;) {
+      size_t length = strlen(input + at);
+      report(input + at, length, cwd, workspace, size);
+      puts("--");
+      at += length + 1;
+    }
   free(workspace);
+  free(input);
   return 0;
 }

@@ -3891,6 +3891,50 @@ static void printf_elision_resolution(void) {
   }
 }
 
+static shell_expand_status_t
+count_and_resolve(const shell_expand_word_request_t *request,
+                  const char **netargv, size_t *length, void *context) {
+  (void)request;
+  ++*(unsigned *)context;
+  *netargv = "2:nm,";
+  *length = 5;
+  return SHELL_EXPAND_RESOLVED;
+}
+
+/* A `test`/`[` -v lookup is admitted only when its name and operator are
+ * known from the source, so every presence the analysis stores for it was
+ * observed during the scan: a word the resolver could still turn into a name
+ * is refused before the resolver is asked. */
+static void presence_lookup_operand_admission(void) {
+  current_source = "resolved workspace";
+  size_t required;
+  CHECK(shell_dep_resolved_workspace_size(512, &limits, &required));
+  CHECK(limits.workspace_size >= required);
+  static const char *const refused[] = {
+      "test -v \"$d\"",     "[ -v \"$d\" ]", "test -v $d",
+      "test ! -v \"$d\"",   "test $o d",     "test $o $d",
+      "test -n x -a -v $d", "[[ -v $d ]]",   "if test -v \"$d\"; then :; fi",
+  };
+  for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+    current_source = refused[i];
+    unsigned calls = 0;
+    CHECK(shell_dep_graph_parse_resolved(current_source, strlen(current_source),
+                                         "/", &limits, graph, count_and_resolve,
+                                         &calls, NULL) == SHELL_DEP_EPARSE);
+    CHECK(calls == 0);
+  }
+  static const char *const admitted[] = {"test -v d", "[ -v d ]",
+                                         "test -v d && test -n \"$d\""};
+  for (size_t i = 0; i < sizeof(admitted) / sizeof(admitted[0]); i++) {
+    current_source = admitted[i];
+    unsigned calls = 0;
+    CHECK(shell_dep_graph_parse_resolved(current_source, strlen(current_source),
+                                         "/", &limits, graph, count_and_resolve,
+                                         &calls, NULL) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(graph).valid);
+  }
+}
+
 static void semantic_empty_bodies(void) {
   static const struct {
     const char *source;
@@ -4370,6 +4414,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && !strcmp(argv[1], "--semantic-words")) {
     printf_elision_resolution();
+    presence_lookup_operand_admission();
     semantic_empty_bodies();
     goto done;
   }
@@ -4499,6 +4544,7 @@ int main(int argc, char **argv) {
     goto done;
   semantic_process_inventory();
   printf_elision_resolution();
+  presence_lookup_operand_admission();
   semantic_empty_bodies();
   conditional_low_pipe_fallback();
   independent_lifetime_guards();

@@ -113,10 +113,18 @@ class IfDescriptors(unittest.TestCase):
                 seen[int(match.group(1))] = match.group(2)
         return seen
 
-    def model(self, source):
-        result = subprocess.run([self.probe, source + "; cat <&3; cat <&4"],
-                                capture_output=True, text=True, timeout=10)
-        lines = result.stdout.splitlines()
+    def reports(self, sources, directory=None):
+        """The probe's report for each source, from one process."""
+        command = [self.probe, "--batch"] + ([directory] if directory else [])
+        result = subprocess.run(
+            command, input=b"".join(source.encode() + b"\0"
+                                    for source in sources),
+            capture_output=True, timeout=120)
+        blocks = result.stdout.decode().split("--\n")[:-1]
+        self.assertEqual(len(blocks), len(sources))
+        return [block.splitlines() for block in blocks]
+
+    def model(self, lines):
         if not lines or lines[0] != "rc=0":
             return None
         commands, files, reads, required = [], {}, [], []
@@ -145,9 +153,12 @@ class IfDescriptors(unittest.TestCase):
             for name in FILES:
                 with open(os.path.join(directory, name), "w") as handle:
                     handle.write(name[1:] + "\n")
-            for source in FIXED + tuple(self.script(rng)
-                                        for _ in range(self.count)):
-                graph = self.model(source)
+            sources = FIXED + tuple(self.script(rng)
+                                    for _ in range(self.count))
+            models = self.reports([source + "; cat <&3; cat <&4"
+                                   for source in sources])
+            for source, lines in zip(sources, models):
+                graph = self.model(lines)
                 if graph is None:
                     continue
                 modeled += 1
@@ -204,14 +215,12 @@ class IfDescriptors(unittest.TestCase):
             root = os.path.realpath(directory)
             for name in ("d1", "d2", "d3"):
                 os.mkdir(os.path.join(root, name))
-            for _ in range(self.count // 2):
-                body = "; ".join(self.cwd_statement(rng, root, 0)
-                                 for _ in range(rng.randint(1, 3)))
-                source = f"{body}; echo end"
-                result = subprocess.run(
-                    [self.probe, source, root], capture_output=True,
-                    text=True, timeout=10)
-                lines = result.stdout.splitlines()
+            bodies = ["; ".join(self.cwd_statement(rng, root, 0)
+                                for _ in range(rng.randint(1, 3)))
+                      for _ in range(self.count // 2)]
+            sources = [f"{body}; echo end" for body in bodies]
+            for body, source, lines in zip(bodies, sources,
+                                           self.reports(sources, root)):
                 if not lines or lines[0] != "rc=0":
                     continue
                 last = [line.split() for line in lines
@@ -241,23 +250,22 @@ class IfDescriptors(unittest.TestCase):
         rng = random.Random(11)
         environment = dict(os.environ, LC_ALL="C", BASH_ENV="", ENV="")
         accepted = 0
-        for _ in range(self.count):
-            source = " ".join(rng.choice(words)
-                              for _ in range(rng.randint(2, 12)))
+        sources = [" ".join(rng.choice(words)
+                            for _ in range(rng.randint(2, 12)))
+                   for _ in range(self.count)]
+        for source, lines in zip(sources, self.reports(sources)):
             invalid = subprocess.run(
                 [self.bash, "--noprofile", "--norc", "-p", "-n"],
                 input=source, capture_output=True, text=True,
                 env=environment, timeout=10).returncode != 0
-            modeled = self.status(source) == "rc=0"
+            modeled = lines[0] == "rc=0"
             accepted += modeled
             with self.subTest(source=source):
                 self.assertFalse(invalid and modeled)
         self.assertGreater(accepted, 0)
 
     def status(self, source):
-        result = subprocess.run([self.probe, source], capture_output=True,
-                                text=True, timeout=10)
-        return result.stdout.splitlines()[0]
+        return self.reports([source])[0][0]
 
     def test_condition_consumes_the_status_of_a_read(self):
         # A read of a closed descriptor fails. The `if` branches on that, so

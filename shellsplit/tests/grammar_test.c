@@ -12856,6 +12856,32 @@ static void parser_test_pipe_after_escaped_redirect_byte(void) {
       valid);
 }
 
+/* A backslash before a newline continues the line only when it is not itself
+ * escaped: in `a\\<LF>}` the pair is a backslash word byte and the brace closes
+ * the group, while in `a\<LF>}` and `a\\\<LF>}` the brace joins the word. */
+static void parser_test_escaped_backslash_before_newline(void) {
+  static const struct {
+    const char *source;
+    bool complete;
+  } cases[] = {
+      {"{ echo a\\\\\n}", true},    {"{ echo a\\\\\\\\\n}", true},
+      {"{ echo a;\\\n}", true},     {"{ echo a\\\n}", false},
+      {"{ echo a\\\\\\\n}", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    static shell_source_result_t draft;
+    shell_parse_result_t fast = {0};
+    valid = (shell_parse_draft(source, strlen(source), NULL, &draft) ==
+             SHELL_SOURCE_COMPLETE) == cases[i].complete &&
+            (shell_parse_fast(source, strlen(source), NULL, &fast) ==
+             SHELL_OK) == cases[i].complete;
+  }
+  parser_test("A newline after an escaped backslash does not continue the line",
+              valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -13972,6 +13998,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_source_io_number_contract();
   parser_test_word_fragment_operator_boundaries();
   parser_test_pipe_after_escaped_redirect_byte();
+  parser_test_escaped_backslash_before_newline();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();

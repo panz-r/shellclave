@@ -273,17 +273,22 @@ static inline size_t shell_source_skip_escaped_line_endings(const char *input,
 
 /* Reverse counterpart for source ranges that end immediately after logical
  * punctuation.  It strips only physical continuations, never horizontal
- * whitespace or ordinary line breaks. */
+ * whitespace, ordinary line breaks or a newline after an escaped backslash. */
 static inline size_t shell_source_skip_escaped_line_endings_backward(
     const char *input, size_t length, size_t position) {
   if (!input || position > length)
     return 0;
-  while (position >= 2) {
-    if (input[position - 1] == '\n' && input[position - 2] == '\\') {
-      position -= 2;
-      continue;
-    }
-    break;
+  while (position >= 2 && input[position - 1] == '\n') {
+    /* The final backslash continues the line only when the run of backslashes
+     * before the newline is odd; a pair is an escaped backslash. A strip
+     * leaves an even run, so the next iteration stops after one byte and the
+     * run is never rescanned. */
+    size_t run = 0;
+    while (run < position - 1 && input[position - 2 - run] == '\\')
+      run++;
+    if (!(run & 1u))
+      break;
+    position -= 2;
   }
   return position;
 }
