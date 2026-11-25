@@ -461,7 +461,7 @@ struct st_policy {
   len_bucket_t *len_buckets; /* Length-indexed pattern buckets */
   size_t num_buckets;        /* ST_MAX_CMD_TOKENS + 1 */
   size_t pattern_count;
-  size_t children_count;
+  size_t children_count;       /* Child entries in use; not allocated slots */
   policy_atomic_stats_t stats; /* Atomic runtime statistics */
   void *user_data;             /* Caller's association; never interpreted */
 };
@@ -818,12 +818,10 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
       return -1;
     uint16_t new_alloc =
         node->children_alloc == 0 ? 4 : node->children_alloc * 2;
-    uint16_t old_alloc = node->children_alloc;
     if (!children_arena_grow(&policy->children_arena, &node->children_offset,
                              &node->children_alloc, new_alloc)) {
       return -1;
     }
-    policy->children_count += node->children_alloc - old_alloc;
   }
 
   children =

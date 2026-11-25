@@ -183,6 +183,28 @@ static int policy_suggestion_is(const st_expand_suggestion_t *suggestion,
 
 /* --- SERIALIZATION --- */
 
+/* The bytes in use never exceed the bytes allocated: adding a pattern grows
+ * child arrays, and removing it leaves their blocks and states in the arena
+ * until compaction, so the working set counts entries, not their slots. */
+static int policy_test_working_set_never_exceeds_memory(void) {
+  st_policy_ctx_t *ctx = st_policy_ctx_new();
+  st_policy_t *policy = st_policy_new(ctx);
+  ASSERT(ctx && policy);
+  ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "docker ps") == ST_OK);
+  for (int i = 0; i < 2000; i++) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "temporary%d value", i);
+    ASSERT(test_st_policy_add(policy, pattern) == ST_OK);
+    ASSERT(st_policy_working_set(policy) <= st_policy_memory_usage(policy));
+    ASSERT(test_st_policy_remove(policy, pattern) == ST_OK);
+    ASSERT(st_policy_working_set(policy) <= st_policy_memory_usage(policy));
+  }
+  st_policy_free(policy);
+  st_policy_ctx_release(ctx);
+  return 1;
+}
+
 static int policy_test_policy_persistence_transitions(void) {
   static const char *patterns[] = {"git",
                                    "git commit -m *",
@@ -2232,6 +2254,7 @@ static int run_policy(int argc, char **argv) {
 
   printf("Lifecycle and mutation:\n");
 
+  TEST(policy_test_working_set_never_exceeds_memory);
   printf("\nSerialisation:\n");
   TEST(policy_test_policy_persistence_transitions);
   TEST(policy_test_policy_load_read_failures_preserve_state);
