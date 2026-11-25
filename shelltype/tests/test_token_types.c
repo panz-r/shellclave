@@ -231,6 +231,7 @@ static int test_classification_matrix(void) {
       {"ftp://files.example.com/pub", ST_TYPE_URL},
       {"my-host.example.com", ST_TYPE_HOSTNAME},
       {"a-b.c", ST_TYPE_LITERAL},
+      {"docker-compose.yml", ST_TYPE_LITERAL},
       {"example.com", ST_TYPE_HOSTNAME},
       {"github.io", ST_TYPE_HOSTNAME},
       {"myapp.dev", ST_TYPE_HOSTNAME},

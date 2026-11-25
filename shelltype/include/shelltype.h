@@ -69,7 +69,8 @@ const char *st_error_string(st_error_t err);
  * #f and #w are incomparable (a filename is not a word, a word is not a
  * filename). #hash, #hyp ⊂ #w ⊂ #val ⊂ *
  * Ambiguous tokens (e.g., "Makefile") could be #w or #f and require user
- * disambiguation.
+ * disambiguation. A hyphenated dotted name such as docker-compose.yml is a
+ * plain literal, not #f.
  */
 
 typedef enum {
@@ -82,7 +83,7 @@ typedef enum {
   ST_TYPE_WORD,         /* #w: [a-zA-Z_][a-zA-Z0-9_]* */
   ST_TYPE_QUOTED,       /* #q: quoted string, no whitespace */
   ST_TYPE_QUOTED_SPACE, /* #qs: quoted string with whitespace */
-  ST_TYPE_FILENAME,     /* #f: no /, has . extension */
+  ST_TYPE_FILENAME,     /* #f: no /, no -, has . extension */
   ST_TYPE_REL_PATH,     /* #r: has .. or / but not ^/ */
   ST_TYPE_ABS_PATH,     /* #p: starts with / */
   ST_TYPE_PATH,         /* #path: any path type (#p ∨ #r ∨ #f) */
