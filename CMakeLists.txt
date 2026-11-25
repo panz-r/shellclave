@@ -889,6 +889,13 @@ if(SHELLCLAVE_BUILD_TOOLS)
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_anomaly_calibrate.cmake)
     set_tests_properties(shellgate_anomaly_calibrate_workspace PROPERTIES
       LABELS shellgate)
+    add_test(NAME shellgate_anomaly_demo_training
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_ANOMALY_DEMO=$<TARGET_FILE:anomaly_demo>
+        -DSHELLCLAVE_ANOMALY_TEMP=${CMAKE_CURRENT_BINARY_DIR}/anomaly-demo-test
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_anomaly_demo.cmake)
+    set_tests_properties(shellgate_anomaly_demo_training PROPERTIES
+      LABELS shellgate)
   endif()
 endif()
 

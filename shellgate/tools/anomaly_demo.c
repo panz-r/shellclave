@@ -179,8 +179,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* Interactive mode */
-  if (!do_decay && !do_prune && !do_compact && !save_path) {
+  /* Interactive mode: the maintenance options replace it; -s only saves what
+   * it learned. */
+  if (!do_decay && !do_prune && !do_compact) {
     printf("Anomaly detection (threshold=%.2f, learning=%s)\n", threshold,
            learning ? "on" : "off");
     printf("Enter commands (Ctrl+D to exit):\n");
@@ -215,7 +216,9 @@ int main(int argc, char **argv) {
         score = 0.0;
       }
 
-      bool detected = (count >= 3) && (score > threshold);
+      /* An empty model scores INFINITY: nothing is known, so nothing is
+       * anomalous yet and the command can be learned. */
+      bool detected = (count >= 3) && isfinite(score) && (score > threshold);
       bool updated = false;
 
       /* Update model if in learning mode */
