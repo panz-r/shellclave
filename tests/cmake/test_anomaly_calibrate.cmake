@@ -8,7 +8,8 @@ endif()
 
 # Corpus records are physical lines. Build a valid record larger than the old
 # fixed reader buffer here so the integration test verifies that it remains one
-# command rather than being split into synthetic records.
+# command rather than being split into synthetic records. A comment-only line
+# is no record and must not stop the run.
 file(MAKE_DIRECTORY "${SHELLCLAVE_ANOMALY_TEMP}")
 set(long_corpus "${SHELLCLAVE_ANOMALY_TEMP}/long-normal.txt")
 string(REPEAT "x" 5000 long_argument)
@@ -19,6 +20,7 @@ foreach(depth RANGE 1 16)
 endforeach()
 file(READ "${SHELLCLAVE_ANOMALY_CORPUS}" base_corpus)
 file(WRITE "${long_corpus}" "${base_corpus}"
+  "# dataset v2\n"
   "printf '%s' ${long_argument}; printf '%s' tail\n"
   "${nested_corpus}\n"
   "while true; do :; done\n")

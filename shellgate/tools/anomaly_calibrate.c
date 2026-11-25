@@ -1357,6 +1357,13 @@ int main(int argc, char **argv) {
     size_t stage_count = 0;
     shell_process_status_t sequence_status = shell_build_anomaly_netseqs_buffer(
         cmd, strlen(cmd), NULL, &raw, &type, &stage_count);
+    /* A comment-only line has no command and is no record, like an empty
+     * line: skipped without counting as unsupported. */
+    if (sequence_status == SHELL_PROCESS_BLANK) {
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&type);
+      continue;
+    }
     if (sequence_status == SHELL_PROCESS_EPARSE ||
         (sequence_status == SHELL_PROCESS_OK && stage_count == 0)) {
       shell_netstring_buffer_free(&raw);
