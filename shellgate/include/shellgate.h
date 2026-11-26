@@ -845,8 +845,10 @@ sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
  * depgraph workspace or resolved-path analysis storage, SG_ERR_TRUNC if the
  * output buffer or bounded subcommand result array was too small (partial
  * results are still valid), or syntax analysis exhausted its capacity. Syntax
- * exhaustion supplies no subcommand results and sets `subcommand_truncated`
- * with an UNDETERMINED verdict. Returns SG_ERR_UNMODELED, with verdict
+ * exhaustion sets `subcommand_truncated` with an UNDETERMINED verdict. It
+ * supplies no subcommand results when it stopped before any range was
+ * qualified, and otherwise the retained prefix, whose rows are partial and
+ * UNDETERMINED. Returns SG_ERR_UNMODELED, with verdict
  * SG_VERDICT_REJECT, when the source parses but the dependency model cannot
  * capture every requirement for running it safely, and
  * SG_ERR_INVALID for invalid source or buffer sizes.

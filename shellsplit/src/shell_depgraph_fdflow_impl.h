@@ -778,11 +778,6 @@ static SHELL_NONNULL(1, 2,
                                                    uint32_t fd, bool *possible,
                                                    bool free);
 
-/* Propagate only observations of unchanged inherited identities into private
- * origins, at the observation point. Later child mutations cannot erase the
- * proof, or turn a child-installed descriptor into a parent observation.
- * PRIVATE_SCOPE follows lexical nesting without scanning descriptor maps.
- */
 /* choices is an empty caller-owned destination. rank is 1 or 2. low_mode is
  * -1 for no temporary resource open, 0 for a free low slot, and 1 for a full
  * low interval (the temporary open consumes a high slot). source_places,

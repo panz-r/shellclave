@@ -1647,10 +1647,10 @@ static SHELL_NONNULL(1) shell_control_syntax_t
                      : SHELL_CONTROL_SYNTAX_NONE;
 }
 
-/* Shellsplit does not model control-flow execution. Use the full lexical
- * tokenizer instead of raw source scans so words in comments, quoted text,
- * escapes, redirect operands, adjacent word fragments, and ordinary argument
- * positions are not mistaken for reserved control words. */
+/* Shellsplit does not model loop, `case` or `coproc` execution. Use the full
+ * lexical tokenizer instead of raw source scans so words in comments, quoted
+ * text, escapes, redirect operands, adjacent word fragments, and ordinary
+ * argument positions are not mistaken for reserved control words. */
 shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
                                                       size_t input_length) {
   if (!input)
@@ -2215,9 +2215,8 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     return SHELL_EPARSE;
   /* Control compounds have their own list grammar (notably `case` uses `;;`).
    * They remain lexically representable so canonical APIs can reject them as
-   * unsupported. Classify them before brace validation: a text-only `then` or
-   * `do` must never be mistaken for structural syntax in an ordinary command.
-   */
+   * unsupported. Classify them before brace validation: a text-only `do` must
+   * never be mistaken for structural syntax in an ordinary command. */
   /* Drafts classify reserved words in the walk below: received EOF can still
    * extend `if` to `ifx`, whereas a closed child has a committed final word. */
   shell_control_syntax_t control =

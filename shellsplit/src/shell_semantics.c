@@ -1121,10 +1121,10 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     if (command_start || awaiting_command) {
       if (command_start && token.type == SHELL_TOKEN_PIPE_NEGATE)
         continue;
-      /* Control syntax is unsupported whether complete or incomplete. The
-       * list validator retains its diagnostic control grammar separately;
-       * this forward semantic pass only needs the command-position keyword
-       * or function introducer, not another descendant walk. */
+      /* Loop, `case` and function syntax is unsupported whether complete or
+       * incomplete. The list validator retains its diagnostic control grammar
+       * separately; this forward semantic pass only needs the command-position
+       * keyword or function introducer, not another descendant walk. */
       if (reserved_word_position) {
         const shell_keyword_t *keyword =
             shell_source_keyword(input, input_length, token.position, NULL);

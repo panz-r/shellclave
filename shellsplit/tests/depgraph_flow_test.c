@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* --- flow (from depgraph_flow_test.c) --- */
+/* --- flow --- */
 static int flow_failures;
 
 #define CHECK(condition)                                                       \

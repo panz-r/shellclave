@@ -2308,8 +2308,9 @@ typedef struct {
   uint32_t alternative_head;
   uint32_t membership_root;
   uint8_t alternative_count;
-  /* Transforms preserve both flags even when filtering leaves one root.
-   * Recursive imports use correlated to select distinct scalar/FD versions. */
+  /* Transforms preserve the flag even when filtering leaves one root. Recursive
+   * imports select distinct scalar/FD versions by dep_route_state_correlated,
+   * which holds when the state has more than one version. */
   bool truncated;
 } dep_route_state_t;
 
@@ -3654,8 +3655,10 @@ typedef struct {
   uint32_t fd;
   uint8_t touched;
 } dep_owner_use_t;
-/* An owner prepares at most SHELL_DEP_MAX_TOKENS * 3 operations
- * (dep_snapshot_source_t.ops), plus the three standard descriptors. */
+/* Uses are distinct descriptors. A token registers at most two: a move its two
+ * ends, any other redirect one descriptor shared by its operation and its
+ * document. The three standard descriptors come on top; the capacity holds
+ * all of them. */
 enum { DEP_OWNER_USE_CAPACITY = SHELL_DEP_MAX_TOKENS * 3 + 3 };
 
 /* Live construction state is separate from final-resolution scratch, but is

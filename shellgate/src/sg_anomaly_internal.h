@@ -18,7 +18,7 @@ sg_anomaly_score_netseq_count(const sg_anomaly_model_t *model,
 double sg_anomaly_unigram_logprob(const sg_anomaly_model_t *model,
                                   sg_anomaly_item_view_t item) SHELL_NONNULL(1);
 
-/* Internal stream form used to embed the v7 single-model format in
+/* Internal stream form used to embed the v8 single-model format in
  * Shellgate's atomic v2 hybrid bundle. The caller owns the stream; read is
  * failure-atomic. Typed results distinguish format, limit, memory and I/O
  * failures without relying on errno surviving unrelated cleanup. */

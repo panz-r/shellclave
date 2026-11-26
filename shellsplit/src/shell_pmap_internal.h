@@ -41,14 +41,13 @@
  * memo only reuses work: within one union a node pair occurs at most once,
  * since nodes carry absolute key prefixes, so a union without it costs the
  * node pairs on which the operands differ, which is the cost of walking their
- * differing keys. When the table is full it is cleared and filling resumes. A
- * clear costs O(size) after at least size / 2 insertions, so O(1) amortized,
- * and it changes no result; the worst case is that diff cost. sweep() and
- * rollback() clear it too, since both recycle ids. The memo is keyed on node
- * ids alone, so every union on one pool must use, for one tag, the same
- * combining function. A function whose result depends on a small amount of
- * context beyond the two subtrees takes that context as its tag; unions with
- * different tags share the table without ever sharing an entry.
+ * differing keys. A union that needs an entry once the table is full fails, as
+ * shell_pmap_attach_memo states, so the work between two clears is bounded.
+ * Only sweep() and rollback() clear it, since both recycle ids. The memo is
+ * keyed on node ids alone, so every union on one pool must use, for one tag,
+ * the same combining function. A function whose result depends on a small
+ * amount of context beyond the two subtrees takes that context as its tag;
+ * unions with different tags share the table without ever sharing an entry.
  *
  * Failure. An operation that would exceed capacity returns false and leaves
  * every published root valid; nodes it already created stay interned and are

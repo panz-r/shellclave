@@ -7,8 +7,7 @@
  * Design:
  * - Fixed-size state headers in a growable array
  * - All children in a flat arena; each node owns a contiguous region
- * - Children sorted: literals first (binary search), then wildcards (type
- * order)
+ * - Children: literals first (linear scan), then wildcards in type order
  * - Wildcard bitmask per node for O(1) compatibility pre-filter
  * - String-interned token text via shared context
  * - Pattern registry: original strings stored once, referenced by ID

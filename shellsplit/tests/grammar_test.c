@@ -9877,16 +9877,16 @@ static int run_tokenizer(int argc, char **argv) {
       shell_commands_free(cmds, count);
   }
 
-  // Test 219: Double 'then' keyword - complex case requires full grammar
-  // parsing For fast tokenizer, we only detect at command start, nested is
-  // flagged
+  // Test 219: Double `do` keyword - complex case requires full grammar
+  // parsing. For the fast tokenizer, we only detect at command start, nested
+  // is flagged
   {
     const char *input = "while true; do do cmd; done";
     shell_command_t *cmds = NULL;
     size_t count = 0;
     int result = (shell_tokenize_commands(input, strlen(input), &cmds,
                                           &count) == SHELL_TOKENIZE_OK);
-    // This is a complex case - fast tokenizer may not catch nested "then then"
+    // This is a complex case - fast tokenizer may not catch nested "do do"
     test("Non-strict tokenizer accepts unsupported compound grammar",
          result == 1);
     if (cmds)
@@ -10972,7 +10972,7 @@ static void parser_extract(const char *input, shell_parse_result_t *result) {
   shell_parse_fast(input, strlen(input), NULL, result);
 }
 
-/* --- LAYER 1: UNIT TESTS - One feature at a time --- */
+/* --- unit tests: one feature at a time --- */
 
 static void parser_test_feature_matrix(void) {
   printf("\n--- Feature Detection Matrix ---\n");
@@ -11564,9 +11564,7 @@ void test_dialect_oracle(void) {
   shell_commands_free(commands, command_count);
 }
 
-/* --- LAYER 2: INTERACTION TESTS - MULTIPLE FEATURES --- */
-
-/* --- LAYER 3: LARGE/COMPLEX TESTS --- */
+/* --- large and complex tests --- */
 
 typedef struct {
   const char *name;
@@ -11647,8 +11645,6 @@ static void parser_test_complex_case_matrix(void) {
     parser_test(cases[i].name, valid);
   }
 }
-
-/* --- ADDITIONAL LAYER 3 TESTS --- */
 
 static void parser_test_strict_mode(void) {
   printf("\n--- Strict Mode ---\n");
@@ -14155,7 +14151,7 @@ static int run_parser(int argc, char **argv) {
   printf("=== FAST PARSER API TESTS ===\n");
   printf("Testing shell_parse_fast() and related functions\n\n");
 
-  printf("=== LAYER 1: UNIT TESTS (~50 tests) ===\n");
+  printf("=== UNIT TESTS ===\n");
   parser_test_feature_matrix();
   parser_test_extglob_expansion_features();
   parser_test_control_word_boundaries();
@@ -14165,14 +14161,8 @@ static int run_parser(int argc, char **argv) {
   test_dialect_oracle();
   parser_test_if_structure();
 
-  printf("\n=== LAYER 2: INTERACTION TESTS (~100 tests) ===\n");
-
-  printf("\n=== LAYER 3: LARGE/COMPLEX TESTS (~100 tests) ===\n");
+  printf("\n=== LARGE AND COMPLEX TESTS ===\n");
   parser_test_complex_case_matrix();
-
-  printf("\n=== ADDITIONAL LAYER 1 TESTS ===\n");
-
-  printf("\n=== ADDITIONAL LAYER 3 TESTS ===\n");
 
   printf("\n=== FEATURE FLAGS API TESTS ===\n");
   parser_test_feature_flags();

@@ -20,7 +20,8 @@ typedef struct {
  * - O(1) allocation (just pointer advancement + alignment)
  * - Doubling growth: starts at initial_size, doubles on each resize
  * - No compact/reclaim between allocations (fragmentation accumulates)
- * - Copying GC: each grow copies all existing data to a new, larger block
+ * - Growth reallocs one contiguous block; fragmented interior space is
+ *   reclaimed only by st_policy_compact()
  *
  * Operational expectations:
  * - Normal workload: arena grows once at startup, stays stable

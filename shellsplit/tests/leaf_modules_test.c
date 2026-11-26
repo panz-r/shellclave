@@ -19,7 +19,8 @@ static size_t work, fresh, hits;
 #include "shell_pmap_internal.h"
 #include "test_allocator.h"
 
-/* --- structures (from structures_test.c) --- */
+/* --- structures (from persistent_map_test.c, avl_index_test.c,
+ * fd_occupancy_test.c and netstring_test.c) --- */
 /* The leaf data structures of the analysis, each checked against a reference
  * model: the persistent map and its union and fold, the AVL index, the file
  * descriptor occupancy tables and the netstring codec. */
@@ -700,8 +701,6 @@ static void structures_test_pmap_union_collection(void) {
   TEST("a collection clears the memo and unions stay correct", ok);
 }
 
-/* The memo only reuses work: a table far too small for the unions run through
- * it is cleared as it fills, and every union is still correct. */
 /* The bits a fold returns for key pairs that differ. */
 static uint32_t structures_fn_bits(void *context, uint64_t key, uint32_t l,
                                    uint32_t r) {
@@ -757,6 +756,8 @@ static void structures_test_pmap_fold_matches_model(void) {
   TEST("a fold agrees with a reference model and makes no node", ok);
 }
 
+/* A memo far too small for the unions run through it fails a union instead of
+ * being cleared, and every union that is answered is correct. */
 static void structures_test_pmap_union_memo_full(void) {
   static shell_pmap_memo_entry_t tiny[8];
   static uint8_t tiny_blocks[1];

@@ -537,7 +537,7 @@ static int run_depgraph_compare(int argc, char **argv) {
 #undef CMD_FIELDS
 #undef CMD_FIELD
 
-/* --- fixture (from fixture_part.c) --- */
+/* --- fixture (from graph_fixture_test.c) --- */
 #define CHECK(x)                                                               \
   do {                                                                         \
     if (!(x)) {                                                                \

@@ -797,9 +797,10 @@ typedef struct {
 /**
  * Parse a shell command into a dependency graph.
  *
- * All pointers in the output graph (tokens, paths, names, values) reference
- * the original `cmd` string. The caller must ensure `cmd` remains valid and
- * unmodified for the lifetime of the graph.
+ * Pointers in the output graph (tokens, paths, names, values) reference the
+ * original `cmd` string, except where a field's own contract says otherwise.
+ * The caller must ensure `cmd` remains valid and unmodified for the lifetime
+ * of the graph.
  *
  * Subshell parsing is internally limited to 16 levels (defense-in-depth).
  * Returns SHELL_DEP_EPARSE when that limit is exceeded.
@@ -816,7 +817,8 @@ typedef struct {
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
- * The graph models simple-command lists, pipelines, and brace/subshell groups.
+ * The graph models simple-command lists, pipelines, brace/subshell groups,
+ * and `if` groups.
  * Bash's reserved `time` prefix produces one TIME node and structural TIME
  * edge to the measured pipeline root. `report_fd` identifies the shell-owned
  * timing report descriptor; a distinct WRITE, APPEND, PIPE, or substitution
@@ -1321,7 +1323,8 @@ typedef struct {
  * versions bounded per state; a child expansion starts from its parent's
  * checkpoint state in O(1) and pays only for what it uses; publication visits
  * each owner's own uses. The analysis is O(n log n) in the source size n.
- * shellsplit/tests/fd_scaling_test.c enforces this per construct family.
+ * The scaling families in shellsplit/tests/depgraph_flow_test.c enforce this
+ * per construct.
  */
 shell_dep_error_t
 shell_dep_graph_parse(const char *cmd, size_t cmd_len, const char *initial_cwd,

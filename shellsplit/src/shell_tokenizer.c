@@ -1822,8 +1822,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     /* `if` opens a group that runs to its `fi`; `then`, `elif` and `else`
      * start its next list. The keywords are structure: they belong to no
      * range, as the braces of a brace group do not. A keyword with no `if`
-     * around it stays an ordinary word here, for the grammar checks to
-     * reject. */
+     * around it is a syntax error. */
     if (!in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
         (c == 'i' || c == 't' || c == 'e' || c == 'f') &&
         fast_lexical_token_at(&documents, pos) &&

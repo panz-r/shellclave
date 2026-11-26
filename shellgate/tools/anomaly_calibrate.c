@@ -16,6 +16,7 @@
  *   -p <type>   Perturbation: swap|insert|substitute|shuffle|all (default: all)
  *   -N <num>    Synthetics per normal command (default: 3)
  *   -f <fmt>    Output: csv|json|text (default: csv)
+ *   -r <seed>   Perturbation RNG seed (default: current time)
  *   -s <file>   Save trained model to file
  *   -h          Show help
  */
