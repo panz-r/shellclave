@@ -76,8 +76,8 @@ bool shell_env_screener_is_whitelisted(const char *name) SHELL_NONNULL(1);
  * @param capacity                read: size of out_indices array
  * @param out_count             write: number of flagged variables (or minimum
  * capacity needed)
- * @param posterior_threshold     read: minimum posterior probability to flag;
- * must be finite and in [0, 1]
+ * @param posterior_threshold     read: a variable is flagged when its posterior
+ * probability is strictly greater than this; must be finite and in [0, 1]
  * @param min_length             read: minimum value length to consider
  * @return                       SHELL_ENV_SCREENER_OK on success,
  * SHELL_ENV_SCREENER_BUFFER_TOO_SMALL if capacity too small (out_count has

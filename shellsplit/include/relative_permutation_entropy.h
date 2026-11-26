@@ -32,7 +32,8 @@ double shell_rpe_ngram_entropy(const char *s, int n) SHELL_NONNULL(1);
  * @return        Median entropy of permutations, or NAN for invalid input or
  *                allocation failure. Unigram entropy (n == 1) does not depend
  *                on character order, so it is the ordinary entropy and needs
- *                no allocation.
+ *                no allocation. A string shorter than 12 bytes is not
+ *                permuted: the result is its own entropy.
  */
 double shell_rpe_permutation_entropy(const char *s, int n_perms, int n)
     SHELL_NONNULL(1);
@@ -43,7 +44,9 @@ double shell_rpe_permutation_entropy(const char *s, int n_perms, int n)
  * @param n_perms Number of permutations to sample
  * @param n       N-gram size
  * @return        Ratio: H(original) / H(permuted), or NAN for invalid input or
- *                allocation failure
+ *                allocation failure. The ratio is 2 when the permuted entropy
+ *                is 0. A string shorter than 12 bytes, or n == 1, is not
+ *                permuted, so the ratio is 1 (2 at entropy 0).
  */
 double shell_rpe_relative_entropy_ratio(const char *s, int n_perms, int n)
     SHELL_NONNULL(1);
@@ -51,7 +54,8 @@ double shell_rpe_relative_entropy_ratio(const char *s, int n_perms, int n)
 /**
  * Calculate conditional entropy H(Char_i | Char_{i-1})
  * @param s  Input string
- * @return   Conditional entropy in bits, or NAN for invalid input
+ * @return   Conditional entropy in bits, or NAN for a string longer than
+ *           UINT32_MAX bytes
  */
 double shell_rpe_conditional_entropy(const char *s) SHELL_NONNULL(1);
 
@@ -60,7 +64,9 @@ double shell_rpe_conditional_entropy(const char *s) SHELL_NONNULL(1);
  * @param s        Input string
  * @param n_perms Number of permutations to sample
  * @return        Median conditional entropy of permutations, or NAN for
- *                invalid input or allocation failure
+ *                invalid input or allocation failure. A string shorter than 12
+ *                bytes is not permuted: the result is its own conditional
+ *                entropy.
  */
 double shell_rpe_permutation_conditional_entropy(const char *s, int n_perms)
     SHELL_NONNULL(1);
@@ -70,7 +76,9 @@ double shell_rpe_permutation_conditional_entropy(const char *s, int n_perms)
  * @param s        Input string
  * @param n_perms Number of permutations to sample
  * @return        Ratio: H_cond(original) / H_cond(permuted), or NAN for
- *                invalid input or allocation failure
+ *                invalid input or allocation failure. The ratio is 2 when the
+ *                permuted entropy is 0. A string shorter than 12 bytes is not
+ *                permuted, so the ratio is 1 (2 at entropy 0).
  */
 double shell_rpe_relative_conditional_entropy(const char *s, int n_perms)
     SHELL_NONNULL(1);

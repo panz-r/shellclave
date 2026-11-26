@@ -46,15 +46,18 @@ void fixed_permute_string(char *s, int perm_index);
 // Conditional entropy H(Char_i | Char_{i-1}) - entropy of char given previous
 // char
 double shell_rpe_conditional_entropy(const char *s) {
-  int bigram_freq[256][256] = {0};
-  int char_freq[256] = {0};
-  int total_bigrams = 0;
+  uint32_t bigram_freq[256][256] = {0};
+  uint32_t char_freq[256] = {0};
+  uint32_t total_bigrams = 0;
 
-  int len = strlen(s);
+  size_t len = strlen(s);
   if (len < 2)
     return 0.0;
+  /* The counts are 32 bits wide. */
+  if (len - 1 > UINT32_MAX)
+    return NAN;
 
-  for (int i = 1; i < len; i++) {
+  for (size_t i = 1; i < len; i++) {
     unsigned char prev = (unsigned char)s[i - 1];
     unsigned char curr = (unsigned char)s[i];
     bigram_freq[prev][curr]++;
