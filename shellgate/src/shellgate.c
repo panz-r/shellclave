@@ -2339,17 +2339,6 @@ static sg_error_t sg_gate_evaluate_body(sg_gate_t *gate, const char *cmd,
     out->verdict = SG_VERDICT_ALLOW;
     return SG_BLANK;
   }
-  if (ferr == SHELL_EPARSE && fast.count == 0) {
-    out->verdict = SG_VERDICT_REJECT;
-    out->deny_reason = bw_copy(&bw, "parse error", 11);
-    sg_init_rejected_subcommand(out, out->deny_reason);
-    if (bw.overflow) {
-      out->truncated = true;
-      out->verdict = SG_VERDICT_UNDETERMINED;
-      return SG_ERR_TRUNC;
-    }
-    return SG_ERR_PARSE;
-  }
   if (ferr == SHELL_EPARSE) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "parse error", 11);
