@@ -1,8 +1,9 @@
 /*
  * trie_variants.c - Token type variant suggestion for edit UI.
- * Walks the trie based on a pattern and returns observed type variants
- * for a specific token position, allowing the UI to present generalization
- * options (more specific to more general).
+ * st_token_variants_at derives the generalization options of one token from
+ * its pattern alone. st_learner_suggest_token_variants walks the learner's trie
+ * along a pattern and returns the type variants observed at a token position.
+ * Both let the UI present options from more specific to more general.
  */
 
 #include "metadata.h"
@@ -82,7 +83,7 @@ size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
           (next_wide == ST_TYPE_ANY || st_is_compatible(joined, next_wide)))
         next_wide = joined;
     }
-    if (next_wide == ST_TYPE_ANY || next_wide == current)
+    if (next_wide == ST_TYPE_ANY)
       break;
     seen[next_wide] = true;
     out_variants[out++] = (st_token_variant_t){
