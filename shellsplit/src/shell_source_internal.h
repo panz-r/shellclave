@@ -88,8 +88,11 @@ static inline SHELL_NONNULL(1) bool shell_source_function_declarator_after(
  * Shell operators delimit reserved words without requiring whitespace, and
  * escaped physical line endings disappear before that decision.  Keep the
  * word-forming exceptions explicit: `!<(` / `!>(` are ordinary words with a
- * process-substitution suffix, `!(...)` is Bash extglob syntax, and numeric or
- * named descriptor prefixes remain part of their containing word. The caller
+ * process-substitution suffix, `!(...)` is read as an extglob pattern, and
+ * numeric or named descriptor prefixes remain part of their containing word.
+ * Bash without extglob parses `!(...)` as a negated subshell, wherever a
+ * command may start; that form is not modeled, and the dependency graph
+ * rejects it. The caller
  * supplies immutable input[0..end) with position <= end. `after` is optional.
  */
 static SHELL_NONNULL(1) inline bool shell_source_match_pipeline_negator(
@@ -5319,6 +5322,9 @@ shell_source_word_expansion_scan(const char *input, size_t length,
         position = continued;
         continue;
       }
+      /* Received input may continue a final lone backslash, so the word is
+       * reported dynamic. A complete source reads it as a literal byte, which
+       * shell_source_skip_complete_shell_word accounts for. */
       if (position + 1 >= length)
         return (shell_source_word_expansion_t){.dynamic = true};
       tilde_prefix = false;

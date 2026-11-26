@@ -125,7 +125,10 @@ typedef struct {
    * string, parameter and arithmetic elements; display spans never overlap.
    * Executable substitution bodies are separate inspections, not traversed
    * for variable/arithmetic flags here. Redirect targets retain their own
-   * classification and are not counted as argument variables/arithmetic. */
+   * classification and are not counted as argument variables/arithmetic. The
+   * operand of a descriptor duplication (`>&$fd`, `<&$fd`) and an unresolved
+   * operand of bare `>&` are not redirect targets: they keep their ordinary
+   * classification and are counted. */
   bool has_variables;
   bool has_pos_vars;
   bool has_special_vars;
