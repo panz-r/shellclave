@@ -70,7 +70,8 @@ static void word_literals(void) {
           SHELL_SOURCE_COMPLETE);
     CHECK(draft.prefix.count == 1 &&
           !(draft.prefix.cmds[0].features &
-            (SHELL_FEAT_CONDITIONALS | SHELL_FEAT_LOOPS | SHELL_FEAT_CASE)));
+            (SHELL_FEAT_CONDITIONALS | SHELL_FEAT_LOOPS | SHELL_FEAT_CASE |
+             SHELL_FEAT_IF)));
     shell_netstring_buffer_t sequence = {0};
     size_t count;
     bool features;
