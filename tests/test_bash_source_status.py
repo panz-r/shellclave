@@ -1,16 +1,70 @@
 """Qualify source statuses with Bash -n and fixed builtin-only EOF fixtures."""
 
 import argparse
+import atexit
 import os
+import select
 import subprocess
 import unittest
 
 
+class Probe:
+    """One long-lived probe process. Starting one per source dominates the run
+    under sanitizers, so requests are framed and answered in turn."""
+
+    def __init__(self, command):
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE)
+        self.pending = b""
+        atexit.register(self.process.kill)
+
+    def read(self, count=None):
+        """Bytes up to and including a newline, or exactly count bytes."""
+        while True:
+            if count is None and b"\n" in self.pending:
+                line, _, self.pending = self.pending.partition(b"\n")
+                return line
+            if count is not None and len(self.pending) >= count:
+                data, self.pending = self.pending[:count], self.pending[count:]
+                return data
+            if not select.select([self.process.stdout], [], [], 10)[0]:
+                self.process.kill()
+                raise TimeoutError("the probe did not answer")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError("the probe ended on this source")
+            self.pending += chunk
+
+    def ask(self, mode, source):
+        """The (status, output) of a request; mode is b"p" or b"a"."""
+        self.process.stdin.write(b"%s %d\n" % (mode, len(source)) + source)
+        self.process.stdin.flush()
+        status, length = self.read().split()
+        return int(status), self.read(int(length))
+
+
 class SourceStatusContract(unittest.TestCase):
+    probes = {}
+
+    def ask(self, mode, source):
+        key = tuple(self.probe)
+        if key not in self.probes:
+            self.probes[key] = Probe(self.probe)
+        try:
+            return self.probes[key].ask(mode, source)
+        except (OSError, RuntimeError, TimeoutError):
+            # A probe that ended on one source must not answer the next.
+            self.probes.pop(key).process.kill()
+            raise
+
     def classify(self, source):
-        result = subprocess.run([*self.probe, "--probe"], input=source,
-                                capture_output=True, check=True, timeout=10)
-        return int(result.stdout)
+        status, output = self.ask(b"p", source)
+        self.assertEqual(status, 0)
+        return int(output)
+
+    def argv(self, source):
+        """The (status, netstring sequence) of a single command's argv."""
+        return self.ask(b"a", source)
 
     def syntax(self, source):
         # -n reads the entire source but never runs a command or substitution.
@@ -504,9 +558,8 @@ class SourceStatusContract(unittest.TestCase):
                     expected = netstring(b"".join(netstring(v) for v in
                                                  (b"printf", b"%s\\0",
                                                   reference[:-1])))
-                    actual = subprocess.run([*self.probe, "--argv"],
-                                            input=source, capture_output=True,
-                                            check=True, timeout=10).stdout
+                    status, actual = self.argv(source)
+                    self.assertEqual(status, 0)
                     self.assertEqual(actual, expected)
                     self.assertEqual(self.classify(source), 0)
 
@@ -576,9 +629,7 @@ class SourceStatusContract(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), 0)
-                result = subprocess.run([*self.probe, "--argv"], input=source,
-                                        capture_output=True, timeout=10)
-                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(self.argv(source)[0], 0)
 
     def test_nested_parameter_quote_context(self):
         cases = (
