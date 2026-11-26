@@ -31,8 +31,12 @@ PRELUDE = (
 def run_terminal_reference(bash, script, payload, expected):
     pid, descriptor = pty.fork()
     if pid == 0:
-        os.execve(bash, [bash, "--noprofile", "--norc", "-p", "-c",
-                         PRELUDE + script], ENVIRONMENT)
+        try:
+            os.execve(bash, [bash, "--noprofile", "--norc", "-p", "-c",
+                             PRELUDE + script], ENVIRONMENT)
+        finally:
+            # A failed exec must not return into the test as a second process.
+            os._exit(127)
     status = None
     output = bytearray()
     sent = False
@@ -62,7 +66,8 @@ def run_terminal_reference(bash, script, payload, expected):
                     sent = True
         else:
             raise AssertionError(f"Readline reference timed out: {bytes(output)!r}")
-        while time.monotonic() < deadline:
+        reap_deadline = time.monotonic() + 5
+        while time.monotonic() < reap_deadline:
             finished, status_value = os.waitpid(pid, os.WNOHANG)
             if finished:
                 status = status_value
