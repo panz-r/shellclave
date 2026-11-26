@@ -5,6 +5,11 @@
  * synthetic anomalies via perturbation, evaluates at multiple thresholds,
  * and outputs ROC curve data (TPR, FPR, precision, F1, AUC).
  *
+ * The model is trained on the same corpus whose commands it then scores, so
+ * the reported false-positive rate and AUC are optimistic for unseen traffic,
+ * and so is the recommended threshold. Calibrate against held-out commands to
+ * judge a threshold.
+ *
  * Usage:
  *   anomaly_calibrate -n normal.txt [options]
  *
@@ -30,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "sg_anomaly.h"
@@ -92,10 +98,10 @@ static void free_corpus(corpus_record_t *records, size_t count) {
 /* Shellgate uses one caller-owned buffer for the rendered result and its
  * dependency-graph workspace. Keep one growable buffer while loading a
  * corpus instead of assuming a small diagnostic buffer is sufficient. */
-static bool ensure_evaluation_buffer(char **buffer, size_t *capacity,
-                                     size_t command_length) {
-  if (!buffer || !capacity)
-    return false;
+static SHELL_NONNULL(1,
+                     2) bool ensure_evaluation_buffer(char **buffer,
+                                                      size_t *capacity,
+                                                      size_t command_length) {
   size_t required = sg_gate_evaluate_size_hint(command_length);
   if (required == SIZE_MAX)
     return false;
@@ -115,11 +121,11 @@ static bool ensure_evaluation_buffer(char **buffer, size_t *capacity,
  * it is safe to retry after growing the same caller-owned workspace. A
  * subcommand-count truncation is a fixed Shellgate output limit, not a buffer
  * shortage, and must be reported instead of retried forever. */
-static sg_error_t evaluate_complete(sg_gate_t *gate, const char *command,
-                                    size_t command_length, char **buffer,
-                                    size_t *capacity, sg_result_t *result) {
-  if (!gate || !command || !buffer || !capacity || !result ||
-      !ensure_evaluation_buffer(buffer, capacity, command_length))
+static SHELL_NONNULL(1, 2, 4, 5, 6) sg_error_t
+    evaluate_complete(sg_gate_t *gate, const char *command,
+                      size_t command_length, char **buffer, size_t *capacity,
+                      sg_result_t *result) {
+  if (!ensure_evaluation_buffer(buffer, capacity, command_length))
     return SG_ERR_MEMORY;
 
   for (;;) {
@@ -165,12 +171,11 @@ typedef enum {
  * unrelated commands, so retain the whole line until its newline (or EOF).
  * Shellgate source is text; reject a raw NUL instead of silently truncating it
  * through C-string interfaces below. */
-static corpus_line_status_t read_corpus_line(FILE *stream, char **line,
-                                             size_t *capacity, size_t *length) {
+static SHELL_NONNULL(1, 2, 3) corpus_line_status_t
+    read_corpus_line(FILE *stream, char **line, size_t *capacity,
+                     size_t *length) {
   if (length)
     *length = 0;
-  if (!stream || !line || !capacity)
-    return CORPUS_LINE_IO;
 
   size_t used = 0;
   for (;;) {
@@ -256,12 +261,13 @@ static bool rare_spans(const char *command, netseq_span_t *raw,
   return true;
 }
 
-static bool render_selection(const netseq_span_t *spans, size_t count,
-                             const size_t *order, const char *rare_command,
-                             bool type_sequence,
-                             shell_netstring_buffer_t *out) {
-  if (!out)
-    return false;
+/* rare_command may be NULL only when order holds no SIZE_MAX marker. */
+static SHELL_NONNULL(1, 3,
+                     6) bool render_selection(const netseq_span_t *spans,
+                                              size_t count, const size_t *order,
+                                              const char *rare_command,
+                                              bool type_sequence,
+                                              shell_netstring_buffer_t *out) {
   *out = (shell_netstring_buffer_t){0};
   char raw_buf[64], type_buf[80];
   netseq_span_t rare_raw, rare_type;
@@ -295,9 +301,21 @@ static bool render_selection(const netseq_span_t *spans, size_t count,
   return true;
 }
 
-static unsigned int rand_uint(unsigned int *state) {
+static SHELL_NONNULL(1) unsigned int rand_uint(unsigned int *state) {
   *state = *state * 1103515245u + 12345u;
   return (*state >> 16) & 0x7fff;
+}
+
+/* A value in [0, bound) without modulo bias; bound is at most the generator
+ * range of 0x8000. */
+static SHELL_NONNULL(1) unsigned int rand_below(unsigned int *state,
+                                                unsigned int bound) {
+  unsigned int limit = 0x8000 - 0x8000 % bound;
+  unsigned int value;
+  do
+    value = rand_uint(state);
+  while (value >= limit);
+  return value % bound;
 }
 
 static bool netseq_span_equal(netseq_span_t left, netseq_span_t right) {
@@ -316,10 +334,12 @@ static bool sequence_has_distinct_stages(const netseq_span_t *raw,
   return false;
 }
 
-static bool perturbation_available(perturb_type_t requested,
-                                   const netseq_span_t *raw,
-                                   const netseq_span_t *type, size_t count) {
-  if (!raw || !type || count == 0 || count > MAX_TOKENS)
+static SHELL_NONNULL(2,
+                     3) bool perturbation_available(perturb_type_t requested,
+                                                    const netseq_span_t *raw,
+                                                    const netseq_span_t *type,
+                                                    size_t count) {
+  if (count == 0 || count > MAX_TOKENS)
     return false;
   bool reorderable = sequence_has_distinct_stages(raw, type, count);
   switch (requested) {
@@ -334,17 +354,15 @@ static bool perturbation_available(perturb_type_t requested,
      * nonempty sequence has such a replacement. */
     return true;
   case PERTURB_ALL:
-    return reorderable || count < MAX_TOKENS || count > 0;
+    return true;
   }
   return false;
 }
 
-static bool choose_rare_command(const netseq_span_t *raw,
-                                const netseq_span_t *type, size_t index,
-                                unsigned int *rng, const char **selected) {
-  if (!raw || !type || !rng || !selected)
-    return false;
-  size_t start = rand_uint(rng) % NUM_RARE;
+static SHELL_NONNULL(1, 2, 4, 5) bool choose_rare_command(
+    const netseq_span_t *raw, const netseq_span_t *type, size_t index,
+    unsigned int *rng, const char **selected) {
+  size_t start = rand_below(rng, NUM_RARE);
   for (size_t attempt = 0; attempt < NUM_RARE; attempt++) {
     const char *candidate = rare_cmds[(start + attempt) % NUM_RARE];
     char raw_buf[64], type_buf[80];
@@ -361,11 +379,10 @@ static bool choose_rare_command(const netseq_span_t *raw,
   return false;
 }
 
-static bool selection_changes_source(const netseq_span_t *raw,
-                                     const netseq_span_t *type,
-                                     size_t source_count, const size_t *order,
-                                     size_t selected_count,
-                                     const char *rare_command) {
+/* rare_command may be NULL only when order holds no SIZE_MAX marker. */
+static SHELL_NONNULL(1, 2, 4) bool selection_changes_source(
+    const netseq_span_t *raw, const netseq_span_t *type, size_t source_count,
+    const size_t *order, size_t selected_count, const char *rare_command) {
   if (selected_count != source_count)
     return true;
   char raw_buf[64], type_buf[80];
@@ -375,7 +392,7 @@ static bool selection_changes_source(const netseq_span_t *raw,
     return false;
   for (size_t index = 0; index < selected_count; index++) {
     if (order[index] == SIZE_MAX) {
-      if (!rare_command || !netseq_span_equal(raw[index], rare_raw) ||
+      if (!netseq_span_equal(raw[index], rare_raw) ||
           !netseq_span_equal(type[index], rare_type))
         return true;
     } else if (!netseq_span_equal(raw[index], raw[order[index]]) ||
@@ -397,8 +414,8 @@ static bool perturb_swap(size_t *order, const netseq_span_t *raw,
   /* Start at a deterministic random pair, then scan for a pair whose
    * canonical raw or typed stages differ. Swapping equal stages is not a
    * synthetic anomaly, even though its index permutation changed. */
-  size_t a = rand_uint(rng) % count;
-  size_t b = rand_uint(rng) % count;
+  size_t a = rand_below(rng, (unsigned int)count);
+  size_t b = rand_below(rng, (unsigned int)count);
   if (a == b)
     b = (b + 1) % count;
   if (netseq_span_equal(raw[a], raw[b]) &&
@@ -432,7 +449,7 @@ static bool perturb_insert(size_t *order, size_t *out_count, size_t count,
     return false;
   if (count >= MAX_TOKENS)
     return false;
-  size_t insert_pos = rand_uint(rng) % (count + 1);
+  size_t insert_pos = rand_below(rng, (unsigned int)count + 1);
   size_t j = 0;
   for (size_t i = 0; i < count; i++) {
     if (i == insert_pos) {
@@ -450,7 +467,7 @@ static bool perturb_insert(size_t *order, size_t *out_count, size_t count,
 static bool perturb_substitute(size_t *order, size_t count, unsigned int *rng) {
   if (count == 0)
     return false;
-  size_t pos = rand_uint(rng) % count;
+  size_t pos = rand_below(rng, (unsigned int)count);
   for (size_t i = 0; i < count; i++) {
     order[i] = i == pos ? SIZE_MAX : i;
   }
@@ -467,7 +484,7 @@ static bool perturb_shuffle(size_t *order, const netseq_span_t *raw,
     order[i] = i;
   /* Shuffle token copies in-place using Fisher-Yates. */
   for (size_t i = count - 1; i > 0; i--) {
-    size_t j = rand_uint(rng) % (i + 1);
+    size_t j = rand_below(rng, (unsigned int)i + 1);
     size_t tmp = order[i];
     order[i] = order[j];
     order[j] = tmp;
@@ -488,9 +505,11 @@ static bool perturb_shuffle(size_t *order, const netseq_span_t *raw,
   return changed;
 }
 
-static bool parse_unsigned_decimal(const char *text, uintmax_t maximum,
-                                   bool allow_zero, uintmax_t *out) {
-  if (!text || !*text || !out)
+static SHELL_NONNULL(1, 4) bool parse_unsigned_decimal(const char *text,
+                                                       uintmax_t maximum,
+                                                       bool allow_zero,
+                                                       uintmax_t *out) {
+  if (!*text)
     return false;
   uintmax_t value = 0;
   for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
@@ -508,42 +527,21 @@ static bool parse_unsigned_decimal(const char *text, uintmax_t maximum,
   return true;
 }
 
-static bool parse_size_option(const char *text, size_t maximum, size_t *out) {
+static SHELL_NONNULL(1, 3) bool parse_size_option(const char *text,
+                                                  size_t maximum, size_t *out) {
   uintmax_t value = 0;
-  if (!out || !parse_unsigned_decimal(text, maximum, false, &value))
+  if (!parse_unsigned_decimal(text, maximum, false, &value))
     return false;
   *out = (size_t)value;
   return true;
 }
 
-static bool parse_seed_option(const char *text, unsigned int *out) {
+static SHELL_NONNULL(1, 2) bool parse_seed_option(const char *text,
+                                                  unsigned int *out) {
   uintmax_t value = 0;
-  if (!out || !parse_unsigned_decimal(text, UINT_MAX, true, &value))
+  if (!parse_unsigned_decimal(text, UINT_MAX, true, &value))
     return false;
   *out = (unsigned int)value;
-  return true;
-}
-
-static bool parse_threshold_range(const char *text) {
-  if (!text || strlen(text) > MAX_THRESHOLD_SPEC_LENGTH)
-    return false;
-  errno = 0;
-  char *cursor = NULL;
-  double parsed_start = strtod(text, &cursor);
-  if (errno != 0 || cursor == text || *cursor != ',')
-    return false;
-  const char *second = cursor + 1;
-  errno = 0;
-  double parsed_end = strtod(second, &cursor);
-  if (errno != 0 || cursor == second || *cursor != ',')
-    return false;
-  const char *third = cursor + 1;
-  errno = 0;
-  double parsed_step = strtod(third, &cursor);
-  if (errno != 0 || cursor == third || *cursor != '\0' ||
-      !isfinite(parsed_start) || !isfinite(parsed_end) ||
-      !isfinite(parsed_step) || parsed_step <= 0.0 || parsed_end < parsed_start)
-    return false;
   return true;
 }
 
@@ -571,10 +569,8 @@ static void threshold_exact_free(threshold_exact_t *number) {
   *number = (threshold_exact_t){0};
 }
 
-static bool threshold_integer_reserve(threshold_integer_t *number,
-                                      size_t capacity) {
-  if (!number)
-    return false;
+static SHELL_NONNULL(1) bool threshold_integer_reserve(
+    threshold_integer_t *number, size_t capacity) {
   if (capacity <= number->capacity)
     return true;
   uint8_t *grown = realloc(number->digits, capacity);
@@ -585,7 +581,8 @@ static bool threshold_integer_reserve(threshold_integer_t *number,
   return true;
 }
 
-static bool threshold_integer_zero(threshold_integer_t *number) {
+static SHELL_NONNULL(1) bool threshold_integer_zero(
+    threshold_integer_t *number) {
   if (!threshold_integer_reserve(number, 1))
     return false;
   number->digits[0] = 0;
@@ -608,9 +605,9 @@ static SHELL_NONNULL(1, 2) bool threshold_integer_copy(
   return true;
 }
 
-static bool threshold_integer_multiply(threshold_integer_t *number,
-                                       unsigned factor) {
-  if (!number || !number->digits || number->count > SIZE_MAX - 4 ||
+static SHELL_NONNULL(1) bool threshold_integer_multiply(
+    threshold_integer_t *number, unsigned factor) {
+  if (!number->digits || number->count > SIZE_MAX - 4 ||
       !threshold_integer_reserve(number, number->count + 4))
     return false;
   unsigned carry = 0;
@@ -628,9 +625,9 @@ static bool threshold_integer_multiply(threshold_integer_t *number,
   return true;
 }
 
-static bool threshold_integer_add_digit(threshold_integer_t *number,
-                                        unsigned digit) {
-  if (!number || !number->digits || number->count == SIZE_MAX ||
+static SHELL_NONNULL(1) bool threshold_integer_add_digit(
+    threshold_integer_t *number, unsigned digit) {
+  if (!number->digits || number->count == SIZE_MAX ||
       !threshold_integer_reserve(number, number->count + 1))
     return false;
   unsigned carry = digit;
@@ -644,23 +641,22 @@ static bool threshold_integer_add_digit(threshold_integer_t *number,
   return true;
 }
 
-static bool threshold_exact_zero(const threshold_exact_t *number) {
-  return number && number->coefficient.count == 1 &&
-         number->coefficient.digits[0] == 0;
+static SHELL_NONNULL(1) bool threshold_exact_zero(
+    const threshold_exact_t *number) {
+  return number->coefficient.count == 1 && number->coefficient.digits[0] == 0;
 }
 
-static bool threshold_exact_copy(threshold_exact_t *destination,
-                                 const threshold_exact_t *source) {
-  if (!destination || !source)
-    return false;
+static SHELL_NONNULL(1, 2) bool threshold_exact_copy(
+    threshold_exact_t *destination, const threshold_exact_t *source) {
   *destination = (threshold_exact_t){.exponent = source->exponent,
                                      .negative = source->negative};
   return threshold_integer_copy(&destination->coefficient,
                                 &source->coefficient);
 }
 
-static bool threshold_exact_normalize(threshold_exact_t *number) {
-  if (!number || !number->coefficient.digits || number->coefficient.count == 0)
+static SHELL_NONNULL(1) bool threshold_exact_normalize(
+    threshold_exact_t *number) {
+  if (!number->coefficient.digits || number->coefficient.count == 0)
     return false;
   threshold_integer_t *coefficient = &number->coefficient;
   while (coefficient->count > 1 &&
@@ -685,11 +681,9 @@ static bool threshold_exact_normalize(threshold_exact_t *number) {
   return true;
 }
 
-static bool threshold_parse_exponent(const char **cursor, const char *end,
-                                     char marker, int64_t *exponent,
-                                     bool *overflow) {
-  if (!cursor || !*cursor || !exponent || !overflow)
-    return false;
+static SHELL_NONNULL(1, 2, 4, 5) bool threshold_parse_exponent(
+    const char **cursor, const char *end, char marker, int64_t *exponent,
+    bool *overflow) {
   *exponent = 0;
   *overflow = false;
   if (*cursor == end ||
@@ -724,9 +718,11 @@ static int threshold_hex_digit(char byte) {
   return -1;
 }
 
-static bool threshold_exact_parse(const char *begin, const char *end,
-                                  threshold_exact_t *out) {
-  if (!begin || !end || !out || begin >= end)
+static SHELL_NONNULL(1, 2,
+                     3) bool threshold_exact_parse(const char *begin,
+                                                   const char *end,
+                                                   threshold_exact_t *out) {
+  if (begin >= end)
     return false;
   *out = (threshold_exact_t){0};
   const char *cursor = begin;
@@ -910,11 +906,10 @@ static bool threshold_exact_compare(const threshold_exact_t *left,
   return true;
 }
 
-static bool threshold_exact_add(const threshold_exact_t *left,
-                                const threshold_exact_t *right,
-                                threshold_exact_t *out) {
-  if (!left || !right || !out)
-    return false;
+static SHELL_NONNULL(1, 2,
+                     3) bool threshold_exact_add(const threshold_exact_t *left,
+                                                 const threshold_exact_t *right,
+                                                 threshold_exact_t *out) {
   *out = (threshold_exact_t){0};
   if (threshold_exact_zero(left))
     return threshold_exact_copy(out, right);
@@ -972,9 +967,9 @@ static bool threshold_exact_multiple(const threshold_exact_t *number,
          threshold_exact_normalize(out);
 }
 
-static bool threshold_exact_double(const threshold_exact_t *number,
-                                   double *out) {
-  if (!number || !out || number->coefficient.count > SIZE_MAX - 48)
+static SHELL_NONNULL(1, 2) bool threshold_exact_double(
+    const threshold_exact_t *number, double *out) {
+  if (number->coefficient.count > SIZE_MAX - 48)
     return false;
   size_t capacity = number->coefficient.count + 48;
   char *text = malloc(capacity);
@@ -1004,11 +999,9 @@ static bool threshold_exact_double(const threshold_exact_t *number,
 /* Count using exact source values, then round each included point once for
  * scoring. No epsilon can reliably distinguish `0.1,0.3,0.1` from an end
  * deliberately spelled one representable value below the next grid point. */
-static bool build_threshold_grid(const char *range_text,
-                                 double thresholds[MAX_THRESHOLDS],
-                                 size_t *count) {
-  if (!range_text || !thresholds || !count ||
-      strlen(range_text) > MAX_THRESHOLD_SPEC_LENGTH)
+static SHELL_NONNULL(1, 2, 3) bool build_threshold_grid(
+    const char *range_text, double thresholds[MAX_THRESHOLDS], size_t *count) {
+  if (strlen(range_text) > MAX_THRESHOLD_SPEC_LENGTH)
     return false;
   char *first_end = NULL;
   char *second_end = NULL;
@@ -1080,13 +1073,10 @@ static bool output_format_valid(const char *format) {
 /* `all` is a deterministic round-robin selection. A selected mutation can be
  * inapplicable to a short sequence, in which case try the later kinds in that
  * same cycle before declaring this record ineligible. */
-static bool apply_perturbation(perturb_type_t requested, size_t sequence_index,
-                               size_t *order, size_t *selected_count,
-                               const netseq_span_t *raw,
-                               const netseq_span_t *type, size_t count,
-                               unsigned int *rng, perturb_type_t *applied) {
-  if (!order || !selected_count || !rng || !applied)
-    return false;
+static SHELL_NONNULL(3, 4, 5, 6, 8, 9) bool apply_perturbation(
+    perturb_type_t requested, size_t sequence_index, size_t *order,
+    size_t *selected_count, const netseq_span_t *raw, const netseq_span_t *type,
+    size_t count, unsigned int *rng, perturb_type_t *applied) {
   size_t tries = requested == PERTURB_ALL ? PERTURB_KIND_COUNT : 1;
   for (size_t attempt = 0; attempt < tries; attempt++) {
     perturb_type_t kind = requested;
@@ -1107,7 +1097,7 @@ static bool apply_perturbation(perturb_type_t requested, size_t sequence_index,
     case PERTURB_SHUFFLE:
       ok = perturb_shuffle(order, raw, type, count, rng);
       break;
-    case PERTURB_ALL:
+    case PERTURB_ALL: /* A kind is never the selector itself. */
       break;
     }
     if (ok) {
@@ -1136,11 +1126,13 @@ static int compare_auc_score(const void *left, const void *right) {
 /* Exact empirical AUC: probability that a synthetic score is greater than a
  * normal score, with half credit for ties. It is independent of the displayed
  * threshold grid and remains well-defined for infinite (but not NaN) scores. */
-static bool empirical_auc(const double *normal, size_t normal_count,
-                          const double *synthetic, size_t synthetic_count,
-                          double *out) {
-  if (!normal || !synthetic || !out || normal_count == 0 ||
-      synthetic_count == 0 || normal_count > SIZE_MAX - synthetic_count)
+static SHELL_NONNULL(1, 3, 5) bool empirical_auc(const double *normal,
+                                                 size_t normal_count,
+                                                 const double *synthetic,
+                                                 size_t synthetic_count,
+                                                 double *out) {
+  if (normal_count == 0 || synthetic_count == 0 ||
+      normal_count > SIZE_MAX - synthetic_count)
     return false;
   size_t total = normal_count + synthetic_count;
   auc_score_t *scores = calloc(total, sizeof(*scores));
@@ -1185,6 +1177,16 @@ static bool empirical_auc(const double *normal, size_t normal_count,
   return true;
 }
 
+/* Whether two paths name one file, by spelling or, when both exist, by
+ * identity. */
+static SHELL_NONNULL(1, 2) bool same_file(const char *left, const char *right) {
+  struct stat left_status, right_status;
+  return strcmp(left, right) == 0 ||
+         (stat(left, &left_status) == 0 && stat(right, &right_status) == 0 &&
+          left_status.st_dev == right_status.st_dev &&
+          left_status.st_ino == right_status.st_ino);
+}
+
 static void print_usage(const char *prog) {
   printf("Usage: %s -n <corpus> [options]\n", prog);
   printf("Options:\n");
@@ -1225,10 +1227,6 @@ int main(int argc, char **argv) {
       if (strlen(argv[i]) > MAX_THRESHOLD_SPEC_LENGTH) {
         fprintf(stderr, "Threshold range exceeds the %u-byte input limit\n",
                 MAX_THRESHOLD_SPEC_LENGTH);
-        return 1;
-      }
-      if (!parse_threshold_range(argv[i])) {
-        fprintf(stderr, "Invalid threshold range: %s\n", argv[i]);
         return 1;
       }
       threshold_text = argv[i];
@@ -1278,15 +1276,25 @@ int main(int argc, char **argv) {
     print_usage(argv[0]);
     return 1;
   }
+  /* The report and the model replace their files. Neither may destroy the
+   * other or the corpus. */
+  if ((output_path && same_file(output_path, normal_path)) ||
+      (save_model_path && same_file(save_model_path, normal_path)) ||
+      (output_path && save_model_path &&
+       same_file(output_path, save_model_path))) {
+    fprintf(stderr, "Error: -n, -o and -s must name different files\n");
+    return 1;
+  }
   if (!output_format_valid(fmt)) {
     fprintf(stderr, "Unknown output format: %s\n", fmt);
     return 1;
   }
   if (!build_threshold_grid(threshold_text, thresholds, &num_thresholds)) {
-    fprintf(
-        stderr,
-        "Threshold range exceeds the %u-point limit or cannot be represented\n",
-        MAX_THRESHOLDS);
+    fprintf(stderr,
+            "Invalid threshold range %s: expected start,end,step with finite "
+            "values, step above zero, end not below start and at most %u "
+            "points\n",
+            threshold_text, MAX_THRESHOLDS);
     return 1;
   }
 
@@ -1366,6 +1374,7 @@ int main(int argc, char **argv) {
       continue;
     }
     if (sequence_status == SHELL_PROCESS_EPARSE ||
+        sequence_status == SHELL_PROCESS_EOUTPUT_LIMIT ||
         (sequence_status == SHELL_PROCESS_OK && stage_count == 0)) {
       shell_netstring_buffer_free(&raw);
       shell_netstring_buffer_free(&type);
@@ -1391,7 +1400,8 @@ int main(int argc, char **argv) {
     sg_error_t evaluation =
         evaluate_complete(gate, cmd, strlen(cmd), &evaluation_buffer,
                           &evaluation_capacity, &result);
-    if (evaluation == SG_ERR_PARSE && result.verdict == SG_VERDICT_REJECT) {
+    if ((evaluation == SG_ERR_PARSE || evaluation == SG_ERR_UNMODELED) &&
+        result.verdict == SG_VERDICT_REJECT) {
       shell_netstring_buffer_free(&raw);
       shell_netstring_buffer_free(&type);
       skipped_source_records++;
@@ -1538,7 +1548,7 @@ int main(int argc, char **argv) {
             selected_rare = choose_rare_command(raw_spans, type_spans,
                                                 order_index, &rng, &rare);
           } else {
-            rare = rare_cmds[rand_uint(&rng) % NUM_RARE];
+            rare = rare_cmds[rand_below(&rng, NUM_RARE)];
             selected_rare = true;
           }
           if (!selected_rare) {
