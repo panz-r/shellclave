@@ -51,37 +51,6 @@ static inline SHELL_NONNULL(1) uint64_t
   return occupancy->may_free & ~occupancy->may_occupied;
 }
 
-/* Bash's F_DUPFD search: the rank-th lowest free descriptor at or above
- * minimum. rank is 1 for a duplicate or save, 2 when a temporary resource
- * descriptor was itself opened in that range first.
- *
- * Rank 1 lands on f when f is free and every searched descriptor below it is
- * occupied, so the candidates are the possibly free descriptors up to and
- * including the first certainly free one. Rank 2 lands on f when exactly one
- * searched descriptor below f is free: f must lie above the first possibly
- * free descriptor and at or below the second certainly free one. The tail is
- * possible when fewer than rank descriptors are certainly free. */
-static inline SHELL_NONNULL(1) shell_fd_allocation_t
-    shell_fd_allocate(const shell_fd_occupancy_t *occupancy, uint32_t minimum,
-                      unsigned rank) {
-  uint64_t searched = shell_fd_range_from(minimum);
-  uint64_t certain = shell_fd_certainly_free(occupancy) & searched;
-  uint64_t possible = occupancy->may_free & searched;
-  uint32_t first_certain = shell_fd_lowest(certain);
-  if (rank == 1)
-    return (shell_fd_allocation_t){possible &
-                                       shell_fd_range_below(first_certain + 1),
-                                   first_certain == 64};
-  uint64_t after_first =
-      first_certain < 64 ? certain & ~(UINT64_C(1) << first_certain) : 0;
-  uint32_t second_certain = shell_fd_lowest(after_first);
-  uint32_t first_possible = shell_fd_lowest(possible);
-  return (shell_fd_allocation_t){possible &
-                                     shell_fd_range_from(first_possible + 1) &
-                                     shell_fd_range_below(second_certain + 1),
-                                 second_certain == 64};
-}
-
 /* Free descriptors in mask that are certainly / possibly free. */
 static inline SHELL_NONNULL(1) unsigned shell_fd_certain_count(
     const shell_fd_occupancy_t *occupancy, uint64_t mask) {
@@ -194,24 +163,6 @@ static inline SHELL_NONNULL(1) shell_fd_allocation_t
   return result;
 }
 
-/* The allocation places one descriptor at its single candidate, or, when
- * several places are possible, at one of them: a strong update of an exact
- * place and a weak one otherwise. Only rank 1 also proves the searched
- * descriptors below an exact place occupied. */
-static inline SHELL_NONNULL(1, 2) void shell_fd_occupancy_take(
-    shell_fd_occupancy_t *occupancy, const shell_fd_allocation_t *allocation,
-    uint32_t minimum, unsigned rank) {
-  uint64_t place = allocation->candidates;
-  if (!allocation->tail && place && !(place & (place - 1))) {
-    occupancy->may_free &= ~place;
-    occupancy->may_occupied |= place;
-    if (rank == 1)
-      occupancy->may_free &= ~(shell_fd_range_from(minimum) & (place - 1));
-    return;
-  }
-  occupancy->may_occupied |= place;
-}
-
 /* A strong update of one descriptor below 64. */
 static inline SHELL_NONNULL(1) void shell_fd_occupancy_set(
     shell_fd_occupancy_t *occupancy, uint32_t fd, bool free, bool occupied) {
@@ -220,18 +171,6 @@ static inline SHELL_NONNULL(1) void shell_fd_occupancy_set(
       free ? occupancy->may_free | bit : occupancy->may_free & ~bit;
   occupancy->may_occupied =
       occupied ? occupancy->may_occupied | bit : occupancy->may_occupied & ~bit;
-}
-
-/* Closing a descriptor known only as one of several places frees one of
- * them: each may now be free, none is certainly free. */
-static inline SHELL_NONNULL(1) void shell_fd_occupancy_release(
-    shell_fd_occupancy_t *occupancy, uint64_t places) {
-  if (places && !(places & (places - 1))) {
-    occupancy->may_free |= places;
-    occupancy->may_occupied &= ~places;
-    return;
-  }
-  occupancy->may_free |= places;
 }
 
 static inline SHELL_NONNULL(1, 2) void shell_fd_occupancy_join(
@@ -405,15 +344,6 @@ static inline SHELL_NONNULL(1) unsigned shell_fd_partition_cases(
     if (shell_fd_occupancy_feasible(&partition->part[part]))
       cases |= 1u << shell_fd_part_full(part);
   return cases;
-}
-
-/* Number of parts holding paths. */
-static inline SHELL_NONNULL(1) unsigned shell_fd_partition_count(
-    const shell_fd_partition_t *partition) {
-  unsigned count = 0;
-  for (unsigned part = 0; part < SHELL_FD_PARTS; part++)
-    count += shell_fd_occupancy_feasible(&partition->part[part]);
-  return count;
 }
 
 #endif
