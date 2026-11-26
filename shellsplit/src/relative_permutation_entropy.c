@@ -135,13 +135,11 @@ double shell_rpe_relative_conditional_entropy(const char *s, int n_perms) {
   double H_original = shell_rpe_conditional_entropy(s);
   double H_permuted = shell_rpe_permutation_conditional_entropy(s, n_perms);
   if (H_permuted == 0.0) {
-    return 2.0; /* permutation collapsed entropy: original was structured */
+    return 2.0; /* A zero permuted entropy would divide by zero; defined as 2.
+                 */
   }
   return H_original / H_permuted;
 }
-
-// Forward declaration
-void fixed_permute_string(char *s, int perm_index);
 
 // Simple deterministic pseudo-random based on seed
 static unsigned int deterministic_rand(unsigned int seed) {
@@ -217,7 +215,8 @@ double shell_rpe_relative_entropy_ratio(const char *s, int n_perms, int n) {
   double H_original = shell_rpe_ngram_entropy(s, n);
   double H_permuted = shell_rpe_permutation_entropy(s, n_perms, n);
   if (H_permuted == 0.0) {
-    return 2.0; /* permutation collapsed entropy: original was structured */
+    return 2.0; /* A zero permuted entropy would divide by zero; defined as 2.
+                 */
   }
   return H_original / H_permuted;
 }
