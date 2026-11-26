@@ -469,9 +469,7 @@ belong in public headers. Put API removal instructions in
 [migration notes](docs/migration.md).
 
 The README's marked C excerpt matches the corresponding section of
-`examples/gate_policy.c` byte-for-byte. Update both together. The documentation
-contract checks the excerpt, complete example output, and local
-Markdown links. Example tests cover policy outcomes, runtime uncertainty,
+`examples/gate_policy.c` byte-for-byte. Update both together. Example tests cover policy outcomes, runtime uncertainty,
 partial results, and evaluation failures against the shipping library.
 Keep public prose organized by caller behavior; implementation history and
 private data-structure notes belong in code comments or commit messages.

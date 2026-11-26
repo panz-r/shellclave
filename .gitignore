@@ -41,7 +41,6 @@ core.*
 *.log
 *.nfa
 *.dot
-shellsplit/tests/generator_crashes.log
 
 # Editors and operating systems
 .cache/
