@@ -11,6 +11,7 @@ import argparse
 import os
 import random
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -177,11 +178,11 @@ class IfDescriptors(unittest.TestCase):
     def cwd_simple(self, rng, root):
         kind, name = rng.random(), rng.choice(("d1", "d2", "d3"))
         if kind < 0.35:
-            return f"cd {root}/{name} || exit"
+            return f"cd {shlex.quote(f'{root}/{name}')} || exit"
         if kind < 0.5:
-            return f"cd {root}/{name}"
+            return f"cd {shlex.quote(f'{root}/{name}')}"
         if kind < 0.6:
-            return f"cd {root}/nodir"
+            return f"cd {shlex.quote(f'{root}/nodir')}"
         if kind < 0.7:
             return "cd .."
         return rng.choice([":", "true"])
@@ -189,9 +190,9 @@ class IfDescriptors(unittest.TestCase):
     def cwd_condition(self, rng, root):
         kind, name = rng.random(), rng.choice(("d1", "d2", "d3"))
         if kind < 0.45:
-            return f"cd {root}/{name}"
+            return f"cd {shlex.quote(f'{root}/{name}')}"
         if kind < 0.7:
-            return f"cd {root}/nodir"
+            return f"cd {shlex.quote(f'{root}/nodir')}"
         return rng.choice(["true", "false"])
 
     def cwd_statement(self, rng, root, depth):
@@ -215,7 +216,8 @@ class IfDescriptors(unittest.TestCase):
         # `if`, Bash is there.
         rng = random.Random(77)
         known = 0
-        with tempfile.TemporaryDirectory() as directory:
+        # The root has a space: a path is one word and one field to the reader.
+        with tempfile.TemporaryDirectory(prefix="cwd root ") as directory:
             root = os.path.realpath(directory)
             for name in ("d1", "d2", "d3"):
                 os.mkdir(os.path.join(root, name))
@@ -227,7 +229,7 @@ class IfDescriptors(unittest.TestCase):
                                            self.reports(sources, root)):
                 if not lines or lines[0] != "rc=0":
                     continue
-                last = [line.split() for line in lines
+                last = [line.split(" ", 2) for line in lines
                         if line.startswith("cwd ")][-1]
                 if last[2] == "unknown":
                     continue
