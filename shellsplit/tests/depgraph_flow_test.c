@@ -307,6 +307,24 @@ static const flow_variant_t flow_read_failure[] = {
    {NOT_HANDLED}, {0}, NO_GRAPH},
   {"if piped", 0, {"if " COND "; then ", "; fi | cat"}, SHELL_DEP_EUNMODELED,
    {NOT_HANDLED}, {0}, NO_GRAPH},
+
+  /* Negation consumes the status of a whole list, not of one pipeline member:
+   * a pipeline's status is its last member's. */
+  {"negated", 0, {"! ", ""}, SHELL_DEP_OK, {0}, {NOT_HANDLED}, NO_GRAPH},
+  {"negated group", 0, {"! { ", "; }"}, SHELL_DEP_OK,
+   {0}, {NOT_HANDLED}, NO_GRAPH},
+  {"negated, piped", 0, {"! ", " | cat"}, SHELL_DEP_EUNMODELED,
+   {NOT_HANDLED}, {0}, NO_GRAPH},
+  {"negated group, piped", 0, {"! { ", "; } | cat"}, SHELL_DEP_EUNMODELED,
+   {NOT_HANDLED}, {0}, NO_GRAPH},
+  {"negated if, piped", 0, {"! if " COND "; then ", "; fi | cat"},
+   SHELL_DEP_EUNMODELED, {NOT_HANDLED}, {0}, NO_GRAPH},
+  {"negated, backgrounded", 0, {"! ", " &"}, SHELL_DEP_EUNMODELED,
+   {NOT_HANDLED}, {0}, NO_GRAPH},
+  {"negated, then &&", 0, {"! ", " && :"}, SHELL_DEP_OK,
+   {0}, {NOT_HANDLED}, NO_GRAPH},
+  {"last member of a negated pipeline", 0, {"! cat | ", ""}, SHELL_DEP_OK,
+   {0}, {NOT_HANDLED}, NO_GRAPH},
 };
 // clang-format on
 

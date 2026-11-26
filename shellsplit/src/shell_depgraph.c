@@ -12690,11 +12690,15 @@ static SHELL_NONNULL(1) bool dep_read_status_consumed(
   const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
   uint32_t range = context->node_range[owner];
   uint16_t successor = pipeline->range_successor[range];
-  if (successor == SHELL_TYPE_AND || successor == SHELL_TYPE_OR ||
-      context->fast->cmds[range].pipeline_negation_count != 0)
+  if (successor == SHELL_TYPE_AND || successor == SHELL_TYPE_OR)
     return true;
+  /* Negation inverts the status of a whole pipeline, which is its last
+   * member's: it consumes the read only if nothing follows in the pipeline or
+   * in the background. */
   if (successor != SHELL_TYPE_SIMPLE)
     return false;
+  if (context->fast->cmds[range].pipeline_negation_count != 0)
+    return true;
   /* Ranges are lexical, and the read's own auxiliary ranges (such as a
    * here-string body) lie within its span. The read ends a group when the
    * group's last range does; an enclosing group's last range is then that
@@ -12724,11 +12728,12 @@ static SHELL_NONNULL(1) bool dep_read_status_consumed(
       return false;
     }
     successor = pipeline->group_successor[group];
-    if (successor == SHELL_TYPE_AND || successor == SHELL_TYPE_OR ||
-        compound->pipeline_negation_count != 0)
+    if (successor == SHELL_TYPE_AND || successor == SHELL_TYPE_OR)
       return true;
     if (successor != SHELL_TYPE_SIMPLE)
       return false;
+    if (compound->pipeline_negation_count != 0)
+      return true;
     role = compound->role;
     arm = compound->arm;
     last = group_last;
