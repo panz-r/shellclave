@@ -161,13 +161,11 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
       !shell_expand_validate(&entry->value,
                              request->purpose != SHELL_EXPAND_WORD_ARGUMENT,
                              cache->measure_display)) {
-    cache->error = SHELL_DEP_EEXPAND;
-    return NULL;
+    goto rejected;
   }
   if (shell_expand_purpose_is_conditional(request->purpose) &&
       entry->value.count != 1) {
-    cache->error = SHELL_DEP_EEXPAND;
-    return NULL;
+    goto rejected;
   }
   if (request->purpose == SHELL_EXPAND_WORD_CONDITIONAL_ARITHMETIC) {
     shell_arithmetic_scalar_result_t facts = shell_arithmetic_analyze_scalar(
@@ -178,10 +176,16 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
                                                             : "",
                                   entry->value.first_length)
              .supported) {
-      cache->error = SHELL_DEP_EEXPAND;
-      return NULL;
+      goto rejected;
     }
   }
   entry->value.resolved = true;
   return &entry->value;
+
+rejected:
+  /* A refused callback result leaves no entry behind a handle. */
+  cache->error = SHELL_DEP_EEXPAND;
+  cache->offsets[offset] = 0;
+  cache->count--;
+  return NULL;
 }

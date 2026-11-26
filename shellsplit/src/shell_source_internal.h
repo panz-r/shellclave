@@ -1510,14 +1510,17 @@ shell_source_skip_arithmetic_expansion_depth(const char *input, size_t length,
     return false;
   if (position >= length)
     return false;
-  size_t height;
+  size_t height, cached;
   if (shell_source_index_get(input, length, position,
-                             SHELL_SOURCE_INDEX_ARITHMETIC, after, &height)) {
+                             SHELL_SOURCE_INDEX_ARITHMETIC, &cached, &height)) {
     if (height > SHELL_MAX_SUBCOMMANDS - shell_source_scan_depth ||
         height > SHELL_SOURCE_MAX_ARITHMETIC_NESTING - nesting + 1)
       return false;
     shell_source_scan_child(height);
-    return *after <= length;
+    if (cached > length)
+      return false;
+    *after = cached;
+    return true;
   }
   if (!shell_source_scan_enter())
     return false;
@@ -1929,12 +1932,16 @@ static inline bool shell_source_find_parentheses_cached(const char *input,
                              &height) &&
       failed_end == length)
     return false;
-  if (shell_source_index_get(input, length, position, found_kind, after,
+  size_t cached;
+  if (shell_source_index_get(input, length, position, found_kind, &cached,
                              &height)) {
     if (height > SHELL_MAX_SUBCOMMANDS - shell_source_scan_depth)
       return false;
     shell_source_scan_child(height);
-    return *after <= length;
+    if (cached > length)
+      return false;
+    *after = cached;
+    return true;
   }
   if (!shell_source_scan_enter())
     return false;
@@ -2552,13 +2559,16 @@ static inline bool shell_source_skip_parameter_expansion(const char *input,
                                                          size_t *after) {
   if (position >= length)
     return false;
-  size_t height;
+  size_t height, cached;
   if (shell_source_index_get(input, length, position,
-                             SHELL_SOURCE_INDEX_PARAMETER, after, &height)) {
+                             SHELL_SOURCE_INDEX_PARAMETER, &cached, &height)) {
     if (height > SHELL_MAX_SUBCOMMANDS - shell_source_scan_depth)
       return false;
     shell_source_scan_child(height);
-    return *after <= length;
+    if (cached > length)
+      return false;
+    *after = cached;
+    return true;
   }
   if (!shell_source_scan_enter())
     return false;
@@ -2658,13 +2668,17 @@ static inline bool shell_source_skip_complete_double_quote(const char *input,
                                                            size_t *after) {
   if (position >= length)
     return false;
-  size_t height;
+  size_t height, cached;
   if (shell_source_index_get(input, length, position,
-                             SHELL_SOURCE_INDEX_DOUBLE_QUOTE, after, &height)) {
+                             SHELL_SOURCE_INDEX_DOUBLE_QUOTE, &cached,
+                             &height)) {
     if (height > SHELL_MAX_SUBCOMMANDS - shell_source_scan_depth)
       return false;
     shell_source_scan_child(height);
-    return *after <= length;
+    if (cached > length)
+      return false;
+    *after = cached;
+    return true;
   }
   if (!shell_source_scan_enter())
     return false;

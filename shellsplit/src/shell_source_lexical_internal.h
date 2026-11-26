@@ -186,34 +186,6 @@ static inline bool shell_source_is_list_trivia(const char *input, size_t start,
          shell_source_skip_list_trivia(input, end, start) == end;
 }
 
-/* After a recognized pipeline negator, horizontal whitespace and escaped
- * physical line endings may extend the gap to its stage. A raw physical line
- * ending or comment terminates the modifier. Recognition itself also permits
- * an adjacent redirection (`!>out command`); word-forming adjacency such as
- * `!echo`, `!2>out`, or `!<(producer)` is rejected by the matcher below. */
-static inline size_t shell_source_skip_pipeline_negator_gap(const char *input,
-                                                            size_t length,
-                                                            size_t position) {
-  if (!input || position > length)
-    return 0;
-  while (position < length) {
-    SHELL_SOURCE_PREFIX_SCAN(1);
-    unsigned char current = (unsigned char)input[position];
-    if (shell_source_blank(current)) {
-      position++;
-      continue;
-    }
-    if (input[position] == '\\' && position + 1 < length) {
-      if (input[position + 1] == '\n') {
-        position += 2;
-        continue;
-      }
-    }
-    break;
-  }
-  return position;
-}
-
 /* A standalone escaped physical line ending is a lexical continuation, not
  * a shell word. It is intentionally narrower than shell_source_is_list_trivia:
  * ordinary newlines remain visible list separators. */
@@ -236,6 +208,7 @@ static inline size_t shell_source_skip_inline_continuations(const char *input,
   if (!input || position > length)
     return 0;
   while (position < length) {
+    SHELL_SOURCE_PREFIX_SCAN(1);
     if (input[position] == ' ' || input[position] == '\t') {
       position++;
       continue;
@@ -249,6 +222,17 @@ static inline size_t shell_source_skip_inline_continuations(const char *input,
     break;
   }
   return position;
+}
+
+/* After a recognized pipeline negator, horizontal whitespace and escaped
+ * physical line endings may extend the gap to its stage. A raw physical line
+ * ending or comment terminates the modifier. Recognition itself also permits
+ * an adjacent redirection (`!>out command`); word-forming adjacency such as
+ * `!echo`, `!2>out`, or `!<(producer)` is rejected by the matcher below. */
+static inline size_t shell_source_skip_pipeline_negator_gap(const char *input,
+                                                            size_t length,
+                                                            size_t position) {
+  return shell_source_skip_inline_continuations(input, length, position);
 }
 
 /* Escaped physical line endings are removed by shell lexical processing, but

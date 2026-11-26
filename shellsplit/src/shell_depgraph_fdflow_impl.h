@@ -3968,9 +3968,15 @@ static bool dep_fd_union_roots(dep_route_journal_t *journal, uint32_t left,
                       tag == DEP_UNION_NAMED_DYNAMIC ? DEP_ROUTE_DYNAMIC
                                                      : DEP_ROUTE_INHERITED,
                       false};
-  return shell_pmap_union(&journal->arena->maps, left, right, dep_fd_union_leaf,
-                          &u, out, false, tag) &&
-         !u.failed;
+  bool built = shell_pmap_union(&journal->arena->maps, left, right,
+                                dep_fd_union_leaf, &u, out, false, tag);
+  if (u.failed) {
+    /* The leaf's failure is out of band, so the pool recorded the unions it
+     * completed as if they had succeeded. Drop them. */
+    shell_pmap_memo_clear(&journal->arena->maps);
+    return false;
+  }
+  return built;
 }
 
 /* The occupancy fact joining part of the two versions' process domains; l and
@@ -4424,7 +4430,7 @@ static bool dep_fd_exact_roots(dep_route_journal_t *journal, uint32_t left,
                      dep_fd_exact_context_key, &walk);
   if (!relation.apart && (bits & DEP_EXACT_CONTEXT)) {
     exact.roots = &walk.roots;
-    uint32_t more;
+    uint32_t more = 0;
     /* Without the memo a fold needs no entry, so it cannot fail. */
     (void)shell_pmap_fold(&journal->arena->maps, left, right,
                           dep_fd_exact_roots_leaf, &exact, &more, false,

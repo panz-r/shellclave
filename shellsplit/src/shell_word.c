@@ -38,7 +38,7 @@ static SHELL_NONNULL(1, 5) shell_process_status_t
       .visitor_context = context,
   };
   shell_process_status_t status = decode_shell_word(text, length, &sink, mode);
-  *decoded_length = sink.output_length;
+  *decoded_length = status == SHELL_PROCESS_OK ? sink.output_length : 0;
   return status;
 }
 

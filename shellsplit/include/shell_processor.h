@@ -306,19 +306,19 @@ typedef bool (*shell_decoded_word_visitor_t)(unsigned char byte,
  * tokenization: callers must isolate the word before calling it. `visitor` may
  * be NULL to measure only. `decoded_length` is required and receives the
  * number of bytes delivered; when the visitor stops traversal it is the
- * delivered prefix length. Non-ASCII ANSI-C Unicode escapes (`\u` / `\U`)
- * return SHELL_PROCESS_EPARSE: their bytes depend on the execution locale,
- * which is not part of the supported shell contract. ASCII Unicode and byte
- * escapes remain supported; literal non-ASCII bytes are not restricted.
- * A word that ends inside a quote has no value, as in Bash where it is a
- * syntax error: it returns SHELL_PROCESS_EPARSE, unless the visitor stops
- * traversal first. A final unquoted backslash is a literal byte. The status
- * carries no detail; shell_parse_draft() on the word names the missing quote
- * (need) and where the word began (incomplete_at).
- * Statically empty process substitutions contribute no bytes (`a<()b` decodes
- * to `ab`); nonempty substitutions retain source spelling. A zero-length
- * decoded payload does not determine argv presence: quoted empty fragments
- * preserve an argument, unlike an unquoted wholly elided process word. */
+ * delivered prefix length; on any other failure it is 0. Non-ASCII ANSI-C
+ * Unicode escapes (`\u` / `\U`) return SHELL_PROCESS_EPARSE: their bytes depend
+ * on the execution locale, which is not part of the supported shell contract.
+ * ASCII Unicode and byte escapes remain supported; literal non-ASCII bytes are
+ * not restricted. A word that ends inside a quote has no value, as in Bash
+ * where it is a syntax error: it returns SHELL_PROCESS_EPARSE, unless the
+ * visitor stops traversal first. A final unquoted backslash is a literal byte.
+ * The status carries no detail; shell_parse_draft() on the word names the
+ * missing quote (need) and where the word began (incomplete_at). Statically
+ * empty process substitutions contribute no bytes (`a<()b` decodes to `ab`);
+ * nonempty substitutions retain source spelling. A zero-length decoded payload
+ * does not determine argv presence: quoted empty fragments preserve an
+ * argument, unlike an unquoted wholly elided process word. */
 shell_process_status_t
 shell_visit_decoded_word(const char *text, size_t length,
                          shell_decoded_word_visitor_t visitor, void *context,

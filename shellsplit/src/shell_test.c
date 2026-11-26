@@ -702,6 +702,8 @@ void shell_test_observe_comparisons(const shell_test_program_t *program,
 void shell_test_observe_presence(const shell_test_program_t *program,
                                  shell_test_presence_observer_t observer,
                                  void *context) {
+  if (program->proven_error)
+    return;
   if (program->uncertain) {
     for (size_t i = 0; i < program->word_count; ++i) {
       const shell_test_value_t *word = &program->words[i];

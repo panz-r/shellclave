@@ -312,20 +312,20 @@ typedef enum {
  * Set cwd_buf_size to 0 to use the default SHELL_DEP_CWD_BUF_SIZE (16384).
  * The actual buffer in shell_dep_graph_t is always SHELL_DEP_CWD_BUF_SIZE
  * bytes; cwd_buf_size in limits is the effective bound checked during parsing.
- * Values from 2 through the buffer maximum are valid. A value of 1 is
- * rejected because even the NUL-terminated root path cannot fit; 0 selects
- * the default. `workspace` is caller-owned storage for parsing, predicate
- * analysis and descriptor routes. Logical ENV_READ names can borrow its
- * source-analysis tail. Keep that storage valid and
- * unchanged while those names are used, or copy the names before reusing it.
- * Graphs without workspace-backed ENV_READ names retain no workspace storage.
- * Graph construction never retains names in temporary thread-local scratch.
- * Insufficient caller arena capacity returns EWORKSPACE. The workspace need
- * not be initialized or cleared before parsing.
- * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as source
- * scratch for delimiter normalization, non-evicting subscript boundaries,
- * compiled conditional programs (even simple literal expressions), pattern
- * evaluation and compiled builtin-test programs.
+ * Values from 2 through the buffer maximum are valid, and a larger value is
+ * clamped to the maximum. A value of 1 is rejected because even the
+ * NUL-terminated root path cannot fit; 0 selects the default. `workspace` is
+ * caller-owned storage for parsing, predicate analysis and descriptor routes.
+ * Logical ENV_READ names can borrow its source-analysis tail. Keep that storage
+ * valid and unchanged while those names are used, or copy the names before
+ * reusing it. Graphs without workspace-backed ENV_READ names retain no
+ * workspace storage. Graph construction never retains names in temporary
+ * thread-local scratch. Insufficient caller arena capacity returns EWORKSPACE.
+ * The workspace need not be initialized or cleared before parsing. Bytes beyond
+ * shell_dep_workspace_size()'s fixed prefix serve as source scratch for
+ * delimiter normalization, non-evicting subscript boundaries, compiled
+ * conditional programs (even simple literal expressions), pattern evaluation
+ * and compiled builtin-test programs.
  * shell_source_workspace_size(command_length, &bytes) gives a sufficient
  * extra capacity. Without this tail, source analysis can return EWORKSPACE
  * even for inputs without heredocs; retry with sufficient source scratch.
@@ -432,8 +432,10 @@ typedef enum {
  * operand once option processing ends. Option errors, `--help` and
  * `--version` exit before reading. Only the reference Bash is modeled: any
  * other shell interpreter name, a dynamic command name, or a dynamic word
- * while Bash still scans options is UNKNOWN. Other commands are NONE; this
- * fact does not follow external wrappers such as `env` or `sudo`. */
+ * while Bash still scans options is UNKNOWN, as is a static option word longer
+ * than the 32 bytes examined, although such a word may in fact be an option
+ * error. Other commands are NONE; this fact does not follow external wrappers
+ * such as `env` or `sudo`. */
 typedef enum {
   SHELL_DEP_STDIN_CODE_NONE = 0,
   /* Reads commands from standard input and executes them. */
