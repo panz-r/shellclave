@@ -44,7 +44,7 @@ def worker(directory, mode):
         if mode == "orphan":
             return 17
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    if mode in ("hang", "resistant"):
+    if mode == "resistant":
         while True:
             signal.pause()
     return 17 if mode == "failure" else 0

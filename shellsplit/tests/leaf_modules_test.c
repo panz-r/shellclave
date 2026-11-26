@@ -1854,7 +1854,6 @@ static int entropy_test_detector_matrices(void) {
                 {"QUJDRA", 0, 0, 0},
                 {"====", 0, 0, 0},
                 {"hello world!", 0, 0, 0},
-                {"", 0, 0, 0},
                 {"", 0, 0, 0}};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     ASSERT(shell_env_screener_looks_like_path(values[i].value) ==

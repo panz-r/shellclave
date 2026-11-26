@@ -358,18 +358,22 @@ static int test_destination_candidate_is_not_published(void) {
   sg_atomic_output_discard(&output);
   ok = test_atomic_directory_only_entry(directory, NULL) && ok;
 
-  sg_test_io_reset();
-  sg_test_io_temp_random_set(random);
-  if (ok)
-    ok = sg_atomic_output_begin(path, &output) == SG_ATOMIC_OUTPUT_OK &&
-         fputs("new", output.stream) >= 0 &&
-         sg_atomic_output_commit(&output) == 0 && file_equals(path, "new");
-  size_t operations = sg_test_io_count();
-  sg_test_io_reset();
-  sg_atomic_output_discard(&output);
-  if (ok)
-    ok = unlink(path) == 0 && operations > 0;
   for (unsigned existing = 0; ok && existing < 2; existing++) {
+    /* Replacing a file also preserves its mode, an operation an absent
+     * destination lacks, so each destination state counts its own. */
+    if (existing)
+      ok = write_file(path, "old");
+    sg_test_io_reset();
+    sg_test_io_temp_random_set(random);
+    if (ok)
+      ok = sg_atomic_output_begin(path, &output) == SG_ATOMIC_OUTPUT_OK &&
+           fputs("new", output.stream) >= 0 &&
+           sg_atomic_output_commit(&output) == 0 && file_equals(path, "new");
+    size_t operations = sg_test_io_count();
+    sg_test_io_reset();
+    sg_atomic_output_discard(&output);
+    if (ok)
+      ok = unlink(path) == 0 && operations > 0;
     for (size_t fail_at = 1; ok && fail_at <= operations; fail_at++) {
       if (existing)
         ok = write_file(path, "old");

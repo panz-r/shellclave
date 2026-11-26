@@ -27,7 +27,6 @@
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
 #include "source_compare.h"
-#include "word_byte_cases.h"
 
 /* --- status (from source_status_test.c) --- */
 #define CHECK(condition)                                                       \

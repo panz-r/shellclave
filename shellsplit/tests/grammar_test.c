@@ -10913,7 +10913,9 @@ static bool parser_result_invariants(const char *input, size_t input_len,
         copied != expected_copy || memcmp(copy, view, expected_copy) != 0 ||
         copy[copied] != '\0' ||
         shell_source_space((unsigned char)input[range->start]) ||
-        shell_source_space((unsigned char)input[range->start + range->len - 1]))
+        shell_source_space(
+            (unsigned char)input[range->start + range->len - 1]) ||
+        range->role > SHELL_RANGE_ROLE_ELSE)
       return false;
     previous_end = range->start + range->len;
   }
@@ -10948,6 +10950,19 @@ static bool parser_result_invariants(const char *input, size_t input_len,
               parent->first_command + parent->command_count)
         return false;
     }
+  }
+  /* A range with a role lies in an `if` group. */
+  for (uint32_t i = 0; i < result->count; i++) {
+    if (result->cmds[i].role == SHELL_RANGE_ROLE_NONE)
+      continue;
+    bool in_if = false;
+    for (uint32_t g = 0; g < result->group_count; g++)
+      in_if |=
+          result->groups[g].kind == SHELL_GROUP_IF &&
+          result->groups[g].first_command <= i &&
+          i - result->groups[g].first_command < result->groups[g].command_count;
+    if (!in_if)
+      return false;
   }
   return true;
 }
@@ -14020,7 +14035,7 @@ static void parser_test_if_structure(void) {
     const char *name;
     const char *input;
     uint32_t ranges, groups;
-    expected_range_t first[6];
+    expected_range_t first[7];
   } cases[] = {
       {"if then fi",
        "if a; then b; fi",
@@ -14043,7 +14058,8 @@ static void parser_test_if_structure(void) {
         {"c", SHELL_RANGE_ROLE_CONDITION, 1},
         {"d", SHELL_RANGE_ROLE_THEN, 1},
         {"e", SHELL_RANGE_ROLE_CONDITION, 2},
-        {"f", SHELL_RANGE_ROLE_THEN, 2}}},
+        {"f", SHELL_RANGE_ROLE_THEN, 2},
+        {"g", SHELL_RANGE_ROLE_ELSE, 3}}},
       {"newlines separate sections",
        "if a\nthen\n  b\nelse\n  c\nfi",
        3,
@@ -14091,7 +14107,7 @@ static void parser_test_if_structure(void) {
                                &result) == SHELL_OK &&
               result.count == cases[i].ranges &&
               result.group_count == cases[i].groups;
-    for (uint32_t r = 0; ok && r < result.count && r < 6; r++) {
+    for (uint32_t r = 0; ok && r < result.count && r < 7; r++) {
       const shell_range_t *range = &result.cmds[r];
       const expected_range_t *want = &cases[i].first[r];
       ok = range->len == strlen(want->text) &&

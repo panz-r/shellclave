@@ -3280,7 +3280,6 @@ static const struct {
     {"echo \\ #", "4:echo,2: #,", 0},
     {"echo \\\t#", "4:echo,2:\t#,", 0},
     {"echo x\\\n#", "4:echo,2:x#,", 0},
-    {"echo x\\\n#", "4:echo,2:x#,", 0},
     {"echo \\\n# ignored\n", "4:echo,", 0},
     {"echo x\\\\ # ignored", "4:echo,2:x\\,", 0},
     {"echo $(printf x)#", "4:echo,12:$(printf x)#,", SHELL_FEAT_SUBSHELL},

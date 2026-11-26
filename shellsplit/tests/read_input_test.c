@@ -4478,34 +4478,8 @@ int main(int argc, char **argv) {
 #endif
     goto done;
   }
-  if (argc == 2 && !strcmp(argv[1], "--recursive-proofs")) {
-    goto done;
-  }
   if (argc == 2 && !strcmp(argv[1], "--outcome-effects")) {
     outcome_assignment_correlation();
-    goto done;
-  }
-  if (argc == 2 && !strcmp(argv[1], "--read-proofs")) {
-#ifdef SHELLSPLIT_TEST_ALLOCATOR
-    shellsplit_test_alloc_fail_at(0);
-#endif
-#ifdef SHELLSPLIT_TEST_ALLOCATOR
-    CHECK(shellsplit_test_alloc_count() == 0);
-    shellsplit_test_alloc_reset();
-#endif
-    goto done;
-  }
-  if (argc == 2 && !strcmp(argv[1], "--private-outcomes")) {
-#ifdef SHELLSPLIT_TEST_ALLOCATOR
-    shellsplit_test_alloc_fail_at(0);
-#endif
-#ifdef SHELLSPLIT_TEST_ALLOCATOR
-    CHECK(shellsplit_test_alloc_count() == 0);
-    shellsplit_test_alloc_reset();
-#endif
-    goto done;
-  }
-  if (argc == 2 && !strcmp(argv[1], "--process-paths")) {
     goto done;
   }
 #ifdef SHELLSPLIT_TEST_ALLOCATOR

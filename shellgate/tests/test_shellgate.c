@@ -100,10 +100,22 @@ static int fail_count = 0;
 #define ASSERT_SG_OK(expression) ASSERT((expression) == SG_OK)
 #define ASSERT_ST_OK(expression) ASSERT((expression) == ST_OK)
 
-/* SHELLCLAVE_TEST_ONLY=name runs only the case of that name. */
+/* SHELLCLAVE_TEST_ONLY=name runs only the case of that name; a name that
+ * matches no case is a failure, not an empty green run. */
+static unsigned selected_count;
 static bool selected(const char *name) {
   const char *only = getenv("SHELLCLAVE_TEST_ONLY");
-  return !only || strcmp(only, name) == 0;
+  bool match = !only || strcmp(only, name) == 0;
+  selected_count += match;
+  return match;
+}
+static bool selection_matched_nothing(void) {
+  if (getenv("SHELLCLAVE_TEST_ONLY") && selected_count == 0) {
+    fprintf(stderr, "SHELLCLAVE_TEST_ONLY=%s matches no test\n",
+            getenv("SHELLCLAVE_TEST_ONLY"));
+    return true;
+  }
+  return false;
 }
 
 #define TEST(name) static void test_##name(void)
@@ -3165,9 +3177,7 @@ TEST(substitution_comment_and_heredoc_capacity_contract) {
                                             process_substitution != 0));
     memset(&result, 0, sizeof(result));
     ASSERT(eval_cmd(gate, command, &result) == SG_ERR_TRUNC);
-    ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
-           result.verdict != SG_VERDICT_ALLOW &&
-           result.verdict != SG_VERDICT_ALLOW);
+    ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
   }
   sg_gate_free(gate);
 }
@@ -7188,5 +7198,5 @@ int main(int argc, char **argv) {
   cleanup_temp_files();
   printf("\n========================================\n");
   printf("Results: %d passed, %d failed\n", pass_count, fail_count);
-  return fail_count > 0 ? 1 : 0;
+  return fail_count > 0 || selection_matched_nothing() ? 1 : 0;
 }

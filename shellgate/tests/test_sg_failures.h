@@ -7,6 +7,10 @@
 
 #include "sg_anomaly.h"
 
+/* Fail the allocation with this index. The seam covers Shellgate's malloc,
+ * calloc and strdup. It leaves out the per-update journal of
+ * anomaly_update_txn_prepare, which sg_anomaly.c keeps outside it on purpose,
+ * so no sweep reaches that allocation failure. */
 void sg_test_alloc_fail_at(size_t allocation_index);
 void sg_test_alloc_reset(void);
 size_t sg_test_alloc_count(void);

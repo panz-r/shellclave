@@ -83,6 +83,7 @@ class ConditionalCommands(unittest.TestCase):
                 rejected = subprocess.run([*self.probe, "--truth", source],
                                           capture_output=True, timeout=10)
                 self.assertEqual(rejected.returncode, 1)
+                self.assertIn(b"graph error", rejected.stderr)
         for operand in ("++2", "--2", "'1--2'", "'1++2'", "'0&&count'",
                         "'1||count'"):
             source = f"[[ {operand} -eq 2 ]]"

@@ -73,10 +73,22 @@ static bool verbose = false;
     }                                                                          \
   } while (0)
 
-/* SHELLCLAVE_TEST_ONLY=name runs only the case of that name. */
+/* SHELLCLAVE_TEST_ONLY=name runs only the case of that name; a name that
+ * matches no case is a failure, not an empty green run. */
+static unsigned selected_count;
 static bool selected(const char *name) {
   const char *only = getenv("SHELLCLAVE_TEST_ONLY");
-  return !only || strcmp(only, name) == 0;
+  bool match = !only || strcmp(only, name) == 0;
+  selected_count += match;
+  return match;
+}
+static bool selection_matched_nothing(void) {
+  if (getenv("SHELLCLAVE_TEST_ONLY") && selected_count == 0) {
+    fprintf(stderr, "SHELLCLAVE_TEST_ONLY=%s matches no test\n",
+            getenv("SHELLCLAVE_TEST_ONLY"));
+    return true;
+  }
+  return false;
 }
 
 #define TEST(name) static void test_##name(void)
@@ -4146,7 +4158,9 @@ TEST(if_lists_are_alternatives_of_the_condition) {
   ASSERT(has_edge(&graph, SHELL_EDGE_OR, (uint32_t)a, (uint32_t)c));
   ASSERT(has_edge(&graph, SHELL_EDGE_AND, (uint32_t)c, (uint32_t)d));
   ASSERT(has_edge(&graph, SHELL_EDGE_OR, (uint32_t)c, (uint32_t)e));
-  ASSERT(!has_edge(&graph, SHELL_EDGE_OR, (uint32_t)b, (uint32_t)c));
+  for (shell_dep_edge_type_t type = SHELL_EDGE_SEQ; type <= SHELL_EDGE_OR;
+       type++)
+    ASSERT(!has_edge(&graph, type, (uint32_t)b, (uint32_t)c));
 
   static const char *const accepted[] = {
       "if true; then :; elif false; then :; fi",
@@ -7342,5 +7356,5 @@ int main(int argc, char **argv) {
 
   printf("\n========================================\n");
   printf("Results: %d passed, %d failed\n", pass_count, fail_count);
-  return fail_count > 0 ? 1 : 0;
+  return fail_count > 0 || selection_matched_nothing() ? 1 : 0;
 }

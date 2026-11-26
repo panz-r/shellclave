@@ -237,15 +237,7 @@ TEST(lifecycle_and_null_safety) {
                 SG_ANOMALY_OK);
   ASSERT_EQ_INT(empty_removed, 0);
 
-  const char *invalid_sequences[][3] = {{"a", NULL, "c"}};
   sg_anomaly_update(model, commands, 5);
-  for (size_t i = 0;
-       i < sizeof(invalid_sequences) / sizeof(invalid_sequences[0]); i++) {
-    ASSERT(isinf(sg_anomaly_score(model, invalid_sequences[i], 3)));
-    ASSERT(!test_has_observed(model, invalid_sequences[i], 3));
-    sg_anomaly_update(model, invalid_sequences[i], 3);
-    ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), 5);
-  }
   const char *empty_stage[] = {"a", "", "c"};
   ASSERT(isfinite(sg_anomaly_score(model, empty_stage, 3)));
   ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(

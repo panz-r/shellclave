@@ -22,7 +22,6 @@
 #include "shell_transform.h"
 #include "syntax_boundary_cases.h"
 #include "test_allocator.h"
-#include "word_byte_cases.h"
 #include "word_expansion_cases.h"
 #include <stdint.h>
 #include <stdio.h>
