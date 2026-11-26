@@ -27,6 +27,7 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -65,6 +66,58 @@ static void print_result(const char *cmd, double score, bool detected,
   printf("\n");
 }
 
+/* A finite number that fills text. */
+static SHELL_NONNULL(1, 2) bool parse_finite(const char *text, double *out) {
+  char *end = NULL;
+  errno = 0;
+  double value = strtod(text, &end);
+  if (end == text || *end != '\0' || errno != 0 || !isfinite(value))
+    return false;
+  *out = value;
+  return true;
+}
+
+/* A non-negative decimal integer that fills text. */
+static SHELL_NONNULL(1, 2) bool parse_count(const char *text, size_t *out) {
+  if (*text < '0' || *text > '9')
+    return false;
+  char *end = NULL;
+  errno = 0;
+  unsigned long long value = strtoull(text, &end, 10);
+  if (*end != '\0' || errno != 0 || value > SIZE_MAX)
+    return false;
+  *out = (size_t)value;
+  return true;
+}
+
+typedef enum { LINE_OK, LINE_EOF, LINE_NUL, LINE_LONG } line_status_t;
+
+/* Read one physical line into line (size bytes) without its newline. A line
+ * with a NUL byte or longer than the buffer is consumed and reported, so it
+ * is neither truncated nor split into several commands. */
+static SHELL_NONNULL(1) line_status_t read_line(char *line, size_t size) {
+  size_t used = 0;
+  line_status_t status = LINE_OK;
+  for (;;) {
+    int current = fgetc(stdin);
+    if (current == EOF) {
+      if (used == 0 && status == LINE_OK)
+        return LINE_EOF;
+      break;
+    }
+    if (current == '\n')
+      break;
+    if (current == '\0')
+      status = LINE_NUL;
+    else if (used + 1 < size)
+      line[used++] = (char)current;
+    else if (status == LINE_OK)
+      status = LINE_LONG;
+  }
+  line[used] = '\0';
+  return status;
+}
+
 static char *trim(char *s) {
   while (isspace((unsigned char)*s))
     s++;
@@ -88,22 +141,32 @@ int main(int argc, char **argv) {
   size_t prune_min = 0;
   bool do_prune = false;
   bool do_compact = false;
+  bool save_failed = false;
 
-  /* Parse CLI options and positional options into runtime settings. */
+  /* Parse CLI options into runtime settings. */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
       model_path = argv[++i];
     } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
       save_path = argv[++i];
     } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-      threshold = atof(argv[++i]);
+      if (!parse_finite(argv[++i], &threshold)) {
+        fprintf(stderr, "Invalid threshold: %s\n", argv[i]);
+        return 1;
+      }
     } else if (strcmp(argv[i], "-u") == 0) {
       learning = true;
     } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-      decay_scale = atof(argv[++i]);
+      if (!parse_finite(argv[++i], &decay_scale)) {
+        fprintf(stderr, "Invalid decay scale: %s\n", argv[i]);
+        return 1;
+      }
       do_decay = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      prune_min = (size_t)atoi(argv[++i]);
+      if (!parse_count(argv[++i], &prune_min)) {
+        fprintf(stderr, "Invalid prune count: %s\n", argv[i]);
+        return 1;
+      }
       do_prune = true;
     } else if (strcmp(argv[i], "-c") == 0) {
       do_compact = true;
@@ -176,6 +239,7 @@ int main(int argc, char **argv) {
       printf("Model saved to %s\n", save_path);
     } else {
       fprintf(stderr, "Failed to save model to %s\n", save_path);
+      save_failed = true;
     }
   }
 
@@ -186,17 +250,28 @@ int main(int argc, char **argv) {
            learning ? "on" : "off");
     printf("Enter commands (Ctrl+D to exit):\n");
 
-    char line[MAX_LINE];
-    while (fgets(line, sizeof(line), stdin)) {
+    char line[MAX_LINE] = {0};
+    line_status_t line_status;
+    while ((line_status = read_line(line, sizeof(line))) != LINE_EOF) {
+      if (line_status != LINE_OK) {
+        fprintf(stderr, "Skipped a line %s\n",
+                line_status == LINE_NUL ? "with a NUL byte"
+                                        : "longer than the line buffer");
+        continue;
+      }
       char *cmd = trim(line);
       if (!*cmd)
         continue;
 
       size_t count = 0;
       shell_netstring_buffer_t netseq = {0};
-      if (shell_build_command_netseq_buffer(cmd, strlen(cmd), NULL, &netseq,
-                                            &count) != SHELL_PROCESS_OK ||
-          !netseq.data) {
+      shell_process_status_t sequence_status =
+          shell_build_command_netseq_buffer(cmd, strlen(cmd), NULL, &netseq,
+                                            &count);
+      /* A comment-only line holds no command. */
+      if (sequence_status == SHELL_PROCESS_BLANK)
+        continue;
+      if (sequence_status != SHELL_PROCESS_OK || !netseq.data) {
         fprintf(stderr, "Could not parse command sequence\n");
         continue;
       }
@@ -241,6 +316,7 @@ int main(int argc, char **argv) {
       printf("Model saved to %s\n", save_path);
     } else {
       fprintf(stderr, "Failed to save model to %s\n", save_path);
+      save_failed = true;
     }
   }
 
@@ -249,5 +325,5 @@ int main(int argc, char **argv) {
   }
 
   sg_anomaly_model_free(model);
-  return 0;
+  return save_failed ? 1 : 0;
 }
