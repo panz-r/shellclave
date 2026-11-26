@@ -1686,10 +1686,12 @@ static SHELL_NONNULL(1, 2) st_error_t
     vacuum_filter_t *old_filters[FILTER_POS_LEVELS];
     uint64_t old_wildcards[FILTER_POS_LEVELS];
     uint64_t old_filter_epochs[FILTER_POS_LEVELS];
+    bool old_has_compound[FILTER_POS_LEVELS];
     memcpy(old_filters, policy->pos_filters, sizeof old_filters);
     memcpy(old_wildcards, policy->pos_wildcard_mask, sizeof old_wildcards);
     memcpy(old_filter_epochs, policy->pos_built_epoch,
            sizeof old_filter_epochs);
+    memcpy(old_has_compound, policy->pos_has_compound, sizeof old_has_compound);
 
     policy->states = staged->states;
     policy->patterns = staged->patterns;
@@ -1704,6 +1706,8 @@ static SHELL_NONNULL(1, 2) st_error_t
            sizeof policy->pos_wildcard_mask);
     memcpy(policy->pos_built_epoch, staged->pos_built_epoch,
            sizeof policy->pos_built_epoch);
+    memcpy(policy->pos_has_compound, staged->pos_has_compound,
+           sizeof policy->pos_has_compound);
     atomic_fetch_add(&policy->epoch, 1);
 
     staged->states = old_states;
@@ -1717,6 +1721,7 @@ static SHELL_NONNULL(1, 2) st_error_t
     memcpy(staged->pos_wildcard_mask, old_wildcards, sizeof old_wildcards);
     memcpy(staged->pos_built_epoch, old_filter_epochs,
            sizeof old_filter_epochs);
+    memcpy(staged->pos_has_compound, old_has_compound, sizeof old_has_compound);
   }
   st_policy_free(staged);
   pthread_rwlock_unlock(&policy->rwlock);
@@ -3551,9 +3556,11 @@ pass1_complete:
   vacuum_filter_t *old_filters[FILTER_POS_LEVELS];
   uint64_t old_wildcards[FILTER_POS_LEVELS];
   uint64_t old_filter_epochs[FILTER_POS_LEVELS];
+  bool old_has_compound[FILTER_POS_LEVELS];
   memcpy(old_filters, policy->pos_filters, sizeof old_filters);
   memcpy(old_wildcards, policy->pos_wildcard_mask, sizeof old_wildcards);
   memcpy(old_filter_epochs, policy->pos_built_epoch, sizeof old_filter_epochs);
+  memcpy(old_has_compound, policy->pos_has_compound, sizeof old_has_compound);
 
   policy->states = staged->states;
   policy->patterns = staged->patterns;
@@ -3567,6 +3574,8 @@ pass1_complete:
          sizeof policy->pos_wildcard_mask);
   memcpy(policy->pos_built_epoch, staged->pos_built_epoch,
          sizeof policy->pos_built_epoch);
+  memcpy(policy->pos_has_compound, staged->pos_has_compound,
+         sizeof policy->pos_has_compound);
   atomic_fetch_add(&policy->epoch, 1);
   pthread_rwlock_unlock(&policy->rwlock);
 
@@ -3580,6 +3589,7 @@ pass1_complete:
   memcpy(staged->pos_filters, old_filters, sizeof old_filters);
   memcpy(staged->pos_wildcard_mask, old_wildcards, sizeof old_wildcards);
   memcpy(staged->pos_built_epoch, old_filter_epochs, sizeof old_filter_epochs);
+  memcpy(staged->pos_has_compound, old_has_compound, sizeof old_has_compound);
   for (size_t i = 0; i < pattern_count; i++)
     st_netpattern_free(&pattern_lines[i]);
   free(pattern_lines);
