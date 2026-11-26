@@ -227,27 +227,24 @@ static SHELL_NONNULL(1, 3) bool token_is_unmodeled_current_shell_builtin(
   }
 }
 
+/* The `wait` builtin takes the options -n and -f (and -p, which is rejected
+ * before this scan). Any other letter is a usage error to Bash, which then
+ * waits for nothing. */
 typedef struct {
   bool option;
+  bool valid;
   size_t position;
-} static_option_scan_t;
+} static_wait_option_t;
 
-static SHELL_NONNULL(2) bool static_option_emit(unsigned char byte,
-                                                void *context) {
-  static_option_scan_t *scan = context;
+static SHELL_NONNULL(2) bool static_wait_option_emit(unsigned char byte,
+                                                     void *context) {
+  static_wait_option_t *scan = context;
   if (scan->position == 0)
-    scan->option = byte == '-' || byte == '+';
+    scan->option = byte == '-';
+  else if (byte != 'n' && byte != 'f')
+    scan->valid = false;
   scan->position++;
   return true;
-}
-
-static SHELL_NONNULL(1, 3, 4) bool token_scan_static_option(
-    const char *input, size_t input_length, const shell_token_t *token,
-    static_option_scan_t *scan) {
-  *scan = (static_option_scan_t){0};
-  return token_visit_static_word(input, input_length, token, static_option_emit,
-                                 scan) &&
-         scan->position > 0;
 }
 
 typedef struct {
@@ -1320,9 +1317,10 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         }
         if (token_static_option_has_letter(input, input_length, &token, 'p'))
           return true;
-        static_option_scan_t option;
-        if (token_scan_static_option(input, input_length, &token, &option) &&
-            option.option)
+        static_wait_option_t option = {.valid = true};
+        if (token_visit_static_word(input, input_length, &token,
+                                    static_wait_option_emit, &option) &&
+            option.option && option.valid)
           continue;
         builtin.wait_options = false;
       }

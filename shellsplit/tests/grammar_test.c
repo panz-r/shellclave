@@ -7290,6 +7290,11 @@ tokenizer_test_current_shell_metaprogramming_semantic_contract(void) {
       "printf -v 3 ignored",
       "read -r value",
       "wait -n",
+      /* Bash stops at a letter that is no option, or at a word that is not
+       * an option, and never reaches a later -p. */
+      "wait -z -p fd",
+      "wait -n -z -p fd",
+      "wait +n -p fd",
       "getopts ab choice",
       ": $((1 + 2))",
       ": $((1--2))",
