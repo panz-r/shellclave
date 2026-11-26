@@ -11,8 +11,8 @@
 #include <stdint.h>
 
 /* Keep this fixture deliberately larger than the current measured maximum so
- * a route-workspace growth turns the dedicated size-contract test into the
- * place that needs adjustment, rather than silently restoring heap use. */
+ * a route-workspace growth turns the workspace ceiling of support_test.c into
+ * the place that needs adjustment, rather than silently restoring heap use. */
 static _Alignas(
     max_align_t) unsigned char shellsplit_test_dep_workspace[40u * 1024u *
                                                              1024u];

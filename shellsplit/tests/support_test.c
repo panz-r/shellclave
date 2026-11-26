@@ -546,9 +546,17 @@ static int run_depgraph_compare(int argc, char **argv) {
     }                                                                          \
   } while (0)
 
+/* The default dependency-graph workspace, measured at 15,695,880 bytes. Its
+ * growth is deliberate: raise this ceiling, and the static test workspace of
+ * depgraph_test_workspace.h if needed, in the change that grows it. */
+#define WORKSPACE_CEILING ((size_t)16u * 1024u * 1024u)
+
 static int run_fixture(int argc, char **argv) {
   (void)argc;
   (void)argv;
+  size_t workspace = 0;
+  CHECK(shell_dep_workspace_size(NULL, &workspace));
+  CHECK(workspace <= WORKSPACE_CEILING);
   shellsplit_graph_fixture_t fixture;
   size_t alignment = shell_dep_workspace_alignment();
   CHECK(shellsplit_graph_fixture_init(&fixture, SHELLSPLIT_FIXTURE_SOURCE, 64,
