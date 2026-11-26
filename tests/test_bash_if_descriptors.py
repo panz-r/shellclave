@@ -95,11 +95,13 @@ class IfDescriptors(unittest.TestCase):
         return text
 
     def script(self, rng):
-        body = "; ".join(self.wrapped(rng) for _ in range(rng.randint(1, 3)))
-        return "exec 3<fa 4<fb; " + body
+        # Lines, not `; `: a background statement ends with `&`, which a `;`
+        # cannot follow.
+        body = "\n".join(self.wrapped(rng) for _ in range(rng.randint(1, 3)))
+        return "exec 3<fa 4<fb\n" + body
 
     def observed(self, source):
-        probe = source + ("; for n in 3 4; do if { true <&$n; } 2>/dev/null; "
+        probe = source + ("\nfor n in 3 4; do if { true <&$n; } 2>/dev/null; "
                           'then echo "fd$n=$(cat <&$n 2>/dev/null)"; '
                           'else echo "fd$n=closed"; fi; done')
         environment = dict(os.environ, LC_ALL="C", BASH_ENV="", ENV="")
@@ -147,7 +149,7 @@ class IfDescriptors(unittest.TestCase):
 
     def test_cat_reads_are_covered(self):
         rng = random.Random(20260)
-        modeled = 0
+        modeled = background = 0
         with tempfile.TemporaryDirectory() as directory:
             self.directory = directory
             for name in FILES:
@@ -155,20 +157,22 @@ class IfDescriptors(unittest.TestCase):
                     handle.write(name[1:] + "\n")
             sources = FIXED + tuple(self.script(rng)
                                     for _ in range(self.count))
-            models = self.reports([source + "; cat <&3; cat <&4"
+            models = self.reports([source + "\ncat <&3; cat <&4"
                                    for source in sources])
             for source, lines in zip(sources, models):
                 graph = self.model(lines)
                 if graph is None:
                     continue
                 modeled += 1
+                background += bool(re.search(r"\) &$", source, re.M))
                 seen = self.observed(source)
                 for fd in FDS:
                     if seen.get(fd) not in (None, "", "closed"):
                         with self.subTest(source=source, fd=fd):
                             self.assertIn("f" + seen[fd], graph[fd])
         self.assertGreater(modeled, self.count // 4)
-
+        # The background wrapper reaches the judgment, not only the generator.
+        self.assertGreater(background, 0)
 
     def cwd_simple(self, rng, root):
         kind, name = rng.random(), rng.choice(("d1", "d2", "d3"))
