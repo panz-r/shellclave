@@ -51,6 +51,7 @@ class ConditionalCommands(unittest.TestCase):
                 source = f"[[ {negate}-t {operand} ]]"
                 with self.subTest(source=source):
                     truth = self.probe_result(source)
+                    self.assertIn(truth, (1, 2))
                     status = self.bash_result(source).returncode
                     self.assertEqual(status == 0, truth == 2)
         for operand in ("count", '\"$count\"'):
