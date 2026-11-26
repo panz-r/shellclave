@@ -180,6 +180,9 @@ typedef struct {
   uint8_t lexical_prefix;
   bool lexical_command_position;
   bool lexical_redirect_operand;
+  /* The previous token ended a conditional or arithmetic command: a `then`,
+   * `elif` or `else` right after it still reopens command position. */
+  bool lexical_compound_end;
   void *workspace; /* Borrowed optional source scratch for iteration. */
   size_t workspace_size;
 } shell_tokenizer_state_t;

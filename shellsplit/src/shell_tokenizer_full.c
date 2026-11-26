@@ -1230,6 +1230,8 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
   if (shell_source_is_escaped_line_ending(state->input, token->position,
                                           token->position + token->length))
     return true;
+  bool after_compound = state->lexical_compound_end;
+  state->lexical_compound_end = false;
   switch (token->type) {
   case SHELL_TOKEN_PIPE:
   case SHELL_TOKEN_PIPE_BOTH:
@@ -1263,6 +1265,7 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
       token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
     state->lexical_command_position = false;
     state->lexical_redirect_operand = false;
+    state->lexical_compound_end = true;
     /* `))` ends the arithmetic command, so a descriptor redirect, `{name}`
      * redirect or comment may follow it directly. `]]` instead must be
      * followed by a delimiter: Bash rejects `[[ a ]]2>out` and `[[ a ]]#c`,
@@ -1306,6 +1309,20 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
   if (continues)
     return true;
   check_keyword(state, token);
+  if (after_compound && !state->lexical_command_position) {
+    size_t after = 0;
+    const shell_keyword_t *introducer = shell_source_keyword(
+        state->input, state->length, token->position, &after);
+    if (introducer && after == token->position + token->length &&
+        (introducer->kind == SHELL_KEYWORD_THEN ||
+         introducer->kind == SHELL_KEYWORD_ELIF ||
+         introducer->kind == SHELL_KEYWORD_ELSE)) {
+      state->lexical_command_position = true;
+      state->lexical_redirect_operand = false;
+      state->lexical_prefix = LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
+      return true;
+    }
+  }
   if (state->lexical_command_position) {
     size_t after = 0;
     /* The words that introduce another command, `if`, `then`, `elif` and
@@ -1767,6 +1784,24 @@ typedef struct {
   /* Nonzero for an `if`: the list it is reading, a shell_range_role_t. */
   uint8_t if_role;
 } shell_list_group_state_t;
+
+/* Whether token is `then`, `elif`, `else` or `fi` at the end of the list the
+ * innermost group, an `if`, is reading: valid right after a compound command
+ * (`if { :; } then :; fi`). */
+static bool list_token_ends_if_list(const shell_token_t *token,
+                                    const char *input, size_t input_length,
+                                    const shell_list_group_state_t *groups,
+                                    size_t group_count) {
+  if (!group_count || !groups[group_count - 1].if_role ||
+      !control_token_is_word(token))
+    return false;
+  const shell_keyword_t *keyword =
+      shell_source_keyword(input, input_length, token->position, &(size_t){0});
+  return keyword && (keyword->kind == SHELL_KEYWORD_THEN ||
+                     keyword->kind == SHELL_KEYWORD_ELIF ||
+                     keyword->kind == SHELL_KEYWORD_ELSE ||
+                     keyword->kind == SHELL_KEYWORD_FI);
+}
 
 /* The state after a compound command ends: its trailing redirects, pipe or
  * connector may follow, and no new word of the parent's command may start. */
@@ -2400,17 +2435,21 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
           break;
         }
       }
-      if (literal_token ||
-          (token.type != SHELL_TOKEN_GROUP_END &&
-           token.type != SHELL_TOKEN_SUBSHELL_END &&
-           token.type != SHELL_TOKEN_PIPE &&
-           token.type != SHELL_TOKEN_PIPE_BOTH &&
-           token.type != SHELL_TOKEN_AND && token.type != SHELL_TOKEN_OR &&
-           token.type != SHELL_TOKEN_SEMICOLON &&
-           token.type != SHELL_TOKEN_BACKGROUND))
+      if ((literal_token ||
+           (token.type != SHELL_TOKEN_GROUP_END &&
+            token.type != SHELL_TOKEN_SUBSHELL_END &&
+            token.type != SHELL_TOKEN_PIPE &&
+            token.type != SHELL_TOKEN_PIPE_BOTH &&
+            token.type != SHELL_TOKEN_AND && token.type != SHELL_TOKEN_OR &&
+            token.type != SHELL_TOKEN_SEMICOLON &&
+            token.type != SHELL_TOKEN_BACKGROUND)) &&
+          !(state.group_redirect_operator_end == 0 &&
+            list_token_ends_if_list(&token, input, input_length, groups,
+                                    group_count)))
         return list_invalid_at(draft, token.position);
       /* A containing-group closer is handled below.  Separators clear this
-       * state through their ordinary transition. */
+       * state through their ordinary transition, and an `if` keyword that ends
+       * the list of the enclosing `if` is handled with the other keywords. */
     }
     if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       if (!state.needs_stage || state.redirect_operand)
@@ -2624,10 +2663,16 @@ static SHELL_NONNULL(1) shell_error_t shell_tokenizer_list_syntax_status_body(
     /* `if` opens a list that `then`, `elif` and `else` move to the next of, and
      * `fi` closes. A word still open at the end of a received draft may yet
      * grow into another word: leave it to the pending-word case below. */
-    if (!literal_token && state.needs_stage && control_token_is_word(&token)) {
+    if (!literal_token &&
+        (state.needs_stage ||
+         (state.after_group && state.group_redirect_operator_end == 0)) &&
+        control_token_is_word(&token)) {
       size_t word_end;
       const shell_keyword_t *keyword =
           shell_source_keyword(input, input_length, token.position, &word_end);
+      /* After a compound command only a keyword that ends the list follows. */
+      if (keyword && !state.needs_stage && keyword->kind == SHELL_KEYWORD_IF)
+        keyword = NULL;
       /* `fi` ends the compound: it cannot be read as the start of a longer
        * word that continues a command. The other keywords can. */
       bool settled = !(draft && can_append && word_end == input_length) ||

@@ -12938,6 +12938,53 @@ static void parser_test_structured_blank_and_empty_source(void) {
       valid);
 }
 
+/* `then`, `elif`, `else` and `fi` end the list of an `if` right after a
+ * compound command, as after a simple one: `if { :; } then :; fi`. A redirect
+ * on the compound makes Bash read them as words, and outside an `if` they are
+ * a syntax error. */
+static void parser_test_if_keyword_after_compound(void) {
+  static const struct {
+    const char *source;
+    bool valid;
+  } cases[] = {
+      {"if { :; } then :; fi", true},
+      {"if true; then { :; } fi", true},
+      {"if true; then ( :; ) fi", true},
+      {"if false; then :; elif { :; } then :; fi", true},
+      {"if true; then :; else { :; } fi", true},
+      {"if [[ 1 ]] then echo hi; fi", true},
+      {"if (( 1 )) then echo hi; fi", true},
+      {"if [[ 1 ]]; then [[ 1 ]] fi", true},
+      {"if [[ 1 ]] then [[ 2 ]] elif (( 3 )) then :; else [[ 4 ]] fi", true},
+      {"if [[ 1 ]] then { :; } fi", true},
+      {"if true; then if true; then :; fi fi", true},
+      {"{ :; } fi", false},
+      {"{ :; } then", false},
+      {"[[ 1 ]] then", false},
+      {"if true; then ( :; ) | cat fi", false},
+      {"if { :; } > f then :; fi", false},
+      {"if true; then { :; } > f fi", false},
+      {"if [[ 1 ]] > f then :; fi", false},
+      {"if true; then { :; } if true; then :; fi; fi", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    static shell_source_result_t draft;
+    shell_processed_commands_t processed = {0};
+    bool accepted = shell_parse_draft(source, strlen(source), NULL, &draft) ==
+                        SHELL_SOURCE_COMPLETE &&
+                    shell_process_commands(source, strlen(source), NULL,
+                                           &processed) == SHELL_PROCESS_OK;
+    shell_processed_commands_free(&processed);
+    valid = accepted == cases[i].valid;
+    if (!valid)
+      fprintf(stderr, "%s: expected %s\n", source,
+              cases[i].valid ? "accepted" : "rejected");
+  }
+  parser_test("An if keyword after a compound command ends the list", valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -14057,6 +14104,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_escaped_backslash_before_newline();
   parser_test_ansi_c_braced_hex_escape();
   parser_test_structured_blank_and_empty_source();
+  parser_test_if_keyword_after_compound();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();

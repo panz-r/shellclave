@@ -213,9 +213,17 @@ typedef struct {
   bool command_start;
   bool prefix_open;
   bool redirect_operand;
+  /* The previous token ended a compound command and no redirect followed it:
+   * `then`, `elif`, `else` and `fi` may follow as they follow a command. After
+   * a redirect Bash reads them as words. */
+  bool compound_end;
+  /* The current keyword ends a list right after a compound command rather
+   * than at command position. */
+  bool token_keyword_after_compound;
   bool token_array_assignment;
-  /* The reserved word the current token is at command position: `if`,
-   * `then`, `elif`, `else` or `fi`; SHELL_KEYWORD_NONE otherwise. */
+  /* The reserved word the current token is at command position, or ends the
+   * list right after a compound command: `if`, `then`, `elif`, `else` or `fi`;
+   * SHELL_KEYWORD_NONE otherwise. */
   shell_keyword_kind_t token_keyword;
 } fast_array_context_t;
 
@@ -272,6 +280,11 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
   context->ready = true;
   context->token_array_assignment = false;
   context->token_keyword = SHELL_KEYWORD_NONE;
+  context->token_keyword_after_compound = false;
+  bool was_compound_end = context->compound_end;
+  context->compound_end =
+      context->token.type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
+      context->token.type == SHELL_TOKEN_ARITHMETIC_COMMAND;
   context->before_prefix = context->prefix;
   context->before_prefix_open = context->prefix_open;
   context->before_syntax_end = context->syntax_end;
@@ -317,6 +330,7 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
     context->prefix_open = false;
     context->word_end = 0;
     context->redirect_operand = false;
+    context->compound_end = true;
     return true;
   }
   if (fast_token_is_redirection(&context->token)) {
@@ -342,7 +356,8 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
   /* The words that introduce another command, or end the compound, are
    * structure at command position: `if` `then` `elif` `else` open a command
    * list like a brace does, `fi` ends the compound like its closer. */
-  if (context->command_start && context->prefix_open) {
+  bool at_command = context->command_start && context->prefix_open;
+  if (at_command || was_compound_end) {
     size_t after = 0;
     const shell_keyword_t *keyword =
         shell_source_keyword(context->state.input, context->state.length,
@@ -350,18 +365,26 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
     if (keyword && after == context->token.position + context->token.length) {
       switch (keyword->kind) {
       case SHELL_KEYWORD_IF:
+        if (!at_command)
+          break;
+        /* fall through */
       case SHELL_KEYWORD_THEN:
       case SHELL_KEYWORD_ELIF:
       case SHELL_KEYWORD_ELSE:
         context->token_keyword = keyword->kind;
+        context->token_keyword_after_compound = was_compound_end;
+        context->command_start = true;
+        context->prefix_open = true;
         context->prefix = shell_pipeline_prefix_state_initial(true);
         context->word_end = 0;
         return true;
       case SHELL_KEYWORD_FI:
         context->token_keyword = keyword->kind;
+        context->token_keyword_after_compound = was_compound_end;
         context->command_start = false;
         context->prefix_open = false;
         context->word_end = 0;
+        context->compound_end = true;
         return true;
       default:
         break;
@@ -1451,6 +1474,34 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     }                                                                          \
   } while (0)
 
+/* End the command that began at subcmd_start and stops before pos. */
+#define FLUSH_PENDING_RANGE()                                                  \
+  do {                                                                         \
+    uint32_t _s = fast_range_trim_start(cmd, subcmd_start, pos);               \
+    uint32_t _e = fast_range_trim_end(cmd, _s, pos);                           \
+    if (_s < _e) {                                                             \
+      if (subcmd_idx >= max_cmds) {                                            \
+        result->status = SHELL_STATUS_TRUNCATED;                               \
+        result->count = subcmd_idx;                                            \
+        goto truncated;                                                        \
+      }                                                                        \
+      result->cmds[subcmd_idx].start = _s;                                     \
+      result->cmds[subcmd_idx].len = _e - _s;                                  \
+      result->cmds[subcmd_idx].type = current_type;                            \
+      result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;      \
+      result->cmds[subcmd_idx].features = 0;                                   \
+      result->cmds[subcmd_idx].group_depth = group_depth;                      \
+      result->cmds[subcmd_idx].group_kinds = group_kinds;                      \
+      CURRENT_SECTION(result->cmds[subcmd_idx].role,                           \
+                      result->cmds[subcmd_idx].arm);                           \
+      if (group_kinds & SHELL_GROUP_IF)                                        \
+        result->cmds[subcmd_idx].features |= SHELL_FEAT_IF;                    \
+      detect_features(cmd, _s, _e - _s, &result->cmds[subcmd_idx].features,    \
+                      execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);    \
+      subcmd_idx++;                                                            \
+    }                                                                          \
+  } while (0)
+
 #define OPEN_GROUP(kind_val, start_val, modifiers_val, negation_count_val,     \
                    time_mode_val)                                              \
   do {                                                                         \
@@ -1779,8 +1830,13 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         fast_lexical_token_at(&documents, pos) &&
         documents.token_keyword != SHELL_KEYWORD_NONE &&
         (documents.before_syntax_end <= subcmd_start ||
+         documents.token_keyword_after_compound ||
          (execution_pipeline_start && documents.before_prefix_open))) {
       shell_keyword_kind_t keyword = documents.token_keyword;
+      /* A conditional or arithmetic command still pending ends at the keyword
+       * that follows it directly. */
+      if (documents.token_keyword_after_compound && subcmd_start < pos)
+        FLUSH_PENDING_RANGE();
       uint32_t keyword_end =
           (uint32_t)(documents.token.position + documents.token.length);
       uint16_t top = group_descriptor_depth
