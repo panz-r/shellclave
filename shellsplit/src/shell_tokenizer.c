@@ -1888,14 +1888,12 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           if_role[top] = SHELL_RANGE_ROLE_THEN;
           valid = true;
         } else if (keyword == SHELL_KEYWORD_ELIF &&
-                   if_role[top] == SHELL_RANGE_ROLE_THEN &&
-                   if_arm[top] != UINT8_MAX) {
+                   if_role[top] == SHELL_RANGE_ROLE_THEN) {
           if_role[top] = SHELL_RANGE_ROLE_CONDITION;
           if_arm[top]++;
           valid = true;
         } else if (keyword == SHELL_KEYWORD_ELSE &&
-                   if_role[top] == SHELL_RANGE_ROLE_THEN &&
-                   if_arm[top] != UINT8_MAX) {
+                   if_role[top] == SHELL_RANGE_ROLE_THEN) {
           if_role[top] = SHELL_RANGE_ROLE_ELSE;
           if_arm[top]++;
           valid = true;

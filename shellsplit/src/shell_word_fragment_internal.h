@@ -39,20 +39,6 @@ static inline SHELL_NONNULL(4) bool shell_source_skip_complete_ansi_c_quote(
   return false;
 }
 
-/* Permissive lexical callers retain an incomplete fragment through EOF. */
-static inline size_t shell_source_skip_ansi_c_quote(const char *input,
-                                                    size_t length,
-                                                    size_t position) {
-  size_t after = 0;
-  if (shell_source_skip_complete_ansi_c_quote(input, length, position, &after))
-    return after;
-  return input && position < length && input[position] == '$' &&
-                 shell_source_logical_next_is(input, length, position, '\'',
-                                              NULL)
-             ? length
-             : position;
-}
-
 /* Decode one complete Bash ANSI-C quote through a byte visitor. This is shared
  * by canonical argv rendering and heredoc delimiter matching so both paths
  * retain identical escape semantics. A false visitor result aborts decoding;

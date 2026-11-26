@@ -1804,10 +1804,7 @@ scan_group_io(const char *input, uint32_t length, const shell_group_t *group,
       input, after, length, group_index, result, max_group_io_ops, &found);
   if (status != SHELL_PROCESS_OK && (found || status != SHELL_PROCESS_EPARSE))
     return status;
-  if (status != SHELL_PROCESS_OK)
-    after = (uint32_t)shell_source_skip_inline_continuations(input, length,
-                                                             group->end);
-  else if (found) {
+  if (status == SHELL_PROCESS_OK && found) {
     size_t last = result->group_io_op_count - 1;
     after = result->group_io_ops[last].source_end;
     after =
@@ -2526,7 +2523,10 @@ shell_process_status_t shell_build_command_netseq_from_stages(
   size_t total = 0;
   size_t rendered_count = 0;
   for (size_t i = 0; i < stages->count; i++) {
-    if (shell_processed_command_word_count(&stages->commands[i]) == 0) {
+    shell_processed_word_iterator_t iterator;
+    shell_processed_argv_iterator_init(&iterator, &stages->commands[i]);
+    shell_token_t token;
+    if (!shell_processed_word_iterator_next(&iterator, &token)) {
       /* An argv-less redirect-only simple command is a real execution stage.
        * The anomaly sequence represents its missing argv[0] as a canonical
        * empty record. This sequence is not a policy netargv transport. */
@@ -2540,13 +2540,6 @@ shell_process_status_t shell_build_command_netseq_from_stages(
       total += record_length;
       rendered_count++;
       continue;
-    }
-    shell_processed_word_iterator_t iterator;
-    shell_processed_argv_iterator_init(&iterator, &stages->commands[i]);
-    shell_token_t token;
-    if (!shell_processed_word_iterator_next(&iterator, &token)) {
-      status = SHELL_PROCESS_EPARSE;
-      goto fail_commands;
     }
     size_t length = 0;
     status =
@@ -2583,20 +2576,15 @@ shell_process_status_t shell_build_command_netseq_from_stages(
   }
   char *position = encoded;
   for (size_t i = 0; i < stages->count; i++) {
-    if (shell_processed_command_word_count(&stages->commands[i]) == 0) {
+    shell_processed_word_iterator_t iterator;
+    shell_processed_argv_iterator_init(&iterator, &stages->commands[i]);
+    shell_token_t token;
+    if (!shell_processed_word_iterator_next(&iterator, &token)) {
       size_t prefix_length = 0;
       (void)shell_netstring_write_prefix(position, SIZE_MAX, 0, &prefix_length);
       position += prefix_length;
       *position++ = ',';
       continue;
-    }
-    shell_processed_word_iterator_t iterator;
-    shell_processed_argv_iterator_init(&iterator, &stages->commands[i]);
-    shell_token_t token;
-    if (!shell_processed_word_iterator_next(&iterator, &token)) {
-      free(encoded);
-      status = SHELL_PROCESS_EPARSE;
-      goto fail_commands;
     }
     size_t length = 0;
     (void)shell_process_measure_word_value(token.start, token.length, &length);

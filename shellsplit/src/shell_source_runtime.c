@@ -119,8 +119,8 @@ bool shell_source_operation_begin_owned(const char *input, size_t length) {
     shell_source_operation_end();
     return false;
   }
-  if (size <= sizeof(source_operation.scratch) && !array_storage)
-    return true;
+  /* A document, a conditional or array storage each size the workspace above
+   * the private scratch, so the owned allocation is always needed. */
   source_operation.owned_workspace = malloc(size);
   if (!source_operation.owned_workspace) {
     shell_source_operation_end();

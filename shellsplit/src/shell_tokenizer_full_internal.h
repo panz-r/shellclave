@@ -145,8 +145,9 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
 /* Report an unescaped parameter expansion anywhere within one lexical token.
  * This includes a variable adjacent to literal word fragments, such as
  * `--limit=${count}`, without treating that one shell word as several argv
- * entries. */
-bool shell_tokenizer_token_has_variable(const shell_token_t *token);
+ * entries. The token is required and came from the tokenizer. */
+bool shell_tokenizer_token_has_variable(const shell_token_t *token)
+    SHELL_NONNULL(1);
 
 /* Tokens borrowing one source buffer belong to the same logical shell word
  * when physically adjacent or separated only by escaped line endings. token

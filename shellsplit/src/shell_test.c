@@ -143,10 +143,6 @@ static SHELL_NONNULL(1) uint16_t primary(shell_test_program_t *p, size_t op,
   }
     SHELL_FILE_COMPARISONS(FILE_COMPARISON_PRIMARY)
 #undef FILE_COMPARISON_PRIMARY
-    else if (p->words[op].value_length == 3 && p->words[op].value[1] != 'n' &&
-             p->words[op].value[1] != 'o' && p->words[op].value[1] != 'e') {
-      kind = TEST_OPAQUE_ERROR;
-    }
 #define NUMERIC_PRIMARY(suffix, spelling)                                      \
   if (is_word(p, op, spelling))                                                \
     kind = TEST_NUMERIC_##suffix;

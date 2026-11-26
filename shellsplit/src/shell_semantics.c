@@ -1245,11 +1245,9 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         uint32_t names = static_set_selector_names(&option);
         if (names != 0)
           return true;
-        builtin.set_selectors--;
-        /* An invalid option name stops Bash before any later selectors. */
-        if (names == 0 ||
-            (builtin.set_selectors == 0 && builtin.set_invalid_after_selectors))
-          builtin.set_builtin = false;
+        /* A selector operand that names no option stops Bash before any later
+         * selectors. */
+        builtin.set_builtin = false;
         continue;
       }
       /* A selector before an invalid flag is still applied. If that selector

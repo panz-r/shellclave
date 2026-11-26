@@ -2741,21 +2741,18 @@ static SHELL_NONNULL(1) dep_fd_ref_t
  * Bash disposes the whole list even when a restoration stopped execution;
  * older scratch descriptors then remain live (with their existing CLEXEC
  * markers) and may still be observed by the caller or an enclosing frame. */
-static SHELL_NONNULL(1, 2) bool dep_fd_discard_undo(
-    dep_route_state_t *state, dep_route_journal_t *journal, uint32_t key,
-    const dep_domain_collection_t *collection) {
+static SHELL_NONNULL(1,
+                     2) bool dep_fd_discard_undo(dep_route_state_t *state,
+                                                 dep_route_journal_t *journal,
+                                                 uint32_t key) {
   if (key == SHELL_DEP_FD_NONE)
     return true;
   dep_fd_ref_t operation = dep_fd_numeric(key);
   if (journal->arena->allocations[key - SHELL_DEP_FD_MAX - 1].role ==
       DEP_ALLOCATION_BINDING)
-    return collection
-               ? dep_route_state_store_access(state, journal, operation,
-                                              DEP_FD_ACCESS_ALLOCATION_SLOTS,
-                                              (dep_route_set_t){.ready = true})
-               : dep_route_state_store_access(state, journal, operation,
-                                              DEP_FD_ACCESS_ALLOCATION_SLOTS,
-                                              (dep_route_set_t){.ready = true});
+    return dep_route_state_store_access(state, journal, operation,
+                                        DEP_FD_ACCESS_ALLOCATION_SLOTS,
+                                        (dep_route_set_t){.ready = true});
   return dep_route_state_store_access(state, journal, operation,
                                       DEP_FD_ACCESS_SAVED,
                                       (dep_route_set_t){.ready = true}) &&
@@ -2776,22 +2773,12 @@ static SHELL_NONNULL(1, 2) bool dep_fd_discard_undo(
  * Parent publication and compound completion share this retirement rule. */
 static SHELL_NONNULL(1, 2, 3) bool dep_fd_retire_operation(
     dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_route_state_t *source, uint32_t undo_key,
-    const dep_domain_collection_t *collection) {
+    const dep_route_state_t *source, uint32_t undo_key) {
   if (undo_key == SHELL_DEP_FD_NONE)
     return true;
   if (journal->arena->allocations[undo_key - SHELL_DEP_FD_MAX - 1].role ==
       DEP_ALLOCATION_BINDING)
-    return dep_fd_discard_undo(state, journal, undo_key, collection);
-  dep_domain_collection_t pins = {
-      .roots = {state, source},
-      .parent = collection,
-  };
-  if (collection) {
-    pins.workspace = collection->workspace;
-    pins.frame = collection->frame;
-  }
-  const dep_domain_collection_t *retire_collection = collection ? &pins : NULL;
+    return dep_fd_discard_undo(state, journal, undo_key);
   dep_route_set_t undo = dep_fd_raw_fact(
       source, journal, dep_fd_numeric(undo_key), DEP_FD_ACCESS_SAVED);
   /* The save occupies exactly one of its possible places, or none on a
@@ -2876,7 +2863,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_retire_operation(
               (dep_route_set_t){.ready = true}))
         return false;
     }
-  return dep_fd_discard_undo(state, journal, undo_key, retire_collection);
+  return dep_fd_discard_undo(state, journal, undo_key);
 }
 
 /* The state of an undo list, after each entry: still running, stopped by a
@@ -2905,19 +2892,17 @@ typedef enum {
  * disposing it. */
 static SHELL_NONNULL(1, 2) dep_undo_result_t
     dep_fd_unwind_key(dep_route_state_t *state, dep_route_journal_t *journal,
-                      uint32_t key, bool exec, dep_undo_result_t list,
-                      const dep_domain_collection_t *collection) {
+                      uint32_t key, bool exec, dep_undo_result_t list) {
   if (key == SHELL_DEP_FD_NONE)
     return list;
   if (list == DEP_UNDO_STOPPED)
-    return dep_fd_discard_undo(state, journal, key, collection)
-               ? DEP_UNDO_STOPPED
-               : DEP_UNDO_EXHAUSTED;
+    return dep_fd_discard_undo(state, journal, key) ? DEP_UNDO_STOPPED
+                                                    : DEP_UNDO_EXHAUSTED;
   if (list == DEP_UNDO_MAYBE_STOPPED) {
     dep_route_state_t disposed = *state;
-    if (dep_fd_unwind_key(state, journal, key, exec, DEP_UNDO_DONE,
-                          collection) == DEP_UNDO_EXHAUSTED ||
-        !dep_fd_discard_undo(&disposed, journal, key, collection) ||
+    if (dep_fd_unwind_key(state, journal, key, exec, DEP_UNDO_DONE) ==
+            DEP_UNDO_EXHAUSTED ||
+        !dep_fd_discard_undo(&disposed, journal, key) ||
         !dep_fd_join(state, &disposed, journal))
       return DEP_UNDO_EXHAUSTED;
     return DEP_UNDO_MAYBE_STOPPED;
@@ -2926,7 +2911,7 @@ static SHELL_NONNULL(1, 2) dep_undo_result_t
   dep_route_set_t target =
       dep_fd_raw_fact(state, journal, operation, DEP_FD_ACCESS_UNDO_TARGET);
   if (!target.count)
-    return dep_fd_retire_operation(state, journal, state, key, collection)
+    return dep_fd_retire_operation(state, journal, state, key)
                ? DEP_UNDO_DONE
                : DEP_UNDO_EXHAUSTED;
   dep_fd_ref_t fd = dep_fd_numeric(target.routes[0].value);
@@ -2969,7 +2954,7 @@ static SHELL_NONNULL(1, 2) dep_undo_result_t
         if (journal->diagnostic_cleanup &&
             !dep_record_diagnostic(&halted, journal))
           return DEP_UNDO_EXHAUSTED;
-        if (!dep_fd_discard_undo(&halted, journal, key, collection))
+        if (!dep_fd_discard_undo(&halted, journal, key))
           return DEP_UNDO_EXHAUSTED;
         if (!open) {
           *state = halted;
@@ -3032,16 +3017,7 @@ static SHELL_NONNULL(1, 2) dep_undo_result_t
     if (keep && !dep_fd_join(state, &before, journal))
       return DEP_UNDO_EXHAUSTED;
   }
-  dep_domain_collection_t pins = {
-      .roots = {state, &before},
-      .parent = collection,
-  };
-  if (collection) {
-    pins.workspace = collection->workspace;
-    pins.frame = collection->frame;
-  }
-  if (!dep_fd_retire_operation(state, journal, &before, key,
-                               collection ? &pins : NULL))
+  if (!dep_fd_retire_operation(state, journal, &before, key))
     return DEP_UNDO_EXHAUSTED;
   dep_route_set_t available =
       dep_fd_raw_fact(state, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
@@ -3105,14 +3081,14 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_publish_one(
       list = dep_fd_unwind_key(
           route_state, changes,
           dep_undo_slot(changes, &close, DEP_ALLOCATION_MOVE_UNDO, false),
-          descriptor_exec, list, collection);
+          descriptor_exec, list);
       if (list == DEP_UNDO_EXHAUSTED)
         return false;
     }
     uint32_t target_key =
         dep_undo_slot(changes, op, DEP_ALLOCATION_TARGET_UNDO, false);
     list = dep_fd_unwind_key(route_state, changes, target_key, descriptor_exec,
-                             list, collection);
+                             list);
     if (list == DEP_UNDO_EXHAUSTED)
       return false;
     if (list != DEP_UNDO_STOPPED && !descriptor_exec &&
@@ -3137,7 +3113,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_publish_one(
     if (op->fd == SHELL_DEP_FD_NAMED && op->resets_descriptor &&
         (changes->observable_fd_count || changes->named_closes) &&
         !dep_fd_retire_operation(route_state, changes, executed_state,
-                                 dep_allocation_slot(changes, op), collection))
+                                 dep_allocation_slot(changes, op)))
       return false;
   }
   return !route_state->truncated &&
@@ -3282,8 +3258,7 @@ static SHELL_NONNULL(1, 2) bool dep_fd_restore_slots_one(
   dep_undo_result_t list = DEP_UNDO_DONE;
   for (uint32_t i = scratch_count; i != 0; i--) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_REDIRECT_FRAMES);
-    list = dep_fd_unwind_key(state, journal, scratch_keys[i - 1], false, list,
-                             NULL);
+    list = dep_fd_unwind_key(state, journal, scratch_keys[i - 1], false, list);
     if (list == DEP_UNDO_EXHAUSTED)
       return false;
   }
@@ -3364,7 +3339,6 @@ dep_fd_default_fact(dep_fd_ref_t fd, dep_fd_access_t access, bool proven_live) {
       access == DEP_FD_ACCESS_UNDO_EXEC || access == DEP_FD_ACCESS_SCRATCH ||
       access == DEP_FD_ACCESS_SETUP_MODE ||
       access == DEP_FD_ACCESS_PROCESS_SLOT ||
-      access == DEP_FD_ACCESS_PROCESS_BEFORE ||
       access == DEP_FD_ACCESS_SELECTOR ||
       access == DEP_FD_ACCESS_PROCESS_DOMAIN)
     return (dep_route_set_t){.ready = true};
@@ -4165,7 +4139,6 @@ static SHELL_NONNULL(1, 5, 6, 7) void dep_fd_key_exact(
       access == DEP_FD_ACCESS_STDIN_REDIR ||
       access == DEP_FD_ACCESS_READ_ARGUMENT ||
       access == DEP_FD_ACCESS_PROCESS_SLOT ||
-      access == DEP_FD_ACCESS_PROCESS_BEFORE ||
       access == DEP_FD_ACCESS_SELECTOR) {
     /* A scratch slot and an ordinary descriptor on another path cannot share
      * a factored map. Preserve ownership until the frame disposes its saves. */
@@ -5776,8 +5749,7 @@ static SHELL_NONNULL(1, 2) bool dep_fd_cleanup_registered(
 static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
     dep_fd_cleanup_range(dep_route_state_t *state, dep_route_journal_t *journal,
                          const dep_fd_op_t *ops, uint32_t begin, uint32_t end,
-                         dep_undo_result_t list,
-                         const dep_domain_collection_t *collection) {
+                         dep_undo_result_t list) {
   for (uint32_t op = end; op-- > begin;) {
     uint32_t keys[3];
     uint32_t count = dep_fd_cleanup_keys(journal, ops + op, keys);
@@ -5786,8 +5758,7 @@ static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
       if (!dep_fd_cleanup_registered(state, journal, keys[i], &access))
         continue;
       DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_UNDO);
-      list =
-          dep_fd_unwind_key(state, journal, keys[i], false, list, collection);
+      list = dep_fd_unwind_key(state, journal, keys[i], false, list);
       if (list == DEP_UNDO_EXHAUSTED)
         return list;
     }
@@ -5950,14 +5921,8 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
         if (reference) {
           /* The test reference unwinds every raise point on its own. */
           dep_route_state_t failed = one;
-          dep_domain_collection_t failure_pins = {
-              .workspace = collection.workspace,
-              .frame = collection.frame,
-              .roots = {&one, &failed},
-              .parent = &path_pins,
-          };
           dep_undo_result_t list = dep_fd_cleanup_range(
-              &failed, journal, ops, 0, begin, DEP_UNDO_DONE, &failure_pins);
+              &failed, journal, ops, 0, begin, DEP_UNDO_DONE);
           if (list == DEP_UNDO_EXHAUSTED ||
               !dep_failure_finish(&failed, journal, list) ||
               !dep_fd_add(failures, 1, failed, journal))
@@ -6007,13 +5972,6 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
   }
   memset(scan->present, 0, sizeof(scan->present));
   memset(scan->pending, 0, sizeof(scan->pending));
-  dep_domain_collection_t pending_pins = {
-      .workspace = collection.workspace,
-      .frame = collection.frame,
-      .states = &scan->pending[0][0][0],
-      .state_count = 2 * DEP_FAILURE_CLASSES * DEP_ROUTE_STATE_CAPACITY,
-      .parent = &collection,
-  };
   for (uint32_t level = levels; level-- > 0;) {
     uint32_t below = (level + 1) & 1u, here = level & 1u;
     memset(scan->present[here], 0, sizeof(scan->present[here]));
@@ -6030,7 +5988,7 @@ static SHELL_NONNULL(1, 2, 4, 5) bool dep_fd_correlated_setup_failures(
                                  : partition == 1 ? DEP_UNDO_MAYBE_STOPPED
                                                   : DEP_UNDO_STOPPED;
         list = dep_fd_cleanup_range(&state, journal, ops, scan->begin[level],
-                                    scan->end[level], list, &pending_pins);
+                                    scan->end[level], list);
         if (list == DEP_UNDO_EXHAUSTED)
           return false;
         uint32_t into = list == DEP_UNDO_DONE            ? 0

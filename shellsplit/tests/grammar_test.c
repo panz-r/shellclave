@@ -1103,9 +1103,7 @@ static void tokenizer_test_source_scanner_boundaries(void) {
                                                    strlen("2>out command"));
 
   valid =
-      valid && shell_source_skip_ansi_c_quote("plain", 5, 0) == 0 &&
-      shell_source_skip_ansi_c_quote("$'x'", 4, 0) == 4 &&
-      shell_source_skip_ansi_c_quote("$'x\\'", 5, 0) == 5 &&
+      valid &&
       !shell_source_skip_complete_ansi_c_quote("$'x\\'", 5, 0, &after) &&
       shell_source_skip_complete_ansi_c_quote("$'x\\\\'", 6, 0, &after) &&
       after == 6 &&

@@ -1905,8 +1905,6 @@ static const char *token_abbreviation(const shell_token_t *token) {
     return "CS";
   case SHELL_ABSTRACT_AR:
     return "AR";
-  case SHELL_ABSTRACT_REDIR:
-    return "RD";
   case SHELL_ABSTRACT_CT:
     return "CT";
   case SHELL_ABSTRACT_STR:

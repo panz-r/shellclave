@@ -113,8 +113,9 @@ static bool is_shell_operator(char c) {
          c == ')' || c == '{' || c == '}' || c == '$' || c == '`' || c == '[';
 }
 
-static bool token_at_word_boundary(const shell_tokenizer_state_t *state) {
-  if (!state || state->position == 0)
+static SHELL_NONNULL(1) bool token_at_word_boundary(
+    const shell_tokenizer_state_t *state) {
+  if (state->position == 0)
     return true;
   char previous = state->input[state->position - 1];
   return shell_source_space((unsigned char)previous) || previous == ';' ||
@@ -376,7 +377,7 @@ static bool parse_variable(shell_tokenizer_state_t *state,
 }
 
 bool shell_tokenizer_token_has_variable(const shell_token_t *token) {
-  if (!token || !token->start || token->length == 0)
+  if (token->length == 0)
     return false;
   shell_source_variable_scan_t scan = {0};
   size_t start = 0, after = 0;
@@ -537,9 +538,9 @@ static bool parse_subshell(shell_tokenizer_state_t *state,
   return false;
 }
 
-static size_t scan_descriptor_target(const char *input, size_t position,
-                                     size_t length) {
-  if (!input || position >= length)
+static SHELL_NONNULL(1) size_t
+    scan_descriptor_target(const char *input, size_t position, size_t length) {
+  if (position >= length)
     return position;
   /* A physical continuation is removed before Bash interprets a duplicate
    * target. Keep it inside the redirect token's raw span even when the target
@@ -1420,13 +1421,9 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
  * because it saw the keyword: that form is malformed shell syntax, while a
  * real declaration remains lexically representable for the semantic boundary
  * to reject as unsupported. */
-static bool control_function_keyword_has_name(const shell_token_t *token,
-                                              const char *input,
-                                              size_t input_length) {
-  if (token && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND)
-    return false;
-  if (!token || !input || token->position > input_length ||
-      token->length > input_length - token->position)
+static SHELL_NONNULL(1, 2) bool control_function_keyword_has_name(
+    const shell_token_t *token, const char *input, size_t input_length) {
+  if (token->type == SHELL_TOKEN_CONDITIONAL_COMMAND)
     return false;
   size_t position = token->position + token->length;
   while (position < input_length &&
@@ -1450,11 +1447,12 @@ typedef struct {
   bool misplaced_marker;
 } control_frame_state_t;
 
-static bool token_is_plain_word(const char *input, size_t input_length,
-                                const shell_token_t *token, const char *word) {
-  if (!input || !token || !word ||
-      (token->type != SHELL_TOKEN_COMMAND &&
-       token->type != SHELL_TOKEN_ARGUMENT))
+static SHELL_NONNULL(1, 3,
+                     4) bool token_is_plain_word(const char *input,
+                                                 size_t input_length,
+                                                 const shell_token_t *token,
+                                                 const char *word) {
+  if (token->type != SHELL_TOKEN_COMMAND && token->type != SHELL_TOKEN_ARGUMENT)
     return false;
   size_t after = token->position;
   return shell_source_match_plain_word(input, input_length, token->position,

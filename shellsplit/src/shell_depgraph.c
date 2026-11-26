@@ -1867,13 +1867,13 @@ static SHELL_NONNULL(1) uint8_t
              : SHELL_DEP_DOC_FLAG_NONE;
 }
 
-static void dep_file_doc_set_cwd(shell_dep_graph_t *graph, uint32_t document,
-                                 uint32_t cwd_offset, bool cwd_known,
-                                 bool cwd_absolute) {
-  if (document >= graph->node_count ||
-      graph->nodes[document].type != SHELL_NODE_DOC ||
-      graph->nodes[document].doc.kind != SHELL_DOC_FILE)
-    return;
+/* Record the working directory a FILE document's name resolves against.
+ * document indexes an installed FILE document of graph. */
+static SHELL_NONNULL(1) void dep_file_doc_set_cwd(shell_dep_graph_t *graph,
+                                                  uint32_t document,
+                                                  uint32_t cwd_offset,
+                                                  bool cwd_known,
+                                                  bool cwd_absolute) {
   shell_dep_doc_t *doc = &graph->nodes[document].doc;
   doc->cwd_known = cwd_known && cwd_offset < graph->cwd_buf.len;
   doc->cwd_offset = doc->cwd_known ? cwd_offset : 0;
@@ -1955,9 +1955,6 @@ static bool add_doc_file(shell_dep_graph_t *g, uint32_t max_nodes,
     e->to = document;
     e->source_fd = fd;
   }
-  if (etype == SHELL_EDGE_SUBST && g->nodes[e->from].type != SHELL_NODE_DOC)
-    e->source_fd = fd;
-
   if (document_index)
     *document_index = document;
   return true;
@@ -2747,7 +2744,6 @@ enum {
    * empty fact means no domain; value zero in a nonempty fact is impossible.
    * Clearing a domain must not turn it into the impossible terminal. */
   DEP_FD_ACCESS_PROCESS_DOMAIN = 1 << 27,
-  DEP_FD_ACCESS_PROCESS_BEFORE = 1 << 28,
   DEP_FD_ACCESS_SELECTOR = 1 << 29,
   /* Root of the interpreter's persistent set of original process-pipe FDs.
    * Forking a compound closes these in the parent, not in its child. */
@@ -3369,7 +3365,6 @@ static bool dep_route_bookkeeping(bool numeric, uint32_t value,
   case DEP_FD_ACCESS_UNDO_EXEC:
   case DEP_FD_ACCESS_SETUP_MODE:
   case DEP_FD_ACCESS_PROCESS_SLOT:
-  case DEP_FD_ACCESS_PROCESS_BEFORE:
     return true;
   case DEP_FD_ACCESS_READ_ARGUMENT:
     return numeric;
