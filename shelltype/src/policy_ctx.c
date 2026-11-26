@@ -298,22 +298,13 @@ bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx) {
   return atomic_load(&ctx->refcount) == 2;
 }
 
-static uint64_t str_pool_hash(const char *str, size_t len) {
-  uint64_t h = 14695981039346656037ull;
-  for (size_t i = 0; i < len; i++) {
-    h ^= (uint64_t)(uint8_t)str[i];
-    h *= 1099511628211ull;
-  }
-  return h;
-}
-
 const char *st_policy_ctx_intern_view(st_policy_ctx_t *ctx, const char *str,
                                       size_t len) {
   if (len == 0)
     return "";
 
   pthread_mutex_lock(&ctx->lock);
-  uint64_t h = str_pool_hash(str, len);
+  uint64_t h = filter_hash_fnv1a(str, len);
   size_t pos = h % ctx->str_pool.capacity;
 
   while (ctx->str_pool.hashes[pos] != HASH_EMPTY) {

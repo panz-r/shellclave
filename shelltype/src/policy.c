@@ -738,8 +738,10 @@ static child_entry_t *find_exact_wildcard_child(const policy_state_t *node,
 /* Forward declaration for is_explicit_wildcard (used by insert_child) */
 static bool is_explicit_wildcard(const char *text, st_token_type_t type);
 
-/* Returns: -1 = allocation failure, 0 = success (filter updated), 1 = success
- * (filter needs rebuild) */
+/* A wildcard child must not already exist: the caller probes
+ * find_exact_wildcard_child first. Duplicate literals are refused here.
+ * Returns: -1 = allocation failure or duplicate literal, 0 = success (filter
+ * updated), 1 = success (filter needs rebuild) */
 static int insert_child(policy_state_t *node, st_policy_t *policy,
                         const st_token_t *token, uint32_t target,
                         uint8_t depth) {
@@ -777,16 +779,6 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
       if (type < children[i].type)
         break;
       insert_pos = i + 1;
-    }
-    /* Duplicate check: same base type AND same text (handles parametrized) */
-    if (insert_pos < total && children[insert_pos].type == type) {
-      bool is_param = text && strchr(text, '.');
-      if (!is_param)
-        return -1; /* non-parametrized: same type = dup */
-      /* Parametrized: check if same parameter */
-      if (children[insert_pos].text != NULL && text != NULL &&
-          strcmp(children[insert_pos].text, text) == 0)
-        return -1;
     }
   }
   assert(insert_pos <= total);

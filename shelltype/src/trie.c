@@ -1448,8 +1448,9 @@ bool st_learner_is_netpattern_blacklisted(const st_learner_t *learner,
 
 /* --- PUBLIC API – SERIALISATION --- */
 
-static bool parse_u32_field(const char *text, char **end, uint32_t *value) {
-  if (!text || !end || !value || !shell_ascii_digit((unsigned char)text[0]))
+static SHELL_NONNULL(1, 2, 3) bool parse_u32_field(const char *text, char **end,
+                                                   uint32_t *value) {
+  if (!shell_ascii_digit((unsigned char)text[0]))
     return false;
   errno = 0;
   unsigned long parsed = strtoul(text, end, 10);
@@ -1679,11 +1680,11 @@ static st_error_t read_outer_record(FILE *fp, unsigned char **payload,
   return ST_OK;
 }
 
-static bool take_netstring_field(const char *record, size_t length,
-                                 size_t *offset,
-                                 shell_netstring_view_t *field) {
-  if (!record || !offset || !field || *offset > length)
-    return false;
+/* Read the netstring that starts at *offset of record, which holds length
+ * bytes with *offset <= length, and advance *offset past it. */
+static SHELL_NONNULL(1, 3, 4) bool take_netstring_field(
+    const char *record, size_t length, size_t *offset,
+    shell_netstring_view_t *field) {
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, record + *offset, length - *offset) !=
       SHELL_NETSTRING_OK)
@@ -1702,8 +1703,9 @@ static bool field_equals(shell_netstring_view_t field, const char *text) {
          memcmp(field.payload, text, length) == 0;
 }
 
-static bool parse_u32_view(shell_netstring_view_t field, uint32_t *value) {
-  if (!value || field.payload_length == 0 || field.payload_length >= 16)
+static SHELL_NONNULL(2) bool parse_u32_view(shell_netstring_view_t field,
+                                            uint32_t *value) {
+  if (field.payload_length == 0 || field.payload_length >= 16)
     return false;
   uint32_t parsed = 0;
   for (size_t i = 0; i < field.payload_length; i++) {
