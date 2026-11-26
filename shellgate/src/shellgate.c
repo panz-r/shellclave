@@ -2309,7 +2309,8 @@ static sg_error_t sg_gate_evaluate_body(sg_gate_t *gate, const char *cmd,
                                         size_t buf_size, sg_result_t *out) {
   if (buf_size == 0)
     return SG_ERR_INVALID;
-  if (cmd_len == 0 || memchr(cmd, '\0', cmd_len) != NULL)
+  if (cmd_len == 0 || cmd_len > UINT32_MAX ||
+      memchr(cmd, '\0', cmd_len) != NULL)
     return SG_ERR_INVALID;
   memset(out, 0, sizeof(*out));
   /* A result no exit has decided is not an authorization. */

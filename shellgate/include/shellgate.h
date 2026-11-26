@@ -851,7 +851,8 @@ sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
  * UNDETERMINED. Returns SG_ERR_UNMODELED, with verdict
  * SG_VERDICT_REJECT, when the source parses but the dependency model cannot
  * capture every requirement for running it safely, and
- * SG_ERR_INVALID for invalid source or buffer sizes.
+ * SG_ERR_INVALID for invalid source (empty, over UINT32_MAX bytes or with a
+ * NUL byte) or buffer sizes.
  * The error code reports the primary failure: `truncated` independently
  * reports incomplete result or diagnostic rendering, so it can also be true
  * with SG_ERR_EXPAND when its failure diagnostic cannot fit, or SG_ERR_MEMORY

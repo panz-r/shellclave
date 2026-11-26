@@ -1357,19 +1357,13 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                                            const shell_limits_t *limits,
                                            shell_parse_result_t *result,
                                            bool prevalidated) {
-  // Validate inputs
+  // Initialize result, so every return leaves it readable.
+  memset(result, 0, sizeof(shell_parse_result_t));
 
   /* Ranges store byte offsets in uint32_t, so larger inputs are not
    * representable by this API.  Reject before any traversal can narrow a
    * position or range length. */
-  if (cmd_len > UINT32_MAX) {
-    result->count = 0;
-    result->status = SHELL_STATUS_ERROR;
-    return SHELL_EINPUT;
-  }
-
-  if (cmd_len == 0) {
-    result->count = 0;
+  if (cmd_len > UINT32_MAX || cmd_len == 0) {
     result->status = SHELL_STATUS_ERROR;
     return SHELL_EINPUT;
   }
@@ -1380,9 +1374,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     local_limits = SHELL_LIMITS_DEFAULT;
     limits = &local_limits;
   }
-
-  // Initialize result
-  memset(result, 0, sizeof(shell_parse_result_t));
 
   /* Whole-source syntax validation owns the byte-domain check as well. It
    * checks every byte before any lexical path can skip or reinterpret it,

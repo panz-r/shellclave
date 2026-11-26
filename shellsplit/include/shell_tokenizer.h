@@ -396,20 +396,22 @@ typedef struct {
  * backslash-LF continuations, comments ending at LF) succeed with no range.
  * CR, VT and FF are ordinary word bytes, including CR before LF; no line-ending
  * normalization is performed. Only backslash-LF is a continuation.
- * Zero-length input remains SHELL_EINPUT. Truncation returns SHELL_ETRUNC and
- * sets SHELL_STATUS_TRUNCATED. Range/output exhaustion can retain completed
- * ranges. Syntax-analysis exhaustion, including conditional expression limits,
- * leaves ranges and groups empty because no structural prefix is qualified.
- * In strict_mode, complete-source syntax validation precedes range/group
- * capacity checks: a malformed suffix is SHELL_EPARSE, not SHELL_ETRUNC.
- * Non-strict parsing retains diagnostic tolerance for unfinished source; its
- * ranges are not a guarantee that the source can be modeled semantically.
- * SHELL_EPARSE is a coarse failure code, including unsupported byte domains;
- * it does not prove a Bash syntax error. Use shell_parse_draft() from
- * shell_source.h for typed syntax/unsupported/input/resource classification;
- * on a rejection it also locates an unfinished construct (incomplete_at) or
- * the offending token (invalid_at). Strict parsing keeps no bookkeeping for
- * that, so accepted input pays nothing: explain a rejection only after it.
+ * Zero-length input and input over UINT32_MAX bytes are SHELL_EINPUT, with an
+ * empty result whose status is SHELL_STATUS_ERROR. Truncation returns
+ * SHELL_ETRUNC and sets SHELL_STATUS_TRUNCATED. Range/output exhaustion can
+ * retain completed ranges. Syntax-analysis exhaustion, including conditional
+ * expression limits, leaves ranges and groups empty because no structural
+ * prefix is qualified. In strict_mode, complete-source syntax validation
+ * precedes range/group capacity checks: a malformed suffix is SHELL_EPARSE, not
+ * SHELL_ETRUNC. Non-strict parsing retains diagnostic tolerance for unfinished
+ * source; its ranges are not a guarantee that the source can be modeled
+ * semantically. SHELL_EPARSE is a coarse failure code, including unsupported
+ * byte domains; it does not prove a Bash syntax error. Use shell_parse_draft()
+ * from shell_source.h for typed syntax/unsupported/input/resource
+ * classification; on a rejection it also locates an unfinished construct
+ * (incomplete_at) or the offending token (invalid_at). Strict parsing keeps no
+ * bookkeeping for that, so accepted input pays nothing: explain a rejection
+ * only after it.
  */
 shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                                const shell_limits_t *limits,
