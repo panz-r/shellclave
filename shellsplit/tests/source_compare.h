@@ -32,6 +32,8 @@ static inline SHELL_NONNULL(1, 2) const
   SHELLSPLIT_SOURCE_FIELD(features);
   SHELLSPLIT_SOURCE_FIELD(group_depth);
   SHELLSPLIT_SOURCE_FIELD(group_kinds);
+  SHELLSPLIT_SOURCE_FIELD(role);
+  SHELLSPLIT_SOURCE_FIELD(arm);
   return NULL;
 }
 

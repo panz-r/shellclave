@@ -63,7 +63,9 @@ static void source_compare_ranges(void) {
   F(pipe_input_mode, SHELL_PIPE_MODE_NONE, SHELL_PIPE_MODE_STDOUT)             \
   F(features, SHELL_FEAT_NONE, SHELL_FEAT_VARS)                                \
   F(group_depth, 0, 1)                                                         \
-  F(group_kinds, SHELL_GROUP_NONE, SHELL_GROUP_BRACE)
+  F(group_kinds, SHELL_GROUP_NONE, SHELL_GROUP_BRACE)                          \
+  F(role, SHELL_RANGE_ROLE_NONE, SHELL_RANGE_ROLE_THEN)                        \
+  F(arm, 0, 1)
   CHECK_FIELDS(FIELDS);
 #undef FIELDS
 }
@@ -84,7 +86,9 @@ static void source_compare_groups(void) {
   F(modifiers, SHELL_CMD_MOD_PIPE_TIMED, SHELL_CMD_MOD_NONE)                   \
   F(pipeline_negation_count, 0, 1)                                             \
   F(pipeline_time_mode, SHELL_PIPE_TIME_DEFAULT, SHELL_PIPE_TIME_POSIX)        \
-  F(pipeline_time_direct, true, false)
+  F(pipeline_time_direct, true, false)                                         \
+  F(role, SHELL_RANGE_ROLE_NONE, SHELL_RANGE_ROLE_ELSE)                        \
+  F(arm, 0, 1)
   CHECK_FIELDS(FIELDS);
 #undef FIELDS
 }
@@ -445,7 +449,9 @@ static void depgraph_compare_test_nodes(void) {
   CMD_FIELD(pipe_stdin_source, UINT32_MAX, 0)                                  \
   CMD_FIELD(pipe_stdin_target, UINT32_MAX, 0)                                  \
   CMD_FIELD(pipe_stdout_source, UINT32_MAX, 0)                                 \
-  CMD_FIELD(pipe_stdout_target, UINT32_MAX, 0)
+  CMD_FIELD(pipe_stdout_target, UINT32_MAX, 0)                                 \
+  CMD_FIELD(stdin_code, SHELL_DEP_STDIN_CODE_NONE,                             \
+            SHELL_DEP_STDIN_CODE_EXECUTES)
   CMD_FIELDS
 #undef CMD_FIELD
   CHECK(shellsplit_test_node_difference(&a, &b) == NULL);

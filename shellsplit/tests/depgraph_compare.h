@@ -109,6 +109,7 @@ static inline SHELL_NONNULL(1, 2) const
     SHELLSPLIT_COMPARE_FIELD(cmd.pipe_stdin_target);
     SHELLSPLIT_COMPARE_FIELD(cmd.pipe_stdout_source);
     SHELLSPLIT_COMPARE_FIELD(cmd.pipe_stdout_target);
+    SHELLSPLIT_COMPARE_FIELD(cmd.stdin_code);
     break;
   case SHELL_NODE_DOC:
     return shellsplit_test_doc_difference(&a->doc, &b->doc);
@@ -161,6 +162,8 @@ static inline SHELL_NONNULL(1, 2) const
   SHELLSPLIT_COMPARE_FIELD(pipeline_negation_count);
   SHELLSPLIT_COMPARE_FIELD(pipeline_time_mode);
   SHELLSPLIT_COMPARE_FIELD(pipeline_time_direct);
+  SHELLSPLIT_COMPARE_FIELD(role);
+  SHELLSPLIT_COMPARE_FIELD(arm);
   return NULL;
 }
 
