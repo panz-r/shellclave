@@ -1034,6 +1034,18 @@ static void semantics_test_processed_command_conveniences(void) {
   CHECK(shell_measure_decoded_word("abc\\", 4, &decoded_length) ==
             SHELL_PROCESS_OK &&
         decoded_length == 4);
+  /* A backtick that nothing closes starts no substitution: its escapes are
+   * removed as in the other words, not kept as a copied span. */
+  {
+    char unclosed[8];
+    size_t written = 0;
+    CHECK(shell_measure_processed_word("`a\\`", 4, &decoded_length) ==
+              SHELL_PROCESS_OK &&
+          decoded_length == 3);
+    CHECK(shell_write_processed_word("`a\\`", 4, unclosed, 3, &written) ==
+              SHELL_PROCESS_OK &&
+          written == 3 && !memcmp(unclosed, "`a`", 3));
+  }
 
   static const char *const control_words[] = {"$'\\c\\\\X'", "$'\\c\\'X'"};
   for (size_t i = 0; i < sizeof(control_words) / sizeof(control_words[0]);

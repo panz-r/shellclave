@@ -174,9 +174,8 @@ render_processed_word(const char *text, size_t length, char *destination,
           shell_source_find_balanced_parentheses(text, length, open,
                                                  &dynamic_after);
     } else if (quote != '\'' && c == '`') {
-      dynamic_after = shell_source_skip_quoted_text(text, length, i, '`');
-      dynamic = dynamic_after > i + 1 && dynamic_after <= length &&
-                text[dynamic_after - 1] == '`';
+      dynamic = shell_source_skip_complete_quoted_text(text, length, i, '`',
+                                                       &dynamic_after);
     }
     if (dynamic) {
       size_t dynamic_length = dynamic_after - i;

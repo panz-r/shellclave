@@ -120,12 +120,13 @@ static SHELL_NONNULL(2) bool legacy_output_note_ansi_literal(unsigned char byte,
 }
 
 /* The caller is positioned at a backtick in a valid source span. This helper
- * checks whether the external spelling has a complete matching delimiter. */
+ * advances past the substitution when its closing backtick is present. */
 static SHELL_NONNULL(1, 3) bool legacy_output_skip_backtick(const char *text,
                                                             size_t length,
                                                             size_t *position) {
-  size_t after = shell_source_skip_quoted_text(text, length, *position, '`');
-  if (after <= *position + 1 || after > length || text[after - 1] != '`')
+  size_t after = 0;
+  if (!shell_source_skip_complete_quoted_text(text, length, *position, '`',
+                                              &after))
     return false;
   *position = after;
   return true;
