@@ -4,9 +4,8 @@ Shellsplit analyzes shell source and classifies its syntax, commands, I/O,
 and state relationships. It provides bounded parsing and retained-source views,
 plus allocating tokenization, canonicalization, abstraction, and transformation.
 
-Use the [shell model reference](../docs/shell-model.md) for supported behavior,
-and the [security model](../SECURITY.md) for execution assumptions and application
-responsibilities.
+Use the [security model](../SECURITY.md) for execution assumptions and
+application responsibilities.
 
 ## Choose an interface
 
@@ -137,8 +136,7 @@ complete unchanged source and its execution context.
 For literal heredocs, document content helpers preserve the final LF and apply
 `<<-` tab removal. Expandable bodies remain templates. Draft records distinguish
 raw received bytes from confirmed content and tentative delimiter lines. See
-[heredoc and draft semantics](../docs/shell-model.md#heredoc-data-and-received-drafts)
-and `shell_source.h` for the precise fields and recovery contract.
+`shell_source.h` for the precise fields and recovery contract.
 
 ## Graph I/O and state facts
 
@@ -149,9 +147,7 @@ analysis alongside policy evaluation.
 CMD nodes include ordinary argv commands and literal-only arithmetic commands.
 Check `cmd.kind`: arithmetic has no tokens and retains its expression span and
 ZERO/NONZERO/UNKNOWN truth fact. It can select later conditional-list paths
-without consuming stdin. Its explicit redirects retain setup effects. See
-[arithmetic commands](../docs/shell-model.md#arithmetic-commands) for the
-supported grammar, conservative proof limits and policy coverage.
+without consuming stdin. Its explicit redirects retain setup effects.
 
 For `wc -l file.txt 2>&1`, the WRITE edge whose `source_fd` is 2 targets an
 inherited FD node numbered 1. In the plain command it targets FD 2. Source-order
@@ -160,13 +156,11 @@ stdout, while `>out 2>&1` sends both outputs to the file.
 
 READ/WRITE edges describe possible shell routing. FD_OPEN/FD_CLOSE retain
 setup effects, including unused or replaced redirects. Path-looking argv values
-have ARG relations. The [I/O reference](../docs/shell-model.md#io-resources-and-setup-effects)
-explains their distinct meanings.
+have ARG relations. The three have distinct meanings.
 
 `cd` remains an ordinary command with incoming CWD and I/O. Its success and
 failure continuations carry their own state facts. Check `cwd_known` before
 reading offsets and use a FILE document's own CWD for pathname interpretation.
-See [CWD and paths](../docs/shell-model.md#cwd-and-lexical-path-facts).
 
 String conditions (`[[ word ]]`, `[[ -n word ]]`, `[[ -z word ]]`, literal and
 static `*` comparisons with `=`/`==`/`!=`, and their negations) have kind
@@ -180,7 +174,7 @@ The graph exposes TRUE/FALSE/UNKNOWN predicate truth and explicit redirect
 setup through `has_redirections`. Use the conditional expansion callback
 purpose to supply a final string value. Redirects are
 installed before nested operand substitutions; the condition body has no
-stdin/stdout byte use. See [conditional semantics](../docs/shell-model.md#string-conditions).
+stdin/stdout byte use.
 
 Scalar-presence conditions (`[[ -v CONFIG ]]` and lexical negation) use the
 VARIABLE_SET predicate. Static scalar names can contain quoted, escaped and
@@ -189,7 +183,7 @@ assigned values counting as set; inherited names can remain UNKNOWN. These
 lookups make no expansion callback and do not read a descriptor's bytes.
 The `test` and `[` builtins use the same presence facts and evaluate compound
 expressions with `!`, `-a`, `-o` and parentheses. They retain ordinary argv and
-policy subjects. See [variable presence](../docs/shell-model.md#scalar-variable-presence).
+policy subjects.
 
 The complete unary pathname predicate family is supported in conditional
 commands and the `test` and `[` builtins: existence and file type (`-e`, `-a`,
@@ -201,7 +195,6 @@ metadata checks. Inspect its pathname and CWD when authorizing the check;
 unresolved arguments can leave its path or predicate kind uncertain. Nonempty
 paths have UNKNOWN truth. Access checks and filesystem timestamps remain runtime
 facts, separate from file-content reads, writes and command execution.
-See [filesystem predicates](../docs/shell-model.md#filesystem-predicates).
 Binary pathname comparisons (`-nt`, `-ot`, `-ef`) are supported in all three
 forms. FILE_COMPARISON nodes retain comparison kinds and ordered FILE operands
 through FILE_COMPARE, FILE_LEFT and FILE_RIGHT edges. These metadata observations
@@ -302,10 +295,6 @@ in the same tail. Even simple literal `[[ … ]]` expressions can require it.
 Command bytes, configuration, workspace, and graph output must obey the
 non-overlap requirements documented by the API.
 
-## API migration
-
-See [migration notes](../docs/migration.md) when updating an existing consumer.
-
 Numeric conditions support `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge` and terminal
 checks with `-t`. Builtins use decimal integer arguments; `[[ ... ]]` numeric
 comparisons use arithmetic expressions. Statically named scalar reads have ENV
@@ -316,4 +305,3 @@ dependency-resolved operand values through the arithmetic resolver purpose.
 Coverage qualifications propagate from potentially executing nested substitutions,
 including redirect process substitutions and optimized file reads. ENV read
 dependencies retain nested parameter re-expansion context after resolver capture.
-See [numeric predicates](../docs/shell-model.md#numeric-predicates-and-terminal-tests).

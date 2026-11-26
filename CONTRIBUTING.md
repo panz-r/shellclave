@@ -114,8 +114,8 @@ Every new commit must be verified again. Untracked top-level files do not
 prevent verification, but tracked changes and dirty or mismatched submodules
 do.
 
-Public API changes must update headers, README ownership/error guidance, tests,
-and applicable migration notes. Keep each commit self-contained, including
+Public API changes must update headers, README ownership/error guidance and
+tests. Keep each commit self-contained, including
 transitive fixes and adaptations, and report precise verification results in
 the pull request.
 
@@ -274,7 +274,7 @@ preserves unresolved pathname facts.
 allocation alignment and scratch calculations use that type. The definition
 list and graph implementation fragments add no runtime registry or traversal.
 To extend this predicate family, append the public kind and flag, add its private
-definition row, and update independent tests and the shell-model reference.
+definition row, and update independent tests and the public headers.
 The separate binary-comparison catalog supplies operator spellings and
 ordinals for conditional parsing, builtin recognition and comparison-node kind
 bits. Binary comparisons do not consume unary predicate roles or edge flags.
@@ -463,10 +463,8 @@ aggregate and label, so it builds every executable it selects.
 ## Documentation and examples
 
 The root README introduces analysis and classification, the result contract,
-and the tested gate example. User-visible shell behavior belongs in the
-[shell model reference](docs/shell-model.md); exact layouts and preconditions
-belong in public headers. Put API removal instructions in
-[migration notes](docs/migration.md).
+and the tested gate example. User-visible shell behavior, exact layouts and preconditions belong in
+public headers. Describe an API removal in its commit message.
 
 The README's marked C excerpt matches the corresponding section of
 `examples/gate_policy.c` byte-for-byte. Update both together. Example tests cover policy outcomes, runtime uncertainty,

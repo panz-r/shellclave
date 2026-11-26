@@ -104,7 +104,6 @@ Applications may supply dependency-resolved pure values through the arithmetic
 resolver purpose or apply an explicit exact-source approval rule. Shellsplit's
 matching graph-status flag qualifies incomplete semantic coverage: later lexical
 commands remain visible, but downstream state and effect proofs are unavailable.
-See [numeric predicates](docs/shell-model.md#numeric-predicates-and-terminal-tests).
 
 ### What policy rules cover
 
@@ -145,8 +144,7 @@ undetermined even alongside an allowed command; an explicit deny or rejection
 still takes precedence. Assignment and redirection effects require authorization
 beyond argv matching.
 Comment-only input introduces no command or shell-state effects and can return
-`ALLOW` with zero subjects. The eligible empty `time` forms are described in the
-[shell model reference](docs/shell-model.md#groups-pipelines-background-execution-and-timing).
+`ALLOW` with zero subjects.
 
 ### I/O effects and additional signals
 
@@ -199,10 +197,10 @@ pre-push verification use that same reference.
 
 | Area | Current analysis support |
 |---|---|
-| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, compound `[[ … ]]` conditions with string, presence and filesystem predicates, and compound `test`/`[` expressions |
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, `if`/`elif`/`else` constructs, literal-only `(( expression ))` commands, compound `[[ … ]]` conditions with string, presence and filesystem predicates, and compound `test`/`[` expressions |
 | Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
 | Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
-| Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, wider `[[ … ]]` predicates, dynamic or mutating arithmetic, and the builtin forms listed in the reference |
+| Unsupported constructs | Loops, `case`, `select`, `coproc`, functions, arrays, wider `[[ … ]]` predicates, dynamic or mutating arithmetic, and unsupported builtin forms |
 | Runtime uncertainty | Represents multiple possible outcomes and reports unresolved arguments, paths and conditional strings explicitly |
 
 Shellgate's default rejection mask additionally rejects arithmetic, conditional
@@ -227,10 +225,8 @@ fixed C/POSIX or UTF-8 locale, established through the
 Comments admit the same literal bytes: `cat résumé.txt # 説明` analyzes the
 command while retaining its original source offsets.
 
-The [shell model reference](docs/shell-model.md) describes supported behavior,
-startup requirements, substitutions, builtins, I/O, working-directory facts,
-and capacity limits. Updates to the reference Bash version include conformance
-tests and the required model adaptations.
+Updates to the reference Bash version include conformance tests and the
+required model adaptations.
 
 ## Build and install
 
@@ -409,7 +405,5 @@ until every borrowing gate has detached and every reader has finished using it.
 ## Further reading
 
 - [Security model and vulnerability reporting](SECURITY.md)
-- [Shell semantics and execution model](docs/shell-model.md)
-- [API migration notes](docs/migration.md)
 - [Contributor builds and verification](CONTRIBUTING.md)
 - [Dependencies and licenses](THIRD_PARTY.md)

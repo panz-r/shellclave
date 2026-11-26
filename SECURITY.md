@@ -108,7 +108,7 @@ addresses the content delivered along the identified flow.
 as a program because of the explicit interpreter. The application evaluates
 the receiving command's role. A SUBST edge alone is not a risk classification.
 The model's unsupported dynamic re-evaluation forms and runtime-dispatch limits
-are listed in the [shell reference](docs/shell-model.md).
+are listed in the public headers.
 
 ## Execution responsibilities
 
@@ -156,8 +156,6 @@ case-sensitive byte matching. Extglob requires enabling `extglob` at executor st
 before parsing source.
 An equivalent launcher must establish these same properties. The application
 owns executor selection; version checks run at the test/configuration boundary.
-See the [shell model](docs/shell-model.md#executor-and-analysis-boundaries) for
-the supported language and configuration distinctions.
 
 ## Reporting a vulnerability
 
