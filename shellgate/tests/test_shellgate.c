@@ -2133,6 +2133,35 @@ TEST(timed_pipeline_ordinary_time_policy_contract) {
   sg_gate_free(gate);
 }
 
+TEST(if_source_is_allowed_by_default) {
+  static const char *rules[] = {"printf *", "true"};
+  sg_gate_t *gate = gate_with_rules(rules, sizeof(rules) / sizeof(rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+
+  sg_result_t result = {0};
+  ASSERT_SG_OK(
+      eval_cmd(gate, "if true; then printf a; else printf b; fi", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
+         result.deny_reason == NULL);
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "if true; then printf a; elif true; then printf b; "
+                        "else printf c; fi",
+                        &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 5);
+
+  /* An arm outside the policy decides the whole source, and an unsupported
+   * construct inside an arm is still refused. */
+  memset(&result, 0, sizeof(result));
+  ASSERT_SG_OK(eval_cmd(gate, "if true; then rm x; fi", &result));
+  ASSERT(result.verdict != SG_VERDICT_ALLOW);
+  memset(&result, 0, sizeof(result));
+  sg_error_t loop =
+      eval_cmd(gate, "if true; then while true; do :; done; fi", &result);
+  ASSERT(loop != SG_OK || result.verdict != SG_VERDICT_ALLOW);
+  sg_gate_free(gate);
+}
+
 TEST(grouped_empty_time_io_policy_contract) {
   static const char *rules[] = {"printf *", "cat", "exec"};
   sg_gate_t *gate = gate_with_rules(rules, sizeof(rules) / sizeof(rules[0]));
@@ -7096,6 +7125,7 @@ int main(int argc, char **argv) {
   RUN(basic_evaluation_matrix);
   RUN(bash_pipeline_time_policy_contract);
   RUN(timed_pipeline_ordinary_time_policy_contract);
+  RUN(if_source_is_allowed_by_default);
   RUN(grouped_empty_time_io_policy_contract);
   RUN(empty_timing_substitution_policy_contract);
   RUN(brace_group_maximum_depth_contract);
