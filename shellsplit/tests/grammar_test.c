@@ -12985,6 +12985,43 @@ static void parser_test_if_keyword_after_compound(void) {
   parser_test("An if keyword after a compound command ends the list", valid);
 }
 
+/* A `then`, `elif` or `else` right after a compound command opens command
+ * position as it does after a simple command, so the unsupported syntax that
+ * follows is refused there too: `if { :; } then declare -a x; fi`. */
+static void parser_test_unsupported_syntax_after_compound_keyword(void) {
+  static const struct {
+    const char *source;
+    bool accepted;
+  } cases[] = {
+      {"if { :; } then echo ok; fi", true},
+      {"if [[ 1 ]] then x=1; elif (( 1 )) then y=2; fi", true},
+      {"if { :; } then declare -a x; fi", false},
+      {"if ( : ) then coproc cat; fi", false},
+      {"if [[ 1 ]] then while true; do :; done; fi", false},
+      {"if (( 1 )) then for i in a; do :; done; fi", false},
+      {"if { :; } then f() { :; }; fi", false},
+      {"if { :; } then case x in x) :;; esac; fi", false},
+      {"if { :; } then :; elif { :; } then declare -a y; fi", false},
+      {"if { :; } then :; else [[ 1 ]] fi", true},
+      {"if { :; } then :; elif { :; } then :; else coproc c; fi", false},
+      {"if true; then if { :; } then :; fi declare -a x; fi", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    shell_processed_commands_t processed = {0};
+    bool accepted = shell_process_commands(source, strlen(source), NULL,
+                                           &processed) == SHELL_PROCESS_OK;
+    shell_processed_commands_free(&processed);
+    valid = accepted == cases[i].accepted;
+    if (!valid)
+      fprintf(stderr, "%s: expected %s\n", source,
+              cases[i].accepted ? "accepted" : "rejected");
+  }
+  parser_test("Unsupported syntax after a then following a compound is refused",
+              valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -14105,6 +14142,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_ansi_c_braced_hex_escape();
   parser_test_structured_blank_and_empty_source();
   parser_test_if_keyword_after_compound();
+  parser_test_unsupported_syntax_after_compound_keyword();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();

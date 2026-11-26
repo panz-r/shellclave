@@ -844,6 +844,9 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
    * readonly declaration before it can reach that model. */
   semantic_builtin_state_t builtin = {0};
   bool command_start = true;
+  /* The previous token ended a compound command without a redirect: `then`,
+   * `elif`, `else` and `fi` may follow it and end the list of an `if`. */
+  bool compound_end = false;
   bool awaiting_command = false;
   /* A plain leading integer assignment is temporary once an executable word
    * follows. Without one it performs arithmetic in the current shell. += can
@@ -898,6 +901,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
                                            regions.regions[operand].length))
           return true;
       command_start = false;
+      compound_end = true;
       pipeline_prefix.scanned = pipeline_prefix.has_stage = true;
       continue;
     }
@@ -911,6 +915,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       if (!shell_arithmetic_analyze(content, content_length).supported)
         return true;
       command_start = false;
+      compound_end = true;
       pipeline_prefix.scanned = true;
       pipeline_prefix.has_stage = true;
       continue;
@@ -998,6 +1003,8 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     if (redirect_operand_end != 0 && token.position < redirect_operand_end)
       continue;
     redirect_operand_end = 0;
+    bool after_compound = compound_end;
+    compound_end = false;
     if (list_operator) {
       if (semantic_finish_test(&builtin, input))
         return true;
@@ -1011,6 +1018,26 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       builtin = (semantic_builtin_state_t){0};
       semantic_word_end = 0;
       continue;
+    }
+    if (after_compound && control_token_is_word(&token)) {
+      const shell_keyword_t *keyword =
+          shell_source_keyword(input, input_length, token.position, NULL);
+      if (keyword && (keyword->kind == SHELL_KEYWORD_THEN ||
+                      keyword->kind == SHELL_KEYWORD_ELIF ||
+                      keyword->kind == SHELL_KEYWORD_ELSE)) {
+        command_start = true;
+        awaiting_command = false;
+        pipeline_prefix = semantic_pipeline_prefix_initial();
+        builtin = (semantic_builtin_state_t){0};
+        semantic_word_end = 0;
+        continue;
+      }
+      if (keyword && keyword->kind == SHELL_KEYWORD_FI) {
+        compound_end = true;
+        builtin = (semantic_builtin_state_t){0};
+        semantic_word_end = 0;
+        continue;
+      }
     }
     if (reserved_word_position &&
         token_starts_bash_compound_command(&token, input, input_length))
@@ -1038,6 +1065,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       if (integer_assignment)
         return true;
       command_start = false;
+      compound_end = true;
       awaiting_command = false;
       pipeline_prefix = compound_depth != 0
                             ? compound_prefixes[--compound_depth]
@@ -1118,6 +1146,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         }
         if (keyword && keyword->kind == SHELL_KEYWORD_FI) {
           command_start = false;
+          compound_end = true;
           awaiting_command = false;
           builtin = (semantic_builtin_state_t){0};
           semantic_word_end = 0;

@@ -2077,6 +2077,31 @@ static void semantics_test_modern_shell_syntax_boundaries(void) {
     shell_processed_commands_free(&processed);
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
+
+    /* A refused source stays refused wherever a command may start, including
+     * after a keyword that follows a compound command directly. */
+    static const char *const command_positions[] = {
+        "if :; then ",
+        "if { :; } then ",
+        "if [[ 1 ]] then ",
+        "if :; then :; elif (( 1 )) then ",
+        "if :; then { :; } else ",
+    };
+    for (size_t position = 0;
+         position < sizeof(command_positions) / sizeof(command_positions[0]);
+         position++) {
+      char embedded[512];
+      int written = snprintf(embedded, sizeof(embedded), "%s%s\nfi",
+                             command_positions[position], input);
+      shell_processed_commands_t nested = {0};
+      bool refused = written > 0 && (size_t)written < sizeof(embedded) &&
+                     shell_process_commands(embedded, (size_t)written, NULL,
+                                            &nested) == SHELL_PROCESS_EPARSE;
+      if (!refused)
+        fprintf(stderr, "accepted after a command position: %s\n", embedded);
+      CHECK(refused);
+      shell_processed_commands_free(&nested);
+    }
   }
 
   static const char *const neighboring_time_forms[] = {
