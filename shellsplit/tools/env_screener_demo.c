@@ -314,6 +314,12 @@ int main(int argc, char **argv) {
 
   char *name = strndup(var_eq_value, name_len);
   char *value = strdup(eq + 1);
+  if (!name || !value) {
+    fprintf(stderr, "Memory error\n");
+    free(name);
+    free(value);
+    return 1;
+  }
 
   printf("\n");
   printf("#####################################################################"

@@ -182,16 +182,23 @@ int main(int argc, char **argv) {
       filename = optarg;
       break;
     case 'e':
-      if (env_count < env_capacity) {
-        env_add[env_count++] = optarg;
+      if (env_count == env_capacity) {
+        fprintf(stderr, "Error: at most %d -e options\n", env_capacity);
+        status = EXIT_FAILURE;
+        goto cleanup;
       }
+      env_add[env_count++] = optarg;
       break;
     case 'c':
       cwd = optarg;
       break;
     case 'p':
-      if (parameters.count < MAX_PARAMETERS)
-        parameters.entries[parameters.count++] = optarg;
+      if (parameters.count == MAX_PARAMETERS) {
+        fprintf(stderr, "Error: at most %d -p options\n", (int)MAX_PARAMETERS);
+        status = EXIT_FAILURE;
+        goto cleanup;
+      }
+      parameters.entries[parameters.count++] = optarg;
       break;
     case 'x':
       expand = true;
