@@ -217,9 +217,10 @@ typedef struct {
    * `then`, `elif`, `else` and `fi` may follow as they follow a command. After
    * a redirect Bash reads them as words. */
   bool compound_end;
-  /* The current keyword ends a list right after a compound command rather
-   * than at command position. */
-  bool token_keyword_after_compound;
+  /* The current token follows a compound command that no redirect followed:
+   * a keyword or closing brace there ends a list, as it does after a
+   * command. */
+  bool token_after_compound;
   bool token_array_assignment;
   /* The reserved word the current token is at command position, or ends the
    * list right after a compound command: `if`, `then`, `elif`, `else` or `fi`;
@@ -280,8 +281,8 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
   context->ready = true;
   context->token_array_assignment = false;
   context->token_keyword = SHELL_KEYWORD_NONE;
-  context->token_keyword_after_compound = false;
   bool was_compound_end = context->compound_end;
+  context->token_after_compound = was_compound_end;
   context->compound_end =
       context->token.type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
       context->token.type == SHELL_TOKEN_ARITHMETIC_COMMAND;
@@ -372,7 +373,6 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
       case SHELL_KEYWORD_ELIF:
       case SHELL_KEYWORD_ELSE:
         context->token_keyword = keyword->kind;
-        context->token_keyword_after_compound = was_compound_end;
         context->command_start = true;
         context->prefix_open = true;
         context->prefix = shell_pipeline_prefix_state_initial(true);
@@ -380,7 +380,6 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
         return true;
       case SHELL_KEYWORD_FI:
         context->token_keyword = keyword->kind;
-        context->token_keyword_after_compound = was_compound_end;
         context->command_start = false;
         context->prefix_open = false;
         context->word_end = 0;
@@ -1830,12 +1829,12 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         fast_lexical_token_at(&documents, pos) &&
         documents.token_keyword != SHELL_KEYWORD_NONE &&
         (documents.before_syntax_end <= subcmd_start ||
-         documents.token_keyword_after_compound ||
+         documents.token_after_compound ||
          (execution_pipeline_start && documents.before_prefix_open))) {
       shell_keyword_kind_t keyword = documents.token_keyword;
       /* A conditional or arithmetic command still pending ends at the keyword
        * that follows it directly. */
-      if (documents.token_keyword_after_compound && subcmd_start < pos)
+      if (documents.token_after_compound && subcmd_start < pos)
         FLUSH_PENDING_RANGE();
       uint32_t keyword_end =
           (uint32_t)(documents.token.position + documents.token.length);
@@ -1983,7 +1982,14 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     }
     if (!in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
         brace_close && structural_delimiter &&
-        (only_whitespace_before_delimiter || directly_after_closed_group)) {
+        (only_whitespace_before_delimiter || directly_after_closed_group ||
+         documents.token_after_compound)) {
+      /* A conditional or arithmetic command still pending ends at the brace
+       * that follows it directly. */
+      if (documents.token_after_compound && subcmd_start < pos) {
+        FLUSH_PENDING_RANGE();
+        subcmd_start = pos;
+      }
       if (brace_group_stack_depth == 0 ||
           brace_group_stack[brace_group_stack_depth - 1] != SHELL_GROUP_BRACE) {
         result->status = SHELL_STATUS_ERROR;

@@ -214,7 +214,10 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
                  (state->lexical_operand_end == 0 ||
                   shell_source_skip_escaped_line_endings(
                       state->input, p, state->lexical_operand_end) == p);
-  if (!state->lexical_command_position || operand)
+  /* A closing brace may also follow a conditional or arithmetic command
+   * directly, as it follows a group. */
+  bool compound_end = !opening && state->lexical_compound_end;
+  if ((!state->lexical_command_position && !compound_end) || operand)
     return false;
   if (!opening && state->brace_group_depth == 0)
     return false;

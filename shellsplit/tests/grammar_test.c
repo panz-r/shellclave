@@ -13022,6 +13022,47 @@ static void parser_test_unsupported_syntax_after_compound_keyword(void) {
               valid);
 }
 
+/* A closing brace follows a conditional or arithmetic command directly, as it
+ * follows a group; a redirect on the command makes it an ordinary word. */
+static void parser_test_brace_after_conditional_command(void) {
+  static const struct {
+    const char *source;
+    bool accepted;
+  } cases[] = {
+      {"{ [[ 1 ]] }", true},
+      {"{ (( 1 )) }", true},
+      {"{ :; [[ 1 ]] }", true},
+      {"if { [[ 1 ]] } then :; fi", true},
+      {"{ [[ 1 ]] } > f", true},
+      {"{ time [[ 1 ]] }", true},
+      {"{ ! [[ 1 ]] }", true},
+      {"{ { [[ 1 ]] } }", true},
+      {"if true; then { (( 1 )) } fi", true},
+      {"{ [[ 1 ]] > f }", false},
+      {"{ [[ 1 ]]} ", false},
+      {"[[ 1 ]] }", false},
+      {"{ [[ 1 ]] }}", false},
+      {"{ [[ 1 ]] } fi", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    static shell_source_result_t draft;
+    shell_processed_commands_t processed = {0};
+    bool accepted = shell_parse_draft(source, strlen(source), NULL, &draft) ==
+                        SHELL_SOURCE_COMPLETE &&
+                    shell_process_commands(source, strlen(source), NULL,
+                                           &processed) == SHELL_PROCESS_OK;
+    shell_processed_commands_free(&processed);
+    valid = accepted == cases[i].accepted;
+    if (!valid)
+      fprintf(stderr, "%s: expected %s\n", source,
+              cases[i].accepted ? "accepted" : "rejected");
+  }
+  parser_test("A closing brace follows a conditional or arithmetic command",
+              valid);
+}
+
 static void parser_test_pipeline_time_metadata(void) {
   static const struct {
     const char *source;
@@ -14143,6 +14184,7 @@ static int run_parser(int argc, char **argv) {
   parser_test_structured_blank_and_empty_source();
   parser_test_if_keyword_after_compound();
   parser_test_unsupported_syntax_after_compound_keyword();
+  parser_test_brace_after_conditional_command();
   parser_test_pipeline_time_metadata();
   parser_test_prefix_scan_scaling();
   parser_test_named_document_and_negation_metadata();
