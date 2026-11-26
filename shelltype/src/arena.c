@@ -59,7 +59,8 @@ bool arena_reserve(arena_t *a, size_t additional) {
   size_t required = a->used + additional;
   if (required <= a->size)
     return true;
-  size_t new_size = a->size;
+  /* An arena initialized with size 0 has nothing to double. */
+  size_t new_size = a->size ? a->size : required;
   while (new_size < required) {
     if (new_size > SIZE_MAX / 2) {
       new_size = required;

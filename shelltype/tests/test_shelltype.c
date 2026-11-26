@@ -1695,6 +1695,14 @@ static int run_arena(int argc, char **argv) {
   ASSERT(memcmp(arena.base, "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0);
   ASSERT((unsigned char)arena.base[capacity - 1] == 0x5a);
 
+  /* An arena of size 0 grows to the request instead of doubling zero. */
+  arena_t empty;
+  if (arena_init(&empty, 0)) {
+    ASSERT(arena_reserve(&empty, 1) && empty.size >= 1 && empty.used == 0);
+    ASSERT(arena_alloc(&empty, 1) != NULL);
+    arena_free(&empty);
+  }
+
   size_t reserved_size = arena.size;
   st_test_alloc_fail_at(1);
   ASSERT(!arena_reserve(&arena, reserved_size));
