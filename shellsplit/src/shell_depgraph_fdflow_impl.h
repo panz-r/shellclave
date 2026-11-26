@@ -605,7 +605,9 @@ static SHELL_NONNULL(1, 2) shell_fd_partition_t
 }
 
 /* Store every part of a domain, each tightened to its case. On a single
- * version, parts equal to the stored ones are left as they are. */
+ * version, parts equal to the stored ones are left as they are. This is the
+ * writer that makes the parts of a domain present together: readers that find
+ * the first part stored read all of them. */
 static SHELL_NONNULL(1, 2, 3) bool dep_fd_domain_store(
     dep_route_state_t *state, dep_route_journal_t *journal,
     shell_fd_partition_t *partition) {

@@ -905,6 +905,8 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_store_binding(
       for (uint32_t part = 0; part < SHELL_FD_PARTS; part++)
         domain[part] = dep_route_state_snapshot(
             &one, changes, dep_fd_numeric(part), DEP_FD_ACCESS_PROCESS_DOMAIN);
+      /* The parts of a domain are stored together (dep_fd_domain_store), so a
+       * stored first part means all four are present and read below. */
       if (domain[0] && changes->arena->snapshots[domain[0] - 1].count) {
         bool free = false, occupied = false;
         const dep_route_set_t *value_routes = added ? added : &routes;
@@ -953,6 +955,8 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_store_binding(
           shell_fd_partition_normalize(&partition);
         else
           shell_fd_partition_refine(&partition);
+        /* Only parts that changed are appended: the others are already stored,
+         * as all parts of a domain are stored together. */
         for (uint32_t part = 0; part < SHELL_FD_PARTS; part++)
           if ((partition.part[part].may_free != stored.part[part].may_free ||
                partition.part[part].may_occupied !=
