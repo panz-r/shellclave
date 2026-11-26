@@ -105,7 +105,8 @@ typedef enum {
                            alnum/_ chars) */
   ST_TYPE_BRANCH, /* #branch: git branch/ref name (main, feature/x, release/v2)
                    */
-  ST_TYPE_SHA,    /* #sha: SHA/hash digest (7-64 hex chars) */
+  ST_TYPE_SHA,    /* #sha: SHA/hash digest (7-64 lowercase hex chars; length 8
+                     is #h) */
   ST_TYPE_IMAGE,  /* #image: container image ref (nginx:latest, ghcr.io/org/app)
                    */
   ST_TYPE_PKG,    /* #pkg: package specifier (express, @babel/core@^7) */

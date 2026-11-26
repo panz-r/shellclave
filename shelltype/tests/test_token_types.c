@@ -160,6 +160,7 @@ static int test_classification_matrix(void) {
       {"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", ST_TYPE_SHA},
       {"deadbee", ST_TYPE_SHA},
       {"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_SHA},
+      {"DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF", ST_TYPE_HEXHASH},
       {"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
        ST_TYPE_SHA},
       {"42", ST_TYPE_NUMBER},
