@@ -90,8 +90,9 @@ foreach(required IN LISTS reference_bash_tests)
   endif()
 endforeach()
 
-# A runner is built for the suites it holds and is not a test of its own.
-list(FILTER SHELLCLAVE_PRODUCTION_TARGETS EXCLUDE REGEX "_runner$")
+# A runner or a probe is built for the suites that use it and is not a test of
+# its own.
+list(FILTER SHELLCLAVE_PRODUCTION_TARGETS EXCLUDE REGEX "_(runner|probe)$")
 list(SORT production_tests)
 list(SORT SHELLCLAVE_PRODUCTION_TARGETS)
 if(NOT "${production_tests}" STREQUAL "${SHELLCLAVE_PRODUCTION_TARGETS}")

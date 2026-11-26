@@ -570,6 +570,8 @@ if(BUILD_TESTING)
   add_executable(shellsplit_if_graph_probe shellsplit/tests/if_graph_probe.c)
   target_link_libraries(shellsplit_if_graph_probe PRIVATE shellsplit)
   shellclave_project_target(shellsplit_if_graph_probe)
+  add_dependencies(shellclave_production_tests shellsplit_source_probe
+                   shellsplit_if_graph_probe)
   # The grammar suite runs against the instrumented and the shipping library:
   # its cases do not use fault hooks, but must cover the test CFG as well as
   # the shipping behavior.
