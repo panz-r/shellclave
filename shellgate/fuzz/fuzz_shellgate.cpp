@@ -2710,9 +2710,74 @@ void validate_gate_pair(sg_gate_t *left, sg_gate_t *right) {
           st_policy_rule_count(sg_gate_allow_policy_borrowed(right)) ||
       st_policy_rule_count(sg_gate_deny_policy_borrowed(left)) !=
           st_policy_rule_count(sg_gate_deny_policy_borrowed(right)) ||
+      sg_gate_policy_count(left) != sg_gate_policy_count(right) ||
+      sg_gate_relation_count(left) != sg_gate_relation_count(right) ||
+      sg_gate_output_count(left) != sg_gate_output_count(right) ||
       test_anomaly_vocabulary(left) != test_anomaly_vocabulary(right) ||
       sg_gate_anomaly_had_error(left) != sg_gate_anomaly_had_error(right))
     invariant_failure("mirrored gate state diverged");
+}
+
+/* A new policy holding one rule, or an empty one for a null rule. */
+st_policy_t *new_rule_policy(const char *cpl) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  if (!context)
+    return nullptr;
+  st_policy_t *policy = st_policy_new(context);
+  st_policy_ctx_release(context);
+  if (!policy || !cpl)
+    return policy;
+  st_netpattern_t pattern = {nullptr, 0};
+  st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
+  if (error == ST_OK)
+    error = st_policy_add_netpattern_view(
+        policy, st_netpattern_view_t{pattern.data, pattern.length});
+  st_netpattern_free(&pattern);
+  if (error != ST_OK) {
+    st_policy_free(policy);
+    return nullptr;
+  }
+  return policy;
+}
+
+/* Outcomes a policy may carry, then enumerators it must refuse. A value
+ * outside the enum is undefined for this C++ caller, so none is passed. */
+const sg_verdict_t kPolicyOutcomes[] = {
+    SG_VERDICT_ALLOW,         SG_VERDICT_AUDIT,        SG_VERDICT_DISCOURAGE,
+    SG_VERDICT_REVIEW,        SG_VERDICT_NEEDS_REASON, SG_VERDICT_DENY,
+    SG_VERDICT_DENY_ESCALATE, SG_VERDICT_REJECT,       SG_VERDICT_UNDETERMINED};
+
+/* Install the same policy in both mirrored gates. Both calls must agree, and a
+ * refused policy stays the caller's. */
+int mirror_add_policy(sg_gate_t *left, sg_gate_t *right, const char *rule,
+                      sg_verdict_t outcome, int *b) {
+  st_policy_t *left_policy = new_rule_policy(rule);
+  st_policy_t *right_policy = new_rule_policy(rule);
+  if (!left_policy || !right_policy) {
+    st_policy_free(left_policy);
+    st_policy_free(right_policy);
+    *b = 0;
+    return 0;
+  }
+  int a = sg_gate_add_policy_owned(left, left_policy, outcome);
+  *b = sg_gate_add_policy_owned(right, right_policy, outcome);
+  if (a != SG_OK)
+    st_policy_free(left_policy);
+  if (*b != SG_OK)
+    st_policy_free(right_policy);
+  return a;
+}
+
+/* Remove one policy above the allow and deny slots from both gates, when
+ * there is one. Removal also drops the relations and outputs that name it. */
+void mirror_remove_policy(sg_gate_t *left, sg_gate_t *right,
+                          FuzzedDataProvider &fdp) {
+  uint32_t count = sg_gate_policy_count(left);
+  if (count <= 2 || count != sg_gate_policy_count(right))
+    return;
+  uint32_t index = 2 + fdp.ConsumeIntegral<uint8_t>() % (count - 2);
+  sg_gate_remove_policy(left, index);
+  sg_gate_remove_policy(right, index);
 }
 
 void run_stateful(FuzzedDataProvider &fdp) {
@@ -2725,7 +2790,7 @@ void run_stateful(FuzzedDataProvider &fdp) {
 
   size_t steps = fdp.ConsumeIntegralInRange<size_t>(1, 24);
   for (size_t step = 0; step < steps && fdp.remaining_bytes() > 0; step++) {
-    uint8_t operation = fdp.ConsumeIntegral<uint8_t>() % 13;
+    uint8_t operation = fdp.ConsumeIntegral<uint8_t>() % 19;
     int a = 0, b = 0;
     switch (operation) {
     case 0: {
@@ -2827,8 +2892,75 @@ void run_stateful(FuzzedDataProvider &fdp) {
                       right_buffer.data(), right_buffer.size());
       if (a != b || !results_equal(left_result, right_result))
         invariant_failure("mirrored stateful evaluation diverged");
+      if (a == SG_OK &&
+          left_result.output_count !=
+              (sg_gate_output_count(left) ? sg_gate_output_count(left) : 1))
+        invariant_failure("result outputs differ from the declared outputs");
       break;
     }
+    case 13: {
+      /* Several policies at once, so the list grows past the two fixed slots
+       * that removal, overrides and outputs need. */
+      size_t additions = 1 + fdp.ConsumeIntegral<uint8_t>() % 3;
+      for (size_t i = 0; i < additions; i++) {
+        const char *rule = fdp.ConsumeIntegral<uint8_t>() % 8 == 7
+                               ? nullptr
+                               : rules[fdp.ConsumeIntegral<uint8_t>() % 7];
+        sg_verdict_t outcome = kPolicyOutcomes[fdp.ConsumeIntegral<uint8_t>() %
+                                               (sizeof(kPolicyOutcomes) /
+                                                sizeof(kPolicyOutcomes[0]))];
+        a = mirror_add_policy(left, right, rule, outcome, &b);
+        if (a != b)
+          break;
+      }
+      /* Removing right after adding keeps relations and outputs naming the
+       * list's later entries in play. */
+      if (a == b && fdp.ConsumeBool())
+        mirror_remove_policy(left, right, fdp);
+      break;
+    }
+    case 14: {
+      uint32_t overrider = fdp.ConsumeIntegral<uint8_t>() % 20;
+      uint32_t overridden = fdp.ConsumeIntegral<uint8_t>() % 20;
+      uint32_t left_relation = UINT32_MAX, right_relation = UINT32_MAX;
+      a = sg_gate_add_override(left, overrider, overridden, &left_relation);
+      b = sg_gate_add_override(right, overrider, overridden, &right_relation);
+      if (a == SG_OK && left_relation != right_relation)
+        invariant_failure("mirrored relation ids diverged");
+      break;
+    }
+    case 15: {
+      uint32_t root = fdp.ConsumeIntegral<uint8_t>() % 20;
+      uint32_t relation_ids[4];
+      uint32_t relation_count = fdp.ConsumeIntegral<uint8_t>() % 5;
+      for (uint32_t i = 0; i < relation_count; i++)
+        relation_ids[i] = fdp.ConsumeIntegral<uint8_t>() % 12;
+      a = sg_gate_add_output(
+          left, root, relation_count ? relation_ids : nullptr, relation_count);
+      b = sg_gate_add_output(
+          right, root, relation_count ? relation_ids : nullptr, relation_count);
+      break;
+    }
+    case 16:
+      mirror_remove_policy(left, right, fdp);
+      break;
+    case 17: {
+      sg_verdict_t outcome = kPolicyOutcomes[fdp.ConsumeIntegral<uint8_t>() %
+                                             (sizeof(kPolicyOutcomes) /
+                                              sizeof(kPolicyOutcomes[0]))];
+      a = sg_gate_set_stop_outcome(left, outcome);
+      b = sg_gate_set_stop_outcome(right, outcome);
+      break;
+    }
+    case 18:
+      if (fdp.ConsumeBool()) {
+        sg_gate_clear_outputs(left);
+        sg_gate_clear_outputs(right);
+      } else {
+        sg_gate_clear_overrides(left);
+        sg_gate_clear_overrides(right);
+      }
+      break;
     }
     if (a != b)
       invariant_failure("mirrored state transition diverged");
@@ -2920,6 +3052,55 @@ void cleanup() {
 
 static void run_fixed_oracles();
 
+/* The policy list's declared answers, checked on a fixed gate: an output is its
+ * root's outcome when the root matched, else what the relations from it reach.
+ * The fuzzed stateful path mirrors two gates and so finds no wrong answer
+ * that both give. */
+void run_policy_list_oracles() {
+  sg_gate_t *gate = sg_gate_new();
+  st_policy_t *broad = new_rule_policy("echo *");
+  st_policy_t *narrow = new_rule_policy("echo secret");
+  uint32_t relation = UINT32_MAX;
+  if (!gate || !broad || !narrow ||
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_add_policy_owned(gate, broad, SG_VERDICT_ALLOW) != SG_OK ||
+      sg_gate_add_policy_owned(gate, narrow, SG_VERDICT_DENY) != SG_OK ||
+      sg_gate_policy_count(gate) != 4 ||
+      sg_gate_add_override(gate, 3, 2, &relation) != SG_OK || relation != 0 ||
+      sg_gate_add_override(gate, 2, 2, &relation) != SG_ERR_INVALID ||
+      sg_gate_add_output(gate, 3, &relation, 1) != SG_OK ||
+      sg_gate_add_output(gate, 2, nullptr, 0) != SG_OK ||
+      sg_gate_add_output(gate, 9, nullptr, 0) != SG_ERR_INVALID)
+    invariant_failure("policy list oracle setup failed");
+
+  struct {
+    const char *source;
+    sg_verdict_t first, second;
+  } const cases[] = {
+      {"echo hi", SG_VERDICT_ALLOW, SG_VERDICT_ALLOW},
+      {"echo secret", SG_VERDICT_DENY, SG_VERDICT_ALLOW},
+  };
+  for (const auto &item : cases) {
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, strlen(item.source));
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(gate, item.source, strlen(item.source),
+                                        buffer.data(), buffer.size(), &result);
+    validate_result(&result, error, buffer.data(), buffer.size());
+    if (error != SG_OK || result.output_count != 2 ||
+        result.outputs[0].verdict != item.first ||
+        result.outputs[1].verdict != item.second)
+      invariant_failure("policy list outputs disagree with the declared chain");
+  }
+
+  /* Removing the overrider drops its relation and the output rooted at it. */
+  sg_gate_remove_policy(gate, 3);
+  if (sg_gate_policy_count(gate) != 3 || sg_gate_relation_count(gate) != 0 ||
+      sg_gate_output_count(gate) != 1)
+    invariant_failure("removal left relations or outputs of the policy");
+  sg_gate_free(gate);
+}
+
 extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   (void)argc;
   (void)argv;
@@ -2956,6 +3137,7 @@ static void run_fixed_oracles() {
     run_generated_expansion_case(mixed_path_case, sizeof(mixed_path_case));
   }
   run_evaluation_buffer_contract_oracle();
+  run_policy_list_oracles();
   run_semantic_reference_oracles();
   run_brace_group_oracles();
   for (uint8_t selector = 0;
