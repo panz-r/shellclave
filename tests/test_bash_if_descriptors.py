@@ -123,9 +123,16 @@ class IfDescriptors(unittest.TestCase):
             command, input=b"".join(source.encode() + b"\0"
                                     for source in sources),
             capture_output=True, timeout=120)
-        blocks = result.stdout.decode().split("--\n")[:-1]
+        # A line of just "--" ends a report; a node line may end in "--".
+        blocks, lines = [], []
+        for line in result.stdout.decode().splitlines():
+            if line == "--":
+                blocks.append(lines)
+                lines = []
+            else:
+                lines.append(line)
         self.assertEqual(len(blocks), len(sources))
-        return [block.splitlines() for block in blocks]
+        return blocks
 
     def model(self, lines):
         if not lines or lines[0] != "rc=0":
@@ -210,6 +217,11 @@ class IfDescriptors(unittest.TestCase):
     def cwd_list(self, rng, root, depth):
         return "; ".join(self.cwd_statement(rng, root, depth + 1)
                          for _ in range(rng.randint(1, 2)))
+
+    def test_report_split_survives_a_command_named_dashes(self):
+        reports = self.reports(["-- x", "echo y"])
+        self.assertEqual([lines[0] for lines in reports], ["rc=0", "rc=0"])
+        self.assertIn("cmd 0 --", reports[0])
 
     def test_known_directory_matches_bash(self):
         # Where the graph knows the working directory of the command after the
