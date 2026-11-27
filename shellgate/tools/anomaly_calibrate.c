@@ -37,6 +37,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "sg_anomaly.h"
 #include "shell_abstract.h"
@@ -1187,6 +1188,45 @@ static SHELL_NONNULL(1, 2) bool same_file(const char *left, const char *right) {
           left_status.st_ino == right_status.st_ino);
 }
 
+/* Whether a report for path may be written aside and renamed over it: the
+ * path is absent or names a regular file. */
+static SHELL_NONNULL(1) bool report_target_is_replaceable(const char *path) {
+  struct stat status;
+  return stat(path, &status) != 0 || S_ISREG(status.st_mode);
+}
+
+/* Create a private sibling of path for the report and open it for writing, with
+ * the mode fopen would give path. The caller frees *temp_path, which names the
+ * file whenever the result is not NULL. */
+static SHELL_NONNULL(1, 2) FILE *open_report_temp(const char *path,
+                                                  char **temp_path) {
+  static const char suffix[] = ".XXXXXX";
+  size_t length = strlen(path);
+  char *temp = malloc(length + sizeof(suffix));
+  if (!temp)
+    return NULL;
+  memcpy(temp, path, length);
+  memcpy(temp + length, suffix, sizeof(suffix));
+  int descriptor = mkstemp(temp);
+  FILE *stream = NULL;
+  if (descriptor >= 0) {
+    mode_t mask = umask(0);
+    umask(mask);
+    if (fchmod(descriptor, 0666 & ~mask) == 0)
+      stream = fdopen(descriptor, "w");
+    if (!stream) {
+      close(descriptor);
+      unlink(temp);
+    }
+  }
+  if (!stream) {
+    free(temp);
+    return NULL;
+  }
+  *temp_path = temp;
+  return stream;
+}
+
 static void print_usage(const char *prog) {
   printf("Usage: %s -n <corpus> [options]\n", prog);
   printf("Options:\n");
@@ -1302,6 +1342,7 @@ int main(int argc, char **argv) {
   sg_gate_t *gate = NULL;
   FILE *fp = NULL;
   FILE *out = NULL;
+  char *temp_path = NULL;
   corpus_record_t *normal = NULL;
   double *normal_scores = NULL;
   double *synth_scores = NULL;
@@ -1653,10 +1694,19 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  out = output_path ? fopen(output_path, "w") : stdout;
-  if (!out) {
-    fprintf(stderr, "Cannot open output: %s\n", output_path);
-    goto cleanup;
+  /* A report replaces its file only when complete: write a sibling file and
+   * rename it over the target, so a failure leaves any earlier report intact.
+   * A target that is no regular file, such as a device, is written directly. */
+  if (output_path) {
+    out = report_target_is_replaceable(output_path)
+              ? open_report_temp(output_path, &temp_path)
+              : fopen(output_path, "w");
+    if (!out) {
+      fprintf(stderr, "Cannot open output: %s\n", output_path);
+      goto cleanup;
+    }
+  } else {
+    out = stdout;
   }
 
   if (strcmp(fmt, "json") == 0) {
@@ -1708,12 +1758,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Cannot write calibration output\n");
     goto cleanup;
   }
-  if (output_path && fclose(out) != 0) {
+  if (output_path) {
+    int closed = fclose(out);
     out = NULL;
-    fprintf(stderr, "Cannot close output: %s\n", output_path);
-    goto cleanup;
+    if (closed != 0) {
+      fprintf(stderr, "Cannot close output: %s\n", output_path);
+      goto cleanup;
+    }
+    if (temp_path && rename(temp_path, output_path) != 0) {
+      fprintf(stderr, "Cannot write output: %s\n", output_path);
+      goto cleanup;
+    }
+    free(temp_path);
+    temp_path = NULL;
   }
-  out = NULL;
 
   /* A report is the primary calibration result. Publish it successfully
    * before attempting the optional model write; a model-save failure may
@@ -1734,6 +1792,10 @@ cleanup:
     fclose(fp);
   if (out && output_path)
     fclose(out);
+  if (temp_path) {
+    unlink(temp_path);
+    free(temp_path);
+  }
   free(line);
   free(evaluation_buffer);
   free(roc);

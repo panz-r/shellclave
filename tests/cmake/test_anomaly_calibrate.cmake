@@ -383,6 +383,25 @@ if(overlong_result EQUAL 0 OR
   message(FATAL_ERROR "anomaly_calibrate accepted an unlearned record: ${overlong_error}${overlong_output}")
 endif()
 
+# A report replaces its file whole: the old content goes, and no sibling
+# staging file stays behind.
+set(report_dir "${SHELLCLAVE_ANOMALY_TEMP}/report-replacement")
+file(REMOVE_RECURSE "${report_dir}")
+file(MAKE_DIRECTORY "${report_dir}")
+file(WRITE "${report_dir}/report.csv" "previous report\n")
+execute_process(
+  COMMAND "${SHELLCLAVE_ANOMALY_CALIBRATE}" -n "${trusted_corpus}"
+          -N 1 -r 4 -t 0,0,1 -f csv -o "${report_dir}/report.csv"
+  RESULT_VARIABLE replace_result
+  ERROR_VARIABLE replace_error)
+file(READ "${report_dir}/report.csv" replaced_report)
+file(GLOB report_entries RELATIVE "${report_dir}" "${report_dir}/*")
+if(NOT replace_result EQUAL 0 OR replaced_report MATCHES "previous report" OR
+   NOT replaced_report MATCHES "^threshold,tp,fp,tn,fn" OR
+   NOT report_entries STREQUAL "report.csv")
+  message(FATAL_ERROR "anomaly_calibrate did not replace the report whole: ${replace_error} ${report_entries}")
+endif()
+
 if(EXISTS "/dev/full")
   set(model_after_report_failure "${SHELLCLAVE_ANOMALY_TEMP}/no-model-after-report-failure.bin")
   file(REMOVE "${model_after_report_failure}")
