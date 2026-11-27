@@ -34,23 +34,6 @@ void shell_tokenizer_arithmetic_content(const shell_token_t *token,
   *content_length = end - open - 1;
 }
 
-/* `{` and `}` are reserved words only as whole tokens: the next logical byte
- * must end the word, as in Bash. Escaped line endings vanish before that byte
- * is judged. A shell metacharacter or the end of input ends the token, except
- * a process substitution, which continues it; `{x`, `}suffix`, `}2>out` and
- * `{<(cmd)` are words, not delimiters. Command position, the preceding byte
- * and group depth are separate lexer context. position < length indexes the
- * brace. */
-static bool brace_token_ends(const char *input, size_t length,
-                             size_t position) {
-  size_t following = shell_source_logical_following(input, length, position);
-  size_t open;
-  return following == length ||
-         (shell_source_word_separator(input[following]) &&
-          !shell_source_process_substitution_open(input, length, following,
-                                                  &open));
-}
-
 /* Input is a required, domain-checked span. No grammar validation is needed
  * merely to initialize or rewind an iterator over that immutable span. */
 void shell_tokenizer_init_prechecked(shell_tokenizer_state_t *state,
@@ -222,18 +205,10 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
     return false;
   if (!opening && state->brace_group_depth == 0)
     return false;
-  if (!opening && p > 0) {
-    size_t before = shell_source_skip_escaped_line_endings_backward(
-        state->input, state->length, p);
-    if (before == 0)
-      return false;
-    char preceding = state->input[before - 1];
-    if (!shell_source_space((unsigned char)preceding) && preceding != ';' &&
-        preceding != '|' && preceding != '&' && preceding != '(' &&
-        preceding != ')')
-      return false;
-  }
-  return brace_token_ends(state->input, state->length, p);
+  if (!opening &&
+      !shell_source_brace_follows_boundary(state->input, state->length, p))
+    return false;
+  return shell_source_brace_word_ends(state->input, state->length, p);
 }
 
 static size_t

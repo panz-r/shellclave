@@ -64,11 +64,7 @@ static SHELL_NONNULL(1) uint32_t
  * and `}\<newline>x` extends it. */
 static bool group_word_ends_here(const char *cmd, uint32_t pos,
                                  uint32_t cmd_len) {
-  size_t next = shell_source_logical_following(cmd, cmd_len, pos);
-  if (next >= cmd_len)
-    return true;
-  return shell_source_space((unsigned char)cmd[next]) ||
-         is_separator(cmd[next]) || cmd[next] == ')';
+  return shell_source_brace_word_ends(cmd, cmd_len, pos);
 }
 
 /* Advance across one shell word without splitting a quoted here-string
@@ -1766,8 +1762,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     }
     bool brace_close =
         c == '}' && brace_group_depth > 0 &&
-        (pos == 0 || shell_source_space((unsigned char)cmd[pos - 1]) ||
-         cmd[pos - 1] == ';' || cmd[pos - 1] == '\n' || cmd[pos - 1] == ')') &&
+        shell_source_brace_follows_boundary(cmd, cmd_len, pos) &&
         (group_word_ends_here(cmd, pos, cmd_len) || brace_close_redirect);
     /* One forward token stream supplies trivia and prefix facts. Neither a
      * literal brace nor a continuation may restart at the stage's source

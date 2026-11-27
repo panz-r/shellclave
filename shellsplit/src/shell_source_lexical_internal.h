@@ -379,6 +379,41 @@ static inline bool shell_source_process_substitution_open(const char *input,
   return shell_source_logical_next_is(input, length, position, '(', open);
 }
 
+/* Brace group delimiters, for every parser path. A `{` or `}` is a delimiter
+ * only as a whole word, so both of these must hold: the byte before it is a
+ * boundary, and the word ends right after it. input[0..length) is immutable
+ * and position < length. */
+
+/* The `}` at position follows a space, newline, list operator or parenthesis,
+ * ignoring escaped physical line endings in between. */
+static SHELL_NONNULL(1) inline bool shell_source_brace_follows_boundary(
+    const char *input, size_t length, size_t position) {
+  if (position == 0)
+    return true;
+  size_t before =
+      shell_source_skip_escaped_line_endings_backward(input, length, position);
+  if (before == 0)
+    return false;
+  char preceding = input[before - 1];
+  return shell_source_space((unsigned char)preceding) || preceding == ';' ||
+         preceding == '|' || preceding == '&' || preceding == '(' ||
+         preceding == ')';
+}
+
+/* The word of the brace at position ends right after it, as in Bash: the next
+ * logical byte, after escaped line endings, ends the input or is a word
+ * separator. A process substitution continues the word, so `{x`, `}suffix`,
+ * `}2>out` and `{<(cmd)` are words, not delimiters. */
+static SHELL_NONNULL(1) inline bool shell_source_brace_word_ends(
+    const char *input, size_t length, size_t position) {
+  size_t following = shell_source_logical_following(input, length, position);
+  size_t open;
+  return following == length ||
+         (shell_source_word_separator(input[following]) &&
+          !shell_source_process_substitution_open(input, length, following,
+                                                  &open));
+}
+
 /* Match one complete, unquoted shell word after removing escaped physical
  * line endings.  Reserved words must use this boundary rather than matching a
  * single lexer fragment: expansion, quote, and process-substitution fragments
