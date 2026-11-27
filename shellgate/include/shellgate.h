@@ -3,7 +3,12 @@
  *
  * Evaluates shell commands with Shellsplit parsing and Shelltype policies.
  * Result strings reference the caller-provided output buffer; result arrays
- * have fixed capacities. Gates are not synchronized.
+ * have fixed capacities.
+ *
+ * Threads: a gate is not synchronized, so use each gate from one thread at a
+ * time. Distinct gates may evaluate concurrently, including gates that share
+ * installed stable policies, which support concurrent logical readers
+ * (see shelltype.h).
  */
 
 #ifndef SHELLGATE_H

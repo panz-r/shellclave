@@ -14,6 +14,10 @@ extern "C" {
 /**
  * Fast shell parser: zero-copy ranges in a fixed-size result. It performs no
  * dynamic allocation. See shell_tokenizer_full.h for allocating tokenization.
+ *
+ * Threads: Shellsplit keeps its parse state per thread, so distinct threads
+ * may parse concurrently. Results, drafts and workspaces belong to the caller
+ * and are not synchronized.
  */
 
 /* --- CONSTANTS AND LIMITS --- */
