@@ -90,11 +90,11 @@ static inline SHELL_NONNULL(1) bool shell_source_function_declarator_after(
  * word-forming exceptions explicit: `!<(` / `!>(` are ordinary words with a
  * process-substitution suffix, `!(...)` is read as an extglob pattern, and
  * numeric or named descriptor prefixes remain part of their containing word.
- * Bash without extglob parses `!(...)` as a negated subshell, wherever a
- * command may start; that form is not modeled, and the dependency graph
- * rejects it. The caller
- * supplies immutable input[0..end) with position <= end. `after` is optional.
- */
+ * The executor contract enables extglob, which makes `!(...)` a pattern word,
+ * and the graph models it as an ordinary command word. Bash without extglob
+ * parses it as a negated subshell, whose effects the analysis would miss. The
+ * caller supplies immutable input[0..end) with position <= end. `after` is
+ * optional. */
 static SHELL_NONNULL(1) inline bool shell_source_match_pipeline_negator(
     const char *input, size_t end, size_t position, size_t *after) {
   if (after)

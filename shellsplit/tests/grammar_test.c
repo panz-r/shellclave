@@ -7295,6 +7295,8 @@ tokenizer_test_current_shell_metaprogramming_semantic_contract(void) {
       "wait -z -p fd",
       "wait -n -z -p fd",
       "wait +n -p fd",
+      /* A bare dash is an operand that ends the options. */
+      "wait - -p fd",
       "getopts ab choice",
       ": $((1 + 2))",
       ": $((1--2))",

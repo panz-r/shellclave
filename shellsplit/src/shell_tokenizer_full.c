@@ -1645,7 +1645,8 @@ static SHELL_NONNULL(1) shell_control_syntax_t
                      : SHELL_CONTROL_SYNTAX_NONE;
 }
 
-/* Shellsplit does not model loop, `case` or `coproc` execution. Use the full
+/* Shellsplit does not model loop, `case`, `select`, `coproc` or function
+ * execution. Use the full
  * lexical tokenizer instead of raw source scans so words in comments, quoted
  * text, escapes, redirect operands, adjacent word fragments, and ordinary
  * argument positions are not mistaken for reserved control words. */

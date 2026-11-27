@@ -233,6 +233,7 @@ static SHELL_NONNULL(1, 3) bool token_is_unmodeled_current_shell_builtin(
 typedef struct {
   bool option;
   bool valid;
+  size_t letters;
   size_t position;
 } static_wait_option_t;
 
@@ -243,6 +244,8 @@ static SHELL_NONNULL(2) bool static_wait_option_emit(unsigned char byte,
     scan->option = byte == '-';
   else if (byte != 'n' && byte != 'f')
     scan->valid = false;
+  else
+    scan->letters++;
   scan->position++;
   return true;
 }
@@ -1118,10 +1121,11 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     if (command_start || awaiting_command) {
       if (command_start && token.type == SHELL_TOKEN_PIPE_NEGATE)
         continue;
-      /* Loop, `case` and function syntax is unsupported whether complete or
-       * incomplete. The list validator retains its diagnostic control grammar
-       * separately; this forward semantic pass only needs the command-position
-       * keyword or function introducer, not another descendant walk. */
+      /* Loop, `case`, `select`, `coproc` and function syntax is unsupported
+       * whether complete or incomplete. The list validator retains its
+       * diagnostic control grammar separately; this forward semantic pass only
+       * needs the command-position keyword or function introducer, not another
+       * descendant walk. */
       if (reserved_word_position) {
         const shell_keyword_t *keyword =
             shell_source_keyword(input, input_length, token.position, NULL);
@@ -1320,7 +1324,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         static_wait_option_t option = {.valid = true};
         if (token_visit_static_word(input, input_length, &token,
                                     static_wait_option_emit, &option) &&
-            option.option && option.valid)
+            option.option && option.valid && option.letters)
           continue;
         builtin.wait_options = false;
       }
