@@ -936,6 +936,53 @@ TEST(override_declaration_validation_and_removal) {
   sg_gate_free(gate);
 }
 
+TEST(relation_ids_span_the_whole_table) {
+  static const char *const cpls[] = {"echo *", "echo ok", "ls"};
+  static const sg_verdict_t outcomes[] = {SG_VERDICT_DENY, SG_VERDICT_ALLOW,
+                                          SG_VERDICT_REVIEW};
+  sg_gate_t *gate = chain_gate(cpls, outcomes, 3); /* 2 broad, 3 ok, 4 ls */
+  ASSERT_NOT_NULL(gate);
+  /* Ids 0 to 62 relate "echo ok" to the broad policy; id 63 relates "ls" to
+   * "echo ok". The ids of an output are bits of one 64-bit set. */
+  uint32_t relation = 0;
+  for (uint32_t i = 0; i < SG_MAX_RELATIONS - 1; i++)
+    ASSERT_SG_OK(sg_gate_add_override(gate, 3, 2, &relation));
+  ASSERT_SG_OK(sg_gate_add_override(gate, 4, 3, &relation));
+  ASSERT(relation == 63 && sg_gate_relation_count(gate) == SG_MAX_RELATIONS);
+  const uint32_t high[] = {63, 31, 32, 0, 62};
+  ASSERT_SG_OK(sg_gate_add_output(gate, 4, high, 5));
+  const uint32_t first[] = {0};
+  ASSERT_SG_OK(sg_gate_add_output(gate, 3, first, 1));
+
+  /* A refusal leaves the declarations as they were. */
+  const uint32_t beyond[] = {SG_MAX_RELATIONS};
+  ASSERT(sg_gate_add_output(gate, 4, beyond, 1) == SG_ERR_INVALID);
+  ASSERT(sg_gate_output_count(gate) == 2);
+  ASSERT(sg_gate_add_override(gate, 4, 2, &relation) == SG_ERR_INVALID);
+  ASSERT(sg_gate_relation_count(gate) == SG_MAX_RELATIONS);
+
+  /* The "ls" root misses "echo ok" and reaches the policy through relation 63;
+   * the second output is rooted at it. */
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo ok", &result));
+  ASSERT(result.output_count == 2 &&
+         result.outputs[0].verdict == SG_VERDICT_ALLOW &&
+         result.outputs[1].verdict == SG_VERDICT_ALLOW);
+
+  /* Removing the broad policy drops the 63 relations that name it and renumbers
+   * relation 63 to id 0, in the output that kept it. */
+  sg_gate_remove_policy(gate, 2);
+  ASSERT(sg_gate_relation_count(gate) == 1 && sg_gate_output_count(gate) == 2);
+  uint32_t overrider = 0, overridden = 0;
+  sg_gate_relation_at(gate, 0, &overrider, &overridden);
+  ASSERT(overrider == 3 && overridden == 2);
+  memset(&result, 0, sizeof(result));
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.output_count == 2 &&
+         result.outputs[0].verdict == SG_VERDICT_REVIEW);
+  sg_gate_free(gate);
+}
+
 TEST(override_removal_of_an_overrider_and_a_borrowed_policy) {
   st_policy_t *borrowed = binding_policy("pwd");
   ASSERT_NOT_NULL(borrowed);
@@ -7111,6 +7158,7 @@ int main(int argc, char **argv) {
   RUN(override_cycle_gives_two_outputs);
   RUN(override_fan_out_tries_relations_in_creation_order);
   RUN(override_declaration_validation_and_removal);
+  RUN(relation_ids_span_the_whole_table);
   RUN(override_removal_of_an_overrider_and_a_borrowed_policy);
   RUN(policy_allocation_failure_returns_the_error_and_no_verdict);
   RUN(anomaly_component_borrowed_views);
