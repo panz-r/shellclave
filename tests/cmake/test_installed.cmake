@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
+include("${CMAKE_CURRENT_LIST_DIR}/consumer_common.cmake")
+
 set(staging "${SHELLCLAVE_BINARY_DIR}/consumer-install-staging")
 set(prefix "${SHELLCLAVE_BINARY_DIR}/consumer install relocated")
 set(build "${SHELLCLAVE_BINARY_DIR}/consumer installed build")
@@ -56,7 +58,8 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -S "${SHELLCLAVE_SOURCE_DIR}/tests/co
   -G "${SHELLCLAVE_GENERATOR}" "-DCMAKE_PREFIX_PATH=${prefix}"
   "-DCMAKE_C_COMPILER=${SHELLCLAVE_C_COMPILER}"
   "-DCMAKE_CXX_COMPILER=${SHELLCLAVE_CXX_COMPILER}"
-  "-DCMAKE_BUILD_TYPE=${SHELLCLAVE_BUILD_TYPE}" RESULT_VARIABLE result)
+  "-DCMAKE_BUILD_TYPE=${SHELLCLAVE_BUILD_TYPE}"
+  "-DSHELLCLAVE_REQUIRED_VERSION=${SHELLCLAVE_VERSION}" RESULT_VARIABLE result)
 if(result)
   message(FATAL_ERROR "Installed consumer configuration failed: ${result}")
 endif()
@@ -78,19 +81,4 @@ execute_process(COMMAND ${build_command} RESULT_VARIABLE result)
 if(result)
   message(FATAL_ERROR "Installed consumer build failed: ${result}")
 endif()
-execute_process(COMMAND "${build}/shellclave_consumer" RESULT_VARIABLE result)
-if(result)
-  message(FATAL_ERROR "Installed consumer execution failed: ${result}")
-endif()
-execute_process(COMMAND "${build}/shellclave_cpp_consumer" RESULT_VARIABLE result)
-if(result)
-  message(FATAL_ERROR "Installed C++ consumer execution failed: ${result}")
-endif()
-execute_process(COMMAND "${build}/shellclave_example_consumer" RESULT_VARIABLE result)
-if(result)
-  message(FATAL_ERROR "Installed gate example execution failed: ${result}")
-endif()
-execute_process(COMMAND "${build}/shellclave_source_consumer" RESULT_VARIABLE result)
-if(result)
-  message(FATAL_ERROR "Installed source example execution failed: ${result}")
-endif()
+run_consumers("${build}" "Installed")
