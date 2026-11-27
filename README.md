@@ -337,7 +337,7 @@ Example output:
 git status --short: argv policy ALLOW
 git reset --hard: argv policy DENY
 git log --oneline: argv policy UNDETERMINED
-if true; then :; fi: argv policy REJECT
+while true; do :; done: argv policy REJECT
 echo "$(whoami)": argv policy ALLOW; substitution inspection required; unresolved argv; dynamic substitution I/O present
 echo "$VALUE": argv policy ALLOW; unresolved argv
 echo ok >"$OUT": argv policy ALLOW; unresolved pathname
